@@ -19,6 +19,7 @@ Quickstart::
 
 from koptim._version import __version__
 from koptim.adafusion import Adafusion
+from koptim.kprodigy import KProdigy
 from koptim.muon import Muon
 
-__all__ = ["Adafusion", "Muon", "__version__"]
+__all__ = ["Adafusion", "KProdigy", "Muon", "__version__"]

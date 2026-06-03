@@ -15,9 +15,17 @@ on commodity GPUs, where optimizer state is precious and weights are bf16.
 - **`Muon`** — an orthogonalized-momentum optimizer (Newton-Schulz) with an
   AdamW fallback for 1-D/embedding params. Highest convergence quality, at half
   of AdamW's state.
+- **`KProdigy`** — a memory-efficient **Prodigy** (parameter-free
+  D-adaptation): train at `lr=1.0` and the optimizer finds the effective LR
+  itself. Matches reference Prodigy bit-for-bit at its defaults, then adds the
+  koptim memory toolkit (bf16/int8 momentum, factored second moment,
+  stochastic-rounding bf16 updates, per-group independent D for SDXL UNet+TE).
 
-Both are standard `torch.optim.Optimizer`s and work one-parameter-at-a-time, so
-they drop into per-parameter / gradient-release training loops unchanged.
+`Adafusion` and `Muon` are standard `torch.optim.Optimizer`s that work
+one-parameter-at-a-time, so they drop into per-parameter / gradient-release
+training loops unchanged. `KProdigy` needs a global reduction over all
+parameters each step (the D estimate), so it is a normal two-pass `step()`
+optimizer (no gradient-release).
 
 ## Install
 
@@ -51,6 +59,40 @@ from koptim import Muon
 
 opt = Muon(model.parameters(), lr=2e-2, momentum_dtype="bfloat16")
 ```
+
+```python
+from koptim import KProdigy
+
+# Parameter-free: lr stays 1.0; D adapts. For SDXL UNet+TE, pass two param
+# groups and KProdigy gives each its own D automatically.
+opt = KProdigy(model.parameters(), lr=1.0, momentum_dtype="bfloat16")
+```
+
+## KProdigy — why
+
+[Prodigy](https://arxiv.org/abs/2306.06101) estimates the distance `D` to the
+solution on the fly and uses it as the effective learning rate — no LR to tune,
+no schedule. The catch in practice is memory (reference Prodigy keeps *four*
+fp32 buffers — double AdamW) and fragile defaults. `KProdigy` keeps the exact
+D-estimation math but:
+
+- stores the first moment in **bf16 / int8** and (optionally) the second moment
+  **factored** (Adafactor row+col), with **stochastic-rounding** bf16 weight
+  updates — the same toolkit as `Adafusion`, so D-adaptation no longer costs
+  more memory than AdamW;
+- ships **sane defaults** (`d_update_freq=1`, `use_bias_correction=False`). The
+  original research repo defaulted these the other way and it *starved the
+  D-bootstrap* — the effective LR failed to rise. See
+  `benchmarks/bench_kprodigy_d.py` for the measured trajectories;
+- gives each param group its **own D** (`independent_d`, auto-on for >1 group)
+  so on SDXL the UNet and Text Encoder don't burn each other's learning rate.
+
+> Status: the full-precision path (bf16 momentum + full fp32 second moment)
+> reproduces reference Prodigy to ~1e-4 on D and is the recommended default.
+> `second_moment="factored"` is experimental (it inflates D somewhat — measure
+> on your model first). With bf16 weights, keep `bf16_method="stochastic_rounding"`:
+> at `d0=1e-6` the early updates are tiny and naive bf16 rounding truncates them
+> to zero, stalling the D-bootstrap.
 
 ## Adafusion — why
 
@@ -90,6 +132,8 @@ brings its per-step cost in line with AdamW on large 2-D weights.
 | **Lion8bit-class memory + momentum** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="int8")` |
 | **Best convergence (memory available)** | `Muon(..., lr=2e-2, momentum_dtype="bfloat16")` |
 | **HF-Adafactor drop-in** | `Adafusion(..., betas=(0.0,0.999), decay_rate=-0.8)` |
+| **No LR to tune (SDXL UNet+TE)** | `KProdigy([{"params": unet, "lr": 1.0}, {"params": te, "lr": 1.0}])` |
+| **Parameter-free + minimum VRAM** | `KProdigy(..., second_moment="factored", momentum_dtype="bfloat16", slice_p=11)` |
 
 > Note: in HF Adafactor, `beta1=0.0` (≠ `None`) still allocates a momentum
 > buffer. `Adafusion(betas=(0.0, ...))` is true no-momentum.
@@ -112,6 +156,21 @@ Muon(
     params, lr=2e-2, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0, *,
     adamw_lr=3e-4, adamw_betas=(0.9, 0.999), adamw_eps=1e-8, adamw_weight_decay=0.0,
     bf16_method="stochastic_rounding", momentum_dtype="float32",
+)
+
+KProdigy(
+    params, lr=1.0, betas=(0.9, 0.999), beta3=None, eps=1e-8, weight_decay=0.0, *,
+    decouple=True,
+    use_bias_correction=False,          # keep off (the repo's True default hurt D)
+    safeguard_warmup=False, d0=1e-6, d_coef=1.0, growth_rate=float("inf"),
+    d_update_freq=1,                    # keep 1 (>1 starves the D-bootstrap)
+    slice_p=1,                          # 11 -> ~11x less D-state, ~0.3% D error
+    independent_d=None,                 # None -> auto: on when >1 param group
+    momentum_dtype="bfloat16",          # "float32" | "bfloat16" | "int8"
+    second_moment="full",               # "full" | "factored" (experimental)
+    eps_factored=1e-30,
+    bf16_method="stochastic_rounding",  # "stochastic_rounding" | "kahan" | "none"
+    factor_conv_as_matrix=True,
 )
 ```
 
