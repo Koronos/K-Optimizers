@@ -183,7 +183,7 @@ uv run ruff check src tests
 
 ## Status
 
-v0.1 alpha. API may change.
+v0.2 alpha. API may change.
 
 ## License
 
