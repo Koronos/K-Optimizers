@@ -1,0 +1,75 @@
+[project]
+name = "koptim"
+description = "K-Optimizers: memory-efficient PyTorch optimizers for bf16 diffusion fine-tuning (Adafusion, Muon)."
+authors = [
+    { name = "Koronos" }
+]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+keywords = [
+    "pytorch",
+    "optimizer",
+    "adafactor",
+    "muon",
+    "diffusion",
+    "memory-efficient",
+    "stochastic-rounding",
+    "bfloat16",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/Koronos/K-Optimizers"
+Repository = "https://github.com/Koronos/K-Optimizers"
+Issues = "https://github.com/Koronos/K-Optimizers/issues"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/koptim/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/koptim"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/koptim", "tests", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "N"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["N802", "N803"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
