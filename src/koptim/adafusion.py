@@ -53,7 +53,12 @@ MomentumDtype = Literal["bfloat16", "float32", "int8"]
 # budget is `free_bytes * SAFETY_FRACTION / BYTES_PER_ELEM`; the divisor accounts
 # for the ~handful of simultaneous transient copies a chunk touches at peak.
 _STACK_SAFETY_FRACTION = 0.10   # use at most ~10% of currently-free VRAM per chunk
-_STACK_BYTES_PER_ELEM = 40      # peak simultaneous transient bytes per stacked element
+# Peak transient bytes per stacked element. This is a property of the optimizer's
+# intermediate tensors, NOT of the model: measured byte-for-byte identical on SDXL
+# and Cosmos shapes. It depends only on the path and config — 2-D factored 24 B
+# (common) / 38 B (momentum+wd+cautious), 1-D non-factored 28 B / 42 B (it also
+# stacks the full second-moment state). 48 = worst measured (42.1) + margin.
+_STACK_BYTES_PER_ELEM = 48
 _MIN_STACK_ELEMS = 262_144      # still batch small tensors even under memory pressure
 _DEFAULT_STACK_ELEMS = 64_000_000  # CPU / unknown device: no VRAM limit to respect
 
