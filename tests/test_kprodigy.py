@@ -183,3 +183,68 @@ def test_state_dict_roundtrip():
     opt2 = KProdigy([p], lr=1.0)
     opt2.load_state_dict(sd)
     assert opt2.param_groups[0]["d"] == opt.param_groups[0]["d"]
+
+
+# -- Adafusion-engine update backend (foreach) -----------------------------
+
+def _mixed_params(dtype=torch.float32):
+    """2-D + conv (4-D) + 1-D params -> exercises factored, full and flat buckets."""
+    g = torch.Generator().manual_seed(0)
+    shapes = [(32, 16), (24, 12), (8, 4, 3, 3), (16,), (32,), (10, 5, 1, 1)]
+    return [
+        torch.nn.Parameter((torch.randn(*s, generator=g, dtype=dtype) * 0.1))
+        for s in shapes
+    ]
+
+
+def _run_kprodigy(ps, *, foreach, steps=12, **kw):
+    opt = KProdigy(ps, lr=1.0, **{"foreach": foreach, **kw})
+    g = torch.Generator().manual_seed(123)
+    ds = []
+    for _ in range(steps):
+        for p in ps:
+            p.grad = torch.randn(p.shape, generator=g, dtype=p.dtype) * 0.05
+        opt.step()
+        ds.append(opt.get_d())
+    return ds
+
+
+@pytest.mark.parametrize("momentum_dtype", ["float32", "bfloat16", "int8", "4bit"])
+@pytest.mark.parametrize("second_moment", ["full", "factored"])
+@pytest.mark.parametrize("cautious", [False, True])
+def test_foreach_matches_per_param(momentum_dtype, second_moment, cautious):
+    """The engine-backed (foreach) update is bit-exact vs the per-param loop on
+    fp32 weights, across momentum dtype / second moment / cautious, on 2-D + conv
+    + 1-D params. (D-estimation is shared, so D is identical by construction.)"""
+    base = _mixed_params()
+    pa = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    kw = dict(momentum_dtype=momentum_dtype, second_moment=second_moment, cautious=cautious)
+    d_pp = _run_kprodigy(pa, foreach=False, **kw)
+    d_fe = _run_kprodigy(pb, foreach=True, **kw)
+    assert d_pp == pytest.approx(d_fe, rel=0, abs=0)  # D identical
+    for a, b in zip(pa, pb, strict=True):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+def test_foreach_4bit_cautious_converges():
+    """The new 4bit momentum + cautious path trains and bootstraps D."""
+    losses, opt = _run(
+        lambda m: KProdigy(m.parameters(), lr=1.0, momentum_dtype="4bit", cautious=True)
+    )
+    assert losses[-1] < 0.1 * losses[0]
+    assert opt.get_d() > 10 * opt.param_groups[0]["d0"]
+
+
+def test_4bit_momentum_is_half_byte_per_param():
+    p = torch.nn.Parameter(torch.randn(64, 64))
+    opt = KProdigy([p], lr=1.0, momentum_dtype="4bit", momentum_4bit_block=128)
+    p.grad = torch.randn_like(p)
+    opt.step()
+    st = opt.state[p]
+    assert st["m"].dtype == torch.uint8
+    assert st["m"].numel() == (p.numel() + 1) // 2          # 0.5 B/param packed
+
+
+def test_invalid_momentum_4bit_accepted():
+    KProdigy([torch.zeros(1, requires_grad=True)], lr=1.0, momentum_dtype="4bit")

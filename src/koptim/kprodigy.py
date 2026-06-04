@@ -11,7 +11,7 @@ bf16 diffusion fine-tuning* — fixing the issues that plagued the original
 fail to rise). The D-estimation math here matches the reference Prodigy bit for
 bit at the defaults; the *enhancements* are orthogonal memory savings:
 
-* **bf16 / int8 first moment** (``momentum_dtype``) — like ``Adafusion``.
+* **bf16 / int8 / 4bit first moment** (``momentum_dtype``) — like ``Adafusion``.
 * **factored second moment** (``second_moment="factored"``) — Adafactor-style
   row+column EMA, ~0 state on convs/attention. Experimental: it uses the
   current-``d`` convention for the second moment (the historical-``d`` scaling
@@ -22,6 +22,15 @@ bit at the defaults; the *enhancements* are orthogonal memory savings:
 * **sliced D statistics** (``slice_p``) — compute the ``s``/``p0`` D-estimation
   buffers on every ``p``-th element (~0.3% D error at ``slice_p=11`` for ~11x
   less D-state).
+
+**Engine.** KProdigy is a two-pass optimizer: pass 1 accumulates the global D
+statistics + computes the new D, pass 2 applies the weight update. The D math
+(pass 1) is the validated reference Prodigy; the *update backend* (pass 2) reuses
+``Adafusion``'s full engine — its **foreach batching**, its **momentum codec**
+(float32/bfloat16/int8/4bit), **cautious** masking, **conv-aware matrixized
+factoring**, and **stochastic-rounding** bf16 weights — with Prodigy's effective
+learning rate (``lr × D``) folded into the update. Set ``foreach=False`` for the
+per-parameter path.
 
 Memory at ``beta1=0`` (no momentum), ``second_moment="factored"``, ``slice_p=11``
 is well under AdamW; even the full-precision default (bf16 momentum + full fp32
@@ -47,26 +56,35 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from koptim._factored import factored_inv_sqrt_factors, update_factored_state
+from koptim._momentum_codec import (
+    _FOURBIT_BLOCK,
+    _make_codec,
+    _MomentumCodec,
+    _quant_int8,
+)
 from koptim._stochastic_rounding import add_stochastic_
 
 __all__ = ["KProdigy"]
 
 _LOW_PRECISION = (torch.bfloat16, torch.float16)
-MomentumDtype = Literal["bfloat16", "float32", "int8"]
+MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 SecondMoment = Literal["full", "factored"]
+
+# Reuse Adafusion's adaptive-VRAM foreach stacking constants so a KProdigy chunk
+# budget never OOMs a full fine-tune (same engine, same safety story).
+_STACK_SAFETY_FRACTION = 0.10
+_STACK_BYTES_PER_ELEM = 48
+_MIN_STACK_ELEMS = 262_144
+_DEFAULT_STACK_ELEMS = 64_000_000
+_FOREACH_BATCH_CUTOFF = 2_000_000
 
 
 def _is_low_precision(t: Tensor) -> bool:
     return t.dtype in _LOW_PRECISION
 
 
-def _quant_int8(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
-    """Quantize a momentum tensor to int8 with a per-row (dim-0) absmax scale."""
-    dims = tuple(range(1, m_fp32.ndim)) if m_fp32.ndim >= 2 else ()
-    absmax = m_fp32.abs().amax(dim=dims, keepdim=True).clamp_(min=1e-12)
-    scale = absmax / 127.0
-    q = (m_fp32 / scale).round_().clamp_(-127, 127).to(torch.int8)
-    return q, scale
+def _rms(t: Tensor) -> Tensor:
+    return t.norm(2) / math.sqrt(max(t.numel(), 1))
 
 
 class KProdigy(Optimizer):
@@ -100,16 +118,34 @@ class KProdigy(Optimizer):
             one component does not burn the other). ``None`` -> auto: on when
             there is more than one param group.
         momentum_dtype: first-moment storage — ``"bfloat16"`` (default, ~2
-            B/param), ``"float32"`` (4 B/param), or ``"int8"`` (~1 B/param).
+            B/param), ``"float32"`` (4 B/param), ``"int8"`` (~1 B/param,
+            per-row absmax), or ``"4bit"`` (~0.5 B/param, signed linear 4-bit
+            with a per-block absmax scale; block size ``momentum_4bit_block``).
+        momentum_4bit_block: block size for ``momentum_dtype="4bit"`` (default
+            128). ``0``/negative means whole-tensor (single scale).
         second_moment: ``"full"`` (default; fp32, exact) or ``"factored"``
             (Adafactor row+col, ~0 state on >=2-D weights; experimental).
         eps_factored: ``eps1`` added to ``grad**2`` before the factored
             reductions (HF Adafactor convention). Only used when factored.
+        cautious: cautious masking (Liang et al. 2024) — zero the update
+            coordinates whose sign disagrees with the gradient, renormalized to
+            keep the step size. Default ``False``. A no-op when ``beta1=0`` (the
+            numerator is the raw grad, so the mask is all-ones).
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
             ``"none"``. No-op on fp32 params.
         factor_conv_as_matrix: reshape 4-D conv kernels to 2-D before factoring
             (the conv-aware fix). Default ``True``.
+        foreach: batch the pass-2 update across parameters with multi-tensor
+            (stacked) ops — Adafusion's engine — instead of a per-parameter
+            Python loop. Default ``True``. The D-estimation pass-1 is always
+            per-parameter (it is a global reduction); only the update backend is
+            batched. Set ``False`` to force the per-parameter update path.
+        foreach_batch_cutoff: per-tensor element count above which a weight is
+            updated by the per-parameter loop instead of being stacked (a
+            performance knob; default 2_000_000, mirroring Adafusion).
+        foreach_stack_budget: max elements in a single stacked foreach chunk.
+            ``None`` (default) adapts to free VRAM; an int pins a fixed cap.
     """
 
     def __init__(
@@ -131,10 +167,15 @@ class KProdigy(Optimizer):
         slice_p: int = 1,
         independent_d: bool | None = None,
         momentum_dtype: MomentumDtype = "bfloat16",
+        momentum_4bit_block: int = _FOURBIT_BLOCK,
         second_moment: SecondMoment = "full",
         eps_factored: float = 1e-30,
+        cautious: bool = False,
         bf16_method: str = "stochastic_rounding",
         factor_conv_as_matrix: bool = True,
+        foreach: bool = True,
+        foreach_batch_cutoff: int = _FOREACH_BATCH_CUTOFF,
+        foreach_stack_budget: int | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not d0 > 0.0:
@@ -151,12 +192,16 @@ class KProdigy(Optimizer):
             raise ValueError(f"d_update_freq must be >= 1, got {d_update_freq}")
         if slice_p < 1:
             raise ValueError(f"slice_p must be >= 1, got {slice_p}")
-        if momentum_dtype not in ("bfloat16", "float32", "int8"):
-            raise ValueError(f"momentum_dtype must be bfloat16/float32/int8, got {momentum_dtype!r}")
+        if momentum_dtype not in ("bfloat16", "float32", "int8", "4bit"):
+            raise ValueError(
+                f"momentum_dtype must be bfloat16/float32/int8/4bit, got {momentum_dtype!r}"
+            )
         if second_moment not in ("full", "factored"):
             raise ValueError(f"second_moment must be full/factored, got {second_moment!r}")
         if bf16_method not in ("stochastic_rounding", "kahan", "none"):
             raise ValueError(f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}")
+        if foreach_batch_cutoff < 1:
+            raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
 
         defaults = {
             "lr": lr,
@@ -177,8 +222,10 @@ class KProdigy(Optimizer):
             "slice_p": slice_p,
             "k": 0,
             "momentum_dtype": momentum_dtype,
+            "momentum_4bit_block": momentum_4bit_block,
             "second_moment": second_moment,
             "eps_factored": eps_factored,
+            "cautious": cautious,
             "bf16_method": bf16_method,
             "factor_conv_as_matrix": factor_conv_as_matrix,
         }
@@ -187,10 +234,25 @@ class KProdigy(Optimizer):
         # Auto: independent D when the user gave more than one param group
         # (e.g. SDXL UNet + Text Encoder), unless explicitly overridden.
         self._independent_d = (len(self.param_groups) > 1) if independent_d is None else independent_d
+        # Adafusion-engine foreach knobs for the pass-2 update backend.
+        self._foreach = foreach
+        self._foreach_batch_cutoff = foreach_batch_cutoff
+        self._foreach_stack_budget = foreach_stack_budget
+        # One momentum codec per dtype string, shared with Adafusion. The codec
+        # owns storage + dequant; KProdigy does its own d-scaled EMA in pass 1
+        # and reads the momentum back (dequant) in pass 2.
+        self._codecs: dict[str, _MomentumCodec] = {}
 
     def get_d(self) -> float:
         """Current D estimate (effective learning rate) of the first group."""
         return float(self.param_groups[0].get("d", self.d0))
+
+    def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
+        md = group["momentum_dtype"]
+        codec = self._codecs.get(md)
+        if codec is None:
+            codec = self._codecs[md] = _make_codec(md)
+        return codec
 
     # -- state -------------------------------------------------------------
 
@@ -209,15 +271,9 @@ class KProdigy(Optimizer):
             state["p0"] = torch.zeros((), device=p.device, dtype=torch.float32)
 
         if beta1 > 0:
-            md = group["momentum_dtype"]
-            if md == "int8":
-                state["m"] = torch.zeros_like(p, dtype=torch.int8)
-                state["m_scale"] = torch.ones(
-                    (p.shape[0],) + (1,) * (p.ndim - 1) if p.ndim >= 2 else (),
-                    dtype=torch.float32, device=p.device,
-                )
-            else:
-                state["m"] = torch.zeros_like(p, dtype=torch.bfloat16 if md == "bfloat16" else torch.float32)
+            # Momentum storage is owned by the shared codec (float/bf16/int8/4bit),
+            # exactly as Adafusion allocates it.
+            self._codec(group).init_state(state, p, group)
 
         if group["second_moment"] == "factored" and p.ndim >= 2:
             gv = p if (p.ndim == 2 or not group["factor_conv_as_matrix"]) else p.reshape(p.shape[0], -1)
@@ -279,6 +335,8 @@ class KProdigy(Optimizer):
         d_over_d0 = d / d0
 
         # ---- pass 1: D estimate + moment EMAs --------------------------------
+        # UNCHANGED Prodigy D-estimation: global reduction over all params, the
+        # d-scaled momentum EMA, and the (full / factored) second-moment EMA.
         d_numerator = lead["d_numerator"] * beta3
         delta_numerator = torch.zeros((), dtype=torch.float32)
         d_denom = torch.zeros((), dtype=torch.float32)
@@ -293,6 +351,7 @@ class KProdigy(Optimizer):
                     "KProdigy: groups sharing one D estimate must use the same lr "
                     "(or 0 for a frozen group). Use independent_d=True for per-group lr."
                 )
+            codec = self._codec(group)
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -324,7 +383,7 @@ class KProdigy(Optimizer):
 
                 # First moment EMA, scaled by current d (reference convention).
                 if beta1 > 0:
-                    self._update_momentum(state, grad_fp32, beta1, d, group["momentum_dtype"])
+                    self._update_momentum(codec, state, grad_fp32, beta1, d, group["momentum_dtype"])
 
                 # Second moment EMA.
                 if "v" in state:
@@ -353,73 +412,101 @@ class KProdigy(Optimizer):
         # the next step, and the momentum/second-moment were scaled by the old d,
         # so the d-cancellation in the Adam ratio stays consistent.
 
-        # ---- pass 2: apply updates ------------------------------------------
+        # ---- pass 2: apply updates (Adafusion engine) -----------------------
         for group in groups:
-            eps = group["eps"]
-            decay = group["weight_decay"]
-            decouple = group["decouple"]
-            bf16_method = group["bf16_method"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                state = self.state[p]
-                state["step"] += 1
-
-                grad = p.grad
-                grad_fp32 = grad if grad.dtype == torch.float32 else grad.float()
-
-                # denom = sqrt(second moment) floored at d*eps. Both the full and
-                # factored second moments reconstruct an O(d) denominator, so the
-                # O(d) numerator (d-scaled momentum / d-scaled grad) cancels.
-                # numerator: d-scaled momentum (beta1>0) or the raw grad
-                # (beta1=0, matching reference Prodigy — there the d cancels in
-                # the Adam ratio, so beta1=0 is RMSprop-like at lr=1).
-                if group["betas"][0] > 0:
-                    numer = self._momentum_value(state, grad_fp32, group, d)
-                else:
-                    numer = grad_fp32.clone()
-
-                if "v" in state:
-                    denom = state["v"].sqrt().clamp_(min=d * eps)
-                    delta = numer.div_(denom)
-                else:
-                    r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
-                    inv_denom = r_factor.mul(c_factor).div_(d).clamp_(max=1.0 / (d * eps))
-                    inv_denom = self._unmatrixize(inv_denom, grad_fp32, group)
-                    delta = numer.mul_(inv_denom)
-
-                delta.mul_(dlr)
-
-                if decay != 0 and decouple:
-                    delta = delta.add_(p.detach().float(), alpha=decay * dlr)
-
-                self._apply_subtract(p, delta, state, bf16_method)
+            params = [p for p in group["params"] if p.grad is not None]
+            for p in params:
+                self.state[p]["step"] += 1
+            self._apply_updates(params, group, d, dlr)
             group["k"] = group["k"] + 1
 
-    # -- momentum helpers --------------------------------------------------
+    # -- pass-2 update backend (Adafusion engine) --------------------------
+
+    def _apply_updates(self, params: list[Tensor], group: dict[str, Any], d: float, dlr: float) -> None:
+        """Apply the Prodigy weight update for every param in ``group``.
+
+        Routes to the batched foreach engine (Adafusion's bucketing) when
+        eligible; falls back per-param otherwise. The Prodigy-specific math
+        (d-scaled denominator, dlr scaling, decoupled WD, eps floor) is identical
+        in both paths.
+        """
+        if not params:
+            return
+        if self._foreach and self._group_foreach_eligible(group):
+            chunk_budget = self._foreach_budget(params[0].device)
+            cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)
+            fast: list[Tensor] = []
+            slow: list[Tensor] = []
+            for p in params:
+                (fast if self._param_foreach_eligible(p, group, cutoff) else slow).append(p)
+            if len(fast) >= 2:
+                self._update_foreach(fast, group, d, dlr, chunk_budget)
+                for p in slow:
+                    self._update_one_param(p, group, d, dlr)
+            else:
+                for p in params:
+                    self._update_one_param(p, group, d, dlr)
+        else:
+            for p in params:
+                self._update_one_param(p, group, d, dlr)
+
+    # -- foreach eligibility / budget (mirrors Adafusion) ------------------
+
+    def _foreach_budget(self, device: torch.device) -> int:
+        if self._foreach_stack_budget is not None:
+            return self._foreach_stack_budget
+        cap = 4 * self._foreach_batch_cutoff
+        if device.type == "cuda":
+            free_bytes = torch.cuda.mem_get_info(device)[0]
+            adaptive = int(free_bytes * _STACK_SAFETY_FRACTION / _STACK_BYTES_PER_ELEM)
+            return max(_MIN_STACK_ELEMS, min(adaptive, cap))
+        return min(_DEFAULT_STACK_ELEMS, cap)
 
     @staticmethod
-    def _update_momentum(state: dict[str, Any], grad_fp32: Tensor, beta1: float, d: float, md: str) -> None:
-        """EMA ``m <- beta1*m + (1-beta1)*d*grad`` in the momentum dtype."""
+    def _group_foreach_eligible(group: dict[str, Any]) -> bool:
+        # kahan needs a per-param shift buffer -> per-param path.
+        return group["bf16_method"] != "kahan"
+
+    def _param_foreach_eligible(self, p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
+        if p.ndim == 0:
+            return False
+        if p.numel() > cutoff:
+            return False
+        if (
+            group["bf16_method"] == "stochastic_rounding"
+            and _is_low_precision(p)
+            and p.dtype != torch.bfloat16
+        ):
+            return False
+        # factored conv kernels (ndim>2) are matrixized into a view -> contiguity.
+        factored = group["second_moment"] == "factored" and p.ndim >= 2 and group["factor_conv_as_matrix"]
+        if p.ndim > 2 and factored:
+            return p.data.is_contiguous() and p.grad.is_contiguous()
+        return True
+
+    # -- momentum EMA (pass 1; D-relevant, kept numerically as before) -----
+
+    @staticmethod
+    def _update_momentum(
+        codec: _MomentumCodec, state: dict[str, Any], grad_fp32: Tensor, beta1: float, d: float, md: str
+    ) -> None:
+        """EMA ``m <- beta1*m + (1-beta1)*d*grad`` in the momentum dtype.
+
+        float/bf16/int8 keep the *exact* arithmetic of the original KProdigy
+        (mul_/add_) so the D-validated behaviour is byte-identical; 4bit uses the
+        shared codec's dequant/EMA/requant.
+        """
         target = d * (1 - beta1)
         if md == "int8":
             m = state["m"].float().mul_(state["m_scale"])
             m.mul_(beta1).add_(grad_fp32, alpha=target)
             state["m"], state["m_scale"] = _quant_int8(m)
+        elif md == "4bit":
+            # m <- beta1*m + (1-beta1)*d*grad == m.lerp_(d*grad, 1-beta1)
+            codec.ema_one(state, grad_fp32 if d == 1.0 else grad_fp32.mul(d), beta1)
         else:
             m = state["m"]
             m.mul_(beta1).add_(grad_fp32.to(m.dtype), alpha=target)
-
-    @staticmethod
-    def _momentum_value(state: dict[str, Any], grad_fp32: Tensor, group: dict[str, Any], d: float) -> Tensor:
-        """Return the fp32 first-moment numerator for the update."""
-        md = group["momentum_dtype"]
-        if md == "int8":
-            return state["m"].float().mul_(state["m_scale"])
-        # Must be a fresh fp32 tensor: the caller mutates it in place, and
-        # ``.float()`` is a no-op (no copy) when the buffer is already fp32.
-        m = state["m"]
-        return m.float() if m.dtype != torch.float32 else m.clone()
 
     # -- shape helpers (conv-aware factoring) ------------------------------
 
@@ -434,6 +521,182 @@ class KProdigy(Optimizer):
         if like.ndim > 2 and group["factor_conv_as_matrix"]:
             return t.view_as(like)
         return t
+
+    # -- per-param update --------------------------------------------------
+
+    @torch.no_grad()
+    def _update_one_param(self, p: Tensor, group: dict[str, Any], d: float, dlr: float) -> None:
+        eps = group["eps"]
+        decay = group["weight_decay"]
+        decouple = group["decouple"]
+        cautious = group["cautious"]
+        bf16_method = group["bf16_method"]
+        state = self.state[p]
+
+        grad = p.grad
+        grad_fp32 = grad if grad.dtype == torch.float32 else grad.float()
+
+        # numerator: d-scaled momentum (beta1>0) or the raw grad (beta1=0).
+        if group["betas"][0] > 0:
+            numer = self._codec(group).dequant_one(state, grad_fp32)
+        else:
+            numer = grad_fp32.clone()
+
+        # denom = sqrt(second moment) floored at d*eps; the O(d) denominator
+        # cancels the O(d) numerator (d-scaled momentum / d-scaled grad).
+        if "v" in state:
+            denom = state["v"].sqrt().clamp_(min=d * eps)
+            delta = numer.div_(denom)
+        else:
+            r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
+            inv_denom = r_factor.mul(c_factor).div_(d).clamp_(max=1.0 / (d * eps))
+            inv_denom = self._unmatrixize(inv_denom, grad_fp32, group)
+            delta = numer.mul_(inv_denom)
+
+        delta.mul_(dlr)
+
+        if decay != 0 and decouple:
+            p_fp32 = p.detach().float()
+            delta = delta.add_(p_fp32, alpha=decay * dlr)
+
+        if cautious:
+            mask = (delta * grad_fp32 > 0).to(delta.dtype)
+            delta = delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
+
+        self._apply_subtract(p, delta, state, bf16_method)
+
+    # -- foreach update (Adafusion bucketing) ------------------------------
+
+    @torch.no_grad()
+    def _update_foreach(
+        self, params: list[Tensor], group: dict[str, Any], d: float, dlr: float, budget: int
+    ) -> None:
+        """Batched pass-2 update: bucket params by effective shape and step each
+        bucket with a handful of stacked kernels (Adafusion's foreach engine),
+        applying Prodigy's d-scaled update math."""
+        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+        full_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+        for p in params:
+            state = self.state[p]
+            g = p.grad
+            if "v" in state:
+                # Full second moment: bucket by exact shape; update is plain
+                # grad/sqrt(v) with no factoring.
+                full_buckets.setdefault((tuple(g.shape), p.dtype), []).append(p)
+            elif g.ndim >= 2:
+                matrixize = g.ndim > 2 and group["factor_conv_as_matrix"]
+                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
+                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+            else:
+                flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
+
+        for (eff, _dt, matrixize), plist in factored_buckets.items():
+            step = max(1, budget // max(eff[0] * eff[1], 1))
+            for i in range(0, len(plist), step):
+                self._factored_bucket(plist[i:i + step], eff, matrixize, group, d, dlr)
+        for (shape, _dt), plist in full_buckets.items():
+            per = 1
+            for s in shape:
+                per *= s
+            step = max(1, budget // max(per, 1))
+            for i in range(0, len(plist), step):
+                self._full_bucket(plist[i:i + step], shape, group, d, dlr)
+        for (length, _dt), plist in flat_buckets.items():
+            step = max(1, budget // max(length, 1))
+            for i in range(0, len(plist), step):
+                self._flat_full_bucket(plist[i:i + step], length, group, d, dlr)
+
+    def _numer_stacked(
+        self, plist: list[Tensor], group: dict[str, Any], mat: Any, eff: tuple[int, ...]
+    ) -> Tensor:
+        """Stacked numerator ``[N, *eff]``: d-scaled momentum (beta1>0) or grad."""
+        if group["betas"][0] > 0:
+            states = [self.state[p] for p in plist]
+            return self._codec(group).dequant_stacked(states, mat, eff)
+        return torch.stack([mat(p.grad).float() for p in plist])
+
+    @torch.no_grad()
+    def _factored_bucket(
+        self, plist: list[Tensor], eff: tuple[int, int], matrixize: bool,
+        group: dict[str, Any], d: float, dlr: float,
+    ) -> None:
+        R, C = eff  # noqa: N806
+        N = len(plist)  # noqa: N806
+        eps = group["eps"]
+        decay = group["weight_decay"]
+        decouple = group["decouple"]
+        cautious = group["cautious"]
+        bf16_method = group["bf16_method"]
+
+        def mat(t: Tensor) -> Tensor:
+            return t.view(R, C) if matrixize else t
+
+        grad = torch.stack([mat(p.grad).float() for p in plist])              # [N, R, C]
+        rows = torch.stack([self.state[p]["row"] for p in plist])            # [N, R]
+        cols = torch.stack([self.state[p]["col"] for p in plist])            # [N, C]
+
+        r_factor = rows.div(rows.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
+        c_factor = cols.rsqrt().unsqueeze(-2)                                        # [N, 1, C]
+        inv_denom = (r_factor * c_factor).div_(d).clamp_(max=1.0 / (d * eps))        # [N, R, C]
+
+        numer = self._numer_stacked(plist, group, mat, (R, C))               # [N, R, C]
+        delta = numer.mul_(inv_denom).mul_(dlr)
+
+        if decay != 0 and decouple:
+            p_fp32 = torch.stack([mat(p.data).float() for p in plist])
+            delta = delta.add_(p_fp32, alpha=decay * dlr)
+
+        if cautious:
+            mask = (delta * grad > 0).to(delta.dtype)
+            denom = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view(N, 1, 1)
+            delta = delta.mul_(mask).div_(denom)
+
+        pviews = [mat(p.data) for p in plist]
+        weights = torch.stack(pviews)                                       # [N, R, C]
+        self._apply_subtract_batched(weights, delta, bf16_method)
+        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+
+    @torch.no_grad()
+    def _full_bucket(
+        self, plist: list[Tensor], shape: tuple[int, ...], group: dict[str, Any], d: float, dlr: float
+    ) -> None:
+        """Batched update for params using the FULL second moment (any shape)."""
+        N = len(plist)  # noqa: N806
+        eps = group["eps"]
+        decay = group["weight_decay"]
+        decouple = group["decouple"]
+        cautious = group["cautious"]
+        bf16_method = group["bf16_method"]
+
+        grad = torch.stack([p.grad.float() for p in plist])                  # [N, *shape]
+        v = torch.stack([self.state[p]["v"] for p in plist])
+        denom = v.sqrt().clamp_(min=d * eps)
+
+        numer = self._numer_stacked(plist, group, lambda t: t, tuple(shape))
+        delta = numer.div_(denom).mul_(dlr)
+
+        if decay != 0 and decouple:
+            p_fp32 = torch.stack([p.data.float() for p in plist])
+            delta = delta.add_(p_fp32, alpha=decay * dlr)
+
+        if cautious:
+            mask = (delta * grad > 0).to(delta.dtype)
+            md = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view([N] + [1] * len(shape))
+            delta = delta.mul_(mask).div_(md)
+
+        pviews = [p.data for p in plist]
+        weights = torch.stack(pviews)
+        self._apply_subtract_batched(weights, delta, bf16_method)
+        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+
+    @torch.no_grad()
+    def _flat_full_bucket(
+        self, plist: list[Tensor], length: int, group: dict[str, Any], d: float, dlr: float
+    ) -> None:
+        """Batched update for 1-D params under factored second_moment (they use the
+        full ``v`` fallback). Same math as :meth:`_full_bucket` for a [N, L] stack."""
+        self._full_bucket(plist, (length,), group, d, dlr)
 
     # -- weight update -----------------------------------------------------
 
@@ -450,3 +713,15 @@ class KProdigy(Optimizer):
             add_stochastic_(p.data, delta_fp32, alpha=-1.0)
         else:
             p.data.sub_(delta_fp32.to(p.dtype))
+
+    @staticmethod
+    def _apply_subtract_batched(weights: Tensor, delta_fp32: Tensor, bf16_method: str) -> None:
+        """Stacked counterpart of :meth:`_apply_subtract` (no kahan/fp16 here)."""
+        if (
+            _is_low_precision(weights)
+            and bf16_method == "stochastic_rounding"
+            and weights.dtype == torch.bfloat16
+        ):
+            add_stochastic_(weights, delta_fp32, alpha=-1.0)
+        else:
+            weights.sub_(delta_fp32.to(weights.dtype))
