@@ -46,7 +46,6 @@ opt = Adafusion(
     lr=1e-4,
     betas=(0.0, 0.999),                  # beta1=0 -> no momentum (near-zero state)
     bf16_method="stochastic_rounding",   # no Kahan buffer, no CPU<->GPU offload
-    compile=True,                        # ~+30% on large 2-D weights (DiT/transformer)
 )
 
 for batch in loader:
@@ -116,8 +115,9 @@ Mini pixel-DDPM on real CC0 images, held-out validation, 4 seeds:
 
 Beats AdamW by ~20% on held-out diffusion loss (non-overlapping across seeds) at
 1/4 the optimizer memory. On a real 2.1 B-param DiT transformer, the no-momentum
-config uses **0.01 GB** of optimizer state (vs AdamW's 8.4 GB); `compile=True`
-brings its per-step cost in line with AdamW on large 2-D weights.
+config uses **0.01 GB** of optimizer state (vs AdamW's 8.4 GB), and `foreach`
+batching (default) keeps its per-step cost competitive with fused AdamW
+([docs/foreach-batching.md](docs/foreach-batching.md)).
 
 > Honest caveat: small-scale benchmarks. At *zero* optimizer state
 > (Adafactor-class), AdamW-quality is not achievable — momentum (~1–2 B/param)
@@ -127,8 +127,8 @@ brings its per-step cost in line with AdamW on large 2-D weights.
 
 | Goal | Configuration |
 |---|---|
-| **Minimum VRAM** (large model) | `Adafusion(..., betas=(0.0,0.999), bf16_method="stochastic_rounding", compile=True)` |
-| **LoRA / LoKr adapters** (many small weights) | `Adafusion(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` — `foreach=True` (default) batches the hundreds of adapter tensors; leave `compile` off |
+| **Minimum VRAM** (large model) | `Adafusion(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` |
+| **LoRA / LoKr adapters** (many small weights) | `Adafusion(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` — `foreach=True` (default) batches the hundreds of adapter tensors |
 | **AdamW-quality, low memory** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="bfloat16")` |
 | **Lion8bit-class memory + momentum** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="int8")` |
 | **Best convergence (memory available)** | `Muon(..., lr=2e-2, momentum_dtype="bfloat16")` |
@@ -155,7 +155,9 @@ Adafusion(
     cautious=False,                     # cautious masking (opt-in regularizer)
     bf16_method="stochastic_rounding",  # "stochastic_rounding" | "kahan" | "none"
     factor_conv_as_matrix=True,         # the conv-aware factoring fix
-    compile=False,                      # torch.compile the factored core
+    foreach=True,                       # multi-tensor batching (docs/foreach-batching.md)
+    foreach_batch_cutoff=2_000_000,     # weights bigger than this loop instead of stacking
+    foreach_stack_budget=None,          # chunk memory cap (None = adaptive to free VRAM)
 )
 
 Muon(

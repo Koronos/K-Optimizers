@@ -34,7 +34,6 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from koptim._compiled import _get_compiled_factored_update
 from koptim._factored import factored_inv_sqrt_factors, update_factored_state
 from koptim._stochastic_rounding import add_stochastic_
 
@@ -120,11 +119,10 @@ class Adafusion(Optimizer):
         factor_conv_as_matrix: reshape 4-D conv kernels to 2-D before factoring
             (the conv-aware fix). Default ``True``; set ``False`` for the legacy
             last-dims behaviour.
-        compile: ``torch.compile`` the factored core. Big win on LARGE 2-D
-            weights (transformer/DiT 2048x2048+, ~+30% measured, closes the gap
-            to AdamW), neutral-to-negative on many small weights; off by default.
-            Only the fixed-beta2 (``decay_rate=None``) factored path with
-            ``clip_threshold > 0`` is compiled. Needs a torch.compile backend.
+        compile: deprecated and ignored. ``torch.compile`` of the per-tensor
+            factored core measured neutral-to-negative across model sizes and is
+            superseded by ``foreach`` batching; the argument is still accepted (so
+            existing configs don't break) but has no effect.
         foreach: batch the step across parameters with multi-tensor (stacked) ops
             instead of a per-parameter Python loop. Default ``True``. Huge win when
             many tensors are stepped at once — LoRA/LoKr adapters (hundreds of tiny
@@ -135,8 +133,7 @@ class Adafusion(Optimizer):
             numerically (stochastic-rounding draws differ, unbiased either way);
             the rest (0-D scalars, int8 momentum, kahan, fp16+SR, non-contiguous
             matrixized convs, single-param groups) transparently falls back to it.
-            For eligible params it supersedes ``compile`` (no per-tensor graph
-            needed). Set ``False`` to force the per-parameter path.
+            Set ``False`` to force the per-parameter path.
         foreach_batch_cutoff: per-tensor element count above which a weight is
             stepped by the per-parameter loop instead of being stacked. A
             **performance** knob, decoupled from VRAM: batching only pays off while
@@ -199,11 +196,6 @@ class Adafusion(Optimizer):
             "factor_conv_as_matrix": factor_conv_as_matrix,
         }
         super().__init__(params, defaults)
-        # Optional torch.compile of the factored core. Big win on LARGE 2-D
-        # weights (e.g. transformer/DiT 2048x2048+, ~+30%), neutral-to-negative
-        # on many small weights. Only the fixed-beta2 (decay_rate=None) factored
-        # path with clip>0 is routed through it.
-        self._factored_fn = _get_compiled_factored_update() if compile else None
         # Multi-tensor (foreach) batching of the factored fast path. Collapses the
         # per-parameter Python loop + per-tensor kernel launches into a handful of
         # stacked-tensor ops per (shape, dtype) bucket — the decisive win when many
@@ -307,7 +299,7 @@ class Adafusion(Optimizer):
         """Group-level options the batched fast path supports."""
         return (
             group["decay_rate"] is None          # fixed beta2 (no step-dependent decay)
-            and group["clip_threshold"] > 0      # clip always applied (matches compiled path)
+            and group["clip_threshold"] > 0      # clip always applied in the batched path
             and group["momentum_dtype"] != "int8"  # int8 requant is per-row, kept per-param
             and group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
         )
@@ -549,18 +541,12 @@ class Adafusion(Optimizer):
         ndim = grad_fp32.ndim
         factored = ndim >= 2
 
-        update_is_clipped = False
         if factored:
             matrixize = ndim > 2 and reshape_conv
             gv = grad_fp32.reshape(grad_fp32.shape[0], -1) if matrixize else grad_fp32
-            if self._factored_fn is not None and clip > 0 and decay_rate is None:
-                # Compiled EMA + reconstruction + clip in one fused graph.
-                update = self._factored_fn(gv, state["row"], state["col"], beta2, eps1, clip)
-                update_is_clipped = True
-            else:
-                update_factored_state(gv, state["row"], state["col"], beta2, eps1)
-                r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
-                update = gv.mul(r_factor).mul_(c_factor)
+            update_factored_state(gv, state["row"], state["col"], beta2, eps1)
+            r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
+            update = gv.mul(r_factor).mul_(c_factor)
             if matrixize:
                 update = update.view_as(grad_fp32)
         else:
@@ -571,7 +557,7 @@ class Adafusion(Optimizer):
             v.lerp_(grad_sq, 1.0 - beta2)
             update = grad_fp32.mul(v.rsqrt())
 
-        if clip > 0 and not update_is_clipped:
+        if clip > 0:
             update.div_((_rms(update) / clip).clamp_(min=1.0))
         update.mul_(lr)
 

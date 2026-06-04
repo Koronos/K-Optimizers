@@ -13,7 +13,6 @@ Quickstart::
         lr=1e-4,
         betas=(0.0, 0.999),                 # beta1=0 -> no momentum (minimum VRAM)
         bf16_method="stochastic_rounding",  # no Kahan buffer, no CPU offload
-        compile=True,                       # ~+30% on large 2-D weights
     )
 """
 

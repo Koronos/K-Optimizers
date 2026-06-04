@@ -38,8 +38,15 @@ All notable changes to this project will be documented in this file.
       byte-for-byte identical on SDXL and Cosmos.
   - Falls back to the per-parameter path for what it doesn't batch: 0-D scalars,
     large weights, `momentum_dtype="int8"`, `bf16_method="kahan"`, fp16+SR,
-    non-contiguous matrixized convs, and single-param (gradient-release)
-    optimizers. For eligible params it supersedes `compile` (no per-tensor graph).
+    non-contiguous matrixized convs, and single-param (gradient-release) optimizers.
+- `ktune` console script (`uv run ktune --model <ckpt>.safetensors --gpu N`) to
+  check the foreach cutoff on your own GPU/model.
+
+### Deprecated
+- `Adafusion(compile=...)` is now a no-op. `torch.compile` of the per-tensor
+  factored core measured neutral-to-negative across model sizes and is superseded
+  by `foreach` batching; the argument is still accepted so existing configs don't
+  break, but does nothing (the compiled path and `koptim/_compiled.py` were removed).
 
 ## [0.2.0] - 2026-06
 
