@@ -94,6 +94,16 @@ class Adafusion(Optimizer):
             to AdamW), neutral-to-negative on many small weights; off by default.
             Only the fixed-beta2 (``decay_rate=None``) factored path with
             ``clip_threshold > 0`` is compiled. Needs a torch.compile backend.
+        foreach: batch the factored fast path across parameters with multi-tensor
+            (stacked) ops instead of a per-parameter Python loop. Default ``True``.
+            Huge win when many small weights are trained at once (LoRA/LoKr
+            adapters: hundreds of tiny tensors) — collapses the per-tensor kernel
+            launches into a few stacked kernels per (shape, dtype) bucket. Matches
+            the per-parameter path numerically (stochastic-rounding draws differ,
+            unbiased either way); shapes/options it doesn't cover (1-D params,
+            int8 momentum, kahan, fp16+SR) transparently fall back to that path.
+            For eligible params it supersedes ``compile`` (no per-tensor graph
+            needed). Set ``False`` to force the per-parameter path.
     """
 
     def __init__(
@@ -111,6 +121,7 @@ class Adafusion(Optimizer):
         bf16_method: str = "stochastic_rounding",
         factor_conv_as_matrix: bool = True,
         compile: bool = False,
+        foreach: bool = True,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -143,6 +154,13 @@ class Adafusion(Optimizer):
         # on many small weights. Only the fixed-beta2 (decay_rate=None) factored
         # path with clip>0 is routed through it.
         self._factored_fn = _get_compiled_factored_update() if compile else None
+        # Multi-tensor (foreach) batching of the factored fast path. Collapses the
+        # per-parameter Python loop + per-tensor kernel launches into a handful of
+        # stacked-tensor ops per (shape, dtype) bucket — the decisive win when many
+        # small weights are trained at once (LoRA/LoKr adapters). Numerically
+        # matches the per-parameter path; stochastic-rounding draws differ
+        # (unbiased either way). Anything it doesn't cover falls back per-param.
+        self._foreach = foreach
 
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
@@ -177,76 +195,235 @@ class Adafusion(Optimizer):
             with torch.enable_grad():
                 loss = closure()
         for group in self.param_groups:
-            beta1, beta2_fixed = group["betas"]
-            eps1, _eps2 = group["eps"]
-            lr, clip = group["lr"], group["clip_threshold"]
-            wd, decay_rate = group["weight_decay"], group["decay_rate"]
-            cautious, bf16_method = group["cautious"], group["bf16_method"]
-            reshape_conv = group["factor_conv_as_matrix"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
+            params = [p for p in group["params"] if p.grad is not None]
+            for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("Adafusion does not support sparse gradients")
-                state = self.state[p]
-                if "step" not in state:
-                    self._init_state(p, state, group)
-                state["step"] += 1
-                beta2 = 1.0 - state["step"] ** decay_rate if decay_rate is not None else beta2_fixed
-
-                grad_fp32 = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
-                ndim = grad_fp32.ndim
-                factored = ndim >= 2
-
-                update_is_clipped = False
-                if factored:
-                    matrixize = ndim > 2 and reshape_conv
-                    gv = grad_fp32.reshape(grad_fp32.shape[0], -1) if matrixize else grad_fp32
-                    if self._factored_fn is not None and clip > 0 and decay_rate is None:
-                        # Compiled EMA + reconstruction + clip in one fused graph.
-                        update = self._factored_fn(gv, state["row"], state["col"], beta2, eps1, clip)
-                        update_is_clipped = True
-                    else:
-                        update_factored_state(gv, state["row"], state["col"], beta2, eps1)
-                        r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
-                        update = gv.mul(r_factor).mul_(c_factor)
-                    if matrixize:
-                        update = update.view_as(grad_fp32)
+            if self._foreach and self._group_foreach_eligible(group):
+                fast: list[Tensor] = []
+                slow: list[Tensor] = []
+                for p in params:
+                    (fast if self._param_foreach_eligible(p, group) else slow).append(p)
+                if len(fast) >= 2:
+                    self._step_factored_foreach(fast, group)
+                    for p in slow:
+                        self._step_one_param(p, group)
                 else:
-                    v = state["v"]
-                    grad_sq = grad_fp32 * grad_fp32
-                    if eps1 > 0:
-                        grad_sq.add_(eps1)
-                    v.lerp_(grad_sq, 1.0 - beta2)
-                    update = grad_fp32.mul(v.rsqrt())
-
-                if clip > 0 and not update_is_clipped:
-                    update.div_((_rms(update) / clip).clamp_(min=1.0))
-                update.mul_(lr)
-
-                if beta1 > 0:
-                    if state["m"].dtype == torch.int8:
-                        m = state["m"].float() * state["m_scale"]   # dequant
-                        m.lerp_(update, 1.0 - beta1)
-                        delta = m.clone()
-                        state["m"], state["m_scale"] = _quant_int8(m)  # requant
-                    else:
-                        m = state["m"]
-                        m.lerp_(update.to(m.dtype), 1.0 - beta1)
-                        delta = m.float() if m.dtype != torch.float32 else m.clone()
-                else:
-                    delta = update
-
-                if wd != 0:
-                    p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
-                    delta = delta.add_(p_fp32, alpha=lr * wd)
-
-                if cautious:
-                    mask = (delta * grad_fp32 > 0).to(delta.dtype)
-                    delta = delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
-
-                self._apply_subtract(p, delta, state, bf16_method)
+                    for p in params:
+                        self._step_one_param(p, group)
+            else:
+                for p in params:
+                    self._step_one_param(p, group)
         return loss
+
+    # ----------------------------------------------------------------- foreach
+    @staticmethod
+    def _group_foreach_eligible(group: dict[str, Any]) -> bool:
+        """Group-level options the batched fast path supports."""
+        return (
+            group["decay_rate"] is None          # fixed beta2 (no step-dependent decay)
+            and group["clip_threshold"] > 0      # clip always applied (matches compiled path)
+            and group["momentum_dtype"] != "int8"  # int8 requant is per-row, kept per-param
+            and group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
+        )
+
+    @staticmethod
+    def _param_foreach_eligible(p: Tensor, group: dict[str, Any]) -> bool:
+        """Per-parameter shapes/dtypes the batched fast path can stack."""
+        if p.ndim < 2:                           # 1-D params use the non-factored path
+            return False
+        if (
+            group["bf16_method"] == "stochastic_rounding"
+            and _is_low_precision(p)
+            and p.dtype != torch.bfloat16        # fp16+SR is unsupported -> per-param (raises)
+        ):
+            return False
+        if p.ndim > 2 and group["factor_conv_as_matrix"]:
+            # Matrixized conv writes back through a reshaped view -> needs contiguity.
+            if not (p.data.is_contiguous() and p.grad.is_contiguous()):
+                return False
+        return True
+
+    @torch.no_grad()
+    def _step_factored_foreach(self, params: list[Tensor], group: dict[str, Any]) -> None:
+        """Factored update for many params at once, bucketed by effective 2-D shape.
+
+        Each bucket is stacked into a single ``[N, R, C]`` tensor and the whole
+        EMA + reconstruction + RMS clip + (optional) momentum + weight decay +
+        cautious + stochastic-rounding update runs as a handful of batched kernels
+        — element-for-element the same math as :meth:`_step_one_param`.
+        """
+        beta1, beta2 = group["betas"]
+        eps1, _eps2 = group["eps"]
+        lr, clip = group["lr"], group["clip_threshold"]
+        wd = group["weight_decay"]
+        cautious, bf16_method = group["cautious"], group["bf16_method"]
+        reshape_conv = group["factor_conv_as_matrix"]
+
+        buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+        for p in params:
+            state = self.state[p]
+            if "step" not in state:
+                self._init_state(p, state, group)
+            state["step"] += 1
+            g = p.grad
+            matrixize = g.ndim > 2 and reshape_conv
+            eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
+            buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+
+        for (eff, _dtype, matrixize), plist in buckets.items():
+            self._factored_bucket(
+                plist, eff, matrixize, beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method
+            )
+
+    @torch.no_grad()
+    def _factored_bucket(
+        self,
+        plist: list[Tensor],
+        eff: tuple[int, int],
+        matrixize: bool,
+        beta1: float,
+        beta2: float,
+        eps1: float,
+        lr: float,
+        clip: float,
+        wd: float,
+        cautious: bool,
+        bf16_method: str,
+    ) -> None:
+        R, C = eff
+        N = len(plist)
+
+        def mat(t: Tensor) -> Tensor:
+            return t.view(R, C) if matrixize else t
+
+        rows = [self.state[p]["row"] for p in plist]
+        cols = [self.state[p]["col"] for p in plist]
+
+        grad = torch.stack([mat(p.grad).float() for p in plist])          # [N, R, C]
+        row = torch.stack(rows)                                           # [N, R]
+        col = torch.stack(cols)                                           # [N, C]
+
+        # Factored second-moment EMA (HF eps placement: eps1 before the means).
+        grad_sq = grad * grad
+        if eps1 > 0:
+            grad_sq = grad_sq.add_(eps1)
+        row.lerp_(grad_sq.mean(dim=-1), 1.0 - beta2)
+        col.lerp_(grad_sq.mean(dim=-2), 1.0 - beta2)
+        torch._foreach_copy_(rows, list(row.unbind(0)))
+        torch._foreach_copy_(cols, list(col.unbind(0)))
+
+        # Reconstruct 1/sqrt(v_hat) = r_factor * c_factor, then clip and scale.
+        r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
+        c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
+        update = grad.mul(r_factor).mul_(c_factor)                                 # [N, R, C]
+        rms = update.reshape(N, -1).norm(2, dim=1) / math.sqrt(R * C)              # per-slice RMS
+        update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1, 1))
+        update.mul_(lr)
+
+        if beta1 > 0:
+            ms = [self.state[p]["m"] for p in plist]
+            mom = torch.stack([mat(m) for m in ms])                       # [N, R, C], momentum dtype
+            mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
+            torch._foreach_copy_([mat(m) for m in ms], list(mom.unbind(0)))
+            delta = mom.float()
+        else:
+            delta = update
+
+        if wd != 0:
+            p_fp32 = torch.stack([mat(p.data).float() for p in plist])
+            delta = delta.add_(p_fp32, alpha=lr * wd)
+
+        if cautious:
+            mask = (delta * grad > 0).to(delta.dtype)
+            denom = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view(N, 1, 1)
+            delta = delta.mul_(mask).div_(denom)
+
+        # Subtract delta from the (matrixized) weights, batched, then scatter back.
+        pviews = [mat(p.data) for p in plist]
+        weights = torch.stack(pviews)                                     # [N, R, C], param dtype
+        self._apply_subtract_batched(weights, delta, bf16_method)
+        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+
+    @staticmethod
+    def _apply_subtract_batched(weights: Tensor, delta_fp32: Tensor, bf16_method: str) -> None:
+        """Stacked counterpart of :meth:`_apply_subtract` (no kahan/fp16 here)."""
+        if (
+            _is_low_precision(weights)
+            and bf16_method == "stochastic_rounding"
+            and weights.dtype == torch.bfloat16
+        ):
+            add_stochastic_(weights, delta_fp32, alpha=-1.0)
+        else:
+            weights.sub_(delta_fp32.to(weights.dtype))
+
+    @torch.no_grad()
+    def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
+        beta1, beta2_fixed = group["betas"]
+        eps1, _eps2 = group["eps"]
+        lr, clip = group["lr"], group["clip_threshold"]
+        wd, decay_rate = group["weight_decay"], group["decay_rate"]
+        cautious, bf16_method = group["cautious"], group["bf16_method"]
+        reshape_conv = group["factor_conv_as_matrix"]
+
+        state = self.state[p]
+        if "step" not in state:
+            self._init_state(p, state, group)
+        state["step"] += 1
+        beta2 = 1.0 - state["step"] ** decay_rate if decay_rate is not None else beta2_fixed
+
+        grad_fp32 = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
+        ndim = grad_fp32.ndim
+        factored = ndim >= 2
+
+        update_is_clipped = False
+        if factored:
+            matrixize = ndim > 2 and reshape_conv
+            gv = grad_fp32.reshape(grad_fp32.shape[0], -1) if matrixize else grad_fp32
+            if self._factored_fn is not None and clip > 0 and decay_rate is None:
+                # Compiled EMA + reconstruction + clip in one fused graph.
+                update = self._factored_fn(gv, state["row"], state["col"], beta2, eps1, clip)
+                update_is_clipped = True
+            else:
+                update_factored_state(gv, state["row"], state["col"], beta2, eps1)
+                r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
+                update = gv.mul(r_factor).mul_(c_factor)
+            if matrixize:
+                update = update.view_as(grad_fp32)
+        else:
+            v = state["v"]
+            grad_sq = grad_fp32 * grad_fp32
+            if eps1 > 0:
+                grad_sq.add_(eps1)
+            v.lerp_(grad_sq, 1.0 - beta2)
+            update = grad_fp32.mul(v.rsqrt())
+
+        if clip > 0 and not update_is_clipped:
+            update.div_((_rms(update) / clip).clamp_(min=1.0))
+        update.mul_(lr)
+
+        if beta1 > 0:
+            if state["m"].dtype == torch.int8:
+                m = state["m"].float() * state["m_scale"]   # dequant
+                m.lerp_(update, 1.0 - beta1)
+                delta = m.clone()
+                state["m"], state["m_scale"] = _quant_int8(m)  # requant
+            else:
+                m = state["m"]
+                m.lerp_(update.to(m.dtype), 1.0 - beta1)
+                delta = m.float() if m.dtype != torch.float32 else m.clone()
+        else:
+            delta = update
+
+        if wd != 0:
+            p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
+            delta = delta.add_(p_fp32, alpha=lr * wd)
+
+        if cautious:
+            mask = (delta * grad_fp32 > 0).to(delta.dtype)
+            delta = delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
+
+        self._apply_subtract(p, delta, state, bf16_method)
 
     @staticmethod
     def _apply_subtract(p: Tensor, delta_fp32: Tensor, state: dict[str, Any], bf16_method: str) -> None:

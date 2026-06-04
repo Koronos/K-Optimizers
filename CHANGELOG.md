@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `Adafusion(foreach=True)` (now the default) — multi-tensor batching of the
+  factored fast path. Params are bucketed by effective 2-D shape + dtype, stacked
+  into one `[N, R, C]` tensor, and the entire EMA + reconstruction + RMS clip +
+  momentum + weight decay + cautious + stochastic-rounding update runs as a
+  handful of batched kernels per bucket instead of a per-parameter Python loop.
+  - **~20× faster** optimizer step on adapter training (the hot case): measured
+    on a real SDXL UNet + PEFT LoRA r=8 (1434 tiny trainable tensors), the step
+    drops from **314 ms → 15 ms** (1.34× of fused AdamW; was 27.5×).
+  - Element-for-element equal to the per-parameter path (bit-exact on CPU; ~1e-8
+    on CUDA from reduction order). Stochastic-rounding draws legitimately differ
+    (unbiased either way). 5 new parametrized parity tests.
+  - Falls back to the per-parameter path for what it doesn't batch: 1-D params,
+    `momentum_dtype="int8"`, `bf16_method="kahan"`, fp16+SR, non-contiguous
+    matrixized convs, and single-param (gradient-release) optimizers. For eligible
+    params it supersedes `compile` (no per-tensor graph needed).
+
 ## [0.2.0] - 2026-06
 
 ### Added

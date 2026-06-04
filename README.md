@@ -128,6 +128,7 @@ brings its per-step cost in line with AdamW on large 2-D weights.
 | Goal | Configuration |
 |---|---|
 | **Minimum VRAM** (large model) | `Adafusion(..., betas=(0.0,0.999), bf16_method="stochastic_rounding", compile=True)` |
+| **LoRA / LoKr adapters** (many small weights) | `Adafusion(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` — `foreach=True` (default) batches the hundreds of adapter tensors; leave `compile` off |
 | **AdamW-quality, low memory** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="bfloat16")` |
 | **Lion8bit-class memory + momentum** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="int8")` |
 | **Best convergence (memory available)** | `Muon(..., lr=2e-2, momentum_dtype="bfloat16")` |
