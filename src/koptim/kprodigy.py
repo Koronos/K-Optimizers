@@ -238,6 +238,11 @@ class KProdigy(Optimizer):
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
+        # Internal switch to batch pass-1 (the D-estimation reduction + moment
+        # EMAs) as well as pass-2. Always True in normal use; exposed only so
+        # benchmarks can isolate the pass-1 batching speedup. The result is
+        # bit-identical either way, so this never affects numerics.
+        self._foreach_pass1 = foreach
         # One momentum codec per dtype string, shared with Adafusion. The codec
         # owns storage + dequant; KProdigy does its own d-scaled EMA in pass 1
         # and reads the momentum back (dequant) in pass 2.
@@ -347,7 +352,7 @@ class KProdigy(Optimizer):
             "safeguard_warmup": safeguard_warmup, "should_update_d": should_update_d,
             "lr": lr,
         }
-        if self._foreach:
+        if self._foreach_pass1:
             delta_numerator, d_denom, device_seen = self._pass1_foreach(groups, pass1_ctx)
         else:
             delta_numerator, d_denom, device_seen = self._pass1_per_param(groups, pass1_ctx)
@@ -588,32 +593,52 @@ class KProdigy(Optimizer):
             grads = torch.stack([records[i][1] for i in idxs])          # [B, *shape]
             states = [records[i][2] for i in idxs]
             group = records[idxs[0]][3]
-            if md in ("float32", "bfloat16"):
+            if md == "bfloat16":
+                # bf16 storage EMAs *in bf16*: whether stacking the [*shape] buffers
+                # into a [B, *shape] tensor changes the in-place add's rounding is
+                # shape-dependent (it does for some shapes at the denormal-scale d0
+                # bootstrap), so it cannot be guaranteed bit-identical. The bf16
+                # momentum EMA therefore stays a per-tensor loop (the exact original
+                # op) — bit-identical by construction. The D-reduction and the
+                # second moment, the actual step-cost dominators, are still batched.
+                target = d * (1 - beta1)
+                for j, s in zip(idxs, states, strict=True):
+                    m = s["m"]
+                    m.mul_(beta1).add_(records[j][1].to(m.dtype), alpha=target)
+            elif md == "float32":
+                # fp32 storage EMA is bit-identical stacked (no denormal ambiguity).
                 target = d * (1 - beta1)
                 ms = [s["m"] for s in states]
-                m_stack = torch.stack(ms)                               # [B, *shape] (m dtype)
+                m_stack = torch.stack(ms)                               # [B, *shape]
                 m_stack.mul_(beta1).add_(grads.to(m_stack.dtype), alpha=target)
                 torch._foreach_copy_(ms, list(m_stack.unbind(0)))
             elif md == "int8":
+                # int8 EMA runs in fp32 (dequant -> EMA -> requant), which IS
+                # bit-identical stacked. The per-param scale follows _quant_int8:
+                # a per dim-0 row scale for ndim>=2 (reduce trailing dims), a single
+                # scalar for ndim<=1 (reduce the whole row). The stacked layout is
+                # [B, *shape]; reduce all dims after B except dim-0-row.
                 target = d * (1 - beta1)
-                # dequant with per-param dim-0 row scale, EMA, requant (dim-0 row).
-                scales = torch.stack([s["m_scale"] for s in states])    # [B, *rowshape]
-                m_stack = torch.stack([s["m"] for s in states]).float().mul_(scales)
-                m_stack.mul_(beta1).add_(grads, alpha=target)
-                reduce_dims = tuple(range(2, m_stack.ndim))
-                if reduce_dims:
-                    absmax = m_stack.abs().amax(dim=reduce_dims, keepdim=True)
-                elif m_stack.ndim == 2:
-                    # 1-D params: original _quant_int8 uses a scalar scale.
-                    absmax = m_stack.abs().amax(dim=1, keepdim=True)
+                ndim = records[idxs[0]][0].ndim
+                m_stack = torch.stack([s["m"] for s in states]).float()  # [B, *shape]
+                # Broadcast each per-param scale ([R,1...] or scalar) under the
+                # leading batch dim.
+                if ndim >= 2:
+                    reduce_dims = tuple(range(2, ndim + 1))
+                    scales = torch.stack([s["m_scale"] for s in states])  # [B, R, 1...]
                 else:
-                    absmax = m_stack.abs().amax(dim=1, keepdim=True)
-                absmax = absmax.clamp_(min=1e-12)
+                    reduce_dims = (1,)
+                    scales = torch.stack(
+                        [s["m_scale"].reshape(1) for s in states]
+                    ).reshape(len(states), 1)                            # [B, 1]
+                m_stack.mul_(scales)
+                m_stack.mul_(beta1).add_(grads, alpha=target)
+                absmax = m_stack.abs().amax(dim=reduce_dims, keepdim=True).clamp_(min=1e-12)
                 new_scale = absmax / 127.0
                 q = (m_stack / new_scale).round_().clamp_(-127, 127).to(torch.int8)
                 torch._foreach_copy_([s["m"] for s in states], list(q.unbind(0)))
                 for s, sc in zip(states, new_scale.unbind(0), strict=True):
-                    s["m_scale"].copy_(sc.view_as(s["m_scale"]))
+                    s["m_scale"].copy_(sc.reshape(s["m_scale"].shape))
             else:  # 4bit — shared codec stacked lerp (bit-identical to ema_one)
                 upd = grads if d == 1.0 else grads.mul(d)
                 self._codec(group).ema_stacked(states, upd, lambda t: t, tuple(records[idxs[0]][0].shape), beta1)
