@@ -149,8 +149,9 @@ batching (default) keeps its per-step cost competitive with fused AdamW
 Adafusion(
     params, lr=1e-3, betas=(0.9, 0.999), eps=(1e-30, 1e-3), weight_decay=0.0, *,
     clip_threshold=1.0,
-    momentum_dtype="bfloat16",          # "float32" | "bfloat16" | "int8"
-    cautious=False,                     # cautious masking (opt-in regularizer)
+    momentum_dtype="bfloat16",          # "float32" | "bfloat16" | "int8" | "4bit"
+    momentum_4bit_block=128,            # block size for 4bit momentum
+    cautious=True,                      # cautious masking; helps w/ momentum, no-op without (set False if beta1=0)
     bf16_method="stochastic_rounding",  # "stochastic_rounding" | "kahan" | "none"
     foreach=True,                       # multi-tensor batching (docs/foreach-batching.md)
     foreach_batch_cutoff=2_000_000,     # weights bigger than this loop instead of stacking

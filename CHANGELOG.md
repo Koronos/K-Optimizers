@@ -60,6 +60,11 @@ All notable changes to this project will be documented in this file.
   and bit-exact vs the per-parameter path on CPU.
 
 ### Changed
+- `cautious` now defaults to **`True`**. Measured on a mini pixel-DDPM (8 paired
+  seeds, per-arm best LR): with momentum it lowers held-out val loss ~1.4% (paired
+  t=−4.07, p<0.05); it is a literal no-op without momentum (the mask is all-ones —
+  mask-active fraction ≈ 0). Set `cautious=False` for no-momentum configs to skip
+  the then-useless masking op.
 - Refactored Adafusion's momentum handling into a unified per-dtype **momentum
   codec** (`init_state` / `ema_one` / `ema_stacked`). The dequant → fp32 EMA →
   requant logic for each `momentum_dtype` now lives in exactly one place instead of

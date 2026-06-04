@@ -412,7 +412,11 @@ class Adafusion(Optimizer):
             blocks raise fidelity at the cost of more scale bytes
             (``4/block`` B/param); ``128`` adds ~0.03 B/param for a ~0.53 B/param
             total. ``0``/negative means whole-tensor (single scale).
-        cautious: enable cautious masking (off by default; opt-in regularizer).
+        cautious: cautious masking (Liang et al. 2024) — zero the update
+            coordinates whose sign disagrees with the gradient. **On by default**:
+            it improves convergence when momentum is on (``beta1>0``) and is a
+            literal no-op without momentum (the mask is all-ones — verified). Turn
+            it off for no-momentum configs to skip the then-useless masking op.
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
             ``"none"``. No-op on fp32 params.
@@ -455,7 +459,7 @@ class Adafusion(Optimizer):
         clip_threshold: float = 1.0,
         momentum_dtype: MomentumDtype = "bfloat16",
         momentum_4bit_block: int = _FOURBIT_BLOCK,
-        cautious: bool = False,
+        cautious: bool = True,
         bf16_method: str = "stochastic_rounding",
         foreach: bool = True,
         foreach_batch_cutoff: int = _FOREACH_BATCH_CUTOFF,
