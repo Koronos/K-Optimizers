@@ -22,10 +22,15 @@ All notable changes to this project will be documented in this file.
   - Element-for-element equal to the per-parameter path (bit-exact on CPU; ~1e-8
     on CUDA from reduction order). Stochastic-rounding draws legitimately differ
     (unbiased either way). 6 new parity/coverage tests.
-  - **Bucket chunking** (`_MAX_STACK_ELEMS`) bounds the transient stack memory so
-    batching never OOMs a full fine-tune — preserving Adafusion's low-memory story.
-    Large weights (which can't share a stack and are bandwidth-bound) route to the
-    per-param loop to skip stack/copy overhead.
+  - **Bucket chunking with a VRAM-adaptive budget** bounds the transient stack
+    memory so batching never OOMs a full fine-tune — preserving Adafusion's
+    low-memory story. The per-chunk element cap defaults to a fraction of
+    *currently-free* VRAM (`foreach_stack_budget=None`): a roomy card batches whole
+    buckets and even stacks large weights; a full card shrinks the chunk and stays
+    safe. No fixed constant biased to one GPU. Weights too big to share a chunk
+    (bandwidth-bound, launch overhead is noise) route to the per-param loop.
+    `foreach_stack_budget=<int>` pins a fixed cap for reproducibility / a hard
+    ceiling on a shared GPU.
   - Falls back to the per-parameter path for what it doesn't batch: 0-D scalars,
     large weights, `momentum_dtype="int8"`, `bf16_method="kahan"`, fp16+SR,
     non-contiguous matrixized convs, and single-param (gradient-release)

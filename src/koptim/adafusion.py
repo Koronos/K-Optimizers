@@ -43,14 +43,19 @@ __all__ = ["Adafusion"]
 _LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8"]
 
-# Upper bound on elements in a single stacked foreach bucket. Stacking a bucket
-# allocates a few transient fp32 copies (grad, update, the SR intermediate), so an
-# unbounded bucket of large weights can OOM during a full fine-tune — which would
-# undercut Adafusion's whole memory story. Chunking caps that transient to roughly
-# a few * this * 4 bytes, independent of model size. Tiny adapter tensors still
-# batch hundreds-at-once; only large-weight buckets split (their per-tensor compute
-# dwarfs the kernel-launch overhead anyway, so the speedup barely changes).
-_MAX_STACK_ELEMS = 4_000_000
+# Stacking a foreach bucket allocates several transient copies of the stacked
+# tensor (grad fp32, the reconstruction, the SR intermediate, ...), so an unbounded
+# bucket of large weights can OOM a full fine-tune — which would undercut
+# Adafusion's whole memory story. We therefore cap the per-chunk element count and
+# split bigger buckets. The cap is **adaptive to free VRAM** rather than a fixed
+# constant: a card with lots of headroom batches whole buckets (and even stacks
+# large weights), while a constrained card shrinks the chunk and stays safe. The
+# budget is `free_bytes * SAFETY_FRACTION / BYTES_PER_ELEM`; the divisor accounts
+# for the ~handful of simultaneous transient copies a chunk touches at peak.
+_STACK_SAFETY_FRACTION = 0.10   # use at most ~10% of currently-free VRAM per chunk
+_STACK_BYTES_PER_ELEM = 40      # peak simultaneous transient bytes per stacked element
+_MIN_STACK_ELEMS = 262_144      # still batch small tensors even under memory pressure
+_DEFAULT_STACK_ELEMS = 64_000_000  # CPU / unknown device: no VRAM limit to respect
 
 
 def _rms(t: Tensor) -> Tensor:
@@ -115,6 +120,11 @@ class Adafusion(Optimizer):
             matrixized convs, single-param groups) transparently falls back to it.
             For eligible params it supersedes ``compile`` (no per-tensor graph
             needed). Set ``False`` to force the per-parameter path.
+        foreach_stack_budget: max elements in a single stacked ``foreach`` chunk.
+            ``None`` (default) adapts to currently-free VRAM each step — a roomy
+            card batches whole buckets (and stacks large weights), a full card
+            shrinks the chunk and stays OOM-safe. Pass an int to pin a fixed cap
+            (reproducibility, or a hard ceiling on a shared GPU).
     """
 
     def __init__(
@@ -133,6 +143,7 @@ class Adafusion(Optimizer):
         factor_conv_as_matrix: bool = True,
         compile: bool = False,
         foreach: bool = True,
+        foreach_stack_budget: int | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -172,6 +183,10 @@ class Adafusion(Optimizer):
         # matches the per-parameter path; stochastic-rounding draws differ
         # (unbiased either way). Anything it doesn't cover falls back per-param.
         self._foreach = foreach
+        # Max elements per stacked chunk. None -> adaptive to free VRAM (see
+        # _foreach_budget); an int forces a fixed cap (useful for reproducibility
+        # or a hard memory ceiling on a shared GPU).
+        self._foreach_stack_budget = foreach_stack_budget
 
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
@@ -211,12 +226,13 @@ class Adafusion(Optimizer):
                 if p.grad.is_sparse:
                     raise RuntimeError("Adafusion does not support sparse gradients")
             if self._foreach and self._group_foreach_eligible(group):
+                budget = self._foreach_budget(params[0].device)
                 fast: list[Tensor] = []
                 slow: list[Tensor] = []
                 for p in params:
-                    (fast if self._param_foreach_eligible(p, group) else slow).append(p)
+                    (fast if self._param_foreach_eligible(p, group, budget) else slow).append(p)
                 if len(fast) >= 2:
-                    self._step_foreach(fast, group)
+                    self._step_foreach(fast, group, budget)
                     for p in slow:
                         self._step_one_param(p, group)
                 else:
@@ -228,6 +244,20 @@ class Adafusion(Optimizer):
         return loss
 
     # ----------------------------------------------------------------- foreach
+    def _foreach_budget(self, device: torch.device) -> int:
+        """Max elements per stacked chunk — adaptive to free VRAM unless overridden.
+
+        Reading currently-free VRAM (not total) means the chunk shrinks exactly
+        when a big model already fills the card, and grows on a roomy card so whole
+        buckets — including large weights — stack at once.
+        """
+        if self._foreach_stack_budget is not None:
+            return self._foreach_stack_budget
+        if device.type == "cuda":
+            free_bytes = torch.cuda.mem_get_info(device)[0]
+            return max(_MIN_STACK_ELEMS, int(free_bytes * _STACK_SAFETY_FRACTION / _STACK_BYTES_PER_ELEM))
+        return _DEFAULT_STACK_ELEMS
+
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
         """Group-level options the batched fast path supports."""
@@ -239,7 +269,7 @@ class Adafusion(Optimizer):
         )
 
     @staticmethod
-    def _param_foreach_eligible(p: Tensor, group: dict[str, Any]) -> bool:
+    def _param_foreach_eligible(p: Tensor, group: dict[str, Any], budget: int) -> bool:
         """Per-parameter shapes/dtypes the batched fast path can stack.
 
         Both branches are covered: ``ndim >= 2`` uses the factored bucket, ``ndim
@@ -248,10 +278,11 @@ class Adafusion(Optimizer):
         """
         if p.ndim == 0:                          # 0-D scalars -> per-param path
             return False
-        if p.numel() > _MAX_STACK_ELEMS // 2:
-            # Large weights can't share a stack (chunk size would be 1) and are
-            # compute/bandwidth-bound anyway — the per-tensor launch overhead is
-            # noise for them, so loop them and skip the stack/copy overhead.
+        if p.numel() > budget // 2:
+            # Too big to share a chunk under the current memory budget (chunk size
+            # would be 1) and compute/bandwidth-bound anyway — the per-tensor launch
+            # overhead is noise for it, so loop it and skip the stack/copy overhead.
+            # On a roomy card the budget is large, so few (if any) weights hit this.
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"
@@ -266,7 +297,7 @@ class Adafusion(Optimizer):
         return True
 
     @torch.no_grad()
-    def _step_foreach(self, params: list[Tensor], group: dict[str, Any]) -> None:
+    def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
         """Batched step for many params at once.
 
         Params are bucketed so each bucket can be stacked into a single tensor and
@@ -299,14 +330,14 @@ class Adafusion(Optimizer):
                 flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
 
         for (eff, _dtype, matrixize), plist in factored_buckets.items():
-            step = max(1, _MAX_STACK_ELEMS // max(eff[0] * eff[1], 1))
+            step = max(1, budget // max(eff[0] * eff[1], 1))
             for i in range(0, len(plist), step):
                 self._factored_bucket(
                     plist[i:i + step], eff, matrixize,
                     beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method,
                 )
         for (length, _dtype), plist in flat_buckets.items():
-            step = max(1, _MAX_STACK_ELEMS // max(length, 1))
+            step = max(1, budget // max(length, 1))
             for i in range(0, len(plist), step):
                 self._nonfactored_bucket(
                     plist[i:i + step], length,

@@ -137,6 +137,26 @@ def test_foreach_matches_per_param(cfg):
         torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
 
 
+def test_foreach_chunking_is_exact():
+    """A tiny stack budget forces buckets to split and large weights to route to
+    the loop — the result must still equal the per-parameter path exactly."""
+    pa = _parity_params()
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
+    # budget=200 elems: every 2-D shape splits into many chunks and the larger
+    # tensors fall to the per-param branch — a stress test of both code paths.
+    oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), foreach=True, foreach_stack_budget=200)
+    ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), foreach=False)
+    gg = torch.Generator().manual_seed(7)
+    for _ in range(8):
+        for a, b in zip(pa, pb):
+            grad = torch.randn(*a.shape, generator=gg) * 0.02
+            a.grad, b.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+    for a, b in zip(pa, pb):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
 def test_foreach_single_param_uses_fallback():
     """A lone eligible param (e.g. gradient-release) still steps correctly."""
     p = torch.nn.Parameter(torch.randn(16, 16))
