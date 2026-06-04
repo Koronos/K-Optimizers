@@ -227,6 +227,61 @@ def test_foreach_matches_per_param(momentum_dtype, second_moment, cautious):
         torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("momentum_dtype", ["float32", "bfloat16", "int8", "4bit"])
+@pytest.mark.parametrize("second_moment", ["full", "factored"])
+@pytest.mark.parametrize("slice_p", [1, 11])
+def test_pass1_foreach_matches_per_param(momentum_dtype, second_moment, slice_p):
+    """Pass-1 (the D-estimation global reduction + the d-scaled momentum / factored
+    second-moment EMAs) must be bit-identical batched (foreach) vs the per-param
+    loop: the same D trajectory AND the same final weights, across momentum dtype
+    x {full, factored} x slice_p, on 2-D + conv + 1-D params."""
+    base = _mixed_params()
+    pa = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    kw = dict(momentum_dtype=momentum_dtype, second_moment=second_moment, slice_p=slice_p)
+    d_pp = _run_kprodigy(pa, foreach=False, steps=15, **kw)
+    d_fe = _run_kprodigy(pb, foreach=True, steps=15, **kw)
+    assert d_pp == pytest.approx(d_fe, rel=0, abs=0)  # D trajectory bit-identical
+    for a, b in zip(pa, pb, strict=True):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("independent_d", [True, False])
+def test_pass1_foreach_matches_per_param_multigroup(independent_d):
+    """Pass-1 batching keeps the per-group D accumulation order-equivalent: the
+    foreach and per-param paths give bit-identical per-group D and weights for a
+    multi-group (SDXL-like) setup, with both global and independent D."""
+    base = _mixed_params()
+    g1, g2 = base[:3], base[3:]
+
+    def build():
+        a = [torch.nn.Parameter(p.detach().clone()) for p in g1]
+        b = [torch.nn.Parameter(p.detach().clone()) for p in g2]
+        return a, b
+
+    def run(a, b, foreach):
+        opt = KProdigy(
+            [{"params": a, "lr": 1.0}, {"params": b, "lr": 1.0}],
+            lr=1.0, foreach=foreach, independent_d=independent_d, slice_p=11,
+        )
+        gen = torch.Generator().manual_seed(99)
+        ds = []
+        for _ in range(15):
+            for p in a + b:
+                p.grad = torch.randn(p.shape, generator=gen, dtype=p.dtype) * 0.05
+            opt.step()
+            ds.append(tuple(grp["d"] for grp in opt.param_groups))
+        return ds
+
+    a1, b1 = build()
+    a2, b2 = build()
+    d_pp = run(a1, b1, foreach=False)
+    d_fe = run(a2, b2, foreach=True)
+    assert d_pp == d_fe  # per-group D trajectory bit-identical
+    for x, y in zip(a1 + b1, a2 + b2, strict=True):
+        torch.testing.assert_close(x.detach(), y.detach(), rtol=0, atol=0)
+
+
 def test_foreach_4bit_cautious_converges():
     """The new 4bit momentum + cautious path trains and bootstraps D."""
     losses, opt = _run(

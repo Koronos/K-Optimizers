@@ -337,60 +337,20 @@ class KProdigy(Optimizer):
         # ---- pass 1: D estimate + moment EMAs --------------------------------
         # UNCHANGED Prodigy D-estimation: global reduction over all params, the
         # d-scaled momentum EMA, and the (full / factored) second-moment EMA.
+        # The foreach path batches every elementwise op with torch.stack /
+        # torch._foreach_*, but keeps the *scalar* numerator/denominator fold in
+        # the original per-parameter order so the D trajectory is bit-identical.
         d_numerator = lead["d_numerator"] * beta3
-        delta_numerator = torch.zeros((), dtype=torch.float32)
-        d_denom = torch.zeros((), dtype=torch.float32)
-        device_seen = None
-
-        for group in groups:
-            decouple = group["decouple"]
-            decay = group["weight_decay"]
-            group_lr = group["lr"]
-            if group_lr not in (lr, 0.0):
-                raise RuntimeError(
-                    "KProdigy: groups sharing one D estimate must use the same lr "
-                    "(or 0 for a frozen group). Use independent_d=True for per-group lr."
-                )
-            codec = self._codec(group)
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                if p.grad.is_sparse:
-                    raise RuntimeError("KProdigy does not support sparse gradients")
-                state = self.state[p]
-                if "step" not in state:
-                    self._init_state(p, state, group)
-                device_seen = p.device
-
-                grad = p.grad
-                grad_fp32 = grad if grad.dtype == torch.float32 else grad.float()
-                if decay != 0 and not decouple:
-                    grad_fp32 = grad_fp32.add(p.detach().float(), alpha=decay)
-
-                if group_lr > 0.0 and should_update_d:
-                    s = state["s"]
-                    p0 = state["p0"]
-                    sliced_g = grad_fp32.flatten()[::slice_p]
-                    sliced_p = p.detach().float().flatten()[::slice_p]
-                    # numerator term: <grad, p0 - p>, scaled. (a*b).sum avoids
-                    # torch.dot (a cuBLAS gemv path that SIGFPEs on some setups).
-                    delta_numerator = delta_numerator.to(p.device) if delta_numerator.device != p.device else delta_numerator
-                    delta_numerator = delta_numerator + (d_over_d0 * dlr) * (sliced_g * (p0 - sliced_p)).sum()
-                    alpha_s = (d_over_d0 * d) if safeguard_warmup else (d_over_d0 * dlr)
-                    s.mul_(beta3).add_(sliced_g, alpha=alpha_s)
-                    d_denom = d_denom.to(p.device) if d_denom.device != p.device else d_denom
-                    d_denom = d_denom + s.abs().sum()
-
-                # First moment EMA, scaled by current d (reference convention).
-                if beta1 > 0:
-                    self._update_momentum(codec, state, grad_fp32, beta1, d, group["momentum_dtype"])
-
-                # Second moment EMA.
-                if "v" in state:
-                    state["v"].mul_(beta2).addcmul_(grad_fp32, grad_fp32, value=d * d * (1 - beta2))
-                else:
-                    gv = self._matrixize(grad_fp32, group)
-                    update_factored_state(gv, state["row"], state["col"], beta2, group["eps_factored"])
+        pass1_ctx = {
+            "beta1": beta1, "beta2": beta2, "beta3": beta3, "d": d, "dlr": dlr,
+            "d_over_d0": d_over_d0, "slice_p": slice_p,
+            "safeguard_warmup": safeguard_warmup, "should_update_d": should_update_d,
+            "lr": lr,
+        }
+        if self._foreach:
+            delta_numerator, d_denom, device_seen = self._pass1_foreach(groups, pass1_ctx)
+        else:
+            delta_numerator, d_denom, device_seen = self._pass1_per_param(groups, pass1_ctx)
 
         # ---- D update --------------------------------------------------------
         if should_update_d and lr > 0.0:
@@ -419,6 +379,286 @@ class KProdigy(Optimizer):
                 self.state[p]["step"] += 1
             self._apply_updates(params, group, d, dlr)
             group["k"] = group["k"] + 1
+
+    # -- pass-1: D estimate + moment EMAs (per-param reference path) --------
+
+    def _collect_grad(
+        self, p: Tensor, group: dict[str, Any]
+    ) -> Tensor:
+        """fp32 gradient with non-decoupled weight decay folded in (pass-1 input)."""
+        grad = p.grad
+        grad_fp32 = grad if grad.dtype == torch.float32 else grad.float()
+        if group["weight_decay"] != 0 and not group["decouple"]:
+            grad_fp32 = grad_fp32.add(p.detach().float(), alpha=group["weight_decay"])
+        return grad_fp32
+
+    @torch.no_grad()
+    def _pass1_per_param(
+        self, groups: list[dict[str, Any]], ctx: dict[str, Any]
+    ) -> tuple[Tensor, Tensor, torch.device | None]:
+        """Reference (per-parameter) pass 1. Bit-exact original behaviour."""
+        beta1, beta2, beta3 = ctx["beta1"], ctx["beta2"], ctx["beta3"]
+        d, dlr, d_over_d0 = ctx["d"], ctx["dlr"], ctx["d_over_d0"]
+        slice_p = ctx["slice_p"]
+        safeguard_warmup = ctx["safeguard_warmup"]
+        should_update_d = ctx["should_update_d"]
+        lr = ctx["lr"]
+
+        delta_numerator = torch.zeros((), dtype=torch.float32)
+        d_denom = torch.zeros((), dtype=torch.float32)
+        device_seen = None
+
+        for group in groups:
+            group_lr = group["lr"]
+            if group_lr not in (lr, 0.0):
+                raise RuntimeError(
+                    "KProdigy: groups sharing one D estimate must use the same lr "
+                    "(or 0 for a frozen group). Use independent_d=True for per-group lr."
+                )
+            codec = self._codec(group)
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError("KProdigy does not support sparse gradients")
+                state = self.state[p]
+                if "step" not in state:
+                    self._init_state(p, state, group)
+                device_seen = p.device
+
+                grad_fp32 = self._collect_grad(p, group)
+
+                if group_lr > 0.0 and should_update_d:
+                    s = state["s"]
+                    p0 = state["p0"]
+                    sliced_g = grad_fp32.flatten()[::slice_p]
+                    sliced_p = p.detach().float().flatten()[::slice_p]
+                    # numerator term: <grad, p0 - p>, scaled. (a*b).sum avoids
+                    # torch.dot (a cuBLAS gemv path that SIGFPEs on some setups).
+                    delta_numerator = delta_numerator.to(p.device) if delta_numerator.device != p.device else delta_numerator
+                    delta_numerator = delta_numerator + (d_over_d0 * dlr) * (sliced_g * (p0 - sliced_p)).sum()
+                    alpha_s = (d_over_d0 * d) if safeguard_warmup else (d_over_d0 * dlr)
+                    s.mul_(beta3).add_(sliced_g, alpha=alpha_s)
+                    d_denom = d_denom.to(p.device) if d_denom.device != p.device else d_denom
+                    d_denom = d_denom + s.abs().sum()
+
+                # First moment EMA, scaled by current d (reference convention).
+                if beta1 > 0:
+                    self._update_momentum(codec, state, grad_fp32, beta1, d, group["momentum_dtype"])
+
+                # Second moment EMA.
+                if "v" in state:
+                    state["v"].mul_(beta2).addcmul_(grad_fp32, grad_fp32, value=d * d * (1 - beta2))
+                else:
+                    gv = self._matrixize(grad_fp32, group)
+                    update_factored_state(gv, state["row"], state["col"], beta2, group["eps_factored"])
+
+        return delta_numerator, d_denom, device_seen
+
+    # -- pass-1: foreach (stacked / bucketed) batched path -----------------
+
+    @torch.no_grad()
+    def _pass1_foreach(
+        self, groups: list[dict[str, Any]], ctx: dict[str, Any]
+    ) -> tuple[Tensor, Tensor, torch.device | None]:
+        """Batched pass 1: every elementwise op (the D-estimation inner products
+        and ``s`` buffer, the d-scaled momentum EMA, and the full/factored
+        second-moment EMA) is computed with stacked / ``torch._foreach_*`` kernels,
+        bucketed by effective shape the same way pass 2 / Adafusion are.
+
+        The *scalar* numerator/denominator accumulation is still folded in the
+        exact original per-parameter order (a cheap left-fold over an ``[N]``
+        vector of per-param partials), so the D trajectory is bit-identical to
+        :meth:`_pass1_per_param`.
+        """
+        beta1, beta2, beta3 = ctx["beta1"], ctx["beta2"], ctx["beta3"]
+        d, dlr, d_over_d0 = ctx["d"], ctx["dlr"], ctx["d_over_d0"]
+        slice_p = ctx["slice_p"]
+        safeguard_warmup = ctx["safeguard_warmup"]
+        should_update_d = ctx["should_update_d"]
+        lr = ctx["lr"]
+
+        # -- collection (original order) ----------------------------------
+        # records[i] = (p, grad_fp32, state, group, do_d) in iteration order.
+        records: list[tuple[Tensor, Tensor, dict[str, Any], dict[str, Any], bool]] = []
+        device_seen = None
+        for group in groups:
+            group_lr = group["lr"]
+            if group_lr not in (lr, 0.0):
+                raise RuntimeError(
+                    "KProdigy: groups sharing one D estimate must use the same lr "
+                    "(or 0 for a frozen group). Use independent_d=True for per-group lr."
+                )
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError("KProdigy does not support sparse gradients")
+                state = self.state[p]
+                if "step" not in state:
+                    self._init_state(p, state, group)
+                device_seen = p.device
+                grad_fp32 = self._collect_grad(p, group)
+                do_d = group_lr > 0.0 and should_update_d
+                records.append((p, grad_fp32, state, group, do_d))
+
+        if not records:
+            return (
+                torch.zeros((), dtype=torch.float32),
+                torch.zeros((), dtype=torch.float32),
+                device_seen,
+            )
+
+        n = len(records)
+        # Per-param scalar partials, kept in record order for the ordered fold.
+        num_partials = torch.zeros(n, dtype=torch.float32, device=device_seen)
+        denom_partials = torch.zeros(n, dtype=torch.float32, device=device_seen)
+
+        # -- (a) batched D-estimation reduction + s buffer ----------------
+        # Bucket the D-stat params by sliced length. Each param contributes a
+        # numerator partial <g, p0-p> and a denom partial |s|.sum after the s EMA.
+        d_buckets: dict[int, list[int]] = {}
+        for i, (_p, _g, _state, _grp, do_d) in enumerate(records):
+            if do_d:
+                d_buckets.setdefault(records[i][2]["s"].numel(), []).append(i)
+
+        for _len, idxs in d_buckets.items():
+            # Stack the sliced grad and (p0 - p) for this bucket.
+            sliced_g = torch.stack([
+                records[i][1].flatten()[::slice_p] for i in idxs
+            ])                                                            # [B, L]
+            sliced_p = torch.stack([
+                records[i][0].detach().float().flatten()[::slice_p] for i in idxs
+            ])                                                            # [B, L]
+            p0 = torch.stack([records[i][2]["p0"].expand_as(sliced_p[0]) for i in idxs])
+            # numerator partials: <g, p0 - p> per param (tail reduction is
+            # bit-identical to a per-tensor .sum()).
+            num = (sliced_g * (p0 - sliced_p)).sum(dim=-1)               # [B]
+            num_partials[idxs] = num.to(num_partials.dtype)
+            # s EMA: s <- beta3*s + alpha_s * g (stacked, bit-identical).
+            alpha_s = (d_over_d0 * d) if safeguard_warmup else (d_over_d0 * dlr)
+            s_stack = torch.stack([records[i][2]["s"] for i in idxs])    # [B, L]
+            s_stack.mul_(beta3).add_(sliced_g, alpha=alpha_s)
+            torch._foreach_copy_(
+                [records[i][2]["s"] for i in idxs], list(s_stack.unbind(0))
+            )
+            denom_partials[idxs] = s_stack.abs().sum(dim=-1).to(denom_partials.dtype)
+
+        # -- (b) batched first-moment (momentum) EMA ----------------------
+        if beta1 > 0:
+            self._pass1_momentum_foreach(records, beta1, d)
+
+        # -- (b) batched second-moment EMA --------------------------------
+        self._pass1_second_moment_foreach(records, beta2, d)
+
+        # -- ordered scalar fold (bit-identical accumulation) -------------
+        # Reconstruct the EXACT original per-param add sequence:
+        #   delta_numerator += (d_over_d0 * dlr) * <g, p0-p>_i
+        #   d_denom         += |s_i|.sum
+        # in record (group->params) order. This is a cheap O(N) left-fold over
+        # the [N] partials (N = #params), not over weight elements.
+        const = d_over_d0 * dlr
+        delta_numerator = torch.zeros((), dtype=torch.float32, device=device_seen)
+        d_denom = torch.zeros((), dtype=torch.float32, device=device_seen)
+        scaled_num = num_partials * const
+        for i in range(n):
+            if records[i][4]:  # do_d
+                delta_numerator = delta_numerator + scaled_num[i]
+                d_denom = d_denom + denom_partials[i]
+        return delta_numerator, d_denom, device_seen
+
+    @torch.no_grad()
+    def _pass1_momentum_foreach(
+        self, records: list[tuple[Tensor, Tensor, dict[str, Any], dict[str, Any], bool]],
+        beta1: float, d: float,
+    ) -> None:
+        """Batched d-scaled first-moment EMA, bucketed by (momentum_dtype, shape).
+
+        Each dtype reproduces the exact per-param arithmetic of
+        :meth:`_update_momentum` (mul_/add_ for float/bf16/int8 with the native
+        dim-0 row scale; the shared codec's stacked lerp for 4bit), so the stored
+        momentum is bit-identical to the per-param path.
+        """
+        buckets: dict[tuple[str, tuple[int, ...]], list[int]] = {}
+        for i, (p, _g, _state, group, _do_d) in enumerate(records):
+            md = group["momentum_dtype"]
+            buckets.setdefault((md, tuple(p.shape)), []).append(i)
+
+        for (md, _shape), idxs in buckets.items():
+            grads = torch.stack([records[i][1] for i in idxs])          # [B, *shape]
+            states = [records[i][2] for i in idxs]
+            group = records[idxs[0]][3]
+            if md in ("float32", "bfloat16"):
+                target = d * (1 - beta1)
+                ms = [s["m"] for s in states]
+                m_stack = torch.stack(ms)                               # [B, *shape] (m dtype)
+                m_stack.mul_(beta1).add_(grads.to(m_stack.dtype), alpha=target)
+                torch._foreach_copy_(ms, list(m_stack.unbind(0)))
+            elif md == "int8":
+                target = d * (1 - beta1)
+                # dequant with per-param dim-0 row scale, EMA, requant (dim-0 row).
+                scales = torch.stack([s["m_scale"] for s in states])    # [B, *rowshape]
+                m_stack = torch.stack([s["m"] for s in states]).float().mul_(scales)
+                m_stack.mul_(beta1).add_(grads, alpha=target)
+                reduce_dims = tuple(range(2, m_stack.ndim))
+                if reduce_dims:
+                    absmax = m_stack.abs().amax(dim=reduce_dims, keepdim=True)
+                elif m_stack.ndim == 2:
+                    # 1-D params: original _quant_int8 uses a scalar scale.
+                    absmax = m_stack.abs().amax(dim=1, keepdim=True)
+                else:
+                    absmax = m_stack.abs().amax(dim=1, keepdim=True)
+                absmax = absmax.clamp_(min=1e-12)
+                new_scale = absmax / 127.0
+                q = (m_stack / new_scale).round_().clamp_(-127, 127).to(torch.int8)
+                torch._foreach_copy_([s["m"] for s in states], list(q.unbind(0)))
+                for s, sc in zip(states, new_scale.unbind(0), strict=True):
+                    s["m_scale"].copy_(sc.view_as(s["m_scale"]))
+            else:  # 4bit — shared codec stacked lerp (bit-identical to ema_one)
+                upd = grads if d == 1.0 else grads.mul(d)
+                self._codec(group).ema_stacked(states, upd, lambda t: t, tuple(records[idxs[0]][0].shape), beta1)
+
+    @torch.no_grad()
+    def _pass1_second_moment_foreach(
+        self, records: list[tuple[Tensor, Tensor, dict[str, Any], dict[str, Any], bool]],
+        beta2: float, d: float,
+    ) -> None:
+        """Batched second-moment EMA: full ``v`` bucketed by shape, factored
+        row/col bucketed by matrixized effective shape. Bit-identical to the
+        per-param addcmul / Adafactor reductions."""
+        full_buckets: dict[tuple[int, ...], list[int]] = {}
+        fac_buckets: dict[tuple[Any, ...], list[int]] = {}
+        for i, (p, _g, state, group, _do_d) in enumerate(records):
+            if "v" in state:
+                full_buckets.setdefault(tuple(p.shape), []).append(i)
+            else:
+                matrixize = p.ndim > 2 and group["factor_conv_as_matrix"]
+                eff = (p.shape[0], p.numel() // p.shape[0]) if matrixize else tuple(p.shape)
+                fac_buckets.setdefault((eff, matrixize), []).append(i)
+
+        v_value = d * d * (1 - beta2)
+        for _shape, idxs in full_buckets.items():
+            grads = torch.stack([records[i][1] for i in idxs])
+            v_stack = torch.stack([records[i][2]["v"] for i in idxs])
+            v_stack.mul_(beta2).addcmul_(grads, grads, value=v_value)
+            torch._foreach_copy_([records[i][2]["v"] for i in idxs], list(v_stack.unbind(0)))
+
+        for (eff, matrixize), idxs in fac_buckets.items():
+            group = records[idxs[0]][3]
+            R, C = eff  # noqa: N806
+            grads = torch.stack([
+                (records[i][1].reshape(R, C) if matrixize else records[i][1]) for i in idxs
+            ])                                                          # [B, R, C]
+            rows = torch.stack([records[i][2]["row"] for i in idxs])    # [B, R]
+            cols = torch.stack([records[i][2]["col"] for i in idxs])    # [B, C]
+            eps1 = group["eps_factored"]
+            grad_sq = grads.pow(2)
+            if eps1 > 0:
+                grad_sq.add_(eps1)
+            rows.lerp_(grad_sq.mean(dim=-1), 1.0 - beta2)
+            cols.lerp_(grad_sq.mean(dim=-2), 1.0 - beta2)
+            torch._foreach_copy_([records[i][2]["row"] for i in idxs], list(rows.unbind(0)))
+            torch._foreach_copy_([records[i][2]["col"] for i in idxs], list(cols.unbind(0)))
 
     # -- pass-2 update backend (Adafusion engine) --------------------------
 
