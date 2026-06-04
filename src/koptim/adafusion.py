@@ -40,7 +40,13 @@ from koptim._stochastic_rounding import add_stochastic_
 __all__ = ["Adafusion"]
 
 _LOW_PRECISION = (torch.bfloat16, torch.float16)
-MomentumDtype = Literal["bfloat16", "float32", "int8"]
+MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
+
+# Block size (number of consecutive flattened elements sharing one absmax scale)
+# for 4-bit momentum. Li et al. ("Memory Efficient Optimizers with 4-bit States",
+# NeurIPS 2023, arXiv:2309.01507) found small blocks materially help at 4-bit; a
+# fidelity replay on real SDXL gradients here confirmed block 128 ≈ int8 fidelity.
+_FOURBIT_BLOCK = 128
 
 # Stacking a foreach bucket allocates several transient copies of the stacked
 # tensor (grad fp32, the reconstruction, the SR intermediate, ...), so an unbounded
@@ -114,6 +120,273 @@ def _quant_int8_stacked(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     return q, scale
 
 
+def _pack_nibbles(nib: Tensor) -> Tensor:
+    """Pack a flat tensor of 4-bit values (``uint8`` in ``[0, 15]``) two-per-byte.
+
+    Operates on the LAST dim so a stacked ``[N, K]`` input packs each row
+    independently into ``[N, ceil(K/2)]``. Odd ``K`` is zero-padded (the dangling
+    high nibble of the final byte is ignored on unpack).
+    """
+    k = nib.shape[-1]
+    if k % 2:
+        nib = torch.cat([nib, nib.new_zeros(*nib.shape[:-1], 1)], dim=-1)
+    pair = nib.reshape(*nib.shape[:-1], -1, 2)
+    return (pair[..., 0] | (pair[..., 1] << 4)).to(torch.uint8)
+
+
+def _unpack_nibbles(packed: Tensor, k: int) -> Tensor:
+    """Inverse of :func:`_pack_nibbles`: ``[..., ceil(k/2)]`` bytes -> ``[..., k]``."""
+    lo = packed & 0x0F
+    hi = (packed >> 4) & 0x0F
+    out = torch.stack([lo, hi], dim=-1).reshape(*packed.shape[:-1], -1)
+    return out[..., :k]
+
+
+def _quant_4bit(m_fp32: Tensor, block_size: int) -> tuple[Tensor, Tensor, int]:
+    """Quantize ``m_fp32`` to signed linear 4-bit with a per-block absmax scale.
+
+    The tensor is flattened, split into consecutive blocks of ``block_size``
+    elements (the final block may be short), and each block gets one ``absmax/7``
+    scale. Values map to ``[-7, 7]`` (15 used levels), are shifted to the unsigned
+    nibble range ``[1, 15]``, and packed two-per-byte for a real 0.5 B/param store.
+
+    Returns ``(packed_uint8[ceil(numel/2)], scale_fp32[nblocks], numel)``. The
+    flat-block layout is identical whether a single tensor or a stacked bucket is
+    quantized, so the batched and per-param paths agree bit-for-bit.
+    """
+    numel = m_fp32.numel()
+    flat = m_fp32.reshape(-1)
+    nblocks = (numel + block_size - 1) // block_size
+    pad = nblocks * block_size - numel
+    if pad:
+        flat = torch.cat([flat, flat.new_zeros(pad)])
+    blocks = flat.view(nblocks, block_size)
+    absmax = blocks.abs().amax(dim=1, keepdim=True).clamp_(min=1e-12)
+    scale = absmax / 7.0
+    q = (blocks / scale).round_().clamp_(-7, 7).to(torch.int8)
+    nib = (q + 8).to(torch.uint8).reshape(-1)[:numel]
+    packed = _pack_nibbles(nib)
+    return packed, scale.reshape(nblocks), numel
+
+
+def _dequant_4bit(packed: Tensor, scale: Tensor, numel: int, block_size: int) -> Tensor:
+    """Inverse of :func:`_quant_4bit`: -> flat fp32 of length ``numel``."""
+    nib = _unpack_nibbles(packed, numel)
+    q = nib.to(torch.float32) - 8.0
+    nblocks = scale.shape[0]
+    pad = nblocks * block_size - numel
+    if pad:
+        q = torch.cat([q, q.new_zeros(pad)])
+    q = q.view(nblocks, block_size).mul_(scale.view(nblocks, 1))
+    return q.reshape(-1)[:numel]
+
+
+def _quant_4bit_stacked(m_fp32: Tensor, block_size: int) -> tuple[Tensor, Tensor]:
+    """Batched :func:`_quant_4bit` for a stacked ``[N, ...]`` momentum tensor.
+
+    Each of the ``N`` slices is flattened and block-quantized independently, so the
+    block boundaries match the per-param path exactly. Returns ``(packed[N, B],
+    scale[N, nblocks])``.
+    """
+    n = m_fp32.shape[0]
+    per = m_fp32[0].numel()
+    flat = m_fp32.reshape(n, per)
+    nblocks = (per + block_size - 1) // block_size
+    pad = nblocks * block_size - per
+    if pad:
+        flat = torch.cat([flat, flat.new_zeros(n, pad)], dim=1)
+    blocks = flat.view(n, nblocks, block_size)
+    absmax = blocks.abs().amax(dim=2, keepdim=True).clamp_(min=1e-12)
+    scale = absmax / 7.0
+    q = (blocks / scale).round_().clamp_(-7, 7).to(torch.int8)
+    nib = (q + 8).to(torch.uint8).reshape(n, -1)[:, :per]
+    packed = _pack_nibbles(nib)                          # [N, ceil(per/2)]
+    return packed, scale.reshape(n, nblocks)
+
+
+def _dequant_4bit_stacked(packed: Tensor, scale: Tensor, per: int, block_size: int) -> Tensor:
+    """Inverse of :func:`_quant_4bit_stacked`: -> ``[N, per]`` fp32."""
+    n = packed.shape[0]
+    nib = _unpack_nibbles(packed, per)                   # [N, per]
+    q = nib.to(torch.float32) - 8.0
+    nblocks = scale.shape[1]
+    pad = nblocks * block_size - per
+    if pad:
+        q = torch.cat([q, q.new_zeros(n, pad)], dim=1)
+    q = q.view(n, nblocks, block_size).mul_(scale.view(n, nblocks, 1))
+    return q.reshape(n, -1)[:, :per]
+
+
+# --------------------------------------------------------------------- codecs
+# The first-moment EMA is always *worked on* as an fp32 tensor in the "effective"
+# layout — matricized ``[R, C]`` (factored) / flat ``[L]`` (non-factored) per
+# param, and stacked ``[N, R, C]`` / ``[N, L]`` in the foreach buckets. A momentum
+# codec owns, for one ``momentum_dtype``, the entire dequant → fp32 EMA → requant
+# cycle so the three step functions never re-implement it. The whole momentum
+# block in each step function collapses to ``delta = codec.ema_*(…, update, beta1)``:
+#
+#   * ``init_state``   — allocate the stored representation in ``state``.
+#   * ``ema_one``      — per-param: dequant ``state`` -> EMA with ``update`` (grad
+#                        shape) -> requant + store; returns the fp32 delta.
+#   * ``ema_stacked``  — foreach: dequant a list of states -> EMA with the stacked
+#                        ``update`` (``[N,…]``) -> requant + store; returns the
+#                        stacked fp32 delta.
+#
+# ``ema_stacked`` takes ``mat`` (the per-param matricizer the factored bucket uses;
+# identity for the non-factored bucket) and ``eff`` (the effective per-param shape
+# ``(R, C)`` or ``(L,)``) so each codec can present whatever stacked layout it needs
+# (per-row for int8, flat-over-blocks for 4bit) while the bucket stays dtype-agnostic.
+
+
+class _MomentumCodec:
+    """Base momentum codec. Subclasses own one ``momentum_dtype``'s storage AND the
+    full dequant → fp32 EMA → requant cycle, so the three step functions never
+    re-implement any of it. Both ``ema_*`` methods perform the in-place EMA
+    ``m.lerp_(update, 1-beta1)`` and return the fp32 first-moment as the step delta.
+    """
+
+    def init_state(self, state: dict[str, Any], grad: Tensor, group: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def ema_one(self, state: dict[str, Any], update: Tensor, beta1: float) -> Tensor:
+        """Per-param: EMA the stored momentum with ``update`` (the param's grad
+        shape) and return the fp32 delta, storing the new momentum back."""
+        raise NotImplementedError
+
+    def ema_stacked(
+        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
+    ) -> Tensor:
+        """Stacked: EMA each state's momentum with the matching slice of ``update``
+        (``[N, R, C]`` / ``[N, L]``) and return the fp32 delta, storing back."""
+        raise NotImplementedError
+
+
+class _FloatCodec(_MomentumCodec):
+    """fp32 / bf16 momentum: store ``m`` directly in ``dtype``.
+
+    The EMA runs in the *stored* dtype (``update.to(m.dtype)``) exactly as the
+    original code did, so fp32/bf16 stay bit-for-bit identical after the refactor.
+    """
+
+    def __init__(self, dtype: torch.dtype) -> None:
+        self.dtype = dtype
+
+    def init_state(self, state: dict[str, Any], grad: Tensor, group: dict[str, Any]) -> None:
+        state["m"] = torch.zeros_like(grad, dtype=self.dtype)
+
+    def ema_one(self, state: dict[str, Any], update: Tensor, beta1: float) -> Tensor:
+        m = state["m"]
+        m.lerp_(update.to(m.dtype), 1.0 - beta1)
+        return m.float() if m.dtype != torch.float32 else m.clone()
+
+    def ema_stacked(
+        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
+    ) -> Tensor:
+        ms = [mat(s["m"]) for s in states]
+        mom = torch.stack(ms)                                        # [N, …], momentum dtype
+        mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
+        torch._foreach_copy_(ms, list(mom.unbind(0)))
+        return mom.float()
+
+
+class _Int8Codec(_MomentumCodec):
+    """int8 momentum: per-row (dim-0) absmax scale (see :func:`_quant_int8`)."""
+
+    def init_state(self, state: dict[str, Any], grad: Tensor, group: dict[str, Any]) -> None:
+        state["m"] = torch.zeros_like(grad, dtype=torch.int8)
+        state["m_scale"] = torch.ones(
+            (grad.shape[0],) + (1,) * (grad.ndim - 1) if grad.ndim >= 2 else (),
+            dtype=torch.float32, device=grad.device,
+        )
+
+    def ema_one(self, state: dict[str, Any], update: Tensor, beta1: float) -> Tensor:
+        m = state["m"].float() * state["m_scale"]                    # dequant
+        m.lerp_(update, 1.0 - beta1)
+        delta = m.clone()
+        state["m"], state["m_scale"] = _quant_int8(m)                # requant
+        return delta
+
+    def ema_stacked(
+        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
+    ) -> Tensor:
+        # The per-row absmax scale of the stacked [N, R, C]/[N, L] momentum (reduce
+        # only the trailing axis) equals each param's per-param scale. Stacked scale
+        # layout: factored [R,1] -> [N,R,1]; non-factored scalar -> [N,1].
+        rowshape = (eff[0], 1) if len(eff) == 2 else (1,)
+        scale = torch.stack([s["m_scale"].view(*rowshape) for s in states])
+        m = torch.stack([mat(s["m"]) for s in states]).float().mul_(scale)  # dequant
+        m.lerp_(update, 1.0 - beta1)
+        delta = m.clone()
+        q, new_scale = _quant_int8_stacked(m)                        # requant
+        torch._foreach_copy_([mat(s["m"]) for s in states], list(q.unbind(0)))
+        for s, sc in zip(states, new_scale.unbind(0), strict=True):
+            s["m_scale"].copy_(sc.view_as(s["m_scale"]))
+        return delta
+
+
+class _FourBitCodec(_MomentumCodec):
+    """4-bit momentum: flat per-block absmax + nibble packing (see :func:`_quant_4bit`).
+
+    Scale layout is flat-over-blocks, NOT per-row; the stacked path operates on each
+    param's flattened ``[per]`` view so block boundaries match the per-param path.
+    """
+
+    @staticmethod
+    def _block_size(grad: Tensor, group: dict[str, Any]) -> int:
+        bs = group["momentum_4bit_block"]
+        numel = grad.numel()
+        return numel if bs <= 0 else min(bs, numel) if numel > 0 else 1
+
+    def init_state(self, state: dict[str, Any], grad: Tensor, group: dict[str, Any]) -> None:
+        numel = grad.numel()
+        bs = self._block_size(grad, group)
+        nblocks = (numel + bs - 1) // bs
+        # zero momentum -> nibble 8 (the zero level after the +8 shift); a packed
+        # byte of two 8-nibbles is 0x88 = 136. Scales are 1.0 so a fresh dequant
+        # returns exactly 0.
+        state["m"] = torch.full(((numel + 1) // 2,), 0x88, dtype=torch.uint8, device=grad.device)
+        state["m_scale"] = torch.ones(nblocks, dtype=torch.float32, device=grad.device)
+        state["m_numel"] = numel
+        state["m_block"] = bs
+
+    def ema_one(self, state: dict[str, Any], update: Tensor, beta1: float) -> Tensor:
+        bs = state["m_block"]
+        m = _dequant_4bit(state["m"], state["m_scale"], state["m_numel"], bs)
+        m = m.view_as(update)                                        # dequant -> update shape
+        m.lerp_(update, 1.0 - beta1)
+        delta = m.clone()
+        packed, scale, _ = _quant_4bit(m, bs)                        # requant
+        state["m"], state["m_scale"] = packed, scale
+        return delta
+
+    def ema_stacked(
+        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
+    ) -> Tensor:
+        n = update.shape[0]
+        per = 1
+        for d in eff:
+            per *= d
+        bs = states[0]["m_block"]
+        packed = torch.stack([s["m"] for s in states])              # [N, ceil(per/2)]
+        sc = torch.stack([s["m_scale"] for s in states])            # [N, nblocks]
+        m = _dequant_4bit_stacked(packed, sc, per, bs).view_as(update)  # dequant
+        m.lerp_(update, 1.0 - beta1)
+        delta = m.clone()
+        new_packed, new_scale = _quant_4bit_stacked(m.reshape(n, per), bs)  # requant
+        torch._foreach_copy_([s["m"] for s in states], list(new_packed.unbind(0)))
+        for s, sc in zip(states, new_scale.unbind(0), strict=True):
+            s["m_scale"].copy_(sc)
+        return delta
+
+
+def _make_codec(momentum_dtype: str) -> _MomentumCodec:
+    if momentum_dtype == "int8":
+        return _Int8Codec()
+    if momentum_dtype == "4bit":
+        return _FourBitCodec()
+    return _FloatCodec(torch.bfloat16 if momentum_dtype == "bfloat16" else torch.float32)
+
+
 class Adafusion(Optimizer):
     """Conv-aware factored optimizer with optional bf16 momentum.
 
@@ -131,9 +404,17 @@ class Adafusion(Optimizer):
         decay_rate: HF Adafactor adaptive ``beta2_t = 1 - step**decay_rate``
             (typical ``-0.8``); ``betas[1]`` ignored when set.
         momentum_dtype: storage for the first-moment buffer when ``beta1>0`` —
-            ``"bfloat16"`` (default; ~2 B/param), ``"float32"`` (4 B/param), or
+            ``"bfloat16"`` (default; ~2 B/param), ``"float32"`` (4 B/param),
             ``"int8"`` (~1 B/param, per-row absmax quantized; Lion8bit-class
-            memory but with the factored adaptive second moment).
+            memory but with the factored adaptive second moment), or ``"4bit"``
+            (~0.5 B/param: signed linear 4-bit, two nibbles per byte, with a
+            per-block absmax scale — block size ``momentum_4bit_block``). On real
+            SDXL gradients block-128 4-bit matched int8's delta cosine vs fp32.
+        momentum_4bit_block: block size (consecutive flattened elements sharing one
+            absmax scale) for ``momentum_dtype="4bit"``. Default ``128``. Smaller
+            blocks raise fidelity at the cost of more scale bytes
+            (``4/block`` B/param); ``128`` adds ~0.03 B/param for a ~0.53 B/param
+            total. ``0``/negative means whole-tensor (single scale).
         cautious: enable cautious masking (off by default; opt-in regularizer).
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
@@ -154,7 +435,8 @@ class Adafusion(Optimizer):
             == 1`` non-factored ``[N, L]``. Matches the per-parameter path
             numerically (stochastic-rounding draws differ, unbiased either way);
             int8 momentum is also batched (per-row absmax dequant/EMA/requant on
-            the stacked layout). The rest (0-D scalars, kahan, fp16+SR,
+            the stacked layout), as is 4bit (per-block absmax, packed nibbles). The
+            rest (0-D scalars, kahan, fp16+SR,
             non-contiguous matrixized convs, single-param groups) transparently
             falls back to it. Set ``False`` to force the per-parameter path.
         foreach_batch_cutoff: per-tensor element count above which a weight is
@@ -183,6 +465,7 @@ class Adafusion(Optimizer):
         clip_threshold: float = 1.0,
         decay_rate: float | None = None,
         momentum_dtype: MomentumDtype = "bfloat16",
+        momentum_4bit_block: int = _FOURBIT_BLOCK,
         cautious: bool = False,
         bf16_method: str = "stochastic_rounding",
         factor_conv_as_matrix: bool = True,
@@ -200,8 +483,10 @@ class Adafusion(Optimizer):
             raise ValueError(f"lr must be >= 0, got {lr}")
         if clip_threshold <= 0.0:
             raise ValueError(f"clip_threshold must be > 0, got {clip_threshold}")
-        if momentum_dtype not in ("bfloat16", "float32", "int8"):
-            raise ValueError(f"momentum_dtype must be bfloat16/float32/int8, got {momentum_dtype!r}")
+        if momentum_dtype not in ("bfloat16", "float32", "int8", "4bit"):
+            raise ValueError(
+                f"momentum_dtype must be bfloat16/float32/int8/4bit, got {momentum_dtype!r}"
+            )
         if bf16_method not in ("stochastic_rounding", "kahan", "none"):
             raise ValueError(f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}")
         if foreach_batch_cutoff < 1:
@@ -214,6 +499,7 @@ class Adafusion(Optimizer):
             "clip_threshold": clip_threshold,
             "decay_rate": decay_rate,
             "momentum_dtype": momentum_dtype,
+            "momentum_4bit_block": momentum_4bit_block,
             "cautious": cautious,
             "bf16_method": bf16_method,
             "factor_conv_as_matrix": factor_conv_as_matrix,
@@ -233,6 +519,17 @@ class Adafusion(Optimizer):
         # Memory-safety ceiling: max elements per stacked chunk. None -> adaptive
         # to free VRAM (see _foreach_budget); an int forces a fixed cap.
         self._foreach_stack_budget = foreach_stack_budget
+        # One momentum codec per dtype string (the codec is stateless beyond the
+        # dtype). Encapsulates every dequant→EMA→requant detail so the three step
+        # functions stay dtype-agnostic.
+        self._codecs: dict[str, _MomentumCodec] = {}
+
+    def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
+        md = group["momentum_dtype"]
+        codec = self._codecs.get(md)
+        if codec is None:
+            codec = self._codecs[md] = _make_codec(md)
+        return codec
 
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
@@ -248,15 +545,7 @@ class Adafusion(Optimizer):
         else:
             state["v"] = torch.zeros_like(grad, dtype=torch.float32)
         if group["betas"][0] > 0:
-            md = group["momentum_dtype"]
-            if md == "int8":
-                state["m"] = torch.zeros_like(grad, dtype=torch.int8)
-                state["m_scale"] = torch.ones(
-                    (grad.shape[0],) + (1,) * (grad.ndim - 1) if grad.ndim >= 2 else (),
-                    dtype=torch.float32, device=p.device,
-                )
-            else:
-                state["m"] = torch.zeros_like(grad, dtype=torch.bfloat16 if md == "bfloat16" else torch.float32)
+            self._codec(group).init_state(state, grad, group)
         if _is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
 
@@ -371,6 +660,7 @@ class Adafusion(Optimizer):
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         reshape_conv = group["factor_conv_as_matrix"]
+        codec = self._codec(group)
 
         factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
         flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
@@ -392,14 +682,14 @@ class Adafusion(Optimizer):
             for i in range(0, len(plist), step):
                 self._factored_bucket(
                     plist[i:i + step], eff, matrixize,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
                 )
         for (length, _dtype), plist in flat_buckets.items():
             step = max(1, budget // max(length, 1))
             for i in range(0, len(plist), step):
                 self._nonfactored_bucket(
                     plist[i:i + step], length,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
                 )
 
     @torch.no_grad()
@@ -416,6 +706,7 @@ class Adafusion(Optimizer):
         wd: float,
         cautious: bool,
         bf16_method: str,
+        codec: _MomentumCodec,
     ) -> None:
         R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
         N = len(plist)  # noqa: N806
@@ -448,26 +739,10 @@ class Adafusion(Optimizer):
         update.mul_(lr)
 
         if beta1 > 0:
-            ms = [self.state[p]["m"] for p in plist]
-            if ms[0].dtype == torch.int8:
-                # Dequant -> EMA (fp32) -> delta is the fp32 EMA -> requant for store.
-                # Mirrors the int8 branch of _step_one_param exactly: the per-row
-                # absmax scale of the stacked [N, R, C] momentum (reduce only C)
-                # equals the per-param scale of each [R, C] tensor.
-                scales = [self.state[p]["m_scale"] for p in plist]
-                scale = torch.stack([s.view(R, 1) for s in scales])       # [N, R, 1]
-                m = torch.stack([mat(q) for q in ms]).float().mul_(scale)  # dequant -> [N, R, C]
-                m.lerp_(update, 1.0 - beta1)
-                delta = m.clone()
-                q, new_scale = _quant_int8_stacked(m)                     # [N, R, C] int8, [N, R, 1]
-                torch._foreach_copy_([mat(qi) for qi in ms], list(q.unbind(0)))
-                for p, s in zip(plist, new_scale.unbind(0), strict=True):
-                    self.state[p]["m_scale"].copy_(s.view_as(self.state[p]["m_scale"]))
-            else:
-                mom = torch.stack([mat(m) for m in ms])                   # [N, R, C], momentum dtype
-                mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
-                torch._foreach_copy_([mat(m) for m in ms], list(mom.unbind(0)))
-                delta = mom.float()
+            # The codec owns every dtype's dequant → fp32 EMA → requant detail; this
+            # block is identical for fp32/bf16/int8/4bit (and to _step_one_param).
+            states = [self.state[p] for p in plist]
+            delta = codec.ema_stacked(states, update, mat, (R, C), beta1)  # [N, R, C]
         else:
             delta = update
 
@@ -499,6 +774,7 @@ class Adafusion(Optimizer):
         wd: float,
         cautious: bool,
         bf16_method: str,
+        codec: _MomentumCodec,
     ) -> None:
         """Non-factored update (full per-coordinate second moment) for 1-D params.
 
@@ -525,24 +801,11 @@ class Adafusion(Optimizer):
         update.mul_(lr)
 
         if beta1 > 0:
-            ms = [self.state[p]["m"] for p in plist]
-            if ms[0].dtype == torch.int8:
-                # 1-D params: a single scalar absmax scale per tensor. Reducing the
-                # whole L axis of the stacked [N, L] momentum reproduces it exactly.
-                scales = [self.state[p]["m_scale"] for p in plist]
-                scale = torch.stack([s.view(1) for s in scales])         # [N, 1]
-                m = torch.stack(ms).float().mul_(scale)                   # dequant -> [N, L]
-                m.lerp_(update, 1.0 - beta1)
-                delta = m.clone()
-                q, new_scale = _quant_int8_stacked(m)                     # [N, L] int8, [N, 1]
-                torch._foreach_copy_(ms, list(q.unbind(0)))
-                for p, s in zip(plist, new_scale.unbind(0), strict=True):
-                    self.state[p]["m_scale"].copy_(s.view_as(self.state[p]["m_scale"]))
-            else:
-                mom = torch.stack(ms)                                     # [N, L], momentum dtype
-                mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
-                torch._foreach_copy_(ms, list(mom.unbind(0)))
-                delta = mom.float()
+            # Same codec entry point as the factored bucket; mat is identity here and
+            # the effective per-param shape is the 1-D length (so int8 reduces the
+            # whole L axis to one scalar scale, 4bit blocks over L).
+            states = [self.state[p] for p in plist]
+            delta = codec.ema_stacked(states, update, lambda t: t, (length,), beta1)  # [N, L]
         else:
             delta = update
 
@@ -611,18 +874,8 @@ class Adafusion(Optimizer):
             update.div_((_rms(update) / clip).clamp_(min=1.0))
         update.mul_(lr)
 
-        if beta1 > 0:
-            if state["m"].dtype == torch.int8:
-                m = state["m"].float() * state["m_scale"]   # dequant
-                m.lerp_(update, 1.0 - beta1)
-                delta = m.clone()
-                state["m"], state["m_scale"] = _quant_int8(m)  # requant
-            else:
-                m = state["m"]
-                m.lerp_(update.to(m.dtype), 1.0 - beta1)
-                delta = m.float() if m.dtype != torch.float32 else m.clone()
-        else:
-            delta = update
+        # Single codec call owns dequant → fp32 EMA → requant for every dtype.
+        delta = self._codec(group).ema_one(state, update, beta1) if beta1 > 0 else update
 
         if wd != 0:
             p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()

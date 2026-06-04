@@ -114,6 +114,10 @@ def _parity_params():
         dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="bfloat16"),       # bf16 momentum
         dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8"),           # int8 momentum
         dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8", weight_decay=0.02),  # int8 + wd
+        dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit"),           # 4-bit momentum
+        dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit", weight_decay=0.02),  # 4bit + wd
+        dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit", momentum_4bit_block=64),
+        dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit", momentum_4bit_block=0),  # whole-tensor
         dict(lr=1e-3, betas=(0.9, 0.999), weight_decay=0.02),               # weight decay
         dict(lr=1e-3, betas=(0.9, 0.999), cautious=True),                   # cautious mask
     ],
@@ -176,6 +180,89 @@ def test_foreach_int8_chunking_is_exact():
         ob.step()
     for a, b in zip(pa, pb, strict=False):
         torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+def test_foreach_4bit_chunking_is_exact():
+    """4-bit momentum: a tiny stack budget splits buckets and routes large tensors
+    to the per-param loop — the batched 4-bit pack/dequant/EMA/requant must still
+    match the per-param path bit-for-bit."""
+    pa = _parity_params()
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
+    oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit",
+                   foreach=True, foreach_stack_budget=200)
+    ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit", foreach=False)
+    gg = torch.Generator().manual_seed(7)
+    for _ in range(8):
+        for a, b in zip(pa, pb, strict=False):
+            grad = torch.randn(*a.shape, generator=gg) * 0.02
+            a.grad, b.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+    for a, b in zip(pa, pb, strict=False):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+def test_4bit_pack_roundtrip():
+    """Nibble pack/unpack round-trips for even and odd element counts, and
+    dequant(quant(m)) stays within the ~1/7 absmax 4-bit grid error."""
+    from koptim.adafusion import (
+        _dequant_4bit,
+        _pack_nibbles,
+        _quant_4bit,
+        _unpack_nibbles,
+    )
+
+    g = torch.Generator().manual_seed(3)
+    for k in (1, 2, 3, 7, 8, 9, 127, 128, 129):
+        nib = torch.randint(0, 16, (k,), generator=g, dtype=torch.uint8)
+        packed = _pack_nibbles(nib)
+        assert packed.numel() == (k + 1) // 2
+        assert torch.equal(_unpack_nibbles(packed, k), nib)
+    for shape in [(64, 128), (7,), (32, 8, 3, 3), (129,)]:
+        m = torch.randn(*shape, generator=g)
+        packed, scale, numel = _quant_4bit(m, 128)
+        rec = _dequant_4bit(packed, scale, numel, 128).view(shape)
+        # per-block grid step is absmax/7; reconstruction error must be bounded by it.
+        assert (rec - m).abs().max() <= m.abs().max() / 7.0 / 2.0 + 1e-6
+
+
+def test_4bit_memory_is_half_byte_per_param():
+    """The 4-bit store is a real 0.5 B/param packed buffer plus small block scales."""
+    p = torch.nn.Parameter(torch.randn(512, 512))
+    opt = Adafusion([p], betas=(0.9, 0.999), momentum_dtype="4bit", momentum_4bit_block=128)
+    p.grad = torch.randn_like(p)
+    opt.step()
+    st = opt.state[p]
+    assert st["m"].dtype == torch.uint8
+    assert st["m"].numel() == (p.numel() + 1) // 2          # exactly 0.5 B/param packed
+    packed_bpp = st["m"].numel() / p.numel()
+    scale_bpp = st["m_scale"].numel() * st["m_scale"].element_size() / p.numel()
+    assert packed_bpp == 0.5
+    assert packed_bpp + scale_bpp < 0.55                    # total well under int8's 1.0
+
+
+def test_4bit_trains_no_nan():
+    """A tiny regression converges with 4-bit momentum, no NaN."""
+    torch.manual_seed(0)
+    x = torch.randn(256, 16)
+    y = x @ torch.randn(16, 1)
+    model = torch.nn.Linear(16, 1)
+    opt = Adafusion(model.parameters(), lr=1e-2, betas=(0.9, 0.999), momentum_dtype="4bit")
+    first = last = None
+    for _ in range(200):
+        opt.zero_grad()
+        loss = (model(x) - y).pow(2).mean()
+        loss.backward()
+        opt.step()
+        first = loss.item() if first is None else first
+        last = loss.item()
+    assert math.isfinite(last) and last < first
+
+
+def test_4bit_invalid_momentum_dtype_rejected():
+    p = [torch.nn.Parameter(torch.randn(4, 4))]
+    with pytest.raises(ValueError):
+        Adafusion(p, momentum_dtype="2bit")
 
 
 def test_foreach_batch_cutoff_validation():

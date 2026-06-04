@@ -53,6 +53,19 @@ All notable changes to this project will be documented in this file.
     int8 + weight decay, and `test_foreach_int8_chunking_is_exact`).
 - `ktune` console script (`uv run ktune --model <ckpt>.safetensors --gpu N`) to
   check the foreach cutoff on your own GPU/model.
+- `momentum_dtype="4bit"` — signed linear 4-bit momentum (round-to-nearest) with a
+  per-block absmax scale, two nibbles packed per byte for a real ~0.5 B/param store
+  (+ a small per-block fp32 scale, ~0.03 B/param at the default block 128). New
+  `momentum_4bit_block` knob (default `128`; `<=0` = whole-tensor). Foreach-batched
+  and bit-exact vs the per-parameter path on CPU.
+
+### Changed
+- Refactored Adafusion's momentum handling into a unified per-dtype **momentum
+  codec** (`init_state` / `ema_one` / `ema_stacked`). The dequant → fp32 EMA →
+  requant logic for each `momentum_dtype` now lives in exactly one place instead of
+  being copy-pasted across the per-parameter step and the two foreach buckets; the
+  step functions call `codec.ema_*`. Pure restructuring — float32/bfloat16/int8
+  remain bit-for-bit identical (existing parity tests pass unchanged).
 
 ### Deprecated
 - `Adafusion(compile=...)` is now a no-op. `torch.compile` of the per-tensor
