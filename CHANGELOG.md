@@ -66,12 +66,32 @@ All notable changes to this project will be documented in this file.
   being copy-pasted across the per-parameter step and the two foreach buckets; the
   step functions call `codec.ema_*`. Pure restructuring — float32/bfloat16/int8
   remain bit-for-bit identical (existing parity tests pass unchanged).
+- `Adafusion(decay_rate=...)` (HF Adafactor adaptive `beta2_t = 1 - step**decay_rate`)
+  is now **foreach-batched** — it no longer disables the fast path. The buckets
+  compute a per-param step-dependent `1 - beta2_t` vector from each param-state's
+  step counter (broadcast `[N, 1]` over the row/col and full-`v` second-moment
+  EMAs), so adaptive beta2 runs through the same batched kernels as fixed beta2.
+  Element-for-element equal to the per-parameter path (bit-exact on CPU; the
+  per-param path's `1 - (1 - step**decay_rate)` round-trip is replayed exactly).
+  Removes the `decay_rate is None` restriction in `_group_foreach_eligible`.
+  - **~17× faster** with `decay_rate` set on a LoRA-like distribution (320 tiny
+    tensors): 53 ms → 3 ms/step (previously `decay_rate` was *forced* to the slow
+    per-parameter loop regardless of `foreach`). New parity test
+    `test_foreach_decay_rate_matches_per_param` (`decay_rate` −0.8 and −0.5).
 
 ### Deprecated
 - `Adafusion(compile=...)` is now a no-op. `torch.compile` of the per-tensor
   factored core measured neutral-to-negative across model sizes and is superseded
   by `foreach` batching; the argument is still accepted so existing configs don't
   break, but does nothing (the compiled path and `koptim/_compiled.py` were removed).
+- `Adafusion(factor_conv_as_matrix=...)` is now a no-op — conv-aware factoring is
+  **always on**. A 4-D conv kernel `[out, in, kh, kw]` is always reshaped to 2-D
+  `[out, in·kh·kw]` before the second moment is factored (row+col EMAs, ≈0 state).
+  The legacy `False` path factored over the tiny trailing dims and left ~0.4 B/param
+  of conv state for no quality gain — it was the entire optimizer-state floor on a
+  diffusion UNet — so its code was removed. The argument is still accepted (so
+  existing configs don't break) but has no effect; passing `True` or `False` now
+  produces identical state and updates.
 
 ## [0.2.0] - 2026-06
 

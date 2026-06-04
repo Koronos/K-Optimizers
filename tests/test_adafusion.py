@@ -13,17 +13,38 @@ from .conftest import train_steps
 
 
 def test_conv_factoring_reduces_state():
-    """Conv-aware factoring stores ~0 state for a conv kernel vs the legacy mode."""
-    def state_floats(reshape: bool) -> int:
-        p = torch.nn.Parameter(torch.randn(64, 32, 3, 3))
-        opt = Adafusion([p], lr=1e-3, betas=(0.0, 0.999), factor_conv_as_matrix=reshape)
-        p.grad = torch.randn_like(p)
-        opt.step()
-        return sum(v.numel() for v in opt.state[p].values() if torch.is_tensor(v))
+    """Conv-aware factoring stores ~0 state for a conv kernel.
 
-    fixed = state_floats(True)
-    legacy = state_floats(False)
-    assert fixed < legacy / 5, f"conv-aware factoring should be much smaller: {fixed} vs {legacy}"
+    A 4-D kernel [out, in, kh, kw] is reshaped to [out, in*kh*kw] and factored to
+    row+col EMAs (out + in*kh*kw floats), far below the full out*in*kh*kw numel.
+    """
+    p = torch.nn.Parameter(torch.randn(64, 32, 3, 3))
+    opt = Adafusion([p], lr=1e-3, betas=(0.0, 0.999))
+    p.grad = torch.randn_like(p)
+    opt.step()
+    state_floats = sum(v.numel() for v in opt.state[p].values() if torch.is_tensor(v))
+    # row (64) + col (288) + step scalar; well under 1/50 of the full 18432 numel.
+    assert state_floats < p.numel() / 50, f"conv state should be tiny: {state_floats} vs {p.numel()}"
+
+
+def test_factor_conv_as_matrix_kwarg_accepted_but_ignored():
+    """The deprecated kwarg is still accepted (configs don't break) and ignored:
+    True and False produce identical state and updates (always matrixized now)."""
+    def run(flag: bool) -> tuple[int, torch.Tensor]:
+        torch.manual_seed(0)
+        p = torch.nn.Parameter(torch.randn(16, 8, 3, 3))
+        opt = Adafusion([p], lr=1e-3, betas=(0.9, 0.999), factor_conv_as_matrix=flag)
+        g = torch.Generator().manual_seed(1)
+        for _ in range(3):
+            p.grad = torch.randn(*p.shape, generator=g) * 0.02
+            opt.step()
+        nstate = sum(v.numel() for v in opt.state[p].values() if torch.is_tensor(v))
+        return nstate, p.detach().clone()
+
+    n_true, p_true = run(True)
+    n_false, p_false = run(False)
+    assert n_true == n_false
+    torch.testing.assert_close(p_true, p_false, rtol=0, atol=0)
 
 
 def test_bf16_momentum_is_half_state():
@@ -200,6 +221,37 @@ def test_foreach_4bit_chunking_is_exact():
         ob.step()
     for a, b in zip(pa, pb, strict=False):
         torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("decay_rate", [-0.8, -0.5])
+def test_foreach_decay_rate_matches_per_param(decay_rate):
+    """Adaptive beta2 (decay_rate) foreach == per-param, bit-exact on CPU.
+
+    The per-param path computes beta2_t = 1 - step**decay_rate from each state's
+    step counter; the foreach buckets must reproduce the same per-param 1-beta2_t
+    lerp weight. Several steps are run so step advances and beta2 actually changes.
+    """
+    pa = _parity_params()
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
+    oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), decay_rate=decay_rate, foreach=True)
+    ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), decay_rate=decay_rate, foreach=False)
+    gg = torch.Generator().manual_seed(7)
+    for _ in range(6):
+        for a, b in zip(pa, pb, strict=False):
+            grad = torch.randn(*a.shape, generator=gg) * 0.02
+            a.grad, b.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+    for a, b in zip(pa, pb, strict=False):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+def test_decay_rate_uses_foreach_path():
+    """decay_rate groups are no longer forced to the per-param loop: the group is
+    foreach-eligible (the old `decay_rate is None` restriction was lifted)."""
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = Adafusion([p], lr=1e-3, betas=(0.9, 0.999), decay_rate=-0.8)
+    assert opt._group_foreach_eligible(opt.param_groups[0])
 
 
 def test_4bit_pack_roundtrip():

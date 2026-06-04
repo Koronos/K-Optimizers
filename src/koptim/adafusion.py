@@ -419,9 +419,12 @@ class Adafusion(Optimizer):
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
             ``"none"``. No-op on fp32 params.
-        factor_conv_as_matrix: reshape 4-D conv kernels to 2-D before factoring
-            (the conv-aware fix). Default ``True``; set ``False`` for the legacy
-            last-dims behaviour.
+        factor_conv_as_matrix: deprecated and ignored. Conv-aware factoring
+            (reshaping a 4-D conv kernel ``[out,in,kh,kw]`` to 2-D
+            ``[out, in·kh·kw]`` before factoring the second moment) is now always
+            on — the legacy ``False`` last-dims path left ~0.4 B/param of conv
+            state for no quality gain and was removed. The argument is still
+            accepted (so existing configs don't break) but has no effect.
         compile: deprecated and ignored. ``torch.compile`` of the per-tensor
             factored core measured neutral-to-negative across model sizes and is
             superseded by ``foreach`` batching; the argument is still accepted (so
@@ -537,7 +540,9 @@ class Adafusion(Optimizer):
         grad = p.grad
         factored = p.ndim >= 2
         if factored:
-            gv = grad if (p.ndim == 2 or not group["factor_conv_as_matrix"]) else grad.reshape(grad.shape[0], -1)
+            # ndim==2 is already its own matrix; ndim>2 (conv) reshapes to
+            # [out, in·kh·kw] before factoring (the conv-aware fix, always on).
+            gv = grad if p.ndim == 2 else grad.reshape(grad.shape[0], -1)
             row_shape = gv.shape[:-1]
             col_shape = gv.shape[:-2] + gv.shape[-1:]
             state["row"] = torch.zeros(row_shape, dtype=torch.float32, device=p.device)
@@ -608,10 +613,13 @@ class Adafusion(Optimizer):
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
-        """Group-level options the batched fast path supports."""
+        """Group-level options the batched fast path supports.
+
+        ``decay_rate`` (adaptive beta2) is supported: the buckets compute a
+        per-param step-dependent beta2 vector, so it goes through foreach too.
+        """
         return (
-            group["decay_rate"] is None          # fixed beta2 (no step-dependent decay)
-            and group["clip_threshold"] > 0      # clip always applied in the batched path
+            group["clip_threshold"] > 0          # clip always applied in the batched path
             and group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
         )
 
@@ -638,7 +646,7 @@ class Adafusion(Optimizer):
             and p.dtype != torch.bfloat16        # fp16+SR is unsupported -> per-param (raises)
         ):
             return False
-        if p.ndim > 2 and group["factor_conv_as_matrix"]:
+        if p.ndim > 2:
             # Matrixized conv writes back through a reshaped view -> needs contiguity.
             return p.data.is_contiguous() and p.grad.is_contiguous()
         return True
@@ -658,8 +666,8 @@ class Adafusion(Optimizer):
         eps1, _eps2 = group["eps"]
         lr, clip = group["lr"], group["clip_threshold"]
         wd = group["weight_decay"]
+        decay_rate = group["decay_rate"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
-        reshape_conv = group["factor_conv_as_matrix"]
         codec = self._codec(group)
 
         factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
@@ -671,7 +679,7 @@ class Adafusion(Optimizer):
             state["step"] += 1
             g = p.grad
             if g.ndim >= 2:
-                matrixize = g.ndim > 2 and reshape_conv
+                matrixize = g.ndim > 2  # conv kernels always reshape to 2-D before factoring
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
                 factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
             else:  # ndim == 1
@@ -682,15 +690,39 @@ class Adafusion(Optimizer):
             for i in range(0, len(plist), step):
                 self._factored_bucket(
                     plist[i:i + step], eff, matrixize,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec, decay_rate,
                 )
         for (length, _dtype), plist in flat_buckets.items():
             step = max(1, budget // max(length, 1))
             for i in range(0, len(plist), step):
                 self._nonfactored_bucket(
                     plist[i:i + step], length,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec, decay_rate,
                 )
+
+    def _one_minus_beta2_vec(
+        self, plist: list[Tensor], beta2: float, decay_rate: float | None
+    ) -> float | Tensor:
+        """The ``1 - beta2`` lerp weight for a bucket's second-moment EMA.
+
+        Fixed beta2 -> the scalar ``1 - beta2`` (unchanged behaviour). Adaptive
+        beta2 (``decay_rate`` set) -> a per-param fp32 vector ``[N]`` of ``1 -
+        beta2_t``, where ``step`` is each param-state's own (already-incremented)
+        counter. A vector (not a scalar from a shared step) stays correct if grads
+        were skipped and steps desynced.
+
+        Bit-exact-parity note: the per-param path computes ``beta2_t = 1.0 -
+        step**decay_rate`` (a Python float) and then lerps with ``1.0 - beta2_t``.
+        ``1.0 - (1.0 - x)`` is not generally ``x`` in floating point, so we replay
+        the *same* two-step round-trip here (per element, as Python floats) rather
+        than the algebraically-simplified ``step**decay_rate``.
+        """
+        if decay_rate is None:
+            return 1.0 - beta2
+        omb = [
+            1.0 - (1.0 - float(self.state[p]["step"]) ** decay_rate) for p in plist
+        ]
+        return torch.tensor(omb, dtype=torch.float32, device=plist[0].grad.device)
 
     @torch.no_grad()
     def _factored_bucket(
@@ -707,6 +739,7 @@ class Adafusion(Optimizer):
         cautious: bool,
         bf16_method: str,
         codec: _MomentumCodec,
+        decay_rate: float | None = None,
     ) -> None:
         R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
         N = len(plist)  # noqa: N806
@@ -721,12 +754,20 @@ class Adafusion(Optimizer):
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
+        # Second-moment EMA weight. Fixed beta2 is a scalar; adaptive (decay_rate)
+        # is a per-param vector beta2_t = 1 - step**decay_rate computed from each
+        # param's own step counter (params normally share a step, but a vector is
+        # the safe form against grad=None desync). 1 - beta2 broadcasts as [N,1,1].
+        one_minus_beta2 = self._one_minus_beta2_vec(plist, beta2, decay_rate)
+        # row/col are [N, R]/[N, C], so a per-param weight broadcasts as [N, 1].
+        omb = one_minus_beta2 if isinstance(one_minus_beta2, float) else one_minus_beta2.view(N, 1)
+
         # Factored second-moment EMA (HF eps placement: eps1 before the means).
         grad_sq = grad * grad
         if eps1 > 0:
             grad_sq = grad_sq.add_(eps1)
-        row.lerp_(grad_sq.mean(dim=-1), 1.0 - beta2)
-        col.lerp_(grad_sq.mean(dim=-2), 1.0 - beta2)
+        row.lerp_(grad_sq.mean(dim=-1), omb)
+        col.lerp_(grad_sq.mean(dim=-2), omb)
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
@@ -775,6 +816,7 @@ class Adafusion(Optimizer):
         cautious: bool,
         bf16_method: str,
         codec: _MomentumCodec,
+        decay_rate: float | None = None,
     ) -> None:
         """Non-factored update (full per-coordinate second moment) for 1-D params.
 
@@ -789,10 +831,15 @@ class Adafusion(Optimizer):
         grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
+        # Per-param second-moment EMA weight (scalar for fixed beta2, [N,1] vector
+        # for adaptive beta2_t = 1 - step**decay_rate; see _one_minus_beta2_vec).
+        one_minus_beta2 = self._one_minus_beta2_vec(plist, beta2, decay_rate)
+        omb = one_minus_beta2 if isinstance(one_minus_beta2, float) else one_minus_beta2.view(N, 1)
+
         grad_sq = grad * grad
         if eps1 > 0:
             grad_sq = grad_sq.add_(eps1)
-        v.lerp_(grad_sq, 1.0 - beta2)
+        v.lerp_(grad_sq, omb)
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
         update = grad.mul(v.rsqrt())                                      # [N, L]
@@ -842,7 +889,6 @@ class Adafusion(Optimizer):
         lr, clip = group["lr"], group["clip_threshold"]
         wd, decay_rate = group["weight_decay"], group["decay_rate"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
-        reshape_conv = group["factor_conv_as_matrix"]
 
         state = self.state[p]
         if "step" not in state:
@@ -855,7 +901,7 @@ class Adafusion(Optimizer):
         factored = ndim >= 2
 
         if factored:
-            matrixize = ndim > 2 and reshape_conv
+            matrixize = ndim > 2  # conv kernels always reshape to 2-D before factoring
             gv = grad_fp32.reshape(grad_fp32.shape[0], -1) if matrixize else grad_fp32
             update_factored_state(gv, state["row"], state["col"], beta2, eps1)
             r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
