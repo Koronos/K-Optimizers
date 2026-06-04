@@ -337,8 +337,7 @@ class Adafusion(Optimizer):
             return False
         if p.ndim > 2 and group["factor_conv_as_matrix"]:
             # Matrixized conv writes back through a reshaped view -> needs contiguity.
-            if not (p.data.is_contiguous() and p.grad.is_contiguous()):
-                return False
+            return p.data.is_contiguous() and p.grad.is_contiguous()
         return True
 
     @torch.no_grad()
@@ -404,8 +403,8 @@ class Adafusion(Optimizer):
         cautious: bool,
         bf16_method: str,
     ) -> None:
-        R, C = eff
-        N = len(plist)
+        R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
+        N = len(plist)  # noqa: N806
 
         def mat(t: Tensor) -> Tensor:
             return t.view(R, C) if matrixize else t
@@ -479,7 +478,7 @@ class Adafusion(Optimizer):
         bucket of equal-length 1-D tensors stacks to ``[N, L]`` and steps as a few
         kernels. Mirrors the ``not factored`` branch of :meth:`_step_one_param`.
         """
-        N = len(plist)
+        N = len(plist)  # noqa: N806 — matrix dim (stacked tensor is [N, L])
         vs = [self.state[p]["v"] for p in plist]                          # each [L], fp32
 
         grad = torch.stack([p.grad.float() for p in plist])               # [N, L]

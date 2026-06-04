@@ -128,12 +128,12 @@ def test_foreach_matches_per_param(cfg):
     ob = Adafusion(pb, foreach=False, **cfg)
     gg = torch.Generator().manual_seed(7)
     for _ in range(10):
-        for a, b in zip(pa, pb):
+        for a, b in zip(pa, pb, strict=False):
             grad = torch.randn(*a.shape, generator=gg) * 0.02
             a.grad, b.grad = grad.clone(), grad.clone()
         oa.step()
         ob.step()
-    for a, b in zip(pa, pb):
+    for a, b in zip(pa, pb, strict=False):
         torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
 
 
@@ -148,12 +148,12 @@ def test_foreach_chunking_is_exact():
     ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), foreach=False)
     gg = torch.Generator().manual_seed(7)
     for _ in range(8):
-        for a, b in zip(pa, pb):
+        for a, b in zip(pa, pb, strict=False):
             grad = torch.randn(*a.shape, generator=gg) * 0.02
             a.grad, b.grad = grad.clone(), grad.clone()
         oa.step()
         ob.step()
-    for a, b in zip(pa, pb):
+    for a, b in zip(pa, pb, strict=False):
         torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
 
 
@@ -194,12 +194,12 @@ def test_foreach_batch_cutoff_routes_large_to_loop_exactly():
     ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), foreach=False)
     gg = torch.Generator().manual_seed(1)
     for _ in range(6):
-        for a, b in zip(pa, pb):
+        for a, b in zip(pa, pb, strict=False):
             grad = torch.randn(*a.shape, generator=gg) * 0.02
             a.grad, b.grad = grad.clone(), grad.clone()
         oa.step()
         ob.step()
-    for a, b in zip(pa, pb):
+    for a, b in zip(pa, pb, strict=False):
         torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
 
 
