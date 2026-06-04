@@ -112,6 +112,8 @@ def _parity_params():
         dict(lr=1e-3, betas=(0.0, 0.999)),                                  # no momentum
         dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="float32"),        # fp32 momentum
         dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="bfloat16"),       # bf16 momentum
+        dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8"),           # int8 momentum
+        dict(lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8", weight_decay=0.02),  # int8 + wd
         dict(lr=1e-3, betas=(0.9, 0.999), weight_decay=0.02),               # weight decay
         dict(lr=1e-3, betas=(0.9, 0.999), cautious=True),                   # cautious mask
     ],
@@ -146,6 +148,25 @@ def test_foreach_chunking_is_exact():
     # tensors fall to the per-param branch — a stress test of both code paths.
     oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), foreach=True, foreach_stack_budget=200)
     ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), foreach=False)
+    gg = torch.Generator().manual_seed(7)
+    for _ in range(8):
+        for a, b in zip(pa, pb, strict=False):
+            grad = torch.randn(*a.shape, generator=gg) * 0.02
+            a.grad, b.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+    for a, b in zip(pa, pb, strict=False):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+def test_foreach_int8_chunking_is_exact():
+    """int8 momentum: a tiny stack budget splits buckets and routes large tensors
+    to the per-param loop — the batched int8 requant must still match per-param."""
+    pa = _parity_params()
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
+    oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8",
+                   foreach=True, foreach_stack_budget=200)
+    ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8", foreach=False)
     gg = torch.Generator().manual_seed(7)
     for _ in range(8):
         for a, b in zip(pa, pb, strict=False):

@@ -37,8 +37,20 @@ All notable changes to this project will be documented in this file.
     - The transient divisor (48 B/element) is itself model-independent — measured
       byte-for-byte identical on SDXL and Cosmos.
   - Falls back to the per-parameter path for what it doesn't batch: 0-D scalars,
-    large weights, `momentum_dtype="int8"`, `bf16_method="kahan"`, fp16+SR,
-    non-contiguous matrixized convs, and single-param (gradient-release) optimizers.
+    large weights, `bf16_method="kahan"`, fp16+SR, non-contiguous matrixized
+    convs, and single-param (gradient-release) optimizers.
+- `momentum_dtype="int8"` is now **foreach-batched** (previously excluded from the
+  fast path and always looped per-parameter). The per-row absmax quantization is
+  done on the stacked layout — dequant → fp32 EMA → requant per bucket — which is
+  element-for-element equal to the per-param int8 path: the per-row absmax of the
+  stacked `[N, R, C]`/`[N, L]` momentum (reduce only the trailing axis) reproduces
+  each tensor's per-param scale exactly. This makes "cheap momentum that fits"
+  (1 B/param, ~2.6 GB state on a 2.57 B SDXL UNet) also fast on adapter training.
+  - **~8× faster** on a LoRA-like distribution (320 tiny tensors, 2.7 M params):
+    98 ms → 12 ms. Full fine-tune ~1.17× (most weights are large and loop by the
+    cutoff). Bit-exact on CPU; CUDA max abs diff ~7e-9 (float reduction order).
+  - 3 new parity/coverage tests (int8 in `test_foreach_matches_per_param`,
+    int8 + weight decay, and `test_foreach_int8_chunking_is_exact`).
 - `ktune` console script (`uv run ktune --model <ckpt>.safetensors --gpu N`) to
   check the foreach cutoff on your own GPU/model.
 

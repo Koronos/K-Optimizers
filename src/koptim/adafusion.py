@@ -92,6 +92,28 @@ def _quant_int8(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     return q, scale
 
 
+def _quant_int8_stacked(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
+    """Batched :func:`_quant_int8` for a stacked momentum tensor.
+
+    ``m_fp32`` is the stacked momentum in its *effective row layout* — either
+    ``[N, R, C]`` (factored bucket) or ``[N, L]`` (non-factored bucket). The
+    per-param int8 path computes a per-row absmax scale that reduces every
+    dimension *except* dim-0 of the original tensor:
+
+    * factored: original ``[R, C]`` (or matrixized conv) -> scale ``[R, 1]``,
+      so the stacked scale is ``[N, R, 1]`` (reduce only the last, ``C``, axis);
+    * non-factored: original ``[L]`` is 1-D -> a single scalar scale per param,
+      so the stacked scale is ``[N, 1]`` (reduce the whole ``L`` axis).
+
+    Reducing only the trailing axis here is element-for-element the same set of
+    values the per-param path reduces per tensor, so the scales match exactly.
+    """
+    absmax = m_fp32.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-12)
+    scale = absmax / 127.0
+    q = (m_fp32 / scale).round_().clamp_(-127, 127).to(torch.int8)
+    return q, scale
+
+
 class Adafusion(Optimizer):
     """Conv-aware factored optimizer with optional bf16 momentum.
 
@@ -131,9 +153,10 @@ class Adafusion(Optimizer):
             as a few stacked kernels: ``ndim >= 2`` factored ``[N, R, C]``, ``ndim
             == 1`` non-factored ``[N, L]``. Matches the per-parameter path
             numerically (stochastic-rounding draws differ, unbiased either way);
-            the rest (0-D scalars, int8 momentum, kahan, fp16+SR, non-contiguous
-            matrixized convs, single-param groups) transparently falls back to it.
-            Set ``False`` to force the per-parameter path.
+            int8 momentum is also batched (per-row absmax dequant/EMA/requant on
+            the stacked layout). The rest (0-D scalars, kahan, fp16+SR,
+            non-contiguous matrixized convs, single-param groups) transparently
+            falls back to it. Set ``False`` to force the per-parameter path.
         foreach_batch_cutoff: per-tensor element count above which a weight is
             stepped by the per-parameter loop instead of being stacked. A
             **performance** knob, decoupled from VRAM: batching only pays off while
@@ -300,7 +323,6 @@ class Adafusion(Optimizer):
         return (
             group["decay_rate"] is None          # fixed beta2 (no step-dependent decay)
             and group["clip_threshold"] > 0      # clip always applied in the batched path
-            and group["momentum_dtype"] != "int8"  # int8 requant is per-row, kept per-param
             and group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
         )
 
@@ -427,10 +449,25 @@ class Adafusion(Optimizer):
 
         if beta1 > 0:
             ms = [self.state[p]["m"] for p in plist]
-            mom = torch.stack([mat(m) for m in ms])                       # [N, R, C], momentum dtype
-            mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
-            torch._foreach_copy_([mat(m) for m in ms], list(mom.unbind(0)))
-            delta = mom.float()
+            if ms[0].dtype == torch.int8:
+                # Dequant -> EMA (fp32) -> delta is the fp32 EMA -> requant for store.
+                # Mirrors the int8 branch of _step_one_param exactly: the per-row
+                # absmax scale of the stacked [N, R, C] momentum (reduce only C)
+                # equals the per-param scale of each [R, C] tensor.
+                scales = [self.state[p]["m_scale"] for p in plist]
+                scale = torch.stack([s.view(R, 1) for s in scales])       # [N, R, 1]
+                m = torch.stack([mat(q) for q in ms]).float().mul_(scale)  # dequant -> [N, R, C]
+                m.lerp_(update, 1.0 - beta1)
+                delta = m.clone()
+                q, new_scale = _quant_int8_stacked(m)                     # [N, R, C] int8, [N, R, 1]
+                torch._foreach_copy_([mat(qi) for qi in ms], list(q.unbind(0)))
+                for p, s in zip(plist, new_scale.unbind(0), strict=True):
+                    self.state[p]["m_scale"].copy_(s.view_as(self.state[p]["m_scale"]))
+            else:
+                mom = torch.stack([mat(m) for m in ms])                   # [N, R, C], momentum dtype
+                mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
+                torch._foreach_copy_([mat(m) for m in ms], list(mom.unbind(0)))
+                delta = mom.float()
         else:
             delta = update
 
@@ -489,10 +526,23 @@ class Adafusion(Optimizer):
 
         if beta1 > 0:
             ms = [self.state[p]["m"] for p in plist]
-            mom = torch.stack(ms)                                         # [N, L], momentum dtype
-            mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
-            torch._foreach_copy_(ms, list(mom.unbind(0)))
-            delta = mom.float()
+            if ms[0].dtype == torch.int8:
+                # 1-D params: a single scalar absmax scale per tensor. Reducing the
+                # whole L axis of the stacked [N, L] momentum reproduces it exactly.
+                scales = [self.state[p]["m_scale"] for p in plist]
+                scale = torch.stack([s.view(1) for s in scales])         # [N, 1]
+                m = torch.stack(ms).float().mul_(scale)                   # dequant -> [N, L]
+                m.lerp_(update, 1.0 - beta1)
+                delta = m.clone()
+                q, new_scale = _quant_int8_stacked(m)                     # [N, L] int8, [N, 1]
+                torch._foreach_copy_(ms, list(q.unbind(0)))
+                for p, s in zip(plist, new_scale.unbind(0), strict=True):
+                    self.state[p]["m_scale"].copy_(s.view_as(self.state[p]["m_scale"]))
+            else:
+                mom = torch.stack(ms)                                     # [N, L], momentum dtype
+                mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
+                torch._foreach_copy_(ms, list(mom.unbind(0)))
+                delta = mom.float()
         else:
             delta = update
 
