@@ -6,20 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - `Adafusion(foreach=True)` (now the default) — multi-tensor batching of the
-  factored fast path. Params are bucketed by effective 2-D shape + dtype, stacked
-  into one `[N, R, C]` tensor, and the entire EMA + reconstruction + RMS clip +
-  momentum + weight decay + cautious + stochastic-rounding update runs as a
-  handful of batched kernels per bucket instead of a per-parameter Python loop.
-  - **~20× faster** optimizer step on adapter training (the hot case): measured
+  step. Params are bucketed by shape, each bucket stacked into one tensor, and
+  the entire update (EMA + reconstruction + RMS clip + momentum + weight decay +
+  cautious + stochastic rounding) runs as a handful of batched kernels per bucket
+  instead of a per-parameter Python loop. Two branches: `ndim >= 2` factored
+  `[N, R, C]`, `ndim == 1` (biases/norms) non-factored `[N, L]`.
+  - **~19× faster** optimizer step on adapter training (the hot case): measured
     on a real SDXL UNet + PEFT LoRA r=8 (1434 tiny trainable tensors), the step
-    drops from **314 ms → 15 ms** (1.34× of fused AdamW; was 27.5×).
+    drops from **318 ms → 16 ms** (1.45× of fused AdamW; was 28×).
+  - **Full fine-tune: ~1.3×** (SDXL UNet, 1680 params: 353 ms → 279 ms). The
+    smaller win is expected — a full fine-tune's optimizer time is dominated by
+    real bandwidth work on large weights, where per-tensor launch overhead is
+    noise; batching only removes that overhead, which dominates in the
+    many-small-tensors (adapter) regime.
   - Element-for-element equal to the per-parameter path (bit-exact on CPU; ~1e-8
     on CUDA from reduction order). Stochastic-rounding draws legitimately differ
-    (unbiased either way). 5 new parametrized parity tests.
-  - Falls back to the per-parameter path for what it doesn't batch: 1-D params,
-    `momentum_dtype="int8"`, `bf16_method="kahan"`, fp16+SR, non-contiguous
-    matrixized convs, and single-param (gradient-release) optimizers. For eligible
-    params it supersedes `compile` (no per-tensor graph needed).
+    (unbiased either way). 6 new parity/coverage tests.
+  - **Bucket chunking** (`_MAX_STACK_ELEMS`) bounds the transient stack memory so
+    batching never OOMs a full fine-tune — preserving Adafusion's low-memory story.
+    Large weights (which can't share a stack and are bandwidth-bound) route to the
+    per-param loop to skip stack/copy overhead.
+  - Falls back to the per-parameter path for what it doesn't batch: 0-D scalars,
+    large weights, `momentum_dtype="int8"`, `bf16_method="kahan"`, fp16+SR,
+    non-contiguous matrixized convs, and single-param (gradient-release)
+    optimizers. For eligible params it supersedes `compile` (no per-tensor graph).
 
 ## [0.2.0] - 2026-06
 

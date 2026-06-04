@@ -91,9 +91,18 @@ def test_cautious_runs():
 
 
 def _parity_params():
-    """A mix that exercises every fast-path branch plus the per-param fallback."""
+    """A mix that exercises every fast-path branch (factored, conv, and 1-D).
+
+    Includes repeated 2-D shapes and repeated 1-D lengths (so buckets have N>1),
+    distinct lengths, and a conv (matrixize).
+    """
     g = torch.Generator().manual_seed(0)
-    shapes = [(64, 128), (128, 64), (64, 128), (32, 8, 3, 3), (8, 96), (96, 8), (40,)]
+    shapes = [
+        (64, 128), (128, 64), (64, 128),      # 2-D, one shape repeated -> bucket N=2
+        (32, 8, 3, 3),                        # conv (matrixize)
+        (8, 96), (96, 8),                     # LoRA-like 2-D
+        (40,), (40,), (128,), (320,),         # 1-D: repeated length + distinct lengths
+    ]
     return [torch.nn.Parameter(torch.randn(*s, generator=g) * 0.05) for s in shapes]
 
 

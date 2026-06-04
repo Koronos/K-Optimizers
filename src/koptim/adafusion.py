@@ -43,6 +43,15 @@ __all__ = ["Adafusion"]
 _LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8"]
 
+# Upper bound on elements in a single stacked foreach bucket. Stacking a bucket
+# allocates a few transient fp32 copies (grad, update, the SR intermediate), so an
+# unbounded bucket of large weights can OOM during a full fine-tune — which would
+# undercut Adafusion's whole memory story. Chunking caps that transient to roughly
+# a few * this * 4 bytes, independent of model size. Tiny adapter tensors still
+# batch hundreds-at-once; only large-weight buckets split (their per-tensor compute
+# dwarfs the kernel-launch overhead anyway, so the speedup barely changes).
+_MAX_STACK_ELEMS = 4_000_000
+
 
 def _rms(t: Tensor) -> Tensor:
     return t.norm(2) / math.sqrt(max(t.numel(), 1))
@@ -94,14 +103,16 @@ class Adafusion(Optimizer):
             to AdamW), neutral-to-negative on many small weights; off by default.
             Only the fixed-beta2 (``decay_rate=None``) factored path with
             ``clip_threshold > 0`` is compiled. Needs a torch.compile backend.
-        foreach: batch the factored fast path across parameters with multi-tensor
-            (stacked) ops instead of a per-parameter Python loop. Default ``True``.
-            Huge win when many small weights are trained at once (LoRA/LoKr
-            adapters: hundreds of tiny tensors) — collapses the per-tensor kernel
-            launches into a few stacked kernels per (shape, dtype) bucket. Matches
-            the per-parameter path numerically (stochastic-rounding draws differ,
-            unbiased either way); shapes/options it doesn't cover (1-D params,
-            int8 momentum, kahan, fp16+SR) transparently fall back to that path.
+        foreach: batch the step across parameters with multi-tensor (stacked) ops
+            instead of a per-parameter Python loop. Default ``True``. Huge win when
+            many tensors are stepped at once — LoRA/LoKr adapters (hundreds of tiny
+            2-D tensors) *and* full fine-tunes (thousands of weights incl. all the
+            1-D biases/norms). Params are bucketed by shape and each bucket steps
+            as a few stacked kernels: ``ndim >= 2`` factored ``[N, R, C]``, ``ndim
+            == 1`` non-factored ``[N, L]``. Matches the per-parameter path
+            numerically (stochastic-rounding draws differ, unbiased either way);
+            the rest (0-D scalars, int8 momentum, kahan, fp16+SR, non-contiguous
+            matrixized convs, single-param groups) transparently falls back to it.
             For eligible params it supersedes ``compile`` (no per-tensor graph
             needed). Set ``False`` to force the per-parameter path.
     """
@@ -205,7 +216,7 @@ class Adafusion(Optimizer):
                 for p in params:
                     (fast if self._param_foreach_eligible(p, group) else slow).append(p)
                 if len(fast) >= 2:
-                    self._step_factored_foreach(fast, group)
+                    self._step_foreach(fast, group)
                     for p in slow:
                         self._step_one_param(p, group)
                 else:
@@ -229,8 +240,18 @@ class Adafusion(Optimizer):
 
     @staticmethod
     def _param_foreach_eligible(p: Tensor, group: dict[str, Any]) -> bool:
-        """Per-parameter shapes/dtypes the batched fast path can stack."""
-        if p.ndim < 2:                           # 1-D params use the non-factored path
+        """Per-parameter shapes/dtypes the batched fast path can stack.
+
+        Both branches are covered: ``ndim >= 2`` uses the factored bucket, ``ndim
+        == 1`` (biases/norms — the bulk of a full fine-tune) uses the non-factored
+        bucket. Only 0-D scalars and the awkward dtype/contiguity cases fall back.
+        """
+        if p.ndim == 0:                          # 0-D scalars -> per-param path
+            return False
+        if p.numel() > _MAX_STACK_ELEMS // 2:
+            # Large weights can't share a stack (chunk size would be 1) and are
+            # compute/bandwidth-bound anyway — the per-tensor launch overhead is
+            # noise for them, so loop them and skip the stack/copy overhead.
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"
@@ -245,13 +266,15 @@ class Adafusion(Optimizer):
         return True
 
     @torch.no_grad()
-    def _step_factored_foreach(self, params: list[Tensor], group: dict[str, Any]) -> None:
-        """Factored update for many params at once, bucketed by effective 2-D shape.
+    def _step_foreach(self, params: list[Tensor], group: dict[str, Any]) -> None:
+        """Batched step for many params at once.
 
-        Each bucket is stacked into a single ``[N, R, C]`` tensor and the whole
-        EMA + reconstruction + RMS clip + (optional) momentum + weight decay +
-        cautious + stochastic-rounding update runs as a handful of batched kernels
-        — element-for-element the same math as :meth:`_step_one_param`.
+        Params are bucketed so each bucket can be stacked into a single tensor and
+        stepped with a handful of kernels — element-for-element the same math as
+        :meth:`_step_one_param`:
+
+        * ``ndim >= 2`` -> factored bucket, keyed by effective 2-D shape ``[N, R, C]``.
+        * ``ndim == 1`` (biases/norms) -> non-factored bucket, keyed by length ``[N, L]``.
         """
         beta1, beta2 = group["betas"]
         eps1, _eps2 = group["eps"]
@@ -260,21 +283,35 @@ class Adafusion(Optimizer):
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         reshape_conv = group["factor_conv_as_matrix"]
 
-        buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
         for p in params:
             state = self.state[p]
             if "step" not in state:
                 self._init_state(p, state, group)
             state["step"] += 1
             g = p.grad
-            matrixize = g.ndim > 2 and reshape_conv
-            eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-            buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+            if g.ndim >= 2:
+                matrixize = g.ndim > 2 and reshape_conv
+                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
+                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+            else:  # ndim == 1
+                flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
 
-        for (eff, _dtype, matrixize), plist in buckets.items():
-            self._factored_bucket(
-                plist, eff, matrixize, beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method
-            )
+        for (eff, _dtype, matrixize), plist in factored_buckets.items():
+            step = max(1, _MAX_STACK_ELEMS // max(eff[0] * eff[1], 1))
+            for i in range(0, len(plist), step):
+                self._factored_bucket(
+                    plist[i:i + step], eff, matrixize,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method,
+                )
+        for (length, _dtype), plist in flat_buckets.items():
+            step = max(1, _MAX_STACK_ELEMS // max(length, 1))
+            for i in range(0, len(plist), step):
+                self._nonfactored_bucket(
+                    plist[i:i + step], length,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method,
+                )
 
     @torch.no_grad()
     def _factored_bucket(
@@ -342,6 +379,67 @@ class Adafusion(Optimizer):
         # Subtract delta from the (matrixized) weights, batched, then scatter back.
         pviews = [mat(p.data) for p in plist]
         weights = torch.stack(pviews)                                     # [N, R, C], param dtype
+        self._apply_subtract_batched(weights, delta, bf16_method)
+        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+
+    @torch.no_grad()
+    def _nonfactored_bucket(
+        self,
+        plist: list[Tensor],
+        length: int,
+        beta1: float,
+        beta2: float,
+        eps1: float,
+        lr: float,
+        clip: float,
+        wd: float,
+        cautious: bool,
+        bf16_method: str,
+    ) -> None:
+        """Non-factored update (full per-coordinate second moment) for 1-D params.
+
+        The bulk of a full fine-tune is biases and norm weights. Their update is
+        the plain Adam-style ``grad / sqrt(v)`` — no row/col factoring — so a
+        bucket of equal-length 1-D tensors stacks to ``[N, L]`` and steps as a few
+        kernels. Mirrors the ``not factored`` branch of :meth:`_step_one_param`.
+        """
+        N = len(plist)
+        vs = [self.state[p]["v"] for p in plist]                          # each [L], fp32
+
+        grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
+        v = torch.stack(vs)                                               # [N, L]
+
+        grad_sq = grad * grad
+        if eps1 > 0:
+            grad_sq = grad_sq.add_(eps1)
+        v.lerp_(grad_sq, 1.0 - beta2)
+        torch._foreach_copy_(vs, list(v.unbind(0)))
+
+        update = grad.mul(v.rsqrt())                                      # [N, L]
+        rms = update.norm(2, dim=1) / math.sqrt(length)                   # per-slice RMS
+        update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1))
+        update.mul_(lr)
+
+        if beta1 > 0:
+            ms = [self.state[p]["m"] for p in plist]
+            mom = torch.stack(ms)                                         # [N, L], momentum dtype
+            mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
+            torch._foreach_copy_(ms, list(mom.unbind(0)))
+            delta = mom.float()
+        else:
+            delta = update
+
+        if wd != 0:
+            p_fp32 = torch.stack([p.data.float() for p in plist])
+            delta = delta.add_(p_fp32, alpha=lr * wd)
+
+        if cautious:
+            mask = (delta * grad > 0).to(delta.dtype)
+            denom = mask.mean(dim=1).clamp_(min=1e-8).view(N, 1)
+            delta = delta.mul_(mask).div_(denom)
+
+        pviews = [p.data for p in plist]
+        weights = torch.stack(pviews)                                     # [N, L], param dtype
         self._apply_subtract_batched(weights, delta, bf16_method)
         torch._foreach_copy_(pviews, list(weights.unbind(0)))
 
