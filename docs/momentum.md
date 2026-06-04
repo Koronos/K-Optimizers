@@ -13,7 +13,7 @@ Adafusion factors the **second** moment for ~free (Adafactor row+col). The
 |---|---|---|---|
 | *(none)* `betas=(0.0, ...)` | 0 B/param | trains, but **~10–12% worse val loss than having momentum** | absolute minimum VRAM |
 | **`"int8"`** ✅ | **1 B/param** | **near-lossless** (cos 0.9999 vs fp32, matches fp32 convergence) | **default cheap momentum — recommended** |
-| `"4bit"` (experimental) | 0.53 B/param | ties int8 in convergence (validated up to 27M params / 64² / 10k steps) | you must go below 1 B/param (huge model / 1024² / batch>1) |
+| `"4bit"` (supported, lighter) | 0.53 B/param | ties int8 in convergence (validated up to 27M params / 64² / 10k steps) | you must go below 1 B/param (huge model / 1024² / batch>1) |
 | `"bfloat16"` | 2 B/param | full-precision momentum | memory is plentiful |
 | `"float32"` | 4 B/param | reference | — |
 
@@ -115,7 +115,7 @@ needs ~8 bits + a scale, full stop.
 |---|---|---|---|---|---|
 | bf16 momentum | 2.0 | ~1.0 | ref | — | OOMs SDXL full FT @16 GB |
 | **int8** | 1.0 | 0.9999 | = fp32 | 1.0× | **recommended** |
-| 4bit (RTN) | 0.53 | 0.97 | ties int8 (validated at scale) | ~1.1× slower | experimental, lighter |
+| 4bit (RTN) | 0.53 | 0.97 | ties int8 (validated at scale) | ~1.1× slower | shipped; lighter option |
 | SR-4bit | 0.53 | 0.97 | ties RTN-4bit | 1.2× slower | rejected (no gain) |
 | FP8 E4M3 | 1.0 | broken | worse than no-mom | 0.8× | rejected (below float floor) |
 | SMMF factored | 0.14 | 0.75 | ~5× worse | 1.5–3.8× slower | rejected (not rank-1) |
