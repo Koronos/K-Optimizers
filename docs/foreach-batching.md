@@ -111,6 +111,32 @@ aspect ratio, and conv-vs-linear. It depends only on path and config:
 `48` = worst observed (42.1) + margin, so the budget is a true ceiling: a chunk's
 transient stays at or below the requested VRAM fraction.
 
+## Check on your own GPU + model (`ktune`)
+
+The defaults were tuned on an RTX 4080. The performance cutoff tracks a hardware
+crossover, so a very different GPU *might* prefer another value. `ktune` measures it
+on your machine — it reads the parameter shapes from a checkpoint's `.safetensors`
+header (no full load, no real weights needed), builds matching tensors on your GPU,
+sweeps the cutoff, and tells you whether to keep the default or change it:
+
+```bash
+# full fine-tune of a UNet / DiT transformer
+uv run ktune --model /path/to/unet.safetensors --gpu 0
+
+# a full SDXL checkpoint: select the UNet keys
+uv run ktune --model /path/to/sdxl.safetensors --filter model.diffusion_model.
+
+# the LoRA-adapter distribution instead of full weights
+uv run ktune --model /path/to/unet.safetensors --lora-rank 8
+
+# match your training config so the timing is representative
+uv run ktune --model /path/to/transformer.safetensors --momentum bf16 --wd 0.01
+```
+
+It prints the per-param-loop baseline, the foreach speedup, a cutoff sweep, and a
+verdict like `==> Keep the default` or `==> Consider foreach_batch_cutoff=…`.
+Equivalent without the console script: `python -m koptim.tune --model …`.
+
 ## Tuning cheat-sheet
 
 - **Default (`None`, `2_000_000`)**: near-optimal for SDXL/Cosmos LoRA *and* full

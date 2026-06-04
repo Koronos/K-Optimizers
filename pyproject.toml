@@ -39,6 +39,9 @@ Homepage = "https://github.com/Koronos/K-Optimizers"
 Repository = "https://github.com/Koronos/K-Optimizers"
 Issues = "https://github.com/Koronos/K-Optimizers/issues"
 
+[project.scripts]
+ktune = "koptim.tune:main"
+
 [dependency-groups]
 dev = [
     "ruff>=0.6",
