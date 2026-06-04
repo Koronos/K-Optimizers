@@ -62,6 +62,18 @@ _STACK_BYTES_PER_ELEM = 48
 _MIN_STACK_ELEMS = 262_144      # still batch small tensors even under memory pressure
 _DEFAULT_STACK_ELEMS = 64_000_000  # CPU / unknown device: no VRAM limit to respect
 
+# Per-tensor element count above which a weight is stepped by the per-parameter
+# loop instead of being stacked. This is a PERFORMANCE threshold, deliberately
+# decoupled from the VRAM-safety budget: batching pays off only while per-tensor
+# kernel-launch overhead dominates (small tensors); a large weight's update is
+# compute/bandwidth-bound, so stacking it just adds copy traffic and is slower.
+# A budget sweep on SDXL and Cosmos full fine-tunes showed a broad flat optimum
+# for cutoffs of ~0.1-4 M elements and a sharp slowdown beyond ~4 M, on both
+# models — i.e. the crossover is an absolute element count, NOT a fraction of
+# VRAM (so it must not scale with the card). 2 M sits in the middle of that
+# plateau. See docs/foreach-batching.md.
+_FOREACH_BATCH_CUTOFF = 2_000_000
+
 
 def _rms(t: Tensor) -> Tensor:
     return t.norm(2) / math.sqrt(max(t.numel(), 1))
@@ -125,11 +137,19 @@ class Adafusion(Optimizer):
             matrixized convs, single-param groups) transparently falls back to it.
             For eligible params it supersedes ``compile`` (no per-tensor graph
             needed). Set ``False`` to force the per-parameter path.
-        foreach_stack_budget: max elements in a single stacked ``foreach`` chunk.
-            ``None`` (default) adapts to currently-free VRAM each step — a roomy
-            card batches whole buckets (and stacks large weights), a full card
-            shrinks the chunk and stays OOM-safe. Pass an int to pin a fixed cap
-            (reproducibility, or a hard ceiling on a shared GPU).
+        foreach_batch_cutoff: per-tensor element count above which a weight is
+            stepped by the per-parameter loop instead of being stacked. A
+            **performance** knob, decoupled from VRAM: batching only pays off while
+            launch overhead dominates (small tensors), so large weights loop. The
+            default ``2_000_000`` is the middle of a flat optimum measured on SDXL
+            and Cosmos full fine-tunes; raise it only if profiling your GPU shows a
+            higher crossover. See ``docs/foreach-batching.md``.
+        foreach_stack_budget: the **memory-safety** ceiling — max elements in a
+            single stacked ``foreach`` chunk. ``None`` (default) adapts to
+            currently-free VRAM each step (roomy card → bigger chunks, full card →
+            smaller, OOM-safe). Pass an int to pin a fixed cap (reproducibility, or
+            a hard ceiling on a shared GPU). Decoupled from ``foreach_batch_cutoff``
+            so raising it never pulls large weights into stacking.
     """
 
     def __init__(
@@ -148,6 +168,7 @@ class Adafusion(Optimizer):
         factor_conv_as_matrix: bool = True,
         compile: bool = False,
         foreach: bool = True,
+        foreach_batch_cutoff: int = _FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
@@ -163,6 +184,8 @@ class Adafusion(Optimizer):
             raise ValueError(f"momentum_dtype must be bfloat16/float32/int8, got {momentum_dtype!r}")
         if bf16_method not in ("stochastic_rounding", "kahan", "none"):
             raise ValueError(f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}")
+        if foreach_batch_cutoff < 1:
+            raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
         defaults = {
             "lr": lr,
             "betas": (beta1, beta2),
@@ -188,9 +211,12 @@ class Adafusion(Optimizer):
         # matches the per-parameter path; stochastic-rounding draws differ
         # (unbiased either way). Anything it doesn't cover falls back per-param.
         self._foreach = foreach
-        # Max elements per stacked chunk. None -> adaptive to free VRAM (see
-        # _foreach_budget); an int forces a fixed cap (useful for reproducibility
-        # or a hard memory ceiling on a shared GPU).
+        # Performance cutoff: weights larger than this loop instead of stacking
+        # (batching only helps while launch overhead dominates). Decoupled from
+        # the VRAM-safety chunk budget below.
+        self._foreach_batch_cutoff = foreach_batch_cutoff
+        # Memory-safety ceiling: max elements per stacked chunk. None -> adaptive
+        # to free VRAM (see _foreach_budget); an int forces a fixed cap.
         self._foreach_stack_budget = foreach_stack_budget
 
     @torch.no_grad()
@@ -231,13 +257,18 @@ class Adafusion(Optimizer):
                 if p.grad.is_sparse:
                     raise RuntimeError("Adafusion does not support sparse gradients")
             if self._foreach and self._group_foreach_eligible(group):
-                budget = self._foreach_budget(params[0].device)
+                chunk_budget = self._foreach_budget(params[0].device)
+                # Effective cutoff = the performance threshold, lowered only if the
+                # memory budget can't fit two of a tensor in a chunk (so batching
+                # would be a wasteful stack-of-1). Roomy card -> cutoff wins;
+                # constrained card -> safety wins.
+                cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)
                 fast: list[Tensor] = []
                 slow: list[Tensor] = []
                 for p in params:
-                    (fast if self._param_foreach_eligible(p, group, budget) else slow).append(p)
+                    (fast if self._param_foreach_eligible(p, group, cutoff) else slow).append(p)
                 if len(fast) >= 2:
-                    self._step_foreach(fast, group, budget)
+                    self._step_foreach(fast, group, chunk_budget)
                     for p in slow:
                         self._step_one_param(p, group)
                 else:
@@ -250,18 +281,26 @@ class Adafusion(Optimizer):
 
     # ----------------------------------------------------------------- foreach
     def _foreach_budget(self, device: torch.device) -> int:
-        """Max elements per stacked chunk — adaptive to free VRAM unless overridden.
+        """Max elements per stacked chunk.
 
-        Reading currently-free VRAM (not total) means the chunk shrinks exactly
-        when a big model already fills the card, and grows on a roomy card so whole
-        buckets — including large weights — stack at once.
+        An explicit ``foreach_stack_budget`` int is returned verbatim. Otherwise the
+        chunk is ``min(adaptive_to_free_VRAM, 4 * batch_cutoff)``:
+
+        * the VRAM term shrinks the chunk when a big model already fills the card
+          (OOM safety) and grows it on a roomy card;
+        * the ``4 * batch_cutoff`` cap stops over-stacking — beyond a few
+          cutoff-sized tensors, stacking medium weights just adds copy bandwidth and
+          is slower (measured on full FT). Tying the cap to the cutoff keeps a single
+          performance knob, and a roomy card no longer over-stacks.
         """
         if self._foreach_stack_budget is not None:
             return self._foreach_stack_budget
+        cap = 4 * self._foreach_batch_cutoff
         if device.type == "cuda":
             free_bytes = torch.cuda.mem_get_info(device)[0]
-            return max(_MIN_STACK_ELEMS, int(free_bytes * _STACK_SAFETY_FRACTION / _STACK_BYTES_PER_ELEM))
-        return _DEFAULT_STACK_ELEMS
+            adaptive = int(free_bytes * _STACK_SAFETY_FRACTION / _STACK_BYTES_PER_ELEM)
+            return max(_MIN_STACK_ELEMS, min(adaptive, cap))
+        return min(_DEFAULT_STACK_ELEMS, cap)
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
@@ -274,20 +313,21 @@ class Adafusion(Optimizer):
         )
 
     @staticmethod
-    def _param_foreach_eligible(p: Tensor, group: dict[str, Any], budget: int) -> bool:
+    def _param_foreach_eligible(p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
         """Per-parameter shapes/dtypes the batched fast path can stack.
 
         Both branches are covered: ``ndim >= 2`` uses the factored bucket, ``ndim
         == 1`` (biases/norms — the bulk of a full fine-tune) uses the non-factored
         bucket. Only 0-D scalars and the awkward dtype/contiguity cases fall back.
+
+        ``cutoff`` is the effective per-tensor size limit (performance threshold,
+        possibly lowered by the memory budget) — bigger weights loop.
         """
         if p.ndim == 0:                          # 0-D scalars -> per-param path
             return False
-        if p.numel() > budget // 2:
-            # Too big to share a chunk under the current memory budget (chunk size
-            # would be 1) and compute/bandwidth-bound anyway — the per-tensor launch
-            # overhead is noise for it, so loop it and skip the stack/copy overhead.
-            # On a roomy card the budget is large, so few (if any) weights hit this.
+        if p.numel() > cutoff:
+            # Compute/bandwidth-bound: the per-tensor launch overhead is noise for
+            # it, so looping is as fast and skips the stack/copy traffic.
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"

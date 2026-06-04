@@ -14,23 +14,28 @@ All notable changes to this project will be documented in this file.
   - **~19× faster** optimizer step on adapter training (the hot case): measured
     on a real SDXL UNet + PEFT LoRA r=8 (1434 tiny trainable tensors), the step
     drops from **318 ms → 16 ms** (1.45× of fused AdamW; was 28×).
-  - **Full fine-tune: ~1.3×** (SDXL UNet, 1680 params: 353 ms → 279 ms). The
-    smaller win is expected — a full fine-tune's optimizer time is dominated by
-    real bandwidth work on large weights, where per-tensor launch overhead is
-    noise; batching only removes that overhead, which dominates in the
-    many-small-tensors (adapter) regime.
+  - **Full fine-tune: ~1.3×** (SDXL UNet, 1680 params: 339 ms → 256 ms; Cosmos
+    685 params: 239 ms → 231 ms). The smaller win is expected — a full fine-tune's
+    optimizer time is dominated by real bandwidth work on large weights, where
+    per-tensor launch overhead is noise; batching only removes that overhead, which
+    dominates in the many-small-tensors (adapter) regime.
   - Element-for-element equal to the per-parameter path (bit-exact on CPU; ~1e-8
     on CUDA from reduction order). Stochastic-rounding draws legitimately differ
-    (unbiased either way). 6 new parity/coverage tests.
-  - **Bucket chunking with a VRAM-adaptive budget** bounds the transient stack
-    memory so batching never OOMs a full fine-tune — preserving Adafusion's
-    low-memory story. The per-chunk element cap defaults to a fraction of
-    *currently-free* VRAM (`foreach_stack_budget=None`): a roomy card batches whole
-    buckets and even stacks large weights; a full card shrinks the chunk and stays
-    safe. No fixed constant biased to one GPU. Weights too big to share a chunk
-    (bandwidth-bound, launch overhead is noise) route to the per-param loop.
-    `foreach_stack_budget=<int>` pins a fixed cap for reproducibility / a hard
-    ceiling on a shared GPU.
+    (unbiased either way). 11 new parity/coverage tests.
+  - **Two decoupled knobs** (see `docs/foreach-batching.md`):
+    - `foreach_batch_cutoff` (default `2_000_000` elements) — the **performance**
+      threshold: weights larger than this loop instead of stacking (batching only
+      helps while launch overhead dominates; large weights are bandwidth-bound).
+      It is an absolute element count, *not* a fraction of VRAM — a budget sweep on
+      SDXL and Cosmos full fine-tunes showed the same model-independent crossover.
+    - `foreach_stack_budget` (default `None`) — the **memory-safety** chunk cap:
+      `min(free_VRAM × 0.10 / 48, 4 × cutoff)`. The VRAM term keeps batching from
+      OOM-ing a full fine-tune; the `4 × cutoff` cap stops over-stacking medium
+      weights (measured slower past ~8 M). An int pins a fixed cap. Decoupling the
+      two means raising the budget never pulls large weights into stacking, and a
+      roomy/huge card stays in the measured optimum instead of degrading.
+    - The transient divisor (48 B/element) is itself model-independent — measured
+      byte-for-byte identical on SDXL and Cosmos.
   - Falls back to the per-parameter path for what it doesn't batch: 0-D scalars,
     large weights, `momentum_dtype="int8"`, `bf16_method="kahan"`, fp16+SR,
     non-contiguous matrixized convs, and single-param (gradient-release)

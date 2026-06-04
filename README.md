@@ -139,6 +139,11 @@ brings its per-step cost in line with AdamW on large 2-D weights.
 > Note: in HF Adafactor, `beta1=0.0` (≠ `None`) still allocates a momentum
 > buffer. `Adafusion(betas=(0.0, ...))` is true no-momentum.
 
+> Adafusion batches the step across parameters by default (`foreach=True`) — a
+> ~19× faster optimizer step on adapter training. Defaults are tuned for both
+> LoRA and full fine-tune; see [docs/foreach-batching.md](docs/foreach-batching.md)
+> for the design and the `foreach_batch_cutoff` / `foreach_stack_budget` knobs.
+
 ## API
 
 ```python

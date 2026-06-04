@@ -157,6 +157,52 @@ def test_foreach_chunking_is_exact():
         torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
 
 
+def test_foreach_batch_cutoff_validation():
+    p = [torch.nn.Parameter(torch.randn(4, 4))]
+    Adafusion(p, foreach_batch_cutoff=1)
+    Adafusion(p, foreach_batch_cutoff=5_000_000)
+    with pytest.raises(ValueError):
+        Adafusion(p, foreach_batch_cutoff=0)
+
+
+def test_foreach_budget_capped_at_4x_cutoff():
+    """The adaptive chunk budget never exceeds 4x the cutoff (over-stacking guard)
+    and scales with the cutoff. Deterministic on CPU (no VRAM read)."""
+    cpu = torch.device("cpu")
+    p = [torch.nn.Parameter(torch.randn(4, 4))]
+    assert Adafusion(p, foreach_batch_cutoff=2_000_000)._foreach_budget(cpu) == 8_000_000
+    assert Adafusion(p, foreach_batch_cutoff=5_000_000)._foreach_budget(cpu) == 20_000_000
+    # an explicit budget is respected verbatim (not capped)
+    assert Adafusion(p, foreach_stack_budget=99_000_000)._foreach_budget(cpu) == 99_000_000
+
+
+def test_foreach_batch_cutoff_routes_large_to_loop_exactly():
+    """A weight above the cutoff loops; smaller ones stack — result is identical.
+
+    The cutoff is decoupled from the (here ample) stack budget, so the large
+    tensor loops on its size alone, not on memory pressure.
+    """
+    torch.manual_seed(0)
+    pa = [
+        torch.nn.Parameter(torch.randn(1500, 1500) * 0.02),  # 2.25 M > cutoff -> loop
+        torch.nn.Parameter(torch.randn(200, 200) * 0.02),    # 40 k <= cutoff -> batch
+        torch.nn.Parameter(torch.randn(200, 200) * 0.02),    # bucket-mate
+    ]
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
+    oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), foreach=True,
+                   foreach_batch_cutoff=1_000_000, foreach_stack_budget=10**9)
+    ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), foreach=False)
+    gg = torch.Generator().manual_seed(1)
+    for _ in range(6):
+        for a, b in zip(pa, pb):
+            grad = torch.randn(*a.shape, generator=gg) * 0.02
+            a.grad, b.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+    for a, b in zip(pa, pb):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
 def test_foreach_single_param_uses_fallback():
     """A lone eligible param (e.g. gradient-release) still steps correctly."""
     p = torch.nn.Parameter(torch.randn(16, 16))
