@@ -395,14 +395,11 @@ class Adafusion(Optimizer):
         lr: learning rate.
         betas: ``(beta1, beta2)``. ``beta1=0`` disables momentum (minimum memory,
             Adafactor-like). ``beta1>0`` enables momentum (AdamW-like quality).
-            ``betas[1]`` is ignored when ``decay_rate`` is set.
         eps: ``(eps1, eps2)``. ``eps1`` is added to ``grad**2`` before the
             factored reductions (HF Adafactor convention). ``eps2`` is currently
             unused (reserved).
         weight_decay: decoupled weight decay (folded into the per-step delta).
         clip_threshold: Adafactor RMS update clipping (``rms(update) <= thr``).
-        decay_rate: HF Adafactor adaptive ``beta2_t = 1 - step**decay_rate``
-            (typical ``-0.8``); ``betas[1]`` ignored when set.
         momentum_dtype: storage for the first-moment buffer when ``beta1>0`` —
             ``"bfloat16"`` (default; ~2 B/param), ``"float32"`` (4 B/param),
             ``"int8"`` (~1 B/param, per-row absmax quantized; Lion8bit-class
@@ -419,16 +416,6 @@ class Adafusion(Optimizer):
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
             ``"none"``. No-op on fp32 params.
-        factor_conv_as_matrix: deprecated and ignored. Conv-aware factoring
-            (reshaping a 4-D conv kernel ``[out,in,kh,kw]`` to 2-D
-            ``[out, in·kh·kw]`` before factoring the second moment) is now always
-            on — the legacy ``False`` last-dims path left ~0.4 B/param of conv
-            state for no quality gain and was removed. The argument is still
-            accepted (so existing configs don't break) but has no effect.
-        compile: deprecated and ignored. ``torch.compile`` of the per-tensor
-            factored core measured neutral-to-negative across model sizes and is
-            superseded by ``foreach`` batching; the argument is still accepted (so
-            existing configs don't break) but has no effect.
         foreach: batch the step across parameters with multi-tensor (stacked) ops
             instead of a per-parameter Python loop. Default ``True``. Huge win when
             many tensors are stepped at once — LoRA/LoKr adapters (hundreds of tiny
@@ -466,13 +453,10 @@ class Adafusion(Optimizer):
         weight_decay: float = 0.0,
         *,
         clip_threshold: float = 1.0,
-        decay_rate: float | None = None,
         momentum_dtype: MomentumDtype = "bfloat16",
         momentum_4bit_block: int = _FOURBIT_BLOCK,
         cautious: bool = False,
         bf16_method: str = "stochastic_rounding",
-        factor_conv_as_matrix: bool = True,
-        compile: bool = False,
         foreach: bool = True,
         foreach_batch_cutoff: int = _FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
@@ -500,12 +484,10 @@ class Adafusion(Optimizer):
             "eps": (float(eps[0]), float(eps[1])),
             "weight_decay": weight_decay,
             "clip_threshold": clip_threshold,
-            "decay_rate": decay_rate,
             "momentum_dtype": momentum_dtype,
             "momentum_4bit_block": momentum_4bit_block,
             "cautious": cautious,
             "bf16_method": bf16_method,
-            "factor_conv_as_matrix": factor_conv_as_matrix,
         }
         super().__init__(params, defaults)
         # Multi-tensor (foreach) batching of the factored fast path. Collapses the
@@ -536,7 +518,6 @@ class Adafusion(Optimizer):
 
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
-        state["step"] = 0
         grad = p.grad
         factored = p.ndim >= 2
         if factored:
@@ -613,11 +594,7 @@ class Adafusion(Optimizer):
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
-        """Group-level options the batched fast path supports.
-
-        ``decay_rate`` (adaptive beta2) is supported: the buckets compute a
-        per-param step-dependent beta2 vector, so it goes through foreach too.
-        """
+        """Group-level options the batched fast path supports."""
         return (
             group["clip_threshold"] > 0          # clip always applied in the batched path
             and group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
@@ -666,7 +643,6 @@ class Adafusion(Optimizer):
         eps1, _eps2 = group["eps"]
         lr, clip = group["lr"], group["clip_threshold"]
         wd = group["weight_decay"]
-        decay_rate = group["decay_rate"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         codec = self._codec(group)
 
@@ -674,9 +650,8 @@ class Adafusion(Optimizer):
         flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
         for p in params:
             state = self.state[p]
-            if "step" not in state:
+            if not state:
                 self._init_state(p, state, group)
-            state["step"] += 1
             g = p.grad
             if g.ndim >= 2:
                 matrixize = g.ndim > 2  # conv kernels always reshape to 2-D before factoring
@@ -690,39 +665,15 @@ class Adafusion(Optimizer):
             for i in range(0, len(plist), step):
                 self._factored_bucket(
                     plist[i:i + step], eff, matrixize,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec, decay_rate,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
                 )
         for (length, _dtype), plist in flat_buckets.items():
             step = max(1, budget // max(length, 1))
             for i in range(0, len(plist), step):
                 self._nonfactored_bucket(
                     plist[i:i + step], length,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec, decay_rate,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
                 )
-
-    def _one_minus_beta2_vec(
-        self, plist: list[Tensor], beta2: float, decay_rate: float | None
-    ) -> float | Tensor:
-        """The ``1 - beta2`` lerp weight for a bucket's second-moment EMA.
-
-        Fixed beta2 -> the scalar ``1 - beta2`` (unchanged behaviour). Adaptive
-        beta2 (``decay_rate`` set) -> a per-param fp32 vector ``[N]`` of ``1 -
-        beta2_t``, where ``step`` is each param-state's own (already-incremented)
-        counter. A vector (not a scalar from a shared step) stays correct if grads
-        were skipped and steps desynced.
-
-        Bit-exact-parity note: the per-param path computes ``beta2_t = 1.0 -
-        step**decay_rate`` (a Python float) and then lerps with ``1.0 - beta2_t``.
-        ``1.0 - (1.0 - x)`` is not generally ``x`` in floating point, so we replay
-        the *same* two-step round-trip here (per element, as Python floats) rather
-        than the algebraically-simplified ``step**decay_rate``.
-        """
-        if decay_rate is None:
-            return 1.0 - beta2
-        omb = [
-            1.0 - (1.0 - float(self.state[p]["step"]) ** decay_rate) for p in plist
-        ]
-        return torch.tensor(omb, dtype=torch.float32, device=plist[0].grad.device)
 
     @torch.no_grad()
     def _factored_bucket(
@@ -739,7 +690,6 @@ class Adafusion(Optimizer):
         cautious: bool,
         bf16_method: str,
         codec: _MomentumCodec,
-        decay_rate: float | None = None,
     ) -> None:
         R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
         N = len(plist)  # noqa: N806
@@ -754,13 +704,9 @@ class Adafusion(Optimizer):
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
-        # Second-moment EMA weight. Fixed beta2 is a scalar; adaptive (decay_rate)
-        # is a per-param vector beta2_t = 1 - step**decay_rate computed from each
-        # param's own step counter (params normally share a step, but a vector is
-        # the safe form against grad=None desync). 1 - beta2 broadcasts as [N,1,1].
-        one_minus_beta2 = self._one_minus_beta2_vec(plist, beta2, decay_rate)
-        # row/col are [N, R]/[N, C], so a per-param weight broadcasts as [N, 1].
-        omb = one_minus_beta2 if isinstance(one_minus_beta2, float) else one_minus_beta2.view(N, 1)
+        # Second-moment EMA weight (fixed beta2). row/col are [N, R]/[N, C], so the
+        # scalar broadcasts cleanly.
+        omb = 1.0 - beta2
 
         # Factored second-moment EMA (HF eps placement: eps1 before the means).
         grad_sq = grad * grad
@@ -816,7 +762,6 @@ class Adafusion(Optimizer):
         cautious: bool,
         bf16_method: str,
         codec: _MomentumCodec,
-        decay_rate: float | None = None,
     ) -> None:
         """Non-factored update (full per-coordinate second moment) for 1-D params.
 
@@ -831,10 +776,8 @@ class Adafusion(Optimizer):
         grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
-        # Per-param second-moment EMA weight (scalar for fixed beta2, [N,1] vector
-        # for adaptive beta2_t = 1 - step**decay_rate; see _one_minus_beta2_vec).
-        one_minus_beta2 = self._one_minus_beta2_vec(plist, beta2, decay_rate)
-        omb = one_minus_beta2 if isinstance(one_minus_beta2, float) else one_minus_beta2.view(N, 1)
+        # Second-moment EMA weight (fixed beta2).
+        omb = 1.0 - beta2
 
         grad_sq = grad * grad
         if eps1 > 0:
@@ -884,17 +827,15 @@ class Adafusion(Optimizer):
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
-        beta1, beta2_fixed = group["betas"]
+        beta1, beta2 = group["betas"]
         eps1, _eps2 = group["eps"]
         lr, clip = group["lr"], group["clip_threshold"]
-        wd, decay_rate = group["weight_decay"], group["decay_rate"]
+        wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
 
         state = self.state[p]
-        if "step" not in state:
+        if not state:
             self._init_state(p, state, group)
-        state["step"] += 1
-        beta2 = 1.0 - state["step"] ** decay_rate if decay_rate is not None else beta2_fixed
 
         grad_fp32 = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
         ndim = grad_fp32.ndim

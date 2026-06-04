@@ -132,7 +132,6 @@ batching (default) keeps its per-step cost competitive with fused AdamW
 | **AdamW-quality, low memory** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="bfloat16")` |
 | **Lion8bit-class memory + momentum** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="int8")` |
 | **Best convergence (memory available)** | `Muon(..., lr=2e-2, momentum_dtype="bfloat16")` |
-| **HF-Adafactor drop-in** | `Adafusion(..., betas=(0.0,0.999), decay_rate=-0.8)` |
 | **No LR to tune (SDXL UNet+TE)** | `KProdigy([{"params": unet, "lr": 1.0}, {"params": te, "lr": 1.0}])` |
 | **Parameter-free + minimum VRAM** | `KProdigy(..., second_moment="factored", momentum_dtype="bfloat16", slice_p=11)` |
 
@@ -150,11 +149,9 @@ batching (default) keeps its per-step cost competitive with fused AdamW
 Adafusion(
     params, lr=1e-3, betas=(0.9, 0.999), eps=(1e-30, 1e-3), weight_decay=0.0, *,
     clip_threshold=1.0,
-    decay_rate=None,                    # HF Adafactor adaptive beta2 (e.g. -0.8)
     momentum_dtype="bfloat16",          # "float32" | "bfloat16" | "int8"
     cautious=False,                     # cautious masking (opt-in regularizer)
     bf16_method="stochastic_rounding",  # "stochastic_rounding" | "kahan" | "none"
-    factor_conv_as_matrix=True,         # the conv-aware factoring fix
     foreach=True,                       # multi-tensor batching (docs/foreach-batching.md)
     foreach_batch_cutoff=2_000_000,     # weights bigger than this loop instead of stacking
     foreach_stack_budget=None,          # chunk memory cap (None = adaptive to free VRAM)
