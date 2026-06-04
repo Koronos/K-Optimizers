@@ -15,10 +15,11 @@ Design (validated by benchmarks/bench_convergence-style experiments):
   measured quality loss → AdamW-quality at ~1/4 of AdamW's optimizer memory.
 * **bf16-correct weight updates** via stochastic rounding (no extra state) or
   Kahan summation.
-* **Optional cautious masking** (Liang et al. 2024): zero the update coordinates
-  whose sign disagrees with the gradient, renormalized to keep the step size.
-  Off by default — it is a regularizer (helps generalization on noisy training),
-  not a training-loss-speed booster.
+* **Cautious masking** (Liang et al. 2024): zero the update coordinates whose
+  sign disagrees with the gradient, renormalized to keep the step size. **On by
+  default** — measured ~1.4% lower held-out val loss with momentum (paired
+  t=-4.07); a literal no-op without momentum. Set ``cautious=False`` for
+  no-momentum configs.
 
 It is a standard ``torch.optim.Optimizer`` with a single per-parameter step, so
 it drops into per-parameter / gradient-release training loops unchanged.
