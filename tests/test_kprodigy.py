@@ -192,7 +192,7 @@ def _mixed_params(dtype=torch.float32):
     g = torch.Generator().manual_seed(0)
     shapes = [(32, 16), (24, 12), (8, 4, 3, 3), (16,), (32,), (10, 5, 1, 1)]
     return [
-        torch.nn.Parameter((torch.randn(*s, generator=g, dtype=dtype) * 0.1))
+        torch.nn.Parameter(torch.randn(*s, generator=g, dtype=dtype) * 0.1)
         for s in shapes
     ]
 

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **KProdigy now reuses Adafusion's full update engine.** KProdigy's pass-2 weight
+  update (previously a per-parameter Python loop) is now backed by Adafusion's
+  foreach batching, momentum codec (`float32`/`bfloat16`/`int8`/`4bit`), cautious
+  masking, conv-aware matrixized factoring, and stochastic-rounding bf16 weights —
+  with Prodigy's effective learning rate (`lr × D`) folded into the update.
+  KProdigy's **D-estimation (pass 1) is unchanged**: the two-pass global reduction,
+  `slice_p`, `independent_d`, `d_coef` etc. produce a bit-identical D trajectory and
+  final weights vs the previous release (verified on CPU fp32 across every
+  dtype/second-moment combo).
+  - New KProdigy args mirroring Adafusion: `momentum_dtype="4bit"`, `cautious`,
+    `foreach` (default `True`), `foreach_batch_cutoff`, `foreach_stack_budget`,
+    `momentum_4bit_block`.
+  - The momentum codecs + quant helpers were extracted from `adafusion.py` into a
+    shared `koptim._momentum_codec` module (re-exported from `koptim.adafusion` for
+    backwards compatibility) — no duplicated implementations.
+  - foreach == per-param: **bit-exact on fp32 weights (CPU and CUDA)** across
+    `momentum_dtype ∈ {float32, bfloat16, int8, 4bit}`, cautious on/off, on 2-D +
+    conv + 1-D params. New foreach-parity/4bit/cautious tests.
+  - Update-backend speedup (foreach vs the old per-param loop): **~1.8× on a
+    LoRA-like distribution**, **~1.5× on the SDXL full-FT distribution**. (Smaller
+    than Adafusion's because KProdigy's pass-1 D-reduction is per-parameter in both
+    arms — only the pass-2 update is batched.)
+  - Memory on the SDXL UNet shape distribution (bytes/param): factored/4bit +
+    `slice_p=11` = **1.27 B/param** (vs Adafusion 4bit 0.54, AdamW-class 8–14).
+    The Prodigy D-state (`s`+`p0`) dominates at `slice_p=1`; `slice_p` is the lever.
 - `Adafusion(foreach=True)` (now the default) — multi-tensor batching of the
   step. Params are bucketed by shape, each bucket stacked into one tensor, and
   the entire update (EMA + reconstruction + RMS clip + momentum + weight decay +
