@@ -95,3 +95,42 @@ AdaMuon is the better fit for "save memory → bigger batch → fewer steps":
 no warmup needed (more stable than AdamW), it loses less per-sample quality as batch
 grows, and its step-time penalty disappears at the larger batch. Scale LR with
 `√(batch)`, plateauing past ~bs 16–32 (rarely reached in diffusion).
+
+## 4. Gradient accumulation = a real big batch? Does it help the noise?
+
+Accumulate N micro-batches of size B (one optimizer step per N×B samples) — the way
+to simulate a big batch under a VRAM limit.
+
+**(a) It IS a real big batch (equivalent).** At effective batch 32 (AdaMuon, fixed
+samples), three ways land on the same loss — the gradient is linear, so accumulating
+micro-batches = the big-batch gradient:
+
+| effective-32 via… | final val |
+|---|---|
+| real bs 32 | 0.0788 |
+| accum 8×4 | 0.0783 |
+| accum 4×8 | 0.0785 |
+| (real bs 4, 8× more updates) | **0.0663** |
+
+The three effective-32 runs overlap; the tiny spread is float summation order. So
+accumulation faithfully reproduces the big batch — **including its downside** (fewer
+optimizer updates), which is why real bs 4 (8× more steps) still wins per sample.
+
+**(b) It does reduce gradient noise — but de-noising didn't help here.** Cosine
+similarity between two independent gradient estimates over E samples (higher = less
+noise):
+
+| effective batch E | 4 | 8 | 32 | 64 | 128 |
+|---|---|---|---|---|---|
+| grad cosine | 0.13 | 0.39 | 0.58 | 0.77 | 0.82 |
+
+Noise drops monotonically with E (accum gives the same de-noising as a real big
+batch). But the noisier small batch converged to a *lower* loss (§4a) — on this task
+the small-batch noise was helping (more updates + regularization), not hurting.
+
+**Takeaway:** grad-accum is exactly a big batch (use it when you genuinely need the
+larger effective batch, e.g. instability at tiny batch). It is not "small-batch
+quality at big-batch memory" — it carries the big batch's fewer-updates penalty.
+AdaMuon's orthogonalization already normalizes the update, so small-batch noise
+rarely destabilizes it → you usually don't need accumulation for stability. The
+memory→bigger-batch play is for wall-clock throughput, not for the loss.
