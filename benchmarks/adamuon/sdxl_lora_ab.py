@@ -169,6 +169,10 @@ def make_optimizer(name, params, lr):
         return Adafusion(params, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16")
     if name == "adamw":
         return torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.999))
+    if name == "adamw_fused":
+        return torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.999), fused=True)
+    if name == "adafactor":
+        return torch.optim.Adafactor(params, lr=lr)
     raise ValueError(name)
 
 
