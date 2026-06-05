@@ -134,3 +134,47 @@ quality at big-batch memory" — it carries the big batch's fewer-updates penalt
 AdaMuon's orthogonalization already normalizes the update, so small-batch noise
 rarely destabilizes it → you usually don't need accumulation for stability. The
 memory→bigger-batch play is for wall-clock throughput, not for the loss.
+
+## 5. Batch-size schedules over training (vary batch as training progresses)
+
+Idea: instead of a constant batch, schedule it over training. Two shapes, both with
+cosine LR decay (AdaMuon, C=64, 16384 samples, 2 seeds, val MSE / wall-clock):
+- **incr 1→64** — small batch early (many noisy updates while far from the optimum),
+  big batch late (clean gradients, fast, as LR→0). Cosine *ramps the batch up*.
+- **decr 64→1** — the intuitive "general/fast early, fine detail late". Cosine ramps
+  the batch *down*.
+
+**The LR coupling is decisive.** Two ways to set the LR:
+- **`lr = lr_peak·cos(p)·√(batch(p)/16)`** — couples LR to the current batch (the √
+  rule from §3, so each batch gets an appropriate LR), or
+- **`lr = lr_peak·cos(p)`** — scheduler only, same LR for every batch.
+
+| schedule | with √batch coupling | clean (cosine only) | wall |
+|---|---|---|---|
+| **incr 1→64** | **0.0589** (= best) | 0.066 | 22 s |
+| decr 64→1 | 0.0738 (worst) | 0.067 | 23 s |
+| const 16 | 0.0616 | 0.062 | 11 s |
+| const 4 | 0.0588 | 0.059 | 42 s |
+
+Findings:
+- **The standout — `incr 1→64` WITH the √batch coupling — matched the best
+  (constant-small-batch) quality at ~half the wall-clock** (0.0589 in 22 s vs const-4's
+  0.0588 in 42 s). Small batch early gets its appropriately-low LR (many cheap updates
+  where progress is steepest); big batch late settles cleanly as LR→0.
+- **The √batch coupling is what makes it work.** Remove it and `incr` drops to 0.066
+  (small-batch-early now over-LR'd); the headline win disappears.
+- **`decr 64→1` (the intuitive one) is the worst WITH the coupling** — the √batch term
+  inflates its big-batch-early LR (to ~5e-3) and wastes the high-LR phase on few
+  updates. Removing the coupling recovers it to ~0.067 (≈ `incr`-clean), but it still
+  doesn't beat a good constant batch.
+- **Sobering caveat:** clean of the LR coupling, neither schedule beats a well-tuned
+  constant batch here — `const 16` (0.062, 11 s) and `const 4` (0.059, 42 s) form the
+  Pareto front; the schedules sit inside it. The schedule's value is real only in the
+  `incr + √batch` corner (best quality at half the time).
+
+Mechanism note: "fine detail late" argues for a **clean** gradient late (big batch /
+low LR), not a noisy small batch — small-batch noise late just jitters around the
+minimum and blurs detail. So the intuitive decreasing schedule has it backwards; the
+detail/curriculum effect people actually exploit comes from **progressive resolution**
+(low-res→high-res), where bigger latents force smaller batches late and the *data*
+(not the batch) supplies the new detail.
