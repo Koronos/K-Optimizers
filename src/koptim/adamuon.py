@@ -173,14 +173,19 @@ class AdaMuon(Optimizer):
             instead of stacking (performance knob; default ``2_000_000``).
         foreach_stack_budget: max elements per stacked chunk. ``None`` (default)
             adapts to free VRAM; an int pins a fixed cap.
-        compile: ``torch.compile`` the whole step body (``fullgraph=False``). Fuses
-            the elementwise chain across foreach buckets — measured ~16% faster on
-            many-small-tensor (LoRA-shaped) workloads where the optimizer is a real
-            fraction of the step; a **no-op win** when the model dominates (SDXL is
-            UNet-bound). NB: compiling *only* the Newton-Schulz does NOT help on
-            LoRA-rank matrices (too small) — the whole-step fusion is the win.
-            One-time warmup; numerically equivalent to eager (SR stays unbiased).
-            Default ``False``.
+        compile: ``torch.compile`` the whole step body (``fullgraph=False``), fusing
+            the step's elementwise chain. **Workload-dependent — benchmark it.** The
+            win scales with how much (fusable) elementwise math the step does, so for
+            AdaMuon (heavy Newton-Schulz + factored + cautious + scale) it helps
+            broadly: measured ~0.34x (-66%) on many small *distinct*-shaped tensors
+            (which defeat ``foreach`` batching), and ~0.6-0.75x on few/tiny/single
+            params. It is ~neutral for compute-bound full fine-tunes and for already-
+            ``foreach``-batched pure-LoRA sets, and a no-op when the model fwd/bwd
+            dominates (SDXL is UNet-bound). One-time warmup; numerically equivalent to
+            eager (bit-exact per step; SR unbiased; no crashes across dtypes/shapes).
+            Not recommended on CPU (inconsistent). NB: compiling *only* the
+            Newton-Schulz does NOT help on LoRA-rank matrices — the win is the
+            whole-step fusion. Default ``False``.
     """
 
     def __init__(

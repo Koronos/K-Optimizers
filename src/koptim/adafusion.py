@@ -164,14 +164,16 @@ class Adafusion(Optimizer):
             smaller, OOM-safe). Pass an int to pin a fixed cap (reproducibility, or
             a hard ceiling on a shared GPU). Decoupled from ``foreach_batch_cutoff``
             so raising it never pulls large weights into stacking.
-        compile: ``torch.compile`` the whole step body (``fullgraph=False``). Fuses
-            the elementwise chain across the foreach buckets — measured ~8% faster
-            on many-small-tensor workloads where the optimizer is a real fraction of
-            the step. It is a **no-op win** when the model forward/backward dominates
-            (e.g. SDXL is UNet-bound, optimizer <1% of the step), so leave it off
-            there. One-time compile warmup on the first step(s); the update is
-            numerically equivalent to eager (bit-exact per step; stochastic rounding
-            stays unbiased). Default ``False``.
+        compile: ``torch.compile`` the whole step body (``fullgraph=False``), fusing
+            the step's elementwise chain. **Workload-dependent — benchmark it.**
+            Adafusion's step has relatively little elementwise math (no
+            orthogonalization), so the gain is small: ~neutral on most shapes, and it
+            can slightly **hurt** a trivial step (a few tiny params, ~+7-10%) where
+            the compile overhead exceeds the fusion. It is a no-op when the model
+            fwd/bwd dominates (SDXL is UNet-bound). One-time warmup; numerically
+            equivalent to eager (bit-exact per step; SR unbiased; no crashes across
+            dtypes/shapes). Not recommended on CPU. (AdaMuon, with much heavier
+            elementwise math, benefits far more from this flag.) Default ``False``.
     """
 
     def __init__(

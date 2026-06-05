@@ -60,14 +60,18 @@ time, so it drops into per-parameter / gradient-release training loops unchanged
 ## Performance: `torch.compile` (`compile=True`)
 
 `Adafusion(..., compile=True)` wraps the whole step body in `torch.compile`
-(`fullgraph=False`), fusing the elementwise chain across the foreach buckets —
-measured **~8% faster** `step()` on many-small-tensor workloads where the
-optimizer is a real fraction of the step. It is a **no-op win when the model
-forward/backward dominates** (e.g. SDXL is UNet-bound — leave it off there).
-One-time compile warmup; the update is numerically equivalent to eager (bit-exact
-per step, stochastic rounding stays unbiased). This is the whole-step compile done
-right — distinct from the early per-tensor `compile` that was removed as redundant
-with `foreach`.
+(`fullgraph=False`), fusing the step's elementwise chain. **Workload-dependent —
+benchmark it.** Adafusion's step has relatively little elementwise math (no
+orthogonalization), so the gain is small: an adversarial `opt.step()` microbench
+(RTX 4080) showed it **~neutral on most shapes** and a **slight loss (~+7-10%) on
+trivial steps** (a few tiny params) where the compile overhead exceeds the fusion.
+It is a no-op when the model fwd/bwd dominates (SDXL is UNet-bound), and not
+recommended on CPU. The update is numerically equivalent to eager (bit-exact per
+step; stochastic rounding unbiased; no crashes across dtypes/shapes — verified).
+This is the whole-step compile done right — distinct from the early per-tensor
+`compile` that was removed as redundant with `foreach`. **`AdaMuon` benefits far
+more** from this flag (its Newton-Schulz math is heavily fusable — see
+[adamuon.md](adamuon.md)).
 
 ## Checkpointing
 

@@ -90,18 +90,29 @@ AdaMuon(
 ## Performance: `torch.compile` (`compile=True`)
 
 `AdaMuon(..., compile=True)` wraps the whole step body in `torch.compile`
-(`fullgraph=False`), fusing the elementwise chain across the foreach buckets.
-Measured **~16% faster** `step()` on a many-small-tensor (LoRA-shaped) load where
-the optimizer is a real fraction of the step. It is a **no-op win when the model
-forward/backward dominates** (real SDXL training is UNet-bound — the optimizer is
-<1% of the step — so leave it off there). One-time compile warmup on the first
-step(s); the update is numerically equivalent to eager (bit-exact per step;
-stochastic rounding stays unbiased — verified).
+(`fullgraph=False`), fusing the step's elementwise chain. **The speedup is
+workload-dependent — benchmark it for yours.** Because AdaMuon's step is heavy on
+fusable elementwise math (Newton-Schulz + factored + cautious + scale), it helps
+broadly. An adversarial `opt.step()` microbench (RTX 4080, eager vs compiled
+ratio, <1 = faster):
 
-Note: compiling *only* the Newton-Schulz iteration does **not** help on LoRA-rank
-matrices (they are too small — the compile wrapper overhead exceeds the fusion
-gain); the win is the whole-step fusion. Compiling NS pays off only for
-large-weight (non-LoRA) Muon updates.
+| param set | ratio | |
+|---|---|---|
+| many small **distinct**-shaped tensors (defeat `foreach`) | **0.34×** | huge win |
+| single huge / single tiny / two params | 0.56–0.74× | helps |
+| compute-bound full fine-tune (large weights) | ~0.98× | ~neutral |
+| already-`foreach`-batched pure-LoRA | ~1.03× | ~neutral/slight loss |
+
+So it is a no-op (or tiny loss) where eager is already efficient (foreach-batched
+LoRA, compute-bound full-FT) or where the model fwd/bwd dominates (real SDXL is
+UNet-bound). One-time warmup; numerically equivalent to eager (bit-exact per step;
+stochastic rounding unbiased; no crashes across dtypes/shapes — verified). Not
+recommended on CPU (inconsistent).
+
+Note: compiling *only* the Newton-Schulz does **not** help on LoRA-rank matrices
+(too small — wrapper overhead exceeds the fusion gain); the win is the whole-step
+fusion. (Adafusion, with much less elementwise math, benefits far less — see
+[adafusion.md](adafusion.md).)
 
 ## Checkpointing
 
