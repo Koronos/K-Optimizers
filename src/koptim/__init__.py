@@ -3,6 +3,8 @@
 Optimizers:
     Adafusion: conv-aware factored optimizer (AdamW-quality at Adafactor memory).
     Muon: orthogonalized-momentum optimizer with an AdamW fallback (hybrid).
+    KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
+    Autofusion: parameter-free LR on Adafusion via a Mechanic tuner (freeze-to-free).
 
 Quickstart::
 
@@ -18,7 +20,7 @@ Quickstart::
 
 from koptim._version import __version__
 from koptim.adafusion import Adafusion
-from koptim.adaptive_adafusion import AdafusionProdigy, AdaptiveAdafusion
+from koptim.autofusion import AdafusionProdigy, AdaptiveAdafusion, Autofusion
 from koptim.kprodigy import KProdigy
 from koptim.muon import Muon
 
@@ -26,6 +28,7 @@ __all__ = [
     "Adafusion",
     "AdafusionProdigy",
     "AdaptiveAdafusion",
+    "Autofusion",
     "KProdigy",
     "Muon",
     "__version__",

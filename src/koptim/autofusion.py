@@ -1,9 +1,10 @@
-"""AdaptiveAdafusion — a parameter-free learning rate on top of *Adafusion's*
+"""Autofusion — a parameter-free learning rate on top of *Adafusion's*
 update rule, via a Mechanic-style online scale tuner, with a **freeze-to-free**
 handoff that turns it into plain Adafusion after warmup.
 
-(Formerly ``AdafusionProdigy`` — a misnomer, it is Mechanic, not Prodigy. The old
-name remains importable as a back-compat alias.)
+(Shipped earlier as ``AdaptiveAdafusion`` / ``AdafusionProdigy`` — the latter a
+misnomer, it is Mechanic, not Prodigy. Both old names remain importable as
+back-compat aliases.)
 
 Motivation
 ----------
@@ -33,8 +34,8 @@ Design (mirrors the reference ``mechanize`` wrapper, arXiv:2306.00144 Alg. 1)
 ----------------------------------------------------------------------------
 The base optimizer is an internal :class:`~koptim.adafusion.Adafusion` at
 ``lr=1``. Each step (while adapting): snapshot ``p``, run the base step to get
-``u_t = p_after - p_before``, accumulate ``Delta_t`` (stored, or recomputed from
-``(p - ref)/sum(s)`` when ``store_delta=False``), form the Mechanic gradient
+``u_t = p_after - p_before``, recompute ``Delta_t`` on the fly from
+``(p - ref)/sum(s)``, form the Mechanic gradient
 ``h_t = <Delta_t, g_t + decay_t>`` summed over params, run the per-beta scalar
 tuner to get ``s``, and set ``p = ref + sum(s) * Delta_t``.
 
@@ -44,25 +45,25 @@ Memory
 ------
 The only irreducible per-parameter cost over plain Adafusion is **``ref`` (one
 extra copy of the weights, in param dtype)** — matching the reference Mechanic
-("at minimum one extra slot of memory"). ``store_delta`` adds a second per-param
-buffer; the reference *defaults it off* and reconstructs ``Delta`` on the fly,
-reporting "negligible effect" — so we default ``store_delta=False`` too.
+("at minimum one extra slot of memory"). ``Delta`` is reconstructed on the fly
+from ``(p - ref) / sum(s)`` (the reference Mechanic does the same, reporting
+"negligible effect"), so no second per-param buffer is ever allocated.
 
 Freeze-to-free (``lr_freeze``)
 ------------------------------
 The headline feature. Mechanic's scale converges to a stable operating LR; once
 it has, the per-step wrapper overhead (snapshot + grad clone + Delta passes) and
-the ``ref``/``delta`` buffers are pure waste. ``lr_freeze`` ends adaptation:
+the ``ref`` buffer are pure waste. ``lr_freeze`` ends adaptation:
 
-* ``None`` — never freeze (plain Mechanic-tuned Adafusion).
+* ``"auto"`` (default) — freeze when ``sum(s)`` plateaus: relative change below
+  ``_LR_FREEZE_TOL`` for ``_LR_FREEZE_PATIENCE`` consecutive near-max steps.
 * ``int N`` — freeze after ``N`` steps.
-* ``"auto"`` — freeze when ``sum(s)`` plateaus: relative change below
-  ``lr_freeze_tol`` for ``lr_freeze_patience`` consecutive steps.
+* ``None`` — never freeze (plain Mechanic-tuned Adafusion).
 
 On freeze we record ``S = sum(s)``, **set the base Adafusion's ``lr`` to ``S``**,
-**free ``ref``/``delta``/tuner scalars**, and route every subsequent ``step()``
+**free ``ref``/tuner scalars**, and route every subsequent ``step()``
 straight to ``base.step()``. After freeze the optimizer **is** the inner plain
-Adafusion at ``lr=S`` — same memory (ref/delta gone), same speed (no wrapper
+Adafusion at ``lr=S`` — same memory (ref gone), same speed (no wrapper
 passes), same update — *by construction*, because ``step()`` literally calls
 ``base.step()``.
 
@@ -99,14 +100,30 @@ from torch import Tensor
 
 from koptim.adafusion import Adafusion
 
-__all__ = ["AdaptiveAdafusion", "AdafusionProdigy"]
+__all__ = ["AdafusionProdigy", "AdaptiveAdafusion", "Autofusion"]
 
 # Mechanic's default tuner betas (arXiv:2306.00144, Alg. 1): n=6 parallel
 # coin-betting tuners with geometrically spaced recency horizons, summed.
 _DEFAULT_BETAS: tuple[float, ...] = (0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999)
 
+# -- internal constants (formerly public knobs; iteration-3 validated these
+# defaults generalize, so they are frozen here rather than exposed in __init__).
+# Changing them is a source edit, not a call-site option.
+#: multiplier on the global param RMS for the data-relative ``s_init="auto"`` seed
+#: (Adafusion's lr=1 update is unit-RMS, so trust ratio ||p||/||u|| == RMS(p)).
+_S_INIT_REL: float = 3e-3
+#: floor the effective ``sum(s)`` at this fraction of its running max (anti-collapse).
+_SCALE_FLOOR_FRAC: float = 0.5
+#: ``lr_freeze="auto"`` plateau: relative ``sum(s)`` change below this counts as flat.
+_LR_FREEZE_TOL: float = 0.02
+#: ``lr_freeze="auto"`` plateau: consecutive flat steps required to freeze.
+_LR_FREEZE_PATIENCE: int = 50
+#: ``lr_freeze="auto"``: a plateau step only counts when ``sum(s)`` is also at least
+#: this fraction of its running max (guards against an early freeze on a transient dip).
+_LR_FREEZE_MAX_FRAC: float = 0.9
 
-class AdaptiveAdafusion(torch.optim.Optimizer):
+
+class Autofusion(torch.optim.Optimizer):
     """Parameter-free LR on Adafusion's update via a Mechanic scale tuner, with a
     freeze-to-pure-Adafusion handoff.
 
@@ -119,51 +136,34 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
             Default ``"auto"`` — a data-relative LARS-style seed set on the first
             step from the global param RMS (Adafusion's ``lr=1`` update is unit-RMS,
             so the trust ratio ``||p||/||u_lr1|| == RMS(p)``); the seed is
-            ``s_init_rel * RMS(p)``, landing the initial effective LR at a
+            ``_S_INIT_REL * RMS(p)``, landing the initial effective LR at a
             data-relative scale instead of ramping there over ~100 steps. Pass a
             float to pin a fixed seed (e.g. ``1e-8`` for very long runs).
-        s_init_rel: the multiplier on the param RMS for the ``s_init="auto"`` seed.
-            Default ``3e-3``. Larger seeds higher (refines down); smaller seeds lower.
-        scale_floor_frac: floor the effective ``sum(s)`` at ``scale_floor_frac`` times
-            its running max, so the discovered LR cannot collapse/stall once it has
-            grown. Default ``0.5``. Set ``0`` to disable the floor.
+        lr_freeze: when to stop adapting and become plain Adafusion at the frozen
+            LR. **The headline feature.** Default ``"auto"`` — freezes on a
+            ``sum(s)`` plateau (validated robust; iteration-3 showed freeze does not
+            hurt and is the value prop). ``int N`` freezes after ``N`` steps.
+            ``None`` never freezes (plain Mechanic-tuned Adafusion). On freeze, the
+            Mechanic ``ref``/tuner scalars are freed and the inner Adafusion runs at
+            ``lr = sum(s)_frozen`` — from then on it is byte-for-byte and
+            speed-for-speed plain Adafusion.
         scale_cap: hard cap on the effective ``sum(s)`` (the discovered LR). Default
             ``"auto"`` — set on the first step to ``scale_cap_rel`` times the
             data-relative seed, so the ceiling tracks the problem's LR scale. **This
-            is the load-bearing stability fix**: on short DDPM horizons the Mechanic
-            scale is prone to a large transient spike (measured: it tries to run to
-            ~1e-2 while the operating LR is ~5e-4); the cap converts that spike into a
-            robust ceiling near the operating LR, removing the seed-dependent
-            divergence. Pass a fixed float to pin a manual ceiling, or ``None`` to
-            disable (reproduces the unstable iteration-1 behavior).
-        scale_cap_rel: multiplier on the seed for the ``scale_cap="auto"`` ceiling.
-            Default ``6.0`` (lands the cap at ~6x the seed, near the swept-optimal LR
-            on the measured DDPM). Lower for a more conservative ceiling; this is the
-            main knob for the auto cap.
+            is the load-bearing stability fix**: on short horizons the Mechanic scale
+            is prone to a large transient spike; the cap converts that into a robust
+            ceiling near the operating LR, removing the seed-dependent divergence.
+            Pass a fixed float to pin a manual ceiling, or ``None`` to disable.
+        scale_cap_rel: **advanced / rarely needed.** Multiplier on the seed for the
+            ``scale_cap="auto"`` ceiling. Default ``6.0``. Iteration-3 validated that
+            this generalizes (val flat across 3–12 on a real SDXL LoRA), so the
+            default is the right choice for almost everyone — it is the one
+            LR-equivalent knob, exposed only for a power user training a very
+            LR-sensitive model who wants a tighter/looser ceiling.
         betas: tuner recency horizons (the 6 Mechanic betas), summed into the LR.
         s_decay: Mechanic's ``lambda`` weight-decay-esque tuner term (default
             ``0.01``). Set ``0`` to disable.
         eps: tuner numerical floor.
-        store_delta: store the per-parameter displacement ``Delta`` from ``ref``.
-            Default ``False`` (matches the reference Mechanic; recomputes
-            ``Delta = (p - ref) / sum(s)`` on the fly, saving 1x param bytes with
-            negligible effect). ``True`` keeps an explicit fp32 ``Delta`` buffer
-            (marginally more accurate in the first few steps).
-        lr_freeze: when to stop adapting and become plain Adafusion at the frozen
-            LR. ``None`` (default) never freezes. ``int N`` freezes after ``N``
-            steps. ``"auto"`` freezes on a ``sum(s)`` plateau (see ``lr_freeze_tol``
-            / ``lr_freeze_patience``). On freeze, ``ref``/``delta``/tuner scalars
-            are freed and the inner Adafusion runs at ``lr = sum(s)_frozen`` — from
-            then on it is byte-for-byte and speed-for-speed plain Adafusion.
-        lr_freeze_tol: for ``lr_freeze="auto"`` — a step counts as a plateau when
-            the relative change of ``sum(s)`` vs the previous step is below this.
-            Default ``0.02``.
-        lr_freeze_patience: for ``lr_freeze="auto"`` — consecutive plateau steps
-            required to trigger the freeze. Default ``50``.
-        lr_freeze_max_frac: for ``lr_freeze="auto"`` — a step only counts toward the
-            plateau when ``sum(s)`` is also at least this fraction of its running max,
-            so a transient DIP (sum(s) flat but well below its peak) does not trigger
-            an early freeze. Default ``0.9``. Set ``0`` to disable the near-max guard.
         adafusion_betas: the inner Adafusion's ``(beta1, beta2)`` momentum /
             second-moment EMAs. Distinct from this class's tuner ``betas`` (which is
             shadowed by the keyword above, so this is the *only* way to set the base
@@ -187,18 +187,12 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         lr: float = 1.0,
         *,
         s_init: float | Literal["auto"] = "auto",
-        s_init_rel: float = 3e-3,
+        lr_freeze: int | Literal["auto"] | None = "auto",
+        scale_cap: float | Literal["auto"] | None = "auto",
+        scale_cap_rel: float = 6.0,
         betas: tuple[float, ...] = _DEFAULT_BETAS,
         s_decay: float = 0.01,
         eps: float = 1e-8,
-        store_delta: bool = False,
-        scale_floor_frac: float = 0.5,
-        scale_cap: float | Literal["auto"] | None = "auto",
-        scale_cap_rel: float = 6.0,
-        lr_freeze: int | Literal["auto"] | None = None,
-        lr_freeze_tol: float = 0.02,
-        lr_freeze_patience: int = 50,
-        lr_freeze_max_frac: float = 0.9,
         adafusion_betas: tuple[float, float] = (0.0, 0.999),
         foreach_warmup: bool = True,
         **adafusion_kwargs: Any,
@@ -207,32 +201,22 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
             raise ValueError(f"lr must be >= 0, got {lr}")
         if s_init != "auto" and not s_init > 0.0:
             raise ValueError(f"s_init must be > 0 or 'auto', got {s_init!r}")
-        if not s_init_rel > 0.0:
-            raise ValueError(f"s_init_rel must be > 0, got {s_init_rel}")
         if not all(0.0 < b < 1.0 for b in betas):
             raise ValueError(f"all tuner betas must be in (0, 1), got {betas}")
         if s_decay < 0.0:
             raise ValueError(f"s_decay must be >= 0, got {s_decay}")
-        if not 0.0 <= scale_floor_frac < 1.0:
-            raise ValueError(f"scale_floor_frac must be in [0, 1), got {scale_floor_frac}")
         if scale_cap is not None and scale_cap != "auto" and not scale_cap > 0.0:
             raise ValueError(f"scale_cap must be > 0, 'auto', or None, got {scale_cap!r}")
         if not scale_cap_rel > 0.0:
             raise ValueError(f"scale_cap_rel must be > 0, got {scale_cap_rel}")
-        if not 0.0 <= lr_freeze_max_frac <= 1.0:
-            raise ValueError(f"lr_freeze_max_frac must be in [0, 1], got {lr_freeze_max_frac}")
         if (
             lr_freeze is not None
             and lr_freeze != "auto"
             and (not isinstance(lr_freeze, int) or lr_freeze < 1)
         ):
             raise ValueError(f"lr_freeze must be None, 'auto', or an int >= 1, got {lr_freeze!r}")
-        if not lr_freeze_tol > 0.0:
-            raise ValueError(f"lr_freeze_tol must be > 0, got {lr_freeze_tol}")
-        if lr_freeze_patience < 1:
-            raise ValueError(f"lr_freeze_patience must be >= 1, got {lr_freeze_patience}")
         # We deliberately do NOT call super().__init__ with our own defaults: this
-        # class owns no per-parameter optimizer state beyond ref/delta, which we
+        # class owns no per-parameter optimizer state beyond ref, which we
         # manage in self._mech. The param_groups are the base Adafusion's.
         param_list = list(params)
         # The base optimizer holds the param_groups and does the real update at
@@ -250,22 +234,19 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         # trust ratio ||p||/||u_lr1|| == RMS(p); seed = s_init_rel * RMS(p)).
         self._s_init_auto = s_init == "auto"
         self._s_init = 0.0 if self._s_init_auto else float(s_init)
-        self._s_init_rel = float(s_init_rel)
+        self._s_init_rel = _S_INIT_REL
         self._s_decay = float(s_decay)
         self._eps = float(eps)
-        self._store_delta = store_delta
         # Phase-C: batch the wrapper's per-param warmup passes (displacement,
         # inner-product partials, ref + S*delta writeback) with torch._foreach_*
         # to cut the ~15x launch overhead over plain Adafusion on many small
-        # tensors (LoRA). Numerically identical to the per-param path. Disabled
-        # when store_delta=True (the explicit per-param delta buffers want the
-        # in-place add path) — falls back to the loop.
+        # tensors (LoRA). Numerically identical to the per-param path.
         self._foreach_warmup = bool(foreach_warmup)
 
         # Scale floor/cap: clamp the effective sum(s) to
-        # [scale_floor_frac * running_max, scale_cap]. Floor (relative to the running
+        # [_SCALE_FLOOR_FRAC * running_max, scale_cap]. Floor (relative to the running
         # max) stops a collapse/stall; cap stops a runaway spike.
-        self._scale_floor_frac = float(scale_floor_frac)
+        self._scale_floor_frac = _SCALE_FLOOR_FRAC
         # scale_cap: a fixed float, None (no cap), or "auto" — set on the first step
         # to scale_cap_rel * (data-relative seed), so the cap tracks the problem's LR
         # scale (the seed is itself data-relative). The Mechanic scale on a short
@@ -278,9 +259,9 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
 
         # Freeze ("become Adafusion") config + bookkeeping.
         self._lr_freeze = lr_freeze
-        self._lr_freeze_tol = float(lr_freeze_tol)
-        self._lr_freeze_patience = int(lr_freeze_patience)
-        self._lr_freeze_max_frac = float(lr_freeze_max_frac)
+        self._lr_freeze_tol = _LR_FREEZE_TOL
+        self._lr_freeze_patience = _LR_FREEZE_PATIENCE
+        self._lr_freeze_max_frac = _LR_FREEZE_MAX_FRAC
         self._frozen = False
         self._frozen_lr: float | None = None
         self._plateau_count = 0
@@ -300,7 +281,6 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
             "max_product": torch.full((n,), 1e-6, dtype=torch.float32),  # m
             "iter": 0,
             "ref": {},     # p -> reference (start) value
-            "delta": {},   # p -> accumulated base-update displacement (store_delta)
         }
 
     # -- introspection -----------------------------------------------------
@@ -347,7 +327,6 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         # Free the wrapper's per-param buffers and tuner scalars — post-freeze the
         # optimizer is byte-for-byte plain Adafusion.
         self._mech["ref"].clear()
-        self._mech["delta"].clear()
         for k in ("s", "v", "reward", "max_product"):
             self._mech[k] = torch.zeros(0)
         self._frozen = True
@@ -386,7 +365,7 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         prev_eff_s_sum: float,
         s_sum: float,
     ) -> tuple[Tensor, dict[Tensor, Tensor]]:
-        """Batched warmup pass (store_delta=False): forms Delta_t per param and the
+        """Batched warmup pass: forms Delta_t per param and the
         Mechanic inner product ``h = <Delta_t, g + decay>`` with ``torch._foreach_*``.
 
         Numerically identical (fp32) to the per-param loop it replaces — it just
@@ -444,9 +423,9 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         first = mech["iter"] == 0
 
         # 1) snapshot params + clone grads (base step may mutate grads, e.g. wd),
-        #    and lazily allocate ref/delta on first sight of each param. We also
-        #    record params in a STABLE order (`plist`) so the Phase-C foreach path
-        #    can batch the displacement/inner-product/writeback over lists.
+        #    and lazily allocate ref on first sight of each param. We also record
+        #    params in a STABLE order (`plist`) so the Phase-C foreach path can
+        #    batch the displacement/inner-product/writeback over lists.
         prev: dict[Tensor, Tensor] = {}
         grads: dict[Tensor, Tensor] = {}
         plist: list[Tensor] = []
@@ -459,8 +438,6 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
                 plist.append(p)
                 if p not in mech["ref"]:
                     mech["ref"][p] = p.detach().clone()
-                    if self._store_delta:
-                        mech["delta"][p] = torch.zeros_like(p, dtype=torch.float32)
 
         if not grads:
             return loss
@@ -497,13 +474,13 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
 
         s = mech["s"]
         s_sum = float(s.sum().item())
-        # For the store_delta=False reconstruction we must undo the *effective*
+        # For the on-the-fly Delta reconstruction we must undo the *effective*
         # (floor/cap-clamped) scale actually applied last step, which equals
         # _last_eff_s_sum (== raw sum(s) when no clamp engaged). On the very first
         # step ref==prev so the displacement is 0 regardless of the denominator.
         prev_eff_s_sum = self._last_eff_s_sum
 
-        use_foreach = self._foreach_warmup and not self._store_delta
+        use_foreach = self._foreach_warmup
 
         if use_foreach:
             h, deltas = self._warmup_foreach(plist, prev, grads, mech, prev_eff_s_sum, s_sum)
@@ -530,12 +507,8 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
                         continue
                     u = (p.detach() - prev[p]).float()  # base update u_t
                     ref = mech["ref"][p]
-                    if self._store_delta:
-                        delta = mech["delta"][p]
-                        delta.add_(u)
-                    else:
-                        delta = (prev[p].float() - ref.float()) / (prev_eff_s_sum + self._eps)
-                        delta = delta.add_(u)
+                    delta = (prev[p].float() - ref.float()) / (prev_eff_s_sum + self._eps)
+                    delta = delta.add_(u)
                     deltas[p] = delta
                     g = grads[p].float()
                     if self._s_decay != 0.0:
@@ -607,6 +580,8 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         self._frozen_lr = sd.get("frozen_lr")
 
 
-# Back-compat alias: the optimizer was shipped as ``AdafusionProdigy`` (a misnomer
-# — it is Mechanic, not Prodigy). Keep the old name importable.
-AdafusionProdigy = AdaptiveAdafusion
+# Back-compat aliases: the optimizer shipped earlier as ``AdaptiveAdafusion`` and,
+# before that, as ``AdafusionProdigy`` (a misnomer — it is Mechanic, not Prodigy).
+# Keep both old names importable.
+AdaptiveAdafusion = Autofusion
+AdafusionProdigy = Autofusion

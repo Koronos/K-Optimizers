@@ -1,25 +1,77 @@
-"""Tests for AdaptiveAdafusion (Mechanic LR tuner on Adafusion, freeze-to-free).
+"""Tests for Autofusion (Mechanic LR tuner on Adafusion, freeze-to-free).
 
-Covers the base Mechanic behavior, the back-compat ``AdafusionProdigy`` alias,
-``store_delta`` agreement, and the new ``lr_freeze`` (int / "auto") handoff that
-turns the optimizer into plain Adafusion after warmup.
+Covers the base Mechanic behavior, the back-compat ``AdaptiveAdafusion`` /
+``AdafusionProdigy`` aliases, the on-the-fly ``Delta`` reconstruction, and the
+``lr_freeze`` (int / "auto") handoff that turns the optimizer into plain Adafusion
+after warmup.
+
+Autofusion's empirical scaffolding (``store_delta``, ``s_init_rel``,
+``scale_floor_frac``, and the auto-freeze ``tol``/``patience``/``max_frac``) was
+collapsed to internal constants once iteration-3 validated the defaults
+generalize; see ``test_purged_knobs_are_not_public`` for the public-surface guard.
 """
 
 from __future__ import annotations
 
-import copy
+import inspect
 
 import torch
 
-from koptim import AdafusionProdigy, AdaptiveAdafusion
+from koptim import AdafusionProdigy, AdaptiveAdafusion, Autofusion
 from koptim.adafusion import Adafusion
 
 from .conftest import train_steps
 
 
-def test_alias_is_same_class() -> None:
-    """AdafusionProdigy is kept importable as a back-compat alias."""
-    assert AdafusionProdigy is AdaptiveAdafusion
+def test_aliases_are_same_class() -> None:
+    """AdaptiveAdafusion and AdafusionProdigy are back-compat aliases of Autofusion."""
+    assert AdaptiveAdafusion is Autofusion
+    assert AdafusionProdigy is Autofusion
+
+
+def test_purged_knobs_are_not_public() -> None:
+    """The empirical scaffolding knobs are gone from the public __init__ signature
+    (they are now module-level constants at their validated defaults)."""
+    params = set(inspect.signature(Autofusion.__init__).parameters)
+    for gone in (
+        "store_delta",
+        "s_init_rel",
+        "scale_floor_frac",
+        "lr_freeze_tol",
+        "lr_freeze_patience",
+        "lr_freeze_max_frac",
+    ):
+        assert gone not in params, f"{gone} should no longer be a public kwarg"
+    # And the headline / advanced knobs that survived the purge are still public.
+    for kept in ("lr_freeze", "scale_cap", "scale_cap_rel", "adafusion_betas"):
+        assert kept in params, f"{kept} must stay public"
+
+
+def test_lr_freeze_defaults_to_auto() -> None:
+    """lr_freeze defaults to 'auto' (the headline freeze-to-free feature, on)."""
+    assert inspect.signature(Autofusion.__init__).parameters["lr_freeze"].default == "auto"
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = Autofusion([p])
+    assert opt._lr_freeze == "auto"
+
+
+def test_internal_constants_unchanged() -> None:
+    """The purged knobs are pinned to the exact values they defaulted to before, so
+    behavior is identical to the old defaults."""
+    from koptim import autofusion as af
+
+    assert af._S_INIT_REL == 3e-3
+    assert af._SCALE_FLOOR_FRAC == 0.5
+    assert af._LR_FREEZE_TOL == 0.02
+    assert af._LR_FREEZE_PATIENCE == 50
+    assert af._LR_FREEZE_MAX_FRAC == 0.9
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = Autofusion([p])
+    assert opt._s_init_rel == 3e-3
+    assert opt._scale_floor_frac == 0.5
+    assert opt._lr_freeze_tol == 0.02
+    assert opt._lr_freeze_patience == 50
+    assert opt._lr_freeze_max_frac == 0.9
 
 
 def test_scale_starts_at_seed_then_rises() -> None:
@@ -28,7 +80,7 @@ def test_scale_starts_at_seed_then_rises() -> None:
     w = torch.randn(32, 32)
     target = torch.randn(32, 32)
     x = torch.nn.Parameter(torch.zeros(32, 32))
-    opt = AdaptiveAdafusion([x], s_init=1e-6, store_delta=True)
+    opt = Autofusion([x], s_init=1e-6, lr_freeze=None)
     opt.zero_grad()
     ((w @ x - target) ** 2).mean().backward()
     opt.step()
@@ -46,42 +98,41 @@ def test_reduces_loss(
 ) -> None:
     """Parameter-free (lr=1) optimizer reduces a toy MLP's loss."""
     x, y = random_batch
-    opt = AdaptiveAdafusion(toy_mlp.parameters(), s_init=1e-4)
+    opt = Autofusion(toy_mlp.parameters(), s_init=1e-4)
     before = (toy_mlp(x) - y).pow(2).mean().item()
     train_steps(toy_mlp, opt, [random_batch] * 50)
     after = (toy_mlp(x) - y).pow(2).mean().item()
     assert after < before, f"loss should drop: {before:.4f} -> {after:.4f}"
 
 
-def test_store_delta_modes_agree(
+def test_delta_reconstruction_is_valid(
     toy_mlp: torch.nn.Module, random_batch: tuple[torch.Tensor, torch.Tensor]
 ) -> None:
-    """store_delta True/False reach comparable loss (the on-the-fly Delta is valid)."""
+    """The on-the-fly Delta = (p - ref)/sum(s) reconstruction drives a real descent
+    (the optimizer never stores Delta explicitly — ref is its only per-param state)."""
     x, y = random_batch
-    m1 = toy_mlp
-    m2 = copy.deepcopy(toy_mlp)
-    o1 = AdaptiveAdafusion(m1.parameters(), s_init=1e-4, store_delta=True)
-    o2 = AdaptiveAdafusion(m2.parameters(), s_init=1e-4, store_delta=False)
-    train_steps(m1, o1, [random_batch] * 40)
-    train_steps(m2, o2, [random_batch] * 40)
-    l1 = (m1(x) - y).pow(2).mean().item()
-    l2 = (m2(x) - y).pow(2).mean().item()
-    assert abs(l1 - l2) < 0.2 * max(l1, l2) + 1e-6, f"modes diverged: {l1} vs {l2}"
+    opt = Autofusion(toy_mlp.parameters(), s_init=1e-4)
+    before = (toy_mlp(x) - y).pow(2).mean().item()
+    train_steps(toy_mlp, opt, [random_batch] * 40)
+    after = (toy_mlp(x) - y).pow(2).mean().item()
+    assert after < before
 
 
-def test_store_delta_defaults_off() -> None:
-    """store_delta defaults to False (reference Mechanic default; ref-only memory)."""
+def test_only_ref_buffer_allocated() -> None:
+    """The only per-param Mechanic state while adapting is ``ref`` (one copy of the
+    weights); no Delta buffer is ever allocated."""
     p = torch.nn.Parameter(torch.randn(8, 8))
-    opt = AdaptiveAdafusion([p])
+    opt = Autofusion([p])
     p.grad = torch.randn_like(p)
     opt.step()
-    assert len(opt._mech["delta"]) == 0, "no delta buffer should be allocated by default"
+    assert "delta" not in opt._mech, "no delta buffer key should exist"
+    assert len(opt._mech["ref"]) == 1, "exactly one ref buffer (for the one param)"
 
 
 def test_forwards_adafusion_kwargs() -> None:
     """Adafusion knobs (clip_threshold, cautious, momentum_dtype) forward to base."""
     p = torch.nn.Parameter(torch.randn(16, 16))
-    opt = AdaptiveAdafusion(
+    opt = Autofusion(
         [p],
         betas=(0.9, 0.99),  # tuner betas
         adafusion_betas=(0.9, 0.999),  # base momentum betas (explicit passthrough)
@@ -99,7 +150,7 @@ def test_forwards_adafusion_kwargs() -> None:
 def test_default_base_betas_no_momentum() -> None:
     """Default inner Adafusion has beta1=0 (no momentum) — exact-freeze regime."""
     p = torch.nn.Parameter(torch.randn(8, 8))
-    opt = AdaptiveAdafusion([p])
+    opt = Autofusion([p])
     assert opt.param_groups[0]["betas"] == (0.0, 0.999)
 
 
@@ -107,7 +158,7 @@ def test_get_s_vector_length() -> None:
     """get_s returns one scale per tuner beta."""
     p = torch.nn.Parameter(torch.randn(8, 8))
     betas = (0.9, 0.99, 0.999)
-    opt = AdaptiveAdafusion([p], betas=betas)
+    opt = Autofusion([p], betas=betas)
     p.grad = torch.randn_like(p)
     opt.step()
     assert opt.get_s().numel() == len(betas)
@@ -117,10 +168,10 @@ def test_get_s_vector_length() -> None:
 
 
 def test_freeze_after_n_steps_frees_state() -> None:
-    """lr_freeze=N freezes at step N and frees ref/delta buffers."""
+    """lr_freeze=N freezes at step N and frees the ref buffer."""
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn(16, 16))
-    opt = AdaptiveAdafusion([p], s_init=1e-4, store_delta=True, lr_freeze=5)
+    opt = Autofusion([p], s_init=1e-4, lr_freeze=5)
     for _ in range(4):
         p.grad = torch.randn_like(p)
         opt.step()
@@ -131,7 +182,6 @@ def test_freeze_after_n_steps_frees_state() -> None:
     assert opt.is_frozen()
     assert opt.frozen_lr is not None and opt.frozen_lr > 0.0
     assert len(opt._mech["ref"]) == 0, "ref freed on freeze"
-    assert len(opt._mech["delta"]) == 0, "delta freed on freeze"
     assert opt.param_groups[0]["lr"] == opt.frozen_lr
 
 
@@ -139,7 +189,7 @@ def test_get_d_stable_after_freeze() -> None:
     """get_d returns the frozen LR (no longer changes) after freezing."""
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn(16, 16))
-    opt = AdaptiveAdafusion([p], s_init=1e-4, lr_freeze=4)
+    opt = Autofusion([p], s_init=1e-4, lr_freeze=4)
     for _ in range(6):
         p.grad = torch.randn_like(p)
         opt.step()
@@ -152,21 +202,19 @@ def test_get_d_stable_after_freeze() -> None:
 
 
 def test_auto_freeze_on_plateau() -> None:
-    """lr_freeze='auto' eventually freezes once the scale plateaus."""
+    """lr_freeze='auto' (the default) eventually freezes once the scale plateaus."""
     torch.manual_seed(0)
     w = torch.randn(24, 24)
     target = torch.randn(24, 24)
     x = torch.nn.Parameter(torch.zeros(24, 24))
-    opt = AdaptiveAdafusion(
-        [x], s_init=1e-4, lr_freeze="auto", lr_freeze_tol=0.05, lr_freeze_patience=10
-    )
-    for _ in range(400):
+    opt = Autofusion([x], s_init=1e-4)  # lr_freeze defaults to "auto"
+    for _ in range(3000):
         opt.zero_grad()
         ((w @ x - target) ** 2).mean().backward()
         opt.step()
         if opt.is_frozen():
             break
-    assert opt.is_frozen(), "auto freeze should trigger on a plateau within 400 steps"
+    assert opt.is_frozen(), "auto freeze should trigger on a plateau"
 
 
 def test_frozen_step_delegates_to_base() -> None:
@@ -178,8 +226,8 @@ def test_frozen_step_delegates_to_base() -> None:
     """
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn(12, 12))
-    opt = AdaptiveAdafusion([p], s_init=1e-4, lr_freeze=3,
-                            momentum_dtype="float32", bf16_method="none")
+    opt = Autofusion([p], s_init=1e-4, lr_freeze=3,
+                     momentum_dtype="float32", bf16_method="none")
     for _ in range(4):
         p.grad = torch.randn_like(p)
         opt.step()
@@ -208,17 +256,17 @@ def test_frozen_step_delegates_to_base() -> None:
 
 # ----------------------- iteration-2: LR-discovery quality -----------------------
 def test_auto_s_init_is_data_relative() -> None:
-    """s_init='auto' seeds the initial effective LR at s_init_rel * RMS(p).
+    """s_init='auto' seeds the initial effective LR at _S_INIT_REL * RMS(p).
 
     Adafusion's lr=1 update is unit-RMS, so the LARS trust ratio ||p||/||u_lr1|| ==
-    RMS(p); the auto seed lands the step-1 effective LR at s_init_rel * RMS(p).
+    RMS(p); the auto seed lands the step-1 effective LR at _S_INIT_REL * RMS(p).
     """
     torch.manual_seed(0)
     w = torch.randn(64, 64)
     target = torch.randn(64, 64)
     x = torch.nn.Parameter(torch.randn(64, 64) * 0.1)  # RMS(p) ~ 0.1
     rms = x.detach().pow(2).mean().sqrt().item()
-    opt = AdaptiveAdafusion([x], s_init="auto", s_init_rel=3e-3)
+    opt = Autofusion([x], s_init="auto")
     opt.zero_grad()
     ((w @ x - target) ** 2).mean().backward()
     opt.step()
@@ -230,7 +278,7 @@ def test_auto_s_init_is_data_relative() -> None:
 def test_auto_s_init_and_cap_are_default() -> None:
     """The defaults are s_init='auto' (data-relative) and scale_cap='auto'."""
     p = torch.nn.Parameter(torch.randn(8, 8))
-    opt = AdaptiveAdafusion([p])
+    opt = Autofusion([p])
     assert opt._s_init_auto is True
     assert opt._scale_cap_auto is True
 
@@ -242,9 +290,7 @@ def test_auto_cap_is_multiple_of_seed() -> None:
     w = torch.randn(64, 64)
     target = torch.randn(64, 64)
     x = torch.nn.Parameter(torch.randn(64, 64) * 0.1)
-    opt = AdaptiveAdafusion(
-        [x], s_init="auto", s_init_rel=3e-3, scale_cap="auto", scale_cap_rel=6.0,
-    )
+    opt = Autofusion([x], s_init="auto", scale_cap="auto", scale_cap_rel=6.0, lr_freeze=None)
     opt.zero_grad()
     ((w @ x - target) ** 2).mean().backward()
     opt.step()
@@ -263,7 +309,7 @@ def test_scale_cap_clamps_lr() -> None:
     w = torch.randn(64, 64)
     target = torch.randn(64, 64)
     x = torch.nn.Parameter(torch.randn(64, 64) * 0.1)
-    opt = AdaptiveAdafusion([x], s_init=1e-3, scale_cap=5e-3, scale_floor_frac=0.0)
+    opt = Autofusion([x], s_init=1e-3, scale_cap=5e-3, lr_freeze=None)
     seen = []
     for _ in range(40):
         opt.zero_grad()
@@ -274,13 +320,13 @@ def test_scale_cap_clamps_lr() -> None:
 
 
 def test_scale_floor_prevents_collapse() -> None:
-    """Once the effective LR has grown, the floor stops it collapsing below
-    scale_floor_frac of its running max."""
+    """Once the effective LR has grown, the floor (internal _SCALE_FLOOR_FRAC=0.5)
+    stops it collapsing below half of its running max."""
     torch.manual_seed(2)
     w = torch.randn(48, 48)
     target = torch.randn(48, 48)
     x = torch.nn.Parameter(torch.randn(48, 48) * 0.1)
-    opt = AdaptiveAdafusion([x], s_init=1e-3, scale_floor_frac=0.5)
+    opt = Autofusion([x], s_init=1e-3, lr_freeze=None)
     seen = []
     for _ in range(60):
         opt.zero_grad()
@@ -301,7 +347,7 @@ def test_floor_does_not_inflate_bootstrap() -> None:
     w = torch.randn(32, 32)
     target = torch.randn(32, 32)
     x = torch.nn.Parameter(torch.zeros(32, 32))
-    opt = AdaptiveAdafusion([x], s_init=1e-6, scale_floor_frac=0.5, scale_cap=None)
+    opt = Autofusion([x], s_init=1e-6, scale_cap=None, lr_freeze=None)
     prev = 0.0
     for i in range(20):
         opt.zero_grad()
@@ -319,7 +365,7 @@ def test_freeze_exact_after_cap() -> None:
     byte-exact even when the cap engaged on the last pre-freeze step."""
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn(12, 12))
-    opt = AdaptiveAdafusion(
+    opt = Autofusion(
         [p], s_init=1e-2, scale_cap=2e-3, lr_freeze=5,
         momentum_dtype="float32", bf16_method="none",
     )
@@ -333,13 +379,14 @@ def test_freeze_exact_after_cap() -> None:
 
 
 def test_hardened_auto_freeze_waits_for_near_max() -> None:
-    """lr_freeze_max_frac: a flat-but-low (transient-dip) scale must NOT freeze; the
-    scale has to be near its running max as well as flat."""
+    """The internal _LR_FREEZE_MAX_FRAC guard: a flat-but-low (transient-dip) scale
+    must NOT freeze; the scale has to be near its running max as well as flat."""
     p = torch.nn.Parameter(torch.randn(8, 8))
-    opt = AdaptiveAdafusion(
-        [p], lr_freeze="auto", lr_freeze_tol=0.5,
-        lr_freeze_patience=3, lr_freeze_max_frac=0.9,
-    )
+    opt = Autofusion([p], lr_freeze="auto")
+    # Drive the auto-freeze plateau logic directly with a short patience so the test
+    # stays fast (the production patience constant is 50).
+    opt._lr_freeze_tol = 0.5
+    opt._lr_freeze_patience = 3
     # Establish a running max well above the current scale, then feed flat low values.
     opt._s_sum_max = 1.0
     opt._prev_s_sum = 0.1
@@ -367,17 +414,16 @@ def _shaped_params() -> list[torch.nn.Parameter]:
 
 def test_foreach_warmup_matches_per_param() -> None:
     """foreach_warmup=True must be numerically identical (fp32 round-off) to the
-    per-param loop, across the full warmup trajectory — incl. the s_decay term
-    and with the floor/cap disabled (raw scale)."""
+    per-param loop, across the full warmup trajectory — incl. the s_decay term."""
     for kwargs in (
         {"s_decay": 0.0},
         {"s_decay": 0.01},
-        {"s_decay": 0.01, "scale_floor_frac": 0.0, "scale_cap": None},
+        {"s_decay": 0.01, "scale_cap": None},
     ):
         a = _shaped_params()
         b = _shaped_params()
-        o_fe = AdaptiveAdafusion(a, lr=1.0, foreach_warmup=True, **kwargs)
-        o_loop = AdaptiveAdafusion(b, lr=1.0, foreach_warmup=False, **kwargs)
+        o_fe = Autofusion(a, lr=1.0, foreach_warmup=True, lr_freeze=None, **kwargs)
+        o_loop = Autofusion(b, lr=1.0, foreach_warmup=False, lr_freeze=None, **kwargs)
         g = torch.Generator().manual_seed(7)
         for _ in range(20):
             for pa, pb in zip(a, b, strict=True):
@@ -394,7 +440,7 @@ def test_foreach_warmup_matches_per_param() -> None:
 def test_foreach_warmup_default_on() -> None:
     """foreach_warmup defaults to True (the fast path)."""
     p = torch.nn.Parameter(torch.randn(8, 8))
-    opt = AdaptiveAdafusion([p])
+    opt = Autofusion([p])
     assert opt._foreach_warmup is True
 
 
@@ -402,10 +448,35 @@ def test_foreach_warmup_does_not_mutate_ref() -> None:
     """The batched writeback must not alias/mutate mech['ref'] (regression: .float()
     on an fp32 tensor returns the same tensor, so an in-place add corrupted ref)."""
     p = torch.nn.Parameter(torch.randn(8, 8))
-    opt = AdaptiveAdafusion([p], foreach_warmup=True)
+    opt = Autofusion([p], foreach_warmup=True)
     p.grad = torch.randn_like(p)
     opt.step()
     ref0 = opt._mech["ref"][p].clone()
     p.grad = torch.randn_like(p)
     opt.step()
     assert torch.equal(opt._mech["ref"][p], ref0), "ref must stay constant across steps"
+
+
+def test_behavior_identical_to_old_defaults() -> None:
+    """Regression guard for the knob purge: the new minimal API must walk the exact
+    same trajectory as the per-param loop at the hardcoded constant values — i.e. the
+    purge is non-functional. Two optimizers built identically must be byte-for-byte
+    equal across both the foreach and the per-param warmup paths."""
+    torch.manual_seed(3)
+    a = _shaped_params()
+    b = _shaped_params()
+    o_fe = Autofusion(a, lr_freeze=None, foreach_warmup=True,
+                      momentum_dtype="float32", bf16_method="none")
+    o_loop = Autofusion(b, lr_freeze=None, foreach_warmup=False,
+                        momentum_dtype="float32", bf16_method="none")
+    g = torch.Generator().manual_seed(11)
+    for _ in range(30):
+        for pa, pb in zip(a, b, strict=True):
+            grad = torch.randn(pa.shape, generator=g)
+            pa.grad = grad.clone()
+            pb.grad = grad.clone()
+        o_fe.step()
+        o_loop.step()
+        assert abs(o_fe.get_d() - o_loop.get_d()) < 1e-6
+        for pa, pb in zip(a, b, strict=True):
+            assert torch.allclose(pa, pb, atol=1e-5, rtol=1e-5)
