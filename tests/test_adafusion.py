@@ -382,3 +382,27 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
         b.grad = g.clone()
         opt_b.step()
     assert torch.equal(a, b), "resumed run must continue bit-exactly"
+
+
+def test_compile_step_matches_eager():
+    """``compile=True`` produces a numerically equivalent update (per-step bit-exact
+    up to FP reassociation) and stays finite. Guards the revived compile feature."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+    ps0 = [torch.randn(16, 24, device=dev) for _ in range(3)]
+    gs = [torch.randn(16, 24, device=dev) * 0.1 for _ in range(3)]
+
+    def run(compile):
+        ps = [torch.nn.Parameter(p.clone()) for p in ps0]
+        opt = Adafusion(ps, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="float32",
+                        bf16_method="none", compile=compile)
+        for _ in range(2):
+            for p, g in zip(ps, gs, strict=True):
+                p.grad = g.clone()
+            opt.step()
+        return [p.detach().clone() for p in ps]
+
+    eager, compiled = run(False), run(True)
+    for e, c in zip(eager, compiled, strict=True):
+        assert torch.isfinite(c).all()
+        assert torch.allclose(e, c, rtol=1e-3, atol=1e-4)

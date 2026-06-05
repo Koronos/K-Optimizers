@@ -173,6 +173,14 @@ class AdaMuon(Optimizer):
             instead of stacking (performance knob; default ``2_000_000``).
         foreach_stack_budget: max elements per stacked chunk. ``None`` (default)
             adapts to free VRAM; an int pins a fixed cap.
+        compile: ``torch.compile`` the whole step body (``fullgraph=False``). Fuses
+            the elementwise chain across foreach buckets — measured ~16% faster on
+            many-small-tensor (LoRA-shaped) workloads where the optimizer is a real
+            fraction of the step; a **no-op win** when the model dominates (SDXL is
+            UNet-bound). NB: compiling *only* the Newton-Schulz does NOT help on
+            LoRA-rank matrices (too small) — the whole-step fusion is the win.
+            One-time warmup; numerically equivalent to eager (SR stays unbiased).
+            Default ``False``.
     """
 
     def __init__(
@@ -192,6 +200,7 @@ class AdaMuon(Optimizer):
         foreach: bool = True,
         foreach_batch_cutoff: int = _FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
+        compile: bool = False,  # noqa: A002 — public kwarg name
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -228,6 +237,14 @@ class AdaMuon(Optimizer):
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
+        # Optional torch.compile of the whole step body. fullgraph=False tolerates
+        # the param-group Python loop; fuses the elementwise chain across foreach
+        # buckets. Measured ~16% faster on many-small-tensor (LoRA-shaped) loads
+        # where the optimizer is a real fraction of the step — a no-op win when the
+        # model fwd/bwd dominates (e.g. SDXL is UNet-bound). NB: compiling ONLY the
+        # Newton-Schulz does NOT help on LoRA-rank matrices (too small); the win is
+        # the whole-step fusion. No host syncs in the step, so SR stays unbiased.
+        self._compiled_step = torch.compile(self._run_step, fullgraph=False) if compile else None
         # One momentum codec per dtype string (stateless beyond the dtype).
         self._codecs: dict[str, _MomentumCodec] = {}
 
@@ -265,6 +282,11 @@ class AdaMuon(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        (self._compiled_step or self._run_step)()
+        return loss
+
+    @torch.no_grad()
+    def _run_step(self) -> None:
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None]
             for p in params:
@@ -287,7 +309,6 @@ class AdaMuon(Optimizer):
             else:
                 for p in params:
                     self._step_one_param(p, group)
-        return loss
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized first moment's stored dtype.

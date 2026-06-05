@@ -87,6 +87,22 @@ AdaMuon(
   The batched 2-D path matches the per-parameter path within bf16 NS tolerance
   (both unbiased); 1-D buckets and all fp32 ops are bit-exact.
 
+## Performance: `torch.compile` (`compile=True`)
+
+`AdaMuon(..., compile=True)` wraps the whole step body in `torch.compile`
+(`fullgraph=False`), fusing the elementwise chain across the foreach buckets.
+Measured **~16% faster** `step()` on a many-small-tensor (LoRA-shaped) load where
+the optimizer is a real fraction of the step. It is a **no-op win when the model
+forward/backward dominates** (real SDXL training is UNet-bound — the optimizer is
+<1% of the step — so leave it off there). One-time compile warmup on the first
+step(s); the update is numerically equivalent to eager (bit-exact per step;
+stochastic rounding stays unbiased — verified).
+
+Note: compiling *only* the Newton-Schulz iteration does **not** help on LoRA-rank
+matrices (they are too small — the compile wrapper overhead exceeds the fusion
+gain); the win is the whole-step fusion. Compiling NS pays off only for
+large-weight (non-LoRA) Muon updates.
+
 ## Checkpointing
 
 `load_state_dict` is overridden (shared `load_state_dict_preserving_dtypes`

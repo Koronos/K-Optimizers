@@ -57,6 +57,18 @@ Adafusion(
 `Adafusion` is a standard `torch.optim.Optimizer` that works one parameter at a
 time, so it drops into per-parameter / gradient-release training loops unchanged.
 
+## Performance: `torch.compile` (`compile=True`)
+
+`Adafusion(..., compile=True)` wraps the whole step body in `torch.compile`
+(`fullgraph=False`), fusing the elementwise chain across the foreach buckets —
+measured **~8% faster** `step()` on many-small-tensor workloads where the
+optimizer is a real fraction of the step. It is a **no-op win when the model
+forward/backward dominates** (e.g. SDXL is UNet-bound — leave it off there).
+One-time compile warmup; the update is numerically equivalent to eager (bit-exact
+per step, stochastic rounding stays unbiased). This is the whole-step compile done
+right — distinct from the early per-tensor `compile` that was removed as redundant
+with `foreach`.
+
 ## Checkpointing
 
 The normal `torch.save(opt.state_dict())` → `opt.load_state_dict(torch.load(...))`

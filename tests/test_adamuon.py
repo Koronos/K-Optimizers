@@ -237,3 +237,27 @@ def test_invalid_args_rejected(kwargs, match):
     p = torch.nn.Parameter(torch.randn(4, 4))
     with pytest.raises(ValueError, match=match):
         AdaMuon([p], **kwargs)
+
+
+def test_compile_step_matches_eager():
+    """``compile=True`` produces a numerically equivalent update and stays finite."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+    ps0 = [torch.randn(16, 24, device=dev) for _ in range(3)]
+    gs = [torch.randn(16, 24, device=dev) * 0.1 for _ in range(3)]
+
+    def run(compile):
+        ps = [torch.nn.Parameter(p.clone()) for p in ps0]
+        opt = AdaMuon(ps, lr=1e-3, betas=(0.95, 0.999), ns_steps=2, cautious=True,
+                      momentum_dtype="float32", bf16_method="none", compile=compile)
+        for _ in range(2):
+            for p, g in zip(ps, gs, strict=True):
+                p.grad = g.clone()
+            opt.step()
+        return [p.detach().clone() for p in ps]
+
+    eager, compiled = run(False), run(True)
+    for e, c in zip(eager, compiled, strict=True):
+        assert torch.isfinite(c).all()
+        # AdaMuon runs Newton-Schulz in bf16 internally -> looser tol than Adafusion
+        assert torch.allclose(e, c, rtol=3e-2, atol=2e-3)
