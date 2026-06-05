@@ -57,21 +57,15 @@ Adafusion(
 `Adafusion` is a standard `torch.optim.Optimizer` that works one parameter at a
 time, so it drops into per-parameter / gradient-release training loops unchanged.
 
-## Performance: `torch.compile` (`compile=True`)
+## On `torch.compile`
 
-`Adafusion(..., compile=True)` wraps the whole step body in `torch.compile`
-(`fullgraph=False`), fusing the step's elementwise chain. **Workload-dependent —
-benchmark it.** Adafusion's step has relatively little elementwise math (no
-orthogonalization), so the gain is small: an adversarial `opt.step()` microbench
-(RTX 4080) showed it **~neutral on most shapes** and a **slight loss (~+7-10%) on
-trivial steps** (a few tiny params) where the compile overhead exceeds the fusion.
-It is a no-op when the model fwd/bwd dominates (SDXL is UNet-bound), and not
-recommended on CPU. The update is numerically equivalent to eager (bit-exact per
-step; stochastic rounding unbiased; no crashes across dtypes/shapes — verified).
-This is the whole-step compile done right — distinct from the early per-tensor
-`compile` that was removed as redundant with `foreach`. **`AdaMuon` benefits far
-more** from this flag (its Newton-Schulz math is heavily fusable — see
-[adamuon.md](adamuon.md)).
+`Adafusion` intentionally exposes **no** `compile` flag. A whole-step
+`torch.compile` was benchmarked (adversarial `opt.step()` microbench, RTX 4080) and
+came out ~neutral on most shapes and a slight loss on trivial steps — Adafusion's
+step has little fusable elementwise math (no orthogonalization), so it is not worth
+the API surface. The flag lives on [`AdaMuon`](adamuon.md), whose heavy
+Newton-Schulz math it does speed up. (Model-level `torch.compile` on your *network*
+is orthogonal and a separate, larger win — see your trainer's docs.)
 
 ## Checkpointing
 

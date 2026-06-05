@@ -164,16 +164,13 @@ class Adafusion(Optimizer):
             smaller, OOM-safe). Pass an int to pin a fixed cap (reproducibility, or
             a hard ceiling on a shared GPU). Decoupled from ``foreach_batch_cutoff``
             so raising it never pulls large weights into stacking.
-        compile: ``torch.compile`` the whole step body (``fullgraph=False``), fusing
-            the step's elementwise chain. **Workload-dependent — benchmark it.**
-            Adafusion's step has relatively little elementwise math (no
-            orthogonalization), so the gain is small: ~neutral on most shapes, and it
-            can slightly **hurt** a trivial step (a few tiny params, ~+7-10%) where
-            the compile overhead exceeds the fusion. It is a no-op when the model
-            fwd/bwd dominates (SDXL is UNet-bound). One-time warmup; numerically
-            equivalent to eager (bit-exact per step; SR unbiased; no crashes across
-            dtypes/shapes). Not recommended on CPU. (AdaMuon, with much heavier
-            elementwise math, benefits far more from this flag.) Default ``False``.
+
+    Note: Adafusion deliberately exposes **no** ``compile`` flag. A whole-step
+    ``torch.compile`` was measured ~neutral on most shapes here and a slight loss on
+    trivial steps (Adafusion's step has little fusable elementwise math), so it is
+    not worth the API surface — Adafusion stays lean. The flag lives on
+    :class:`~koptim.adamuon.AdaMuon`, whose heavy Newton-Schulz math it actually
+    speeds up.
     """
 
     def __init__(
@@ -192,7 +189,6 @@ class Adafusion(Optimizer):
         foreach: bool = True,
         foreach_batch_cutoff: int = _FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
-        compile: bool = False,  # noqa: A002 — public kwarg name
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -237,13 +233,6 @@ class Adafusion(Optimizer):
         # Memory-safety ceiling: max elements per stacked chunk. None -> adaptive
         # to free VRAM (see _foreach_budget); an int forces a fixed cap.
         self._foreach_stack_budget = foreach_stack_budget
-        # Optional torch.compile of the WHOLE step body (not the old per-tensor
-        # factored fn — that was redundant with foreach). fullgraph=False tolerates
-        # the param-group Python loop; measured ~8% faster on many-small-tensor
-        # workloads where the optimizer is a meaningful fraction of the step (a no-op
-        # win when the model fwd/bwd dominates, e.g. SDXL). The step has no host syncs
-        # (no .item()), so it traces cleanly; stochastic rounding stays unbiased.
-        self._compiled_step = torch.compile(self._run_step, fullgraph=False) if compile else None
         # One momentum codec per dtype string (the codec is stateless beyond the
         # dtype). Encapsulates every dequant→EMA→requant detail so the three step
         # functions stay dtype-agnostic.
@@ -281,11 +270,6 @@ class Adafusion(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        (self._compiled_step or self._run_step)()
-        return loss
-
-    @torch.no_grad()
-    def _run_step(self) -> None:
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None]
             for p in params:
@@ -312,6 +296,7 @@ class Adafusion(Optimizer):
             else:
                 for p in params:
                     self._step_one_param(p, group)
+        return loss
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized first moment's stored dtype.

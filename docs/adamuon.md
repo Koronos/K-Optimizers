@@ -111,8 +111,9 @@ recommended on CPU (inconsistent).
 
 Note: compiling *only* the Newton-Schulz does **not** help on LoRA-rank matrices
 (too small — wrapper overhead exceeds the fusion gain); the win is the whole-step
-fusion. (Adafusion, with much less elementwise math, benefits far less — see
-[adafusion.md](adafusion.md).)
+fusion. This flag is **AdaMuon-only by design**: [`Adafusion`](adafusion.md) has
+little fusable elementwise math (no orthogonalization), so a whole-step compile was
+~neutral there and not worth the API surface — Adafusion stays lean.
 
 ## Checkpointing
 
