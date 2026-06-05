@@ -36,17 +36,25 @@ linear warmup. "EXPLOTA" = diverged.
 Free VRAM with int8/4bit momentum → larger batch → fewer steps/epoch. Two measured
 effects, both in AdaMuon's favor:
 
-**(a) AdaMuon keeps more quality-per-sample at large batch — the gap WIDENS.**
-Fixed sample budget (same data, fewer steps as batch grows):
+**(a) Bigger batch HURTS the loss per sample (both optimizers); AdaMuon stays lower
+at every batch.** Fixed sample budget, **each optimizer at its own best LR per
+batch** (so this is apples-to-apples, not a fixed-LR artifact):
 
-| | bs 16 | bs 64 | bs 128 |
-|---|---|---|---|
-| AdaMuon val | 0.0567 | 0.0673 | 0.0796 |
-| AdamW-fused val | 0.0732 | 0.0936 | 0.1104 |
-| AdaMuon advantage | 22% | **28%** | **28%** |
+| batch | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|
+| AdaMuon val | 0.0654 | 0.0663 | 0.0681 | 0.0721 | 0.0788 | 0.0889 |
+| AdamW val | 0.0702 | 0.0706 | 0.0729 | 0.0778 | 0.0846 | 0.0970 |
+| AdaMuon better | 7% | 6% | 7% | 7% | 7% | 8% |
 
-This is the documented Muon property ("scaling batch widens the gap vs AdamW"),
-confirmed on this AdaMuon.
+- **Bigger batch is a speed↔quality trade, not free quality:** at fixed data, val
+  rises ~+36% (AdaMuon) / +38% (AdamW) from bs 2→64 — fewer optimizer updates,
+  even with the LR retuned. The reason to use a big batch is *wall-clock throughput*
+  (GPU saturation + the diluted NS overhead below), accepting a small loss penalty.
+- **With the LR retuned per batch, AdaMuon's edge is a steady ~7–8%** — it does NOT
+  visibly widen here. The "gap widens with batch" you'll see quoted (and that we saw
+  at *fixed* LR: 22%→28%) is mostly AdamW degrading faster when its LR is *not*
+  retuned for the larger batch; retune both and the gap is roughly constant. AdaMuon
+  still wins at every batch, just don't oversell the widening.
 
 **(b) AdaMuon's Newton-Schulz overhead DILUTES at large batch (O(m/B)).**
 
@@ -63,25 +71,24 @@ use the larger batch the memory savings buy.
 
 LR_opt found by a per-batch LR sweep (fixed samples, 10% warmup + cosine):
 
-| batch | LR_opt | (×, vs bs 8) |
+| batch | AdaMuon LR_opt | AdamW LR_opt |
 |---|---|---|
-| 2 | 6e-4 | 0.5× |
-| 4 | 1.2e-3 | 1× |
-| 8 | 1.2e-3 | 1× |
-| 16 | 2.5e-3 | 2× |
-| 32 | 2.5e-3 | 2× (plateau) |
-| 64 | 2.5e-3 | 2× (plateau) |
+| 2 | ~1.2e-3 | 3e-3 |
+| 4–8 | ~1.2e-3 | 6e-3 |
+| 16–32 | 2.5e-3 | 6e-3 |
+| 64 | 2.5e-3 | 3e-3 |
 
-**Rule of thumb:** `lr_new ≈ lr_base · √(batch_new / batch_base)` — i.e. **double the
-batch → ×1.4 the LR** (and halve the batch → ÷1.4). It holds cleanly across the
-small-batch range and **plateaus around bs 16–32** (the critical batch for this
-task — beyond it, a higher LR no longer compensates for the fewer updates).
-Diffusion batches (images/latents are large, so bs is usually 1–8) sit safely *below*
-that plateau, in the regime where √-scaling works.
+- **Rule of thumb:** `lr_new ≈ lr_base · √(batch_new / batch_base)` — double the batch
+  → ×1.4 the LR, halve it → ÷1.4. In practice the diffusion range (bs 1–8) is nearly
+  **flat** (you barely touch the LR); it rises ~2× by bs 16–32 then **plateaus** (the
+  critical batch — beyond it a higher LR no longer compensates for fewer updates).
+  Large latents keep diffusion below that plateau, where √-scaling is a safe guide.
+- **AdaMuon's LR is ~5× *lower* than AdamW's** (≈1.2e-3 vs ≈6e-3): the orthogonalized
+  update is RMS-normalized, so it needs a smaller raw LR. **Do not reuse your AdamW
+  LR for AdaMuon — divide it by ~5** as a starting point.
 
-(AdamW's optimum sat above the tested grid here, so its scaling isn't pinned down by
-this run — the literature reports √-scaling for both, but AdamW loses more
-quality-per-sample at large batch, per §2a.)
+(The literature reports √-scaling for both optimizers; here both LR_opt curves are
+nearly flat then plateau in this small-batch range, with AdaMuon's ~5× lower.)
 
 ## Bottom line
 AdaMuon is the better fit for "save memory → bigger batch → fewer steps":
