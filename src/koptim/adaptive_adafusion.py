@@ -115,9 +115,31 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         lr: outer multiplier on the discovered scale. **Leave at 1.0** — Mechanic
             finds the scale. (Kept so a schedule can still be layered on top.)
         s_init: Mechanic's initial scale seed. The paper default is ``1e-8``; on
-            short fine-tuning runs the bootstrap is slow there, so we default to
-            ``1e-4`` (reaches a stable operating LR within ~100 steps on a measured
-            DDPM sweep). Lower it toward the paper value for very long runs.
+            short fine-tuning runs the bootstrap is slow there (short-horizon bias).
+            Default ``"auto"`` — a data-relative LARS-style seed set on the first
+            step from the global param RMS (Adafusion's ``lr=1`` update is unit-RMS,
+            so the trust ratio ``||p||/||u_lr1|| == RMS(p)``); the seed is
+            ``s_init_rel * RMS(p)``, landing the initial effective LR at a
+            data-relative scale instead of ramping there over ~100 steps. Pass a
+            float to pin a fixed seed (e.g. ``1e-8`` for very long runs).
+        s_init_rel: the multiplier on the param RMS for the ``s_init="auto"`` seed.
+            Default ``3e-3``. Larger seeds higher (refines down); smaller seeds lower.
+        scale_floor_frac: floor the effective ``sum(s)`` at ``scale_floor_frac`` times
+            its running max, so the discovered LR cannot collapse/stall once it has
+            grown. Default ``0.5``. Set ``0`` to disable the floor.
+        scale_cap: hard cap on the effective ``sum(s)`` (the discovered LR). Default
+            ``"auto"`` — set on the first step to ``scale_cap_rel`` times the
+            data-relative seed, so the ceiling tracks the problem's LR scale. **This
+            is the load-bearing stability fix**: on short DDPM horizons the Mechanic
+            scale is prone to a large transient spike (measured: it tries to run to
+            ~1e-2 while the operating LR is ~5e-4); the cap converts that spike into a
+            robust ceiling near the operating LR, removing the seed-dependent
+            divergence. Pass a fixed float to pin a manual ceiling, or ``None`` to
+            disable (reproduces the unstable iteration-1 behavior).
+        scale_cap_rel: multiplier on the seed for the ``scale_cap="auto"`` ceiling.
+            Default ``6.0`` (lands the cap at ~6x the seed, near the swept-optimal LR
+            on the measured DDPM). Lower for a more conservative ceiling; this is the
+            main knob for the auto cap.
         betas: tuner recency horizons (the 6 Mechanic betas), summed into the LR.
         s_decay: Mechanic's ``lambda`` weight-decay-esque tuner term (default
             ``0.01``). Set ``0`` to disable.
@@ -138,6 +160,10 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
             Default ``0.02``.
         lr_freeze_patience: for ``lr_freeze="auto"`` — consecutive plateau steps
             required to trigger the freeze. Default ``50``.
+        lr_freeze_max_frac: for ``lr_freeze="auto"`` — a step only counts toward the
+            plateau when ``sum(s)`` is also at least this fraction of its running max,
+            so a transient DIP (sum(s) flat but well below its peak) does not trigger
+            an early freeze. Default ``0.9``. Set ``0`` to disable the near-max guard.
         adafusion_betas: the inner Adafusion's ``(beta1, beta2)`` momentum /
             second-moment EMAs. Distinct from this class's tuner ``betas`` (which is
             shadowed by the keyword above, so this is the *only* way to set the base
@@ -160,25 +186,40 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         params: Iterable[Any],
         lr: float = 1.0,
         *,
-        s_init: float = 1e-4,
+        s_init: float | Literal["auto"] = "auto",
+        s_init_rel: float = 3e-3,
         betas: tuple[float, ...] = _DEFAULT_BETAS,
         s_decay: float = 0.01,
         eps: float = 1e-8,
         store_delta: bool = False,
+        scale_floor_frac: float = 0.5,
+        scale_cap: float | Literal["auto"] | None = "auto",
+        scale_cap_rel: float = 6.0,
         lr_freeze: int | Literal["auto"] | None = None,
         lr_freeze_tol: float = 0.02,
         lr_freeze_patience: int = 50,
+        lr_freeze_max_frac: float = 0.9,
         adafusion_betas: tuple[float, float] = (0.0, 0.999),
         **adafusion_kwargs: Any,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"lr must be >= 0, got {lr}")
-        if s_init <= 0.0:
-            raise ValueError(f"s_init must be > 0, got {s_init}")
+        if s_init != "auto" and not s_init > 0.0:
+            raise ValueError(f"s_init must be > 0 or 'auto', got {s_init!r}")
+        if not s_init_rel > 0.0:
+            raise ValueError(f"s_init_rel must be > 0, got {s_init_rel}")
         if not all(0.0 < b < 1.0 for b in betas):
             raise ValueError(f"all tuner betas must be in (0, 1), got {betas}")
         if s_decay < 0.0:
             raise ValueError(f"s_decay must be >= 0, got {s_decay}")
+        if not 0.0 <= scale_floor_frac < 1.0:
+            raise ValueError(f"scale_floor_frac must be in [0, 1), got {scale_floor_frac}")
+        if scale_cap is not None and scale_cap != "auto" and not scale_cap > 0.0:
+            raise ValueError(f"scale_cap must be > 0, 'auto', or None, got {scale_cap!r}")
+        if not scale_cap_rel > 0.0:
+            raise ValueError(f"scale_cap_rel must be > 0, got {scale_cap_rel}")
+        if not 0.0 <= lr_freeze_max_frac <= 1.0:
+            raise ValueError(f"lr_freeze_max_frac must be in [0, 1], got {lr_freeze_max_frac}")
         if (
             lr_freeze is not None
             and lr_freeze != "auto"
@@ -203,19 +244,42 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
 
         self._lr = float(lr)
         self._betas = torch.tensor(betas, dtype=torch.float32)
-        self._s_init = float(s_init)
+        # s_init: a fixed float, or "auto" (data-relative LARS-style seed set on the
+        # first step from the param RMS — Adafusion's lr=1 update is unit-RMS, so the
+        # trust ratio ||p||/||u_lr1|| == RMS(p); seed = s_init_rel * RMS(p)).
+        self._s_init_auto = s_init == "auto"
+        self._s_init = 0.0 if self._s_init_auto else float(s_init)
+        self._s_init_rel = float(s_init_rel)
         self._s_decay = float(s_decay)
         self._eps = float(eps)
         self._store_delta = store_delta
+
+        # Scale floor/cap: clamp the effective sum(s) to
+        # [scale_floor_frac * running_max, scale_cap]. Floor (relative to the running
+        # max) stops a collapse/stall; cap stops a runaway spike.
+        self._scale_floor_frac = float(scale_floor_frac)
+        # scale_cap: a fixed float, None (no cap), or "auto" — set on the first step
+        # to scale_cap_rel * (data-relative seed), so the cap tracks the problem's LR
+        # scale (the seed is itself data-relative). The Mechanic scale on a short
+        # horizon is prone to a large transient spike; the cap converts that into a
+        # robust ceiling near the operating LR.
+        self._scale_cap_auto = scale_cap == "auto"
+        self._scale_cap = None if scale_cap in (None, "auto") else float(scale_cap)
+        self._scale_cap_rel = float(scale_cap_rel)
+        self._s_sum_max = 0.0  # running max of the effective sum(s)
 
         # Freeze ("become Adafusion") config + bookkeeping.
         self._lr_freeze = lr_freeze
         self._lr_freeze_tol = float(lr_freeze_tol)
         self._lr_freeze_patience = int(lr_freeze_patience)
+        self._lr_freeze_max_frac = float(lr_freeze_max_frac)
         self._frozen = False
         self._frozen_lr: float | None = None
         self._plateau_count = 0
         self._prev_s_sum: float | None = None
+        # The last *effective* sum(s) actually applied to params (after floor/cap).
+        # Used at freeze so the folded base lr matches the trajectory the model walks.
+        self._last_eff_s_sum: float = 0.0
 
         # Tuner state (lives on CPU until first step pins it to the param device).
         n = len(betas)
@@ -223,7 +287,9 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
             "s": torch.zeros(n, dtype=torch.float32),
             "v": torch.zeros(n, dtype=torch.float32),          # sum of squared h
             "reward": torch.zeros(n, dtype=torch.float32),     # r
-            "max_product": torch.zeros(n, dtype=torch.float32),  # m
+            # m floored at 1e-6 (matches the reference impl), so the wealth seed is
+            # non-degenerate even if the first-step inner product happens to be ~0.
+            "max_product": torch.full((n,), 1e-6, dtype=torch.float32),  # m
             "iter": 0,
             "ref": {},     # p -> reference (start) value
             "delta": {},   # p -> accumulated base-update displacement (store_delta)
@@ -231,10 +297,13 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
 
     # -- introspection -----------------------------------------------------
     def get_d(self) -> float:
-        """Discovered effective learning rate (``lr * sum(s)``, or frozen LR)."""
+        """Discovered effective learning rate (the floor/cap-clamped ``lr * sum(s)``
+        actually applied to params, or the frozen LR)."""
         if self._frozen:
             return float(self._frozen_lr)  # type: ignore[arg-type]
-        return self._lr * float(self._mech["s"].sum().item())
+        if self._mech["iter"] == 0:
+            return self._lr * float(self._mech["s"].sum().item())
+        return self._last_eff_s_sum
 
     def get_s(self) -> torch.Tensor:
         """Per-beta scale vector (CPU copy)."""
@@ -258,9 +327,12 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
 
         Adafusion's update is linear in ``lr``, so running the base at
         ``lr = sum(s)`` reproduces the frozen ``p = ref + sum(s)·Delta`` trajectory
-        exactly (up to unbiased bf16/SR rounding) — see module docstring.
+        exactly (up to unbiased bf16/SR rounding) — see module docstring. We freeze
+        at the *effective* (floor/cap-clamped) sum(s) the model is actually walking
+        at, so the handoff stays exact even when the floor/cap engaged on the last
+        step.
         """
-        s_sum = max(self._lr * float(self._mech["s"].sum().item()), 0.0)
+        s_sum = max(self._last_eff_s_sum, 0.0)
         self._frozen_lr = s_sum
         for group in self.param_groups:
             group["lr"] = s_sum
@@ -278,9 +350,14 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
             return
         if self._lr_freeze == "auto":
             prev = self._prev_s_sum
+            # A step counts toward the plateau only if sum(s) is BOTH flat (rel change
+            # below tol) AND near its running max (>= max_frac * running_max). The
+            # near-max guard prevents an early freeze on a transient DIP (iter-1: the
+            # plain flatness test froze on noisy transients before the scale settled).
+            near_max = s_sum >= self._lr_freeze_max_frac * self._s_sum_max
             if prev is not None and prev > 0.0:
                 rel = abs(s_sum - prev) / prev
-                if rel < self._lr_freeze_tol:
+                if rel < self._lr_freeze_tol and near_max:
                     self._plateau_count += 1
                 else:
                     self._plateau_count = 0
@@ -331,6 +408,25 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
             for k in ("s", "v", "reward", "max_product"):
                 mech[k] = mech[k].to(dev)
             betas = self._betas = betas.to(dev)
+            # Data-relative (LARS-style) seed: Adafusion's lr=1 update is unit-RMS,
+            # so the trust ratio ||p|| / ||u_lr1|| == RMS(p). Seeding s_init from the
+            # global param RMS lands the *initial* effective LR at a data-relative
+            # scale instead of a fixed 1e-8/1e-4 that has to ramp there over ~100
+            # steps (short-horizon bias). The tuner then refines from a good seed.
+            if self._s_init_auto:
+                sq = 0.0
+                cnt = 0
+                for p in prev:
+                    pf = prev[p].float()
+                    sq = sq + (pf * pf).sum()
+                    cnt += pf.numel()
+                rms = float((sq / max(cnt, 1)) ** 0.5) if cnt else 0.0
+                self._s_init = max(self._s_init_rel * rms, 1e-8)
+            # Auto cap: a fixed multiple of the seed (which is itself data-relative
+            # under s_init="auto"), so the ceiling tracks the problem's LR scale.
+            # Needs the seed, so it runs after the seed is resolved.
+            if self._scale_cap_auto:
+                self._scale_cap = self._scale_cap_rel * max(self._s_init, 1e-8)
 
         # 2) run the base Adafusion step (the real normalize-then-momentum update
         #    at lr=1). u_t = p_after - p_before is the base update vector.
@@ -338,6 +434,11 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
 
         s = mech["s"]
         s_sum = float(s.sum().item())
+        # For the store_delta=False reconstruction we must undo the *effective*
+        # (floor/cap-clamped) scale actually applied last step, which equals
+        # _last_eff_s_sum (== raw sum(s) when no clamp engaged). On the very first
+        # step ref==prev so the displacement is 0 regardless of the denominator.
+        prev_eff_s_sum = self._last_eff_s_sum
 
         # 3) global norms for the Mechanic weight-decay-esque term (paper Alg.1
         #    line 10). (a*b).sum() everywhere (CUDA SIGFPE on torch.dot here).
@@ -365,7 +466,7 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
                     delta = mech["delta"][p]
                     delta.add_(u)
                 else:
-                    delta = (prev[p].float() - ref.float()) / (s_sum + self._eps)
+                    delta = (prev[p].float() - ref.float()) / (prev_eff_s_sum + self._eps)
                     delta = delta.add_(u)
                 deltas[p] = delta
                 g = grads[p].float()
@@ -392,8 +493,19 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         wealth = self._s_init * m / betas.numel() + reward
         s.copy_(wealth / (torch.sqrt(v) + self._eps))
 
-        # 6) set p = ref + lr * sum(s) * Delta_t.
+        # 6) set p = ref + lr * sum(s) * Delta_t, with a floor/cap on the effective
+        #    scale: clamp sum(s) to [floor_frac * running_max, cap]. The running-max
+        #    floor stops a collapse/stall (seed-0); the cap stops a runaway spike
+        #    (seed-1). The floor only engages once the scale has grown (running max),
+        #    so it never inflates the legitimate early bootstrap.
         new_s_sum = max(float(s.sum().item()) * self._lr, 0.0)
+        if self._scale_cap is not None and new_s_sum > self._scale_cap:
+            new_s_sum = self._scale_cap
+        self._s_sum_max = max(self._s_sum_max, new_s_sum)
+        floor = self._scale_floor_frac * self._s_sum_max
+        if new_s_sum < floor:
+            new_s_sum = floor
+        self._last_eff_s_sum = new_s_sum
         for p, delta in deltas.items():
             ref = mech["ref"][p]
             p.copy_((ref.float() + new_s_sum * delta).to(p.dtype))

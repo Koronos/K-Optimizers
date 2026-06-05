@@ -204,3 +204,151 @@ def test_frozen_step_delegates_to_base() -> None:
     base_fork.step()    # plain Adafusion at lr=S
     assert torch.equal(p.detach(), p_fork.detach()), "frozen step != Adafusion(lr=S) step"
     assert opt._mech["iter"] == iters_before, "frozen step must not advance the tuner"
+
+
+# ----------------------- iteration-2: LR-discovery quality -----------------------
+def test_auto_s_init_is_data_relative() -> None:
+    """s_init='auto' seeds the initial effective LR at s_init_rel * RMS(p).
+
+    Adafusion's lr=1 update is unit-RMS, so the LARS trust ratio ||p||/||u_lr1|| ==
+    RMS(p); the auto seed lands the step-1 effective LR at s_init_rel * RMS(p).
+    """
+    torch.manual_seed(0)
+    w = torch.randn(64, 64)
+    target = torch.randn(64, 64)
+    x = torch.nn.Parameter(torch.randn(64, 64) * 0.1)  # RMS(p) ~ 0.1
+    rms = x.detach().pow(2).mean().sqrt().item()
+    opt = AdaptiveAdafusion([x], s_init="auto", s_init_rel=3e-3)
+    opt.zero_grad()
+    ((w @ x - target) ** 2).mean().backward()
+    opt.step()
+    assert abs(opt.get_d() - 3e-3 * rms) < 1e-5, (
+        f"auto seed should be 3e-3 * RMS(p)={3e-3 * rms:.2e}, got {opt.get_d():.2e}"
+    )
+
+
+def test_auto_s_init_and_cap_are_default() -> None:
+    """The defaults are s_init='auto' (data-relative) and scale_cap='auto'."""
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = AdaptiveAdafusion([p])
+    assert opt._s_init_auto is True
+    assert opt._scale_cap_auto is True
+
+
+def test_auto_cap_is_multiple_of_seed() -> None:
+    """scale_cap='auto' resolves on step 1 to scale_cap_rel * the data-relative seed,
+    so the ceiling tracks the problem's LR scale."""
+    torch.manual_seed(0)
+    w = torch.randn(64, 64)
+    target = torch.randn(64, 64)
+    x = torch.nn.Parameter(torch.randn(64, 64) * 0.1)
+    opt = AdaptiveAdafusion(
+        [x], s_init="auto", s_init_rel=3e-3, scale_cap="auto", scale_cap_rel=6.0,
+    )
+    opt.zero_grad()
+    ((w @ x - target) ** 2).mean().backward()
+    opt.step()
+    assert abs(opt._scale_cap - 6.0 * opt._s_init) < 1e-12
+    # and the discovered LR can never exceed it
+    for _ in range(50):
+        opt.zero_grad()
+        ((w @ x - target) ** 2).mean().backward()
+        opt.step()
+        assert opt.get_d() <= opt._scale_cap + 1e-9
+
+
+def test_scale_cap_clamps_lr() -> None:
+    """scale_cap is a hard ceiling on the discovered effective LR."""
+    torch.manual_seed(1)
+    w = torch.randn(64, 64)
+    target = torch.randn(64, 64)
+    x = torch.nn.Parameter(torch.randn(64, 64) * 0.1)
+    opt = AdaptiveAdafusion([x], s_init=1e-3, scale_cap=5e-3, scale_floor_frac=0.0)
+    seen = []
+    for _ in range(40):
+        opt.zero_grad()
+        ((w @ x - target) ** 2).mean().backward()
+        opt.step()
+        seen.append(opt.get_d())
+    assert max(seen) <= 5e-3 + 1e-9, f"cap should hold; max LR seen {max(seen):.3e}"
+
+
+def test_scale_floor_prevents_collapse() -> None:
+    """Once the effective LR has grown, the floor stops it collapsing below
+    scale_floor_frac of its running max."""
+    torch.manual_seed(2)
+    w = torch.randn(48, 48)
+    target = torch.randn(48, 48)
+    x = torch.nn.Parameter(torch.randn(48, 48) * 0.1)
+    opt = AdaptiveAdafusion([x], s_init=1e-3, scale_floor_frac=0.5)
+    seen = []
+    for _ in range(60):
+        opt.zero_grad()
+        ((w @ x - target) ** 2).mean().backward()
+        opt.step()
+        seen.append(opt.get_d())
+    peak = max(seen)
+    post_peak_min = min(seen[seen.index(peak):])
+    assert post_peak_min >= 0.5 * peak - 1e-9, (
+        f"floor breached: post-peak min {post_peak_min:.3e} < 0.5*peak {0.5 * peak:.3e}"
+    )
+
+
+def test_floor_does_not_inflate_bootstrap() -> None:
+    """The floor is relative to the RUNNING max, so the legitimate early ramp-up of
+    the scale is never inflated (the floor only tracks what has already been seen)."""
+    torch.manual_seed(0)
+    w = torch.randn(32, 32)
+    target = torch.randn(32, 32)
+    x = torch.nn.Parameter(torch.zeros(32, 32))
+    opt = AdaptiveAdafusion([x], s_init=1e-6, scale_floor_frac=0.5, scale_cap=None)
+    prev = 0.0
+    for i in range(20):
+        opt.zero_grad()
+        ((w @ x - target) ** 2).mean().backward()
+        opt.step()
+        d = opt.get_d()
+        # while monotonically rising, d should equal the raw sum(s) (floor == d itself)
+        if d >= prev:
+            assert abs(d - opt._mech["s"].sum().item()) < 1e-9 or i == 0
+        prev = d
+
+
+def test_freeze_exact_after_cap() -> None:
+    """Freeze folds the EFFECTIVE (capped) sum(s) into the base lr, so the handoff is
+    byte-exact even when the cap engaged on the last pre-freeze step."""
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(12, 12))
+    opt = AdaptiveAdafusion(
+        [p], s_init=1e-2, scale_cap=2e-3, lr_freeze=5,
+        momentum_dtype="float32", bf16_method="none",
+    )
+    for _ in range(6):
+        p.grad = torch.randn_like(p)
+        opt.step()
+    assert opt.is_frozen()
+    # frozen lr must equal the capped value, not the (larger) raw sum(s)
+    assert opt.frozen_lr <= 2e-3 + 1e-9
+    assert opt.param_groups[0]["lr"] == opt.frozen_lr
+
+
+def test_hardened_auto_freeze_waits_for_near_max() -> None:
+    """lr_freeze_max_frac: a flat-but-low (transient-dip) scale must NOT freeze; the
+    scale has to be near its running max as well as flat."""
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = AdaptiveAdafusion(
+        [p], lr_freeze="auto", lr_freeze_tol=0.5,
+        lr_freeze_patience=3, lr_freeze_max_frac=0.9,
+    )
+    # Establish a running max well above the current scale, then feed flat low values.
+    opt._s_sum_max = 1.0
+    opt._prev_s_sum = 0.1
+    for _ in range(10):
+        # s_sum stays flat at 0.1 (rel change 0) but is only 0.1 of the max -> no freeze
+        opt._maybe_freeze(0.1, 100)
+    assert not opt.is_frozen(), "flat-but-low scale must not trigger the freeze"
+    # Now near the max and flat -> should freeze within patience steps.
+    opt._s_sum_max = 0.1
+    for _ in range(5):
+        opt._maybe_freeze(0.1, 100)
+    assert opt.is_frozen(), "flat AND near-max scale should freeze"
