@@ -209,6 +209,70 @@ ending on detail essential; small-only can't do detail) is clear and matches pra
 treat the magnitudes as illustrative. (Contrast with §5: scheduling *batch size* for
 the same "general→detail" goal did not work — resolution is the right knob.)
 
+## 7. Combining all three: resolution curriculum + memory-coupled batch + per-tier LR
+
+The natural next question: **stack §5 + §6** — a resolution curriculum (§6) where each
+tier also rides the memory→batch trade (§2) under one schedule (§5). Coarse/cheap tiers
+afford a big batch; the expensive high-res tier is forced to a small batch (large
+latents), exactly the diffusion reality. Same high-freq 64² data, eval @64², 2 seeds.
+Tier plan `(res, micro_bs, accum, n_steps)`; `eff = micro_bs·accum`; LR per tier
+`= lr_peak·cos(p_tier)·√(eff/16)`.
+
+| config | tier plan | **val @64²** | wall | peak px/step |
+|---|---|---|---|---|
+| `fullres_big_ceil` (ceiling) | bs16 @64², 600 st | **0.0610** | 7.4 s | 65536 |
+| **`combined_accum`** | 16²·bs64 → 32²·bs16 → 64²·bs4×**accum4** | **0.0630** | 16.1 s | **16384** |
+| `fullres_small_ptc` | bs4 @64², 600 st | 0.0735 | 7.4 s | 16384 |
+| `combined_pertier` | 16²·bs64 → 32²·bs16 → 64²·bs4 (no accum) | 0.0780 | 7.3 s | 16384 |
+
+**The LR schedule is again decisive — and the first attempt failed for exactly that
+reason.** A naive *global* cosine over the whole run scored **0.0894 (worst of all)**:
+the LR decayed to ≈0 right as the expensive high-res detail tier began, starving the
+phase that actually learns the fine detail. The fix is a **per-tier cosine (warm
+restart)** so every resolution tier — especially the final high-res one — gets the full
+LR. This single change moved the combined design from worst (0.089) to near-ceiling
+(0.063).
+
+What the corrected numbers say about *which* lever matters:
+
+- **The combined design DOES reach the ceiling — but its payoff is peak memory, not
+  speed.** `combined_accum` lands at 0.0630 vs the 0.0610 big-batch ceiling (within 3%)
+  while peaking at **1/4 the activation memory** (16384 vs 65536 px/step). That is the
+  real win: *big-batch quality at small-batch VRAM.* The cost is wall-clock — 16.1 s vs
+  7.4 s (~2.2×), because accumulation runs `accum`× the fwd/bwd per optimizer step (same
+  total compute as the real big batch, with no kernel-batching speedup). It is a
+  **memory↔time trade**, not a free lunch.
+- **The effective batch at the final high-res tier is the lever — not the curriculum
+  itself.** `combined_pertier` (same curriculum, same per-tier cosine, but bs4 / no
+  accum at high-res) scores 0.0780 — *worse* than simply training bs4 at full
+  resolution throughout (`fullres_small_ptc`, 0.0735). On this proxy the cheap low-res
+  warm-up tiers don't pay for themselves; what closes the gap to the ceiling is raising
+  the **effective batch in the high-res tier** (accum4 → eff16), which `combined_accum`
+  does and `combined_pertier` does not.
+
+**So, "the best way to combine them" (answer to the design question):**
+1. **LR — per-tier cosine / warm restart, scaled by `√(eff_batch)`.** A single global
+   schedule kills the final detail phase; restart the cosine each tier so high-res gets
+   full LR (this was the difference between 0.089 and 0.063).
+2. **Resolution — small→large** (§6), ending on the detail target. Cheap and correct in
+   direction, but on this small proxy it added little on its own.
+3. **Batch/memory — the operative knob is a *large effective batch at the final
+   high-res tier*.** When VRAM forbids a real big batch there (large latents),
+   **gradient accumulation recovers ~the big-batch ceiling at small-batch peak memory**
+   — paid for in wall-clock.
+
+Net: the trio works and is genuinely useful **when you are VRAM-bound at high
+resolution** (you buy ceiling-quality detail at a fraction of the activation memory).
+If VRAM is *not* the constraint, just use the big batch at the target resolution — it
+hits the same quality faster. The curriculum and the per-tier schedule are enablers of
+the memory play, not independent quality wins on this task.
+
+Caveat: synthetic 64² task, conv U-Net, 2 seeds, AdaMuon-only — directional, not a
+magnitude benchmark. The robust, reusable findings are *(a)* never let a global
+schedule starve the final high-res tier (per-tier restart), and *(b)* accumulation is
+how you reach the high-res effective-batch ceiling under a VRAM cap, trading wall-clock
+for memory.
+
 ## Bottom line (all of the above)
 
 - **Warmup (§1):** AdaMuon doesn't need it — the orthogonalization caps the update
@@ -229,3 +293,11 @@ the same "general→detail" goal did not work — resolution is the right knob.)
   `small→large` (ending on high-res) nearly matches the high-res ceiling with half the
   expensive steps; ending on low-res erases detail. Do general→detail via resolution,
   not batch.
+- **All three combined (§7):** stacking curriculum + per-tier `√batch` LR + memory-coupled
+  batch reaches **within 3% of the big-batch ceiling at 1/4 the peak activation memory** —
+  but the payoff is *memory, not speed* (accumulation pays it back in ~2.2× wall-clock).
+  Two load-bearing rules: use a **per-tier cosine (warm restart)** so a global schedule
+  doesn't starve the final high-res tier (the difference between 0.089 and 0.063), and the
+  operative knob is the **effective batch at that high-res tier** (via accumulation under a
+  VRAM cap) — the curriculum alone added little. Worth it precisely when you're VRAM-bound
+  at high resolution.
