@@ -92,6 +92,7 @@ Based on Mechanic by Ashok Cutkosky, Aaron Defazio & Harsh Mehta
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable
 from typing import Any, Literal
 
@@ -215,16 +216,20 @@ class Autofusion(torch.optim.Optimizer):
             and (not isinstance(lr_freeze, int) or lr_freeze < 1)
         ):
             raise ValueError(f"lr_freeze must be None, 'auto', or an int >= 1, got {lr_freeze!r}")
-        # We deliberately do NOT call super().__init__ with our own defaults: this
-        # class owns no per-parameter optimizer state beyond ref, which we
-        # manage in self._mech. The param_groups are the base Adafusion's.
         param_list = list(params)
         # The base optimizer holds the param_groups and does the real update at
         # lr=1.0 (the Mechanic scale is applied by THIS class, on top) until freeze,
         # after which its lr is set to the frozen scale and it runs alone.
         self.base = Adafusion(param_list, lr=1.0, betas=adafusion_betas, **adafusion_kwargs)
+        # Register as a *proper* torch Optimizer (step/state-dict hooks, _step_count,
+        # profiling) so external machinery attaches cleanly: LR schedulers (e.g. a
+        # CosineAnnealingLR for the post-freeze decay) and accelerate/deepspeed step
+        # hooks. We then SHARE the base Adafusion's param_groups/state/defaults so
+        # there is a single source of truth — the LR a scheduler writes lands on the
+        # base that does the update, and opt.state introspection sees the base state.
+        super().__init__(param_list, {"lr": 1.0})
         self.param_groups = self.base.param_groups
-        self.state = self.base.state  # share so opt.state introspection sees both
+        self.state = self.base.state
         self.defaults = self.base.defaults
 
         self._lr = float(lr)
@@ -309,6 +314,81 @@ class Autofusion(torch.optim.Optimizer):
     def zero_grad(self, set_to_none: bool = True) -> None:  # noqa: FBT001, FBT002
         self.base.zero_grad(set_to_none=set_to_none)
 
+    # -- checkpointing -----------------------------------------------------
+    def state_dict(self) -> dict[str, Any]:
+        """Full state: base Adafusion + the Mechanic tuner + freeze bookkeeping.
+
+        Without serializing the tuner state, a checkpoint taken mid-warmup would
+        cold-start the LR adaptation on resume, and a *frozen* optimizer would
+        un-freeze and re-warmup (a disruptive LR change mid-training). The
+        per-parameter ``ref`` points are stored in **stable param order** (not
+        keyed by Tensor identity, which does not survive (de)serialization).
+        """
+        params = [p for g in self.param_groups for p in g["params"]]
+        index = {p: i for i, p in enumerate(params)}
+        ref_list: list[Tensor | None] = [None] * len(params)
+        for p, r in self._mech["ref"].items():
+            ref_list[index[p]] = r.detach().clone()
+        return {
+            # deepcopy: torch's Optimizer.state_dict() returns LIVE references to
+            # the base's state tensors (row/col, momentum), and load_state_dict does
+            # NOT copy them when dtype/device match. Without this clone, a checkpoint
+            # taken then continued (the original keeps training, a second optimizer
+            # loads the dict) would SHARE the base state tensors — the original's
+            # in-place EMA update would corrupt the loaded optimizer's state. Snapshot.
+            "base": copy.deepcopy(self.base.state_dict()),
+            "mech": {
+                "s": self._mech["s"].detach().clone(),
+                "v": self._mech["v"].detach().clone(),
+                "reward": self._mech["reward"].detach().clone(),
+                "max_product": self._mech["max_product"].detach().clone(),
+                "iter": self._mech["iter"],
+                "ref": ref_list,
+            },
+            "frozen": self._frozen,
+            "frozen_lr": self._frozen_lr,
+            "s_init": self._s_init,
+            "scale_cap": self._scale_cap,
+            "s_sum_max": self._s_sum_max,
+            "last_eff_s_sum": self._last_eff_s_sum,
+            "plateau_count": self._plateau_count,
+            "prev_s_sum": self._prev_s_sum,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore state produced by :meth:`state_dict` (tuner + freeze included)."""
+        self.base.load_state_dict(state_dict["base"])
+        # base.load_state_dict may rebuild its containers — re-point the shared views.
+        self.param_groups = self.base.param_groups
+        self.state = self.base.state
+        self.defaults = self.base.defaults
+
+        params = [p for g in self.param_groups for p in g["params"]]
+        dev = params[0].device if params else torch.device("cpu")
+        m = state_dict["mech"]
+        self._mech["s"] = m["s"].to(dev)
+        self._mech["v"] = m["v"].to(dev)
+        self._mech["reward"] = m["reward"].to(dev)
+        self._mech["max_product"] = m["max_product"].to(dev)
+        self._mech["iter"] = int(m["iter"])
+        ref: dict[Tensor, Tensor] = {}
+        for i, r in enumerate(m["ref"]):
+            if r is not None:
+                ref[params[i]] = r.to(params[i].device)
+        self._mech["ref"] = ref
+        # betas was moved to the param device on the first step; keep it consistent
+        # so a mid-warmup resume (iter>0, which skips the first-step device pin) works.
+        self._betas = self._betas.to(dev)
+
+        self._frozen = bool(state_dict["frozen"])
+        self._frozen_lr = state_dict["frozen_lr"]
+        self._s_init = float(state_dict["s_init"])
+        self._scale_cap = state_dict["scale_cap"]
+        self._s_sum_max = float(state_dict["s_sum_max"])
+        self._last_eff_s_sum = float(state_dict["last_eff_s_sum"])
+        self._plateau_count = int(state_dict["plateau_count"])
+        self._prev_s_sum = state_dict["prev_s_sum"]
+
     # -- freeze ------------------------------------------------------------
     def _freeze(self) -> None:
         """Stop adapting: fold ``sum(s)`` into the base lr and free Mechanic state.
@@ -389,13 +469,16 @@ class Autofusion(torch.optim.Optimizer):
         # g + decay (decay only if s_decay != 0); decay uses the global grad/param
         # norms (paper Alg.1 line 10). Compute the norms with foreach reductions.
         if self._s_decay != 0.0:
+            # fp32 view of the params, computed ONCE and reused for both the
+            # param-norm (decay denominator) and the decay add below (was cast 3x
+            # per step — wasted launches on LoRA-shaped many-tiny-tensor models).
+            pf = [p.detach().float() for p in ps]
             gsq = torch._foreach_mul(gs, gs)
-            psq = torch._foreach_mul([p.detach().float() for p in ps], [p.detach().float() for p in ps])
+            psq = torch._foreach_mul(pf, pf)
             grad_norm = torch.sqrt(torch.stack([t.sum() for t in gsq]).sum())
             param_norm = torch.sqrt(torch.stack([t.sum() for t in psq]).sum())
             coef = float(self._s_decay * s_sum * grad_norm / (param_norm + self._eps))
             # g + decay where decay = coef * p ; batched scaled add.
-            pf = [p.detach().float() for p in ps]
             gplus = torch._foreach_add(gs, pf, alpha=coef)
         else:
             gplus = gs
@@ -565,19 +648,6 @@ class Autofusion(torch.optim.Optimizer):
         # 7) decide whether to freeze (and become plain Adafusion) for next step.
         self._maybe_freeze(new_s_sum, mech["iter"])
         return loss
-
-    # -- state dict (delegate to base; tuner state is small) ---------------
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "base": self.base.state_dict(),
-            "frozen": self._frozen,
-            "frozen_lr": self._frozen_lr,
-        }
-
-    def load_state_dict(self, sd: dict[str, Any]) -> None:
-        self.base.load_state_dict(sd["base"])
-        self._frozen = sd.get("frozen", False)
-        self._frozen_lr = sd.get("frozen_lr")
 
 
 # Back-compat aliases: the optimizer shipped earlier as ``AdaptiveAdafusion`` and,

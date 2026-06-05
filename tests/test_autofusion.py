@@ -480,3 +480,84 @@ def test_behavior_identical_to_old_defaults() -> None:
         assert abs(o_fe.get_d() - o_loop.get_d()) < 1e-6
         for pa, pb in zip(a, b, strict=True):
             assert torch.allclose(pa, pb, atol=1e-5, rtol=1e-5)
+
+
+def test_state_dict_resume_mid_warmup() -> None:
+    """A checkpoint taken mid-warmup resumes the tuner EXACTLY (no cold-start).
+
+    If the tuner state (s/v/reward/max_product/ref/seeds) were not serialized,
+    the resumed optimizer would re-bootstrap the LR and diverge.
+    """
+    torch.manual_seed(0)
+    p_ref = torch.randn(8, 8)
+    grads = [torch.randn(8, 8) for _ in range(10)]
+
+    a = torch.nn.Parameter(p_ref.clone())
+    opt_a = Autofusion([a], lr_freeze=None)
+    for g in grads[:5]:
+        a.grad = g.clone()
+        opt_a.step()
+    sd = opt_a.state_dict()
+
+    b = torch.nn.Parameter(a.detach().clone())
+    opt_b = Autofusion([b], lr_freeze=None)
+    opt_b.load_state_dict(sd)
+
+    for g in grads[5:]:
+        a.grad = g.clone()
+        opt_a.step()
+        b.grad = g.clone()
+        opt_b.step()
+
+    assert torch.equal(a, b), "resumed mid-warmup run must continue bit-exactly"
+    assert abs(opt_a.get_d() - opt_b.get_d()) < 1e-12
+
+
+def test_state_dict_resume_frozen() -> None:
+    """A FROZEN checkpoint resumes frozen — it does NOT un-freeze / re-warmup."""
+    torch.manual_seed(0)
+    p_ref = torch.randn(8, 8)
+    grads = [torch.randn(8, 8) for _ in range(10)]
+
+    a = torch.nn.Parameter(p_ref.clone())
+    opt_a = Autofusion([a], lr_freeze=3)  # freezes after step 3
+    for g in grads[:5]:
+        a.grad = g.clone()
+        opt_a.step()
+    assert opt_a.is_frozen()
+
+    sd = opt_a.state_dict()
+    b = torch.nn.Parameter(a.detach().clone())
+    opt_b = Autofusion([b], lr_freeze=3)
+    opt_b.load_state_dict(sd)
+    assert opt_b.is_frozen(), "a frozen checkpoint must resume frozen"
+    assert opt_b.frozen_lr == opt_a.frozen_lr
+
+    for g in grads[5:]:
+        a.grad = g.clone()
+        opt_a.step()
+        b.grad = g.clone()
+        opt_b.step()
+    assert torch.equal(a, b)
+
+
+def test_lr_scheduler_compatibility() -> None:
+    """A torch LR scheduler can wrap Autofusion and step without error.
+
+    Autofusion is a proper ``torch.optim.Optimizer`` (calls super().__init__),
+    so schedulers (e.g. CosineAnnealingLR for the post-freeze decay) attach and
+    introspect ``param_groups`` cleanly.
+    """
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = Autofusion([p], lr_freeze=3)
+    sched = CosineAnnealingLR(opt, T_max=10)
+    for _ in range(8):
+        p.grad = torch.randn(8, 8)
+        opt.step()
+        sched.step()  # must not raise
+    # after freeze the scheduler drives the (now plain-Adafusion) lr
+    assert opt.is_frozen()
+    assert len(sched.get_last_lr()) == len(opt.param_groups)

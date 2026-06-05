@@ -71,6 +71,44 @@ at the boundary introduces a one-time EMA-scale change — the post-freeze
 trajectory is still genuine Adafusion(`lr=S`), just not bit-identical to the
 pre-freeze extrapolation. Use the default `beta1 == 0` for a seamless freeze.
 
+### LR schedules after freeze (the Prodigy + Cosine pattern)
+
+`Autofusion` is a proper `torch.optim.Optimizer`, so a standard LR scheduler
+attaches to it directly. The intended pattern mirrors how parameter-free
+optimizers are usually run — *discover* the LR, then *decay* it:
+
+```python
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+opt = Autofusion(model.parameters(), lr_freeze="auto")
+sched = CosineAnnealingLR(opt, T_max=total_steps)
+
+for step in range(total_steps):
+    ...                       # loss.backward()
+    opt.step()
+    sched.step()              # ignored during warmup; shapes the LR after freeze
+    opt.zero_grad()
+```
+
+The scheduler writes `param_groups[...]["lr"]`. **During warmup that lr is
+ignored** — the Mechanic scale (`sum(s)`) drives the update — so the scheduler is
+effectively a no-op until freeze. **After freeze** the base runs alone off
+`param_groups["lr"]`, so the scheduler now shapes the discovered LR `S` (Cosine
+decays from `S` toward 0). Net effect: Autofusion finds the peak LR for you, then
+Cosine anneals it — no manual peak-LR tuning. (A scheduler that reads
+`get_last_lr()` before freeze sees the base lr, not the live Mechanic scale; use
+`get_d()` for the effective LR during warmup.)
+
+### Checkpointing
+
+`state_dict()` / `load_state_dict()` capture the **full** optimizer — the base
+Adafusion *and* the Mechanic tuner (`s`/`v`/`reward`/`max_product`/`ref`/seeds)
+*and* the freeze bookkeeping — so a checkpoint taken **mid-warmup** resumes the LR
+adaptation exactly (no cold-start re-bootstrap), and a **frozen** checkpoint
+resumes frozen (no disruptive un-freeze + re-warmup). The snapshot is independent:
+`state_dict()` deep-copies the base state, so you may keep training after taking
+one without the checkpoint aliasing the live state.
+
 ## API
 
 ```python
