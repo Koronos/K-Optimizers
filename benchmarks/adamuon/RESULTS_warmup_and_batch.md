@@ -90,12 +90,6 @@ LR_opt found by a per-batch LR sweep (fixed samples, 10% warmup + cosine):
 (The literature reports √-scaling for both optimizers; here both LR_opt curves are
 nearly flat then plateau in this small-batch range, with AdaMuon's ~5× lower.)
 
-## Bottom line
-AdaMuon is the better fit for "save memory → bigger batch → fewer steps":
-no warmup needed (more stable than AdamW), it loses less per-sample quality as batch
-grows, and its step-time penalty disappears at the larger batch. Scale LR with
-`√(batch)`, plateauing past ~bs 16–32 (rarely reached in diffusion).
-
 ## 4. Gradient accumulation = a real big batch? Does it help the noise?
 
 Accumulate N micro-batches of size B (one optimizer step per N×B samples) — the way
@@ -214,3 +208,24 @@ Caveat: tiny synthetic task, conv U-Net, 2 seeds — the *direction* (small→la
 ending on detail essential; small-only can't do detail) is clear and matches practice;
 treat the magnitudes as illustrative. (Contrast with §5: scheduling *batch size* for
 the same "general→detail" goal did not work — resolution is the right knob.)
+
+## Bottom line (all of the above)
+
+- **Warmup (§1):** AdaMuon doesn't need it — the orthogonalization caps the update
+  RMS, so it never diverges without warmup (AdamW does at high LR). Drop it, or keep a
+  tiny one out of habit.
+- **Batch size (§2–3):** bigger batch *hurts* loss per sample (a speed↔quality trade,
+  not free quality) for both optimizers; AdaMuon stays ~7–8% better at every batch and
+  its Newton-Schulz step-tax dilutes to ~tied at large batch. Scale LR ≈ `√(batch)`
+  (nearly flat in the diffusion range, plateau past ~bs 16–32). AdaMuon's LR is **~5×
+  lower** than AdamW's — don't reuse the AdamW LR.
+- **Gradient accumulation (§4):** mathematically *is* a real big batch — it de-noises
+  the gradient but carries the fewer-updates penalty; not "small-batch quality at
+  big-batch memory." Use only when you truly need the larger effective batch.
+- **Batch-size schedules (§5):** scheduling batch over training does **not** robustly
+  beat a well-tuned constant batch; the one bright corner (`incr 1→64` + √batch LR
+  coupling) only ties constant-small-batch quality at half the wall-clock.
+- **Resolution curriculum (§6):** *this* is the right "general → fine detail" lever.
+  `small→large` (ending on high-res) nearly matches the high-res ceiling with half the
+  expensive steps; ending on low-res erases detail. Do general→detail via resolution,
+  not batch.
