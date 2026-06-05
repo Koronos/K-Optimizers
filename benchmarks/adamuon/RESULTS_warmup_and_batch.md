@@ -273,6 +273,66 @@ schedule starve the final high-res tier (per-tier restart), and *(b)* accumulati
 how you reach the high-res effective-batch ceiling under a VRAM cap, trading wall-clock
 for memory.
 
+## 8. LR-schedule *shape*: stable-then-cosine (the lever §5/§7 under-weighted)
+
+§5 and §7 chased the **batch** as the knob and treated the LR schedule as a passive
+cosine. The reframing here: maybe the dynamic-batch "win" was mostly the √batch LR
+coupling (§5's own caveat), and the real lever is just **fix the batch to the largest
+that fits at the target resolution** (= the *smallest* batch, bs4@64²) and **shape the
+LR well** — specifically a *stable LR held high, then a cosine decay over the back half*
+(the trapezoid / WSD schedule). Controlled test, eval @64²: every arm swept over
+LR ∈ {6e-4, 1.2e-3, 2.4e-3}, **best-per-arm** (so the √batch confound is controlled by
+the sweep, not by a coupling term). 2 seeds, ~6.5 s wall for *all* arms (equal compute).
+
+| arm | schedule | batch / res | **val @64²** | best LR |
+|---|---|---|---|---|
+| `big_ceil` (ceiling) | cosine | bs16 @64² | **0.0601** | 2.4e-3 |
+| **`lowres_big_stable_then_cos`** | stable→cosine | curriculum→bs4@64² | **0.0689** | 2.4e-3 |
+| `hi_stable_then_cos` | stable→cosine | bs4 @64² | 0.0700 | 1.2e-3 |
+| `lowres_big_cosine` | per-tier cosine | curriculum→bs4@64² | 0.0710 | 2.4e-3 |
+| `hi_cosine` | cosine | bs4 @64² | 0.0715 | 1.2e-3 |
+| `lowres_big_const` | constant | curriculum→bs4@64² | 0.0723 | 1.2e-3 |
+| `hi_const` | constant | bs4 @64² | 0.0738 | 6e-4 |
+
+- **Schedule shape is a real ~5% lever at fixed batch.** `constant` (0.0738) < `cosine`
+  (0.0715) < **`stable→cosine`** (0.0700). Holding the LR high does the bulk of the
+  work; a short final decay lands it without burning steps ramping up from zero. This is
+  the WSD/trapezoid result, reproduced for AdaMuon on diffusion.
+- **It stacks with the resolution curriculum, and a *global* trapezoid beats §7's
+  per-tier restarts.** `curriculum + stable→cosine` (0.0689) is the best at bs4 memory —
+  better than `curriculum + per-tier cosine` (0.0710, §7's fix). Why: the high-res tier
+  occupies the *back half* of training, so a single stable→cosine holds peak LR through
+  every coarse/low-res tier and decays **exactly across the detail phase**. This
+  *generalizes* §7's "don't let the schedule starve the high-res tier": you don't need
+  per-tier warm restarts — you need the decay to land **on** the detail phase and the
+  stable-high LR to cover everything before it. (§8 supersedes §7's per-tier-cosine
+  recommendation: prefer one stable→cosine timed so its decay covers the final high-res
+  tier.)
+- **But shaping the LR does NOT replace a real big batch.** Every bs4 arm tops out at
+  ~0.069; the bs16 ceiling (0.0601) is ~13 % better at *the same wall-clock*. So
+  stable→cosine is the best you can do *at that memory*, not a substitute for the bigger
+  batch when VRAM allows it.
+- **Reconciles §5.** With the LR swept honestly (no √batch coupling), a fixed small
+  batch + stable→cosine **beats the dynamic-batch schedules** — confirming §5's caveat
+  that the `incr 1→64` headline was largely an LR-coupling artifact, not the batch
+  schedule itself.
+
+**The three operating points (pick by your constraint):**
+
+| constraint | config | val @64² | wall | peak mem |
+|---|---|---|---|---|
+| memory-bound **and** time-bound | bs4 + curriculum + **stable→cosine** | 0.0689 | ~6.5 s | bs4 |
+| memory-bound, time to spare | + grad-accum → eff-16 (§7) | 0.0630 | ~16 s | bs4 |
+| memory to spare | real **bs16** @64² + cosine | 0.0601 | ~6.5 s | bs16 |
+
+The user's stable→cosine moved the cheap-and-fast point from 0.0735 (plain cosine) to
+**0.0689** — the best return per unit of memory *and* wall-clock on this proxy.
+
+Caveat: synthetic 64² task, conv U-Net, 2 seeds, AdaMuon — directional. The robust,
+reusable takeaway: **hold the LR high and decay it (cosine) over the final/detail phase**
+beats both a constant LR and a from-zero cosine, and a single well-timed decay beats
+per-tier restarts.
+
 ## Bottom line (all of the above)
 
 - **Warmup (§1):** AdaMuon doesn't need it — the orthogonalization caps the update
@@ -296,8 +356,14 @@ for memory.
 - **All three combined (§7):** stacking curriculum + per-tier `√batch` LR + memory-coupled
   batch reaches **within 3% of the big-batch ceiling at 1/4 the peak activation memory** —
   but the payoff is *memory, not speed* (accumulation pays it back in ~2.2× wall-clock).
-  Two load-bearing rules: use a **per-tier cosine (warm restart)** so a global schedule
-  doesn't starve the final high-res tier (the difference between 0.089 and 0.063), and the
-  operative knob is the **effective batch at that high-res tier** (via accumulation under a
-  VRAM cap) — the curriculum alone added little. Worth it precisely when you're VRAM-bound
-  at high resolution.
+  The operative knob is the **effective batch at the high-res tier** (via accumulation
+  under a VRAM cap) — the curriculum alone added little. Worth it precisely when you're
+  VRAM-bound at high resolution.
+- **LR-schedule shape (§8):** the lever §5/§7 under-weighted. At fixed batch,
+  `constant` < `cosine` < **`stable→cosine`** (trapezoid/WSD) — hold the LR high, decay it
+  over the back half. It stacks with the curriculum (`curriculum + stable→cosine` = 0.0689,
+  the best at small-batch memory) and a *single* well-timed decay **beats §7's per-tier
+  restarts** (just time the decay to cover the final high-res/detail phase). This is the
+  best return per unit of memory *and* wall-clock — but it still doesn't reach a real big
+  batch (0.060) if you can afford the VRAM. Confirms §5's caveat: the dynamic-batch
+  "win" was largely the √batch LR coupling, not the batch schedule.
