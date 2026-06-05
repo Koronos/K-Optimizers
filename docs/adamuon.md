@@ -1,0 +1,138 @@
+# AdaMuon — design & API
+
+> Muon's Newton-Schulz orthogonalized momentum + an Adafactor-style **factored,
+> quantized second moment of the orthogonalized update**. Aims to beat AdamW on
+> precision at near-Adafactor memory. Separate from `Muon` (the simpler
+> heavy-ball hybrid) and from `Adafusion` (whose backend it reuses).
+
+## Why
+
+A deep-research sweep (adversarially fact-checked) found the best-evidenced
+direction for *beating* AdamW on convergence/precision without blowing up memory
+is **orthogonalized momentum (Muon) + variance adaptation (the "Ada" part)** —
+AdaMuon improves on plain Muon by adding an Adam-style second moment on the
+orthogonalized update, and that variance adaptation is the credited factor. All
+published evidence is on LLMs, not diffusion: the fine-detail-fidelity advantage
+for SDXL/Flux is the hypothesis this optimizer is built to test, not an
+established fact.
+
+AdaMuon clones ~90% of `Adafusion`'s backend (factored second moment, int8/4bit
+momentum codec, foreach batching, stochastic rounding, dtype-safe checkpointing)
+and inserts the orthogonalization.
+
+## Pipeline (and how it differs from Adafusion)
+
+`Adafusion`: factor the second moment of the **gradient** → normalize → take
+momentum of the **normalized update**.
+
+`AdaMuon` reverses the order for ≥2-D weights:
+
+1. **First moment of the RAW gradient** — `m = β1·m + (1-β1)·g`, kept quantized
+   (bf16/int8/4bit) in the shared codec.
+2. **Orthogonalize** `m` with a 5-step Newton-Schulz iteration → `O ≈ U·Vᵀ`.
+3. **Factored second moment OF `O`** (row+col EMA) → `u = O · inv_sqrt(v̂)`.
+4. **RMS scale** to a shape-independent target, then apply at `lr`.
+
+1-D params (biases, norm scales) are **not** orthogonalized — they use
+Adafusion's non-factored Adam-style path (full per-coordinate second moment, same
+quantized momentum), RMS-normalized to the same target so one `lr` governs the
+whole model.
+
+### Update-norm: why `0.2`, not `0.2·√max(R,C)`
+
+Plain Muon scales `O` (RMS `≈1/√max(R,C)`) by `0.2·√max(R,C)` for a
+shape-independent applied RMS of `0.2`. In AdaMuon the factored `inv_sqrt(v̂)`
+already brings `u` to RMS `≈1` (its `c_factor ≈ √max(R,C)`), so reapplying
+`√max(R,C)` would double-count the shape and make the update grow with layer
+size. AdaMuon therefore scales by the **constant** `0.2` only. `clip_threshold`
+(default `1.0`) is an RMS ceiling in the RMS≈1 domain — load-bearing for the first
+few steps while the factored second moment warms up, a near no-op thereafter.
+
+### Momentum semantics ≠ `Muon`
+
+`Muon` uses heavy-ball (`m = momentum·m + g`) + Nesterov; **AdaMuon uses an
+Adam-style EMA lerp** (`m = β1·m + (1-β1)·g`) — the canonical AdaMuon form, and
+what the shared codec implements (so int8/4bit momentum and bit-exact checkpoint
+resume come for free). A learning rate tuned for `Muon` will not transfer
+directly.
+
+## Memory
+
+Factored second moment (row+col, ~0) + one quantized first moment: ~2 B/param
+(bf16) / ~1 B (int8) / ~0.5 B (4bit). Adafactor-class, well under AdamW. Newton-
+Schulz runs in bf16 internally regardless of `momentum_dtype`.
+
+## API
+
+```python
+AdaMuon(
+    params, lr=2e-2, betas=(0.95, 0.999), eps=(1e-30, 1e-3), weight_decay=0.0, *,
+    ns_steps=2, clip_threshold=1.0, momentum_dtype="bfloat16",
+    momentum_4bit_block=128, cautious=True, bf16_method="stochastic_rounding",
+    foreach=True, foreach_batch_cutoff=2_000_000, foreach_stack_budget=None,
+)
+```
+
+- `lr` is Muon-scale (larger than Adam); a single `lr` covers 2-D and 1-D (all
+  normalized to applied RMS `≈0.2·lr`).
+- `betas=(β1, β2)`: `β1` first-moment EMA (`β1=0` → no momentum buffer); `β2`
+  factored second-moment decay.
+- `cautious` is **on by default** (validated): a paired pixel-DDPM sweep showed it
+  flips AdaMuon from a loss to a win vs Adafusion (~2% on all seeds). `ns_steps` is
+  **2** by default, not the LLM-standard 5 — 5 over-orthogonalizes here (slower AND
+  worse); 2 was the sweet spot (faster + better). Both re-tune per task; see the
+  evaluation note below.
+- `foreach=True` batches the step (bucketed by shape, with a batched `bmm`
+  Newton-Schulz) — the decisive win for LoRA/LoKr (hundreds of tiny 2-D weights).
+  The batched 2-D path matches the per-parameter path within bf16 NS tolerance
+  (both unbiased); 1-D buckets and all fp32 ops are bit-exact.
+
+## Checkpointing
+
+`load_state_dict` is overridden (shared `load_state_dict_preserving_dtypes`
+helper) so a quantized first moment is not silently upcast to fp32 on resume —
+preserving both the memory and bit-exact resume.
+
+## Evaluation (v1, self-contained pixel-DDPM proxy)
+
+Paired-seed A/B vs `Adafusion` (and `AdamW8bit` / `Lion8bit` / fp32 AdamW) on a
+small pixel-space DDPM (conv UNet, C=128, 3 seeds, identical init/data/noise per
+seed, LR swept per arm, held-out val MSE). Not real SDXL/Flux — a first signal.
+
+- **Defaults matter.** With the *original* defaults (`ns_steps=5`, `cautious=False`)
+  AdaMuon **lost** to Adafusion (0.0710 vs 0.0697). Two changes flipped it:
+  `cautious=True` (helps ~2%, all seeds) and `ns_steps=2` (5 over-orthogonalizes —
+  slower *and* worse). Both are now the defaults.
+- **Tuned (`ns_steps=2`, `cautious=True`, lr 1e-3) AdaMuon wins on everything that
+  matters:**
+  - convergence/step — reaches each val target in ~35 % fewer steps;
+  - convergence/wall-clock — reaches `val≤0.070` in ~7.9 s vs Adafusion ~9.6 s,
+    *despite* ~12 vs ~9.4 ms/step (faster convergence beats slower steps);
+  - final quality — floors at ~0.065 vs Adafusion's ~0.069 (which it never beats);
+  - memory — tie (2.03 B/param).
+- Comfortably beats AdamW8bit (0.0762) / Lion8bit (0.0767) / fp32 AdamW (~0.088).
+- Open work: claw back the per-step gap (lower the non-NS overhead, bf16 the
+  post-NS factored region) and re-find the sweet spot at scale.
+
+## Known caveats / to validate
+
+- All "beats AdamW" evidence is **LLM, not diffusion** — validate fine-detail
+  fidelity empirically on SDXL/Flux LoRA before claiming the result.
+- The factored second moment is computed on `O` (near-orthonormal, small
+  magnitude); its mean scale differs from gradient-based Adafusion, so re-validate
+  `clip_threshold` / `lr` on a real run rather than copying Adafusion's tuning.
+- Newton-Schulz on tiny LoRA matrices is launch-bound; the batched `bmm` path
+  mitigates it but the crossover vs `foreach=False` should be profiled per GPU.
+
+## Follow-ups (not in v1)
+
+- Schedule-free / Prodigy parameter-free LR (kill scheduler dependence for fine
+  detail) — analogous to the `Adafusion → Autofusion` relationship.
+
+## See also
+
+- [muon.md](muon.md) — the simpler heavy-ball Muon hybrid this builds on.
+- [adafusion.md](adafusion.md), [kprodigy.md](kprodigy.md),
+  [autofusion.md](autofusion.md), [foreach-batching.md](foreach-batching.md),
+  [momentum.md](momentum.md).
+```
