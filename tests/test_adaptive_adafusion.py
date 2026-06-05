@@ -352,3 +352,60 @@ def test_hardened_auto_freeze_waits_for_near_max() -> None:
     for _ in range(5):
         opt._maybe_freeze(0.1, 100)
     assert opt.is_frozen(), "flat AND near-max scale should freeze"
+
+
+# -- Phase C: batched (foreach) warmup ------------------------------------
+
+
+def _shaped_params() -> list[torch.nn.Parameter]:
+    torch.manual_seed(1)
+    return [
+        torch.nn.Parameter(torch.randn(s))
+        for s in [(8, 8), (16, 4), (3,), (5, 7), (2, 2, 2)]
+    ]
+
+
+def test_foreach_warmup_matches_per_param() -> None:
+    """foreach_warmup=True must be numerically identical (fp32 round-off) to the
+    per-param loop, across the full warmup trajectory — incl. the s_decay term
+    and with the floor/cap disabled (raw scale)."""
+    for kwargs in (
+        {"s_decay": 0.0},
+        {"s_decay": 0.01},
+        {"s_decay": 0.01, "scale_floor_frac": 0.0, "scale_cap": None},
+    ):
+        a = _shaped_params()
+        b = _shaped_params()
+        o_fe = AdaptiveAdafusion(a, lr=1.0, foreach_warmup=True, **kwargs)
+        o_loop = AdaptiveAdafusion(b, lr=1.0, foreach_warmup=False, **kwargs)
+        g = torch.Generator().manual_seed(7)
+        for _ in range(20):
+            for pa, pb in zip(a, b, strict=True):
+                grad = torch.randn(pa.shape, generator=g)
+                pa.grad = grad.clone()
+                pb.grad = grad.clone()
+            o_fe.step()
+            o_loop.step()
+            assert abs(o_fe.get_d() - o_loop.get_d()) < 1e-6
+            for pa, pb in zip(a, b, strict=True):
+                assert torch.allclose(pa, pb, atol=1e-4, rtol=1e-4)
+
+
+def test_foreach_warmup_default_on() -> None:
+    """foreach_warmup defaults to True (the fast path)."""
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = AdaptiveAdafusion([p])
+    assert opt._foreach_warmup is True
+
+
+def test_foreach_warmup_does_not_mutate_ref() -> None:
+    """The batched writeback must not alias/mutate mech['ref'] (regression: .float()
+    on an fp32 tensor returns the same tensor, so an in-place add corrupted ref)."""
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = AdaptiveAdafusion([p], foreach_warmup=True)
+    p.grad = torch.randn_like(p)
+    opt.step()
+    ref0 = opt._mech["ref"][p].clone()
+    p.grad = torch.randn_like(p)
+    opt.step()
+    assert torch.equal(opt._mech["ref"][p], ref0), "ref must stay constant across steps"

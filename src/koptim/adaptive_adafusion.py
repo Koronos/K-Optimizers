@@ -200,6 +200,7 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         lr_freeze_patience: int = 50,
         lr_freeze_max_frac: float = 0.9,
         adafusion_betas: tuple[float, float] = (0.0, 0.999),
+        foreach_warmup: bool = True,
         **adafusion_kwargs: Any,
     ) -> None:
         if lr < 0.0:
@@ -253,6 +254,13 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         self._s_decay = float(s_decay)
         self._eps = float(eps)
         self._store_delta = store_delta
+        # Phase-C: batch the wrapper's per-param warmup passes (displacement,
+        # inner-product partials, ref + S*delta writeback) with torch._foreach_*
+        # to cut the ~15x launch overhead over plain Adafusion on many small
+        # tensors (LoRA). Numerically identical to the per-param path. Disabled
+        # when store_delta=True (the explicit per-param delta buffers want the
+        # in-place add path) — falls back to the loop.
+        self._foreach_warmup = bool(foreach_warmup)
 
         # Scale floor/cap: clamp the effective sum(s) to
         # [scale_floor_frac * running_max, scale_cap]. Floor (relative to the running
@@ -368,6 +376,57 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
             if iters_done >= int(self._lr_freeze):
                 self._freeze()
 
+    # -- warmup foreach (Phase C) ------------------------------------------
+    def _warmup_foreach(
+        self,
+        plist: list[Tensor],
+        prev: dict[Tensor, Tensor],
+        grads: dict[Tensor, Tensor],
+        mech: dict[str, Any],
+        prev_eff_s_sum: float,
+        s_sum: float,
+    ) -> tuple[Tensor, dict[Tensor, Tensor]]:
+        """Batched warmup pass (store_delta=False): forms Delta_t per param and the
+        Mechanic inner product ``h = <Delta_t, g + decay>`` with ``torch._foreach_*``.
+
+        Numerically identical (fp32) to the per-param loop it replaces — it just
+        fuses the many small per-tensor kernels into multi-tensor launches, which
+        is the entire warmup-overhead win on LoRA-shaped (many tiny tensors)
+        models. The reductions for the inner product stay per-tensor (cheap vs the
+        elementwise sub/div/add) but are summed in one pass.
+        """
+        ps = plist
+        prevs = [prev[p] for p in ps]
+        refs = [mech["ref"][p] for p in ps]
+        gs = [grads[p].float() for p in ps]
+
+        # u_t = p_after - prev  (base update); delta = (prev - ref)/denom + u
+        us = torch._foreach_sub([p.detach() for p in ps], prevs)
+        us = [u.float() for u in us]
+        deltas_list = torch._foreach_sub([pv.float() for pv in prevs], [r.float() for r in refs])
+        torch._foreach_div_(deltas_list, prev_eff_s_sum + self._eps)
+        torch._foreach_add_(deltas_list, us)
+
+        # g + decay (decay only if s_decay != 0); decay uses the global grad/param
+        # norms (paper Alg.1 line 10). Compute the norms with foreach reductions.
+        if self._s_decay != 0.0:
+            gsq = torch._foreach_mul(gs, gs)
+            psq = torch._foreach_mul([p.detach().float() for p in ps], [p.detach().float() for p in ps])
+            grad_norm = torch.sqrt(torch.stack([t.sum() for t in gsq]).sum())
+            param_norm = torch.sqrt(torch.stack([t.sum() for t in psq]).sum())
+            coef = float(self._s_decay * s_sum * grad_norm / (param_norm + self._eps))
+            # g + decay where decay = coef * p ; batched scaled add.
+            pf = [p.detach().float() for p in ps]
+            gplus = torch._foreach_add(gs, pf, alpha=coef)
+        else:
+            gplus = gs
+
+        prods = torch._foreach_mul(deltas_list, gplus)
+        h = torch.stack([t.sum() for t in prods]).sum()
+
+        deltas = dict(zip(ps, deltas_list, strict=True))
+        return h, deltas
+
     # -- step --------------------------------------------------------------
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:  # noqa: C901
@@ -385,15 +444,19 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         first = mech["iter"] == 0
 
         # 1) snapshot params + clone grads (base step may mutate grads, e.g. wd),
-        #    and lazily allocate ref/delta on first sight of each param.
+        #    and lazily allocate ref/delta on first sight of each param. We also
+        #    record params in a STABLE order (`plist`) so the Phase-C foreach path
+        #    can batch the displacement/inner-product/writeback over lists.
         prev: dict[Tensor, Tensor] = {}
         grads: dict[Tensor, Tensor] = {}
+        plist: list[Tensor] = []
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 grads[p] = p.grad.detach().clone()
                 prev[p] = p.detach().clone()
+                plist.append(p)
                 if p not in mech["ref"]:
                     mech["ref"][p] = p.detach().clone()
                     if self._store_delta:
@@ -440,47 +503,51 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         # step ref==prev so the displacement is 0 regardless of the denominator.
         prev_eff_s_sum = self._last_eff_s_sum
 
-        # 3) global norms for the Mechanic weight-decay-esque term (paper Alg.1
-        #    line 10). (a*b).sum() everywhere (CUDA SIGFPE on torch.dot here).
-        grad_sq = 0.0
-        param_sq = 0.0
-        if self._s_decay != 0.0:
-            for p, g in grads.items():
-                gf = g.float()
-                grad_sq = grad_sq + (gf * gf).sum()
-                pf = p.detach().float()
-                param_sq = param_sq + (pf * pf).sum()
-            grad_norm = torch.sqrt(grad_sq) if torch.is_tensor(grad_sq) else torch.tensor(0.0)
-            param_norm = torch.sqrt(param_sq) if torch.is_tensor(param_sq) else torch.tensor(0.0)
+        use_foreach = self._foreach_warmup and not self._store_delta
 
-        # 4) form Delta_t per param and h = <Delta_t, g + decay> summed over params.
-        deltas: dict[Tensor, Tensor] = {}
-        inner = None
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p not in grads:
-                    continue
-                u = (p.detach() - prev[p]).float()  # base update u_t
-                ref = mech["ref"][p]
-                if self._store_delta:
-                    delta = mech["delta"][p]
-                    delta.add_(u)
-                else:
-                    delta = (prev[p].float() - ref.float()) / (prev_eff_s_sum + self._eps)
-                    delta = delta.add_(u)
-                deltas[p] = delta
-                g = grads[p].float()
-                if self._s_decay != 0.0:
-                    decay = (
-                        self._s_decay * p.detach().float() * s_sum
-                        * grad_norm / (param_norm + self._eps)
-                    )
-                    contrib = (delta * (g + decay)).sum()
-                else:
-                    contrib = (delta * g).sum()
-                inner = contrib if inner is None else inner + contrib
+        if use_foreach:
+            h, deltas = self._warmup_foreach(plist, prev, grads, mech, prev_eff_s_sum, s_sum)
+        else:
+            # 3) global norms for the Mechanic weight-decay-esque term (paper Alg.1
+            #    line 10). (a*b).sum() everywhere (CUDA SIGFPE on torch.dot here).
+            grad_sq = 0.0
+            param_sq = 0.0
+            if self._s_decay != 0.0:
+                for p, g in grads.items():
+                    gf = g.float()
+                    grad_sq = grad_sq + (gf * gf).sum()
+                    pf = p.detach().float()
+                    param_sq = param_sq + (pf * pf).sum()
+                grad_norm = torch.sqrt(grad_sq) if torch.is_tensor(grad_sq) else torch.tensor(0.0)
+                param_norm = torch.sqrt(param_sq) if torch.is_tensor(param_sq) else torch.tensor(0.0)
 
-        h = inner  # scalar tensor on device
+            # 4) form Delta_t per param and h = <Delta_t, g + decay> summed over params.
+            deltas = {}
+            inner = None
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p not in grads:
+                        continue
+                    u = (p.detach() - prev[p]).float()  # base update u_t
+                    ref = mech["ref"][p]
+                    if self._store_delta:
+                        delta = mech["delta"][p]
+                        delta.add_(u)
+                    else:
+                        delta = (prev[p].float() - ref.float()) / (prev_eff_s_sum + self._eps)
+                        delta = delta.add_(u)
+                    deltas[p] = delta
+                    g = grads[p].float()
+                    if self._s_decay != 0.0:
+                        decay = (
+                            self._s_decay * p.detach().float() * s_sum
+                            * grad_norm / (param_norm + self._eps)
+                        )
+                        contrib = (delta * (g + decay)).sum()
+                    else:
+                        contrib = (delta * g).sum()
+                    inner = contrib if inner is None else inner + contrib
+            h = inner  # scalar tensor on device
 
         # 5) Mechanic tuner recurrences (arXiv:2306.00144 Alg. 1, lines 11-16).
         m = mech["max_product"]
@@ -506,9 +573,20 @@ class AdaptiveAdafusion(torch.optim.Optimizer):
         if new_s_sum < floor:
             new_s_sum = floor
         self._last_eff_s_sum = new_s_sum
-        for p, delta in deltas.items():
-            ref = mech["ref"][p]
-            p.copy_((ref.float() + new_s_sum * delta).to(p.dtype))
+        if use_foreach:
+            # Batched writeback: p = ref + new_s_sum * delta (fp32 math, cast back).
+            ps = list(deltas.keys())
+            ds = list(deltas.values())
+            # NB: .float() on an already-fp32 tensor returns the SAME tensor, so we
+            # must clone to avoid the in-place add mutating mech["ref"].
+            refs_f = [mech["ref"][p].detach().float().clone() for p in ps]
+            torch._foreach_add_(refs_f, ds, alpha=new_s_sum)  # refs_f := ref + S*delta
+            for p, val in zip(ps, refs_f, strict=True):
+                p.copy_(val.to(p.dtype))
+        else:
+            for p, delta in deltas.items():
+                ref = mech["ref"][p]
+                p.copy_((ref.float() + new_s_sum * delta).to(p.dtype))
 
         mech["iter"] += 1
         # 7) decide whether to freeze (and become plain Adafusion) for next step.
