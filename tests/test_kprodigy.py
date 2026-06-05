@@ -9,6 +9,8 @@ setups.
 
 from __future__ import annotations
 
+import io
+
 import pytest
 import torch
 
@@ -303,3 +305,43 @@ def test_4bit_momentum_is_half_byte_per_param():
 
 def test_invalid_momentum_4bit_accepted():
     KProdigy([torch.zeros(1, requires_grad=True)], lr=1.0, momentum_dtype="4bit")
+
+
+@pytest.mark.parametrize("momentum_dtype", ["bfloat16", "int8", "4bit"])
+def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
+    """A torch.save/load checkpoint resumes BIT-EXACTLY, keeps the configured
+    momentum dtype, and restores the D estimate.
+
+    torch's default ``load_state_dict`` upcasts state tensors to the param's dtype
+    (fp32), silently inflating quantized momentum back to fp32 on resume.
+    ``KProdigy`` overrides ``load_state_dict`` to restore the stored dtype; the D
+    bookkeeping (``d``/``d_numerator``/...) rides along in ``param_groups``.
+    """
+    torch.manual_seed(0)
+    p_ref = torch.randn(16, 8)
+    grads = [torch.randn(16, 8) for _ in range(10)]
+
+    a = torch.nn.Parameter(p_ref.clone())
+    opt_a = KProdigy([a], lr=1.0, momentum_dtype=momentum_dtype)
+    for g in grads[:5]:
+        a.grad = g.clone()
+        opt_a.step()
+
+    buf = io.BytesIO()
+    torch.save(opt_a.state_dict(), buf)
+    buf.seek(0)
+    sd = torch.load(buf, weights_only=False)
+
+    b = torch.nn.Parameter(a.detach().clone())
+    opt_b = KProdigy([b], lr=1.0, momentum_dtype=momentum_dtype)
+    opt_b.load_state_dict(sd)
+
+    assert opt_b.state[b]["m"].dtype == opt_a.state[a]["m"].dtype
+    assert opt_b.get_d() == opt_a.get_d()  # D estimate restored (lives in param_groups)
+
+    for g in grads[5:]:
+        a.grad = g.clone()
+        opt_a.step()
+        b.grad = g.clone()
+        opt_b.step()
+    assert torch.equal(a, b), "resumed run must continue bit-exactly"

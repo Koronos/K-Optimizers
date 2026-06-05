@@ -51,6 +51,7 @@ from koptim._momentum_codec import (
     _quant_int8,
     _quant_int8_stacked,
     _unpack_nibbles,
+    load_state_dict_preserving_dtypes,
 )
 from koptim._stochastic_rounding import add_stochastic_
 
@@ -289,6 +290,17 @@ class Adafusion(Optimizer):
                 for p in params:
                     self._step_one_param(p, group)
         return loss
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore state, preserving the quantized first moment's stored dtype.
+
+        torch's default ``load_state_dict`` upcasts every state tensor to the
+        param's dtype (fp32), which would silently inflate a bf16/int8/4bit
+        ``momentum_dtype`` back to fp32 on resume — losing the memory the codec
+        was chosen to save and breaking bit-exact resume. Delegate to the shared
+        helper that restores each tensor to how it was checkpointed.
+        """
+        load_state_dict_preserving_dtypes(self, state_dict)
 
     # ----------------------------------------------------------------- foreach
     def _foreach_budget(self, device: torch.device) -> int:

@@ -57,6 +57,23 @@ Adafusion(
 `Adafusion` is a standard `torch.optim.Optimizer` that works one parameter at a
 time, so it drops into per-parameter / gradient-release training loops unchanged.
 
+## Checkpointing
+
+The normal `torch.save(opt.state_dict())` → `opt.load_state_dict(torch.load(...))`
+workflow resumes **bit-exactly** and **preserves the configured `momentum_dtype`**.
+This needs care: torch's default `Optimizer.load_state_dict` upcasts every state
+tensor to the param's dtype (fp32), which would silently inflate a quantized first
+moment back to fp32 on resume — e.g. `int8` → `fp32` is 4× the momentum bytes,
+defeating the whole point of choosing it. `Adafusion` overrides `load_state_dict`
+to restore each tensor to how it was checkpointed (bf16→fp32→bf16 and the
+int8/4bit *codes* round-trip through fp32 losslessly).
+
+> Note: `state_dict()` returns references to the live state (standard torch). To
+> snapshot in-process and keep training the *same* optimizer before loading the
+> dict elsewhere, `torch.save` it first — serialization freezes the snapshot. We
+> deliberately do **not** deep-copy inside `state_dict()` so checkpointing never
+> doubles peak VRAM (the case `Adafusion` is built for).
+
 ## See also
 
 - [foreach-batching.md](foreach-batching.md) — the multi-tensor batching design

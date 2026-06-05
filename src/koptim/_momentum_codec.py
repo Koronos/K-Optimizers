@@ -37,6 +37,7 @@ __all__ = [
     "_Int8Codec",
     "_FourBitCodec",
     "_make_codec",
+    "load_state_dict_preserving_dtypes",
     "_quant_int8",
     "_quant_int8_stacked",
     "_pack_nibbles",
@@ -379,3 +380,41 @@ def _make_codec(momentum_dtype: str) -> _MomentumCodec:
     if momentum_dtype == "4bit":
         return _FourBitCodec()
     return _FloatCodec(torch.bfloat16 if momentum_dtype == "bfloat16" else torch.float32)
+
+
+def load_state_dict_preserving_dtypes(
+    optimizer: torch.optim.Optimizer, state_dict: dict[str, Any]
+) -> None:
+    """Restore optimizer state WITHOUT torch's lossy momentum upcast.
+
+    ``torch.optim.Optimizer.load_state_dict`` casts every per-param state tensor
+    to the *param's* dtype (fp32) on load. For koptim's quantized first moment
+    that silently inflates bf16/int8/4bit momentum back to fp32 on resume —
+    discarding the memory-efficient representation the user configured (e.g. int8
+    -> fp32 is 4x the momentum bytes, defeating the point) AND breaking bit-exact
+    resume. We snapshot the stored per-tensor dtypes, run the default load, then
+    cast each state tensor back to how it was saved: bf16->fp32->bf16 is exact,
+    and the int8/uint8 *codes* round-trip through fp32 exactly, so the resumed
+    state is byte-identical to the checkpoint.
+
+    torch numbers params ``0..N-1`` in flattened ``param_groups`` order and the
+    state keys are those same ids, so the stored dtype for the param at flattened
+    position ``i`` is ``saved["state"][i]`` (load_state_dict already required the
+    structures to match).
+    """
+    saved = state_dict.get("state", {})
+    saved_dtypes = {
+        idx: {k: v.dtype for k, v in s.items() if torch.is_tensor(v)}
+        for idx, s in saved.items()
+    }
+    torch.optim.Optimizer.load_state_dict(optimizer, state_dict)
+    params = [p for group in optimizer.param_groups for p in group["params"]]
+    for i, p in enumerate(params):
+        dtypes = saved_dtypes.get(i)
+        if dtypes is None or p not in optimizer.state:
+            continue
+        st = optimizer.state[p]
+        for key, dtype in dtypes.items():
+            t = st.get(key)
+            if torch.is_tensor(t) and t.dtype != dtype:
+                st[key] = t.to(dtype)

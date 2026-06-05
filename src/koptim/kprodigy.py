@@ -61,6 +61,7 @@ from koptim._momentum_codec import (
     _make_codec,
     _MomentumCodec,
     _quant_int8,
+    load_state_dict_preserving_dtypes,
 )
 from koptim._stochastic_rounding import add_stochastic_
 
@@ -310,6 +311,18 @@ class KProdigy(Optimizer):
         for scope in scopes:
             self._step_scope(scope)
         return loss
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore state, preserving the quantized first moment's stored dtype.
+
+        torch's default ``load_state_dict`` upcasts every state tensor to the
+        param's dtype (fp32), which would silently inflate a bf16/int8/4bit
+        ``momentum_dtype`` back to fp32 on resume — losing the memory the codec
+        was chosen to save and breaking bit-exact resume. Delegate to the shared
+        helper that restores each tensor to how it was checkpointed. (Prodigy's
+        ``d``/``step``/``s``/``p0`` bookkeeping rides along in the same state.)
+        """
+        load_state_dict_preserving_dtypes(self, state_dict)
 
     @torch.no_grad()
     def _step_scope(self, groups: list[dict[str, Any]]) -> None:

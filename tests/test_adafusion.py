@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import math
 
 import pytest
@@ -339,3 +340,45 @@ def test_foreach_bf16_weights_train_no_nan():
         loss.backward()
         opt.step()
     assert torch.isfinite(loss)
+
+
+@pytest.mark.parametrize("momentum_dtype", ["bfloat16", "float32", "int8", "4bit"])
+def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
+    """A torch.save/load checkpoint resumes BIT-EXACTLY and keeps the configured
+    momentum dtype.
+
+    torch's default ``Optimizer.load_state_dict`` upcasts every state tensor to
+    the param's dtype (fp32), which would silently inflate a quantized first
+    moment back to fp32 on resume (int8 -> fp32 is 4x the momentum bytes —
+    defeating ``momentum_dtype``) and break exact resume. ``Adafusion`` overrides
+    ``load_state_dict`` to restore the stored dtype.
+    """
+    torch.manual_seed(0)
+    p_ref = torch.randn(16, 8)
+    grads = [torch.randn(16, 8) for _ in range(10)]
+
+    a = torch.nn.Parameter(p_ref.clone())
+    opt_a = Adafusion([a], lr=1e-3, betas=(0.9, 0.999), momentum_dtype=momentum_dtype)
+    for g in grads[:5]:
+        a.grad = g.clone()
+        opt_a.step()
+
+    # Serialize the way real training does (the snapshot is frozen by save).
+    buf = io.BytesIO()
+    torch.save(opt_a.state_dict(), buf)
+    buf.seek(0)
+    sd = torch.load(buf, weights_only=False)
+
+    b = torch.nn.Parameter(a.detach().clone())
+    opt_b = Adafusion([b], lr=1e-3, betas=(0.9, 0.999), momentum_dtype=momentum_dtype)
+    opt_b.load_state_dict(sd)
+
+    # Momentum kept its configured storage dtype (not silently upcast to fp32).
+    assert opt_b.state[b]["m"].dtype == opt_a.state[a]["m"].dtype
+
+    for g in grads[5:]:
+        a.grad = g.clone()
+        opt_a.step()
+        b.grad = g.clone()
+        opt_b.step()
+    assert torch.equal(a, b), "resumed run must continue bit-exactly"

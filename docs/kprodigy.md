@@ -53,6 +53,16 @@ KProdigy(
 )
 ```
 
+## Checkpointing
+
+`torch.save(opt.state_dict())` → `load_state_dict` resumes **bit-exactly**: the
+**D estimate** (`d` / `d_numerator` / `d_max` / `d_hat`) rides along in
+`param_groups`, and the first moment keeps its configured `momentum_dtype`.
+KProdigy overrides `load_state_dict` for the same reason as Adafusion — torch's
+default upcasts the quantized momentum to fp32 on load (e.g. `int8` → `fp32`, 4×
+the bytes), so it restores the stored dtype instead. (Same `state_dict()`
+live-reference caveat as Adafusion — `torch.save` to freeze a snapshot.)
+
 ## See also
 
 - [adafusion.md](adafusion.md) — the update engine KProdigy's pass-2 reuses.
