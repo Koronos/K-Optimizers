@@ -178,3 +178,39 @@ minimum and blurs detail. So the intuitive decreasing schedule has it backwards;
 detail/curriculum effect people actually exploit comes from **progressive resolution**
 (low-res→high-res), where bigger latents force smaller batches late and the *data*
 (not the batch) supplies the new detail.
+
+## 6. Resolution curriculum (the *right* lever for "general → detail")
+
+§5 showed a batch-size schedule doesn't deliver the "coarse early, fine late" idea.
+The lever that *does* is **resolution**. Pure test — FIXED batch (16), CONSTANT LR
+(no scheduler, no batch changes), so only the resolution varies. High-freq synthetic
+images at 64² (the detail target) + a downsampled 16² version; the conv U-Net is
+resolution-agnostic; **evaluate at 64²** (where the fine detail lives). 600 steps, 2
+seeds.
+
+| condition | **val @64² (detail)** | val @16² | wall |
+|---|---|---|---|
+| large only (ceiling) | **0.0597** | 0.339 | 6.8 s |
+| **small → large** (coarse→fine) | **0.0637** | 0.296 | 6.4 s |
+| mixed (interleaved) | 0.0771 | 0.151 | 6.3 s |
+| large → small (reverse) | 0.1692 | 0.149 | 6.3 s |
+| small only (floor) | 0.2170 | 0.140 | 6.5 s |
+
+- **`small → large` nearly matches the `large only` detail ceiling (0.0637 vs 0.0597)
+  using only HALF the high-res steps** (300 vs 600). The cheap low-res phase warms up
+  the coarse structure so the high-res phase learns the detail efficiently.
+- **Order is the key: you must END on the high-res (detail) data.** The reverse
+  (`large → small`) collapses to 0.169 — late low-res training *erases* the
+  high-frequency capability (catastrophic-forgetting-like). So "fine detail late" is
+  literally correct, expressed as resolution.
+- **`small only` can't reproduce detail at all** (0.217 — it never saw the high
+  frequencies); `mixed` works but the ordered curriculum beats it.
+- **At small scale all conditions cost the same** (resolutions are cheap), so the win
+  here is "ceiling detail at no extra cost, with half the expensive steps." At
+  production scale (high-res is expensive) `small→large` *also* saves compute — a
+  Pareto win. This is the established progressive-/multi-resolution training practice.
+
+Caveat: tiny synthetic task, conv U-Net, 2 seeds — the *direction* (small→large good;
+ending on detail essential; small-only can't do detail) is clear and matches practice;
+treat the magnitudes as illustrative. (Contrast with §5: scheduling *batch size* for
+the same "general→detail" goal did not work — resolution is the right knob.)
