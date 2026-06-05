@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`AdaptiveAdafusion`** — a parameter-free learning rate on Adafusion's update
+  via a [Mechanic](https://arxiv.org/abs/2306.00144) scalar tuner (an
+  update-agnostic online LR tuner), with a **freeze-to-free** handoff:
+  - Train at `lr=1.0`; the tuner discovers the effective LR (read via `get_d()`),
+    keeping Adafusion's exact normalize-then-momentum update verbatim.
+  - `lr_freeze` (`None` / `int N` / `"auto"`) ends adaptation: it folds the
+    discovered LR `S` into the inner Adafusion's `lr`, **frees the Mechanic
+    `ref`/`delta` buffers**, and routes every later `step()` straight to the base —
+    so after freeze it is **byte-for-byte and speed-for-speed plain Adafusion at
+    `lr=S`**. With the default `adafusion_betas=(0.0, 0.999)` (beta1=0) the handoff
+    is bit-exact (Adafusion's update is then linear in `lr`); `"auto"` freezes on an
+    LR plateau (`lr_freeze_tol`/`lr_freeze_patience`). Mirrors the freeze-then-free
+    pattern shipped by `prodigy-plus-schedule-free`'s `prodigy_steps`.
+  - `store_delta=False` by default (matches the reference Mechanic; reconstructs
+    `Delta=(p-ref)/sum(s)` on the fly), so the only per-param state while adapting
+    is the irreducible `ref` (one extra copy of the weights).
+  - `adafusion_betas` passthrough sets the inner momentum betas (the tuner `betas`
+    kwarg shadows them); all other Adafusion knobs forward through `**kwargs`.
+  - Previously shipped as `AdafusionProdigy` (a misnomer — it is Mechanic, not
+    Prodigy); that name remains importable as an alias.
 - **KProdigy now reuses Adafusion's full update engine.** KProdigy's pass-2 weight
   update (previously a per-parameter Python loop) is now backed by Adafusion's
   foreach batching, momentum codec (`float32`/`bfloat16`/`int8`/`4bit`), cautious

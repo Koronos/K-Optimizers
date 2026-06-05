@@ -20,6 +20,14 @@ on commodity GPUs, where optimizer state is precious and weights are bf16.
   itself. Matches reference Prodigy bit-for-bit at its defaults, then adds the
   koptim memory toolkit (bf16/int8 momentum, factored second moment,
   stochastic-rounding bf16 updates, per-group independent D for SDXL UNet+TE).
+- **`AdaptiveAdafusion`** — a parameter-free LR on **Adafusion's** update via a
+  [Mechanic](https://arxiv.org/abs/2306.00144) scalar tuner: train at `lr=1.0`
+  and it auto-discovers the LR, keeping Adafusion's exact normalize-then-momentum
+  update (unlike Prodigy, whose D-math is Adam-shaped). Its headline is
+  **freeze-to-free** (`lr_freeze`): after warmup it folds the discovered LR into
+  the base, frees the tuner's `ref` buffer, and becomes **byte-for-byte and
+  speed-for-speed plain Adafusion**. (Shipped earlier as `AdafusionProdigy`, kept
+  as an alias.)
 
 `Adafusion` and `Muon` are standard `torch.optim.Optimizer`s that work
 one-parameter-at-a-time, so they drop into per-parameter / gradient-release
@@ -65,6 +73,20 @@ from koptim import KProdigy
 # Parameter-free: lr stays 1.0; D adapts. For SDXL UNet+TE, pass two param
 # groups and KProdigy gives each its own D automatically.
 opt = KProdigy(model.parameters(), lr=1.0, momentum_dtype="bfloat16")
+```
+
+```python
+from koptim import AdaptiveAdafusion
+
+# Parameter-free Adafusion: lr stays 1.0; a Mechanic tuner finds the LR. After
+# `lr_freeze` steps it frees the tuner state and runs as pure Adafusion at the
+# discovered LR (free thereafter). lr_freeze="auto" freezes on an LR plateau.
+opt = AdaptiveAdafusion(
+    model.parameters(),
+    lr_freeze=600,                       # or "auto"; None = never freeze
+    adafusion_betas=(0.0, 0.999),        # beta1=0 => bit-exact freeze (default)
+    bf16_method="stochastic_rounding",
+)
 ```
 
 ## KProdigy — why
