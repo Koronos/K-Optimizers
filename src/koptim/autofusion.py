@@ -77,11 +77,13 @@ Bit-exactness of the *handoff* (does ``lr=S`` reproduce the pre-freeze
   **bit-exact** (fp32; up to unbiased bf16/SR rounding otherwise). Freeze is exact.
 * **``beta1 > 0``:** the first-moment EMA accumulates the *``lr``-scaled* update
   (``ema(lr·update)``), so the buffer built at ``lr=1`` during warmup carries a
-  different scale than one built at ``lr=S``. Folding ``S`` into ``lr`` at the
-  freeze boundary thus introduces a one-time EMA-scale change. The post-freeze
-  trajectory is still genuine Adafusion(lr=S) going forward (and converges fine),
-  it is simply not bit-identical to the pre-freeze extrapolation. For a
-  truly seamless freeze use the default ``beta1 == 0``.
+  different scale than one built at ``lr=S``. The EMA is *linear* in that scale,
+  so freeze folds ``S`` into the stored momentum as well as the lr (see
+  ``_freeze``) — without it the first frozen step throws the full ``lr=1``-scaled
+  momentum at the ``lr=S`` regime, a one-time blow-up (~500× the surrounding
+  steps). With the fold the handoff is exact too: bit-exact for
+  ``float32``/``int8``/``4bit`` (the quantized codecs rescale their ``m_scale``)
+  and rounding-exact for ``bfloat16``. So freeze is seamless at any ``beta1``.
 
 CUDA note: this env SIGFPEs on ``torch.dot`` for CUDA tensors, so every inner
 product is ``(a * b).sum()``.
@@ -170,11 +172,10 @@ class Autofusion(torch.optim.Optimizer):
             shadowed by the keyword above, so this is the *only* way to set the base
             momentum). Default ``(0.0, 0.999)`` — **no first-moment EMA**, which is
             both Eduardo's minimum-VRAM config AND the regime where freeze is
-            *bit-exact* (with ``beta1 > 0`` the momentum buffer accumulates the
-            ``lr``-scaled update, so folding ``S`` into ``lr`` at freeze introduces a
-            one-time EMA-scale change at the boundary — the trajectory is still plain
-            Adafusion(lr=S) going forward, just not bit-identical to the pre-freeze
-            ``ref + S·Delta`` extrapolation; see module docstring).
+            *bit-exact*. With ``beta1 > 0`` the momentum buffer accumulates the
+            ``lr``-scaled update, and freeze folds ``S`` into the stored momentum as
+            well as the lr (exact for fp32/int8/4bit, rounding-exact for bf16) so the
+            handoff has no boundary jump either; see ``_freeze`` / the module docstring.
         **adafusion_kwargs: forwarded verbatim to the internal
             :class:`~koptim.adafusion.Adafusion` base (``clip_threshold``,
             ``cautious``, ``momentum_dtype``, ``bf16_method``, ``foreach``,
@@ -399,9 +400,28 @@ class Autofusion(torch.optim.Optimizer):
         at the *effective* (floor/cap-clamped) sum(s) the model is actually walking
         at, so the handoff stays exact even when the floor/cap engaged on the last
         step.
+
+        With momentum (``beta1 > 0``) the first-moment EMA breaks that linearity:
+        during warmup the base ran at ``lr=1`` so its momentum accumulated
+        ``lr=1``-scaled updates, while the applied step was ``S·Delta``; post-freeze
+        the base runs at ``lr=S``, whose per-step update is ``S·(lr=1 update)``. So
+        we fold ``S`` into the stored momentum as well — otherwise the first
+        post-freeze steps carry an ``lr=1``-scaled momentum *history* against
+        ``lr=S``-scaled new terms, a one-time transient bump in the update (the
+        little "celebration" jump when the LR locks in). The EMA is linear in that
+        scale, so this makes the momentum handoff exact too (bit-exact for
+        fp32/int8/4bit, rounding-exact for bf16). For ``beta1=0`` there is no
+        momentum and the loop below is a no-op.
         """
         s_sum = max(self._last_eff_s_sum, 0.0)
         self._frozen_lr = s_sum
+        if s_sum != 1.0:
+            for group in self.param_groups:
+                codec = self.base._codec(group)
+                for p in group["params"]:
+                    state = self.base.state.get(p)
+                    if state is not None and "m" in state:
+                        codec.scale_(state, s_sum)
         for group in self.param_groups:
             group["lr"] = s_sum
         # Free the wrapper's per-param buffers and tuner scalars — post-freeze the

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
 import torch
 
 from koptim import AdafusionProdigy, AdaptiveAdafusion, Autofusion
@@ -561,3 +562,70 @@ def test_lr_scheduler_compatibility() -> None:
     # after freeze the scheduler drives the (now plain-Adafusion) lr
     assert opt.is_frozen()
     assert len(sched.get_last_lr()) == len(opt.param_groups)
+
+
+@pytest.mark.parametrize(
+    ("momentum_dtype", "rtol"),
+    [("float32", 0.0), ("int8", 1e-5), ("4bit", 1e-5), ("bfloat16", 1e-2)],
+)
+def test_freeze_folds_momentum_into_lr(momentum_dtype, rtol):
+    """Freeze folds the discovered LR ``S`` into the base lr AND into the stored
+    first moment.
+
+    During warmup the base runs at ``lr=1`` (its momentum accumulates lr=1-scaled
+    updates) while the applied step is ``S·Delta``. Post-freeze the base runs at
+    ``lr=S``. The EMA is linear in lr, so freeze must fold ``S`` into the momentum
+    too — exact for fp32/int8/4bit (the quantized codecs scale their ``m_scale``),
+    rounding-exact for bf16.
+    """
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(16, 8))
+    opt = Autofusion(
+        [p], lr_freeze=None, adafusion_betas=(0.9, 0.999), momentum_dtype=momentum_dtype
+    )
+    for _ in range(6):
+        p.grad = torch.randn(16, 8)
+        opt.step()
+
+    codec = opt.base._codec(opt.base.param_groups[0])
+    m_before = codec.dequant_one(opt.base.state[p], p).clone()
+
+    s = 3e-3
+    opt._last_eff_s_sum = s
+    opt._freeze()
+    assert opt.is_frozen()
+
+    m_after = codec.dequant_one(opt.base.state[p], p)
+    assert torch.allclose(m_after, s * m_before, rtol=rtol, atol=1e-7)
+
+
+def test_freeze_with_momentum_no_celebration_jump():
+    """The first post-freeze step is continuous with the pre-freeze trajectory.
+
+    Folding ``S`` into the momentum at freeze keeps the handoff to ``base(lr=S)``
+    smooth. WITHOUT the fold the lr=1-scaled momentum history detonates the first
+    frozen step (measured ~500x the surrounding steps) — the regression this guards.
+    """
+    torch.manual_seed(1)
+    p = torch.nn.Parameter(torch.randn(64, 32) * 0.1)
+    target = torch.randn(64, 32)
+    opt = Autofusion(
+        [p], lr_freeze=12, adafusion_betas=(0.9, 0.999), momentum_dtype="float32"
+    )
+    norms = []
+    prev = p.detach().clone()
+    froze_at = None
+    for i in range(20):
+        p.grad = p.detach() - target  # smooth quadratic gradient
+        opt.step()
+        norms.append((p.detach() - prev).norm().item())
+        prev = p.detach().clone()
+        if froze_at is None and opt.is_frozen():
+            froze_at = i
+
+    assert froze_at is not None and froze_at + 1 < len(norms)
+    pre = sum(norms[froze_at - 2 : froze_at + 1]) / 3.0
+    first_frozen = norms[froze_at + 1]  # first fully-frozen step
+    assert first_frozen < 3.0 * pre, (
+        f"freeze jump: first frozen step |dp|={first_frozen:.3e} vs pre-freeze {pre:.3e}"
+    )

@@ -65,11 +65,17 @@ to `base.step()`. After freeze it **is** plain Adafusion at `lr=S` — same memo
 
 With the default `adafusion_betas=(0.0, 0.999)` (beta1=0, the minimum-VRAM
 config), Adafusion's update is linear in `lr`, so the handoff is **bit-exact**:
-`base.step(lr=1)` then `p = ref + S·Δ` equals `base.step(lr=S)`. With `beta1 > 0`
-the first-moment EMA accumulates the `lr`-scaled update, so folding `S` into `lr`
-at the boundary introduces a one-time EMA-scale change — the post-freeze
-trajectory is still genuine Adafusion(`lr=S`), just not bit-identical to the
-pre-freeze extrapolation. Use the default `beta1 == 0` for a seamless freeze.
+`base.step(lr=1)` then `p = ref + S·Δ` equals `base.step(lr=S)`.
+
+With `beta1 > 0` (momentum) the first-moment EMA is also linear in `lr` but
+*carries history*: during warmup it accumulated `lr=1`-scaled updates while the
+applied step was `S·Δ`. Freeze therefore folds `S` into the **stored momentum**
+as well as the lr — otherwise the first frozen step throws the full `lr=1`-scaled
+momentum at the `lr=S` regime, a one-time blow-up (measured ~500× the surrounding
+steps — the little "celebration" jump when the LR locks in). With the fold the
+momentum handoff is exact too: bit-exact for `float32`/`int8`/`4bit` (the
+quantized codecs just rescale their per-row/block `m_scale`) and rounding-exact
+for `bfloat16`. So freeze is seamless at any `beta1`.
 
 ### LR schedules after freeze (the Prodigy + Cosine pattern)
 

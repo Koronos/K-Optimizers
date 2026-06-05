@@ -218,6 +218,15 @@ class _MomentumCodec:
         """Return the stacked fp32 momentum ``[N, *eff]`` (no mutation)."""
         raise NotImplementedError
 
+    def scale_(self, state: dict[str, Any], factor: float) -> None:
+        """Multiply the stored first moment in place by a scalar.
+
+        The quantized codecs scale the per-row/block ``m_scale`` (no requant
+        error); the float codec scales ``m`` directly. Used by Autofusion's freeze
+        to fold the discovered LR into the momentum (the EMA is linear in lr).
+        """
+        raise NotImplementedError
+
 
 class _FloatCodec(_MomentumCodec):
     """fp32 / bf16 momentum: store ``m`` directly in ``dtype``.
@@ -254,6 +263,9 @@ class _FloatCodec(_MomentumCodec):
         self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...]
     ) -> Tensor:
         return torch.stack([mat(s["m"]) for s in states]).float()
+
+    def scale_(self, state: dict[str, Any], factor: float) -> None:
+        state["m"].mul_(factor)  # in stored dtype; exact for fp32, rounded for bf16
 
 
 class _Int8Codec(_MomentumCodec):
@@ -300,6 +312,9 @@ class _Int8Codec(_MomentumCodec):
         rowshape = (m.shape[1],) + (1,) * (per_ndim - 1) if per_ndim >= 2 else (1,) * per_ndim
         scale = torch.stack([s["m_scale"].reshape(rowshape) for s in states])
         return m.mul_(scale)
+
+    def scale_(self, state: dict[str, Any], factor: float) -> None:
+        state["m_scale"].mul_(factor)  # dequant = m * m_scale -> scales value exactly
 
 
 class _FourBitCodec(_MomentumCodec):
@@ -372,6 +387,9 @@ class _FourBitCodec(_MomentumCodec):
         sc = torch.stack([s["m_scale"] for s in states])
         n = packed.shape[0]
         return _dequant_4bit_stacked(packed, sc, per, bs).reshape((n, *eff))
+
+    def scale_(self, state: dict[str, Any], factor: float) -> None:
+        state["m_scale"].mul_(factor)  # per-block scale -> scales the value exactly
 
 
 def _make_codec(momentum_dtype: str) -> _MomentumCodec:
