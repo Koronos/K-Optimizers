@@ -41,16 +41,26 @@ per step than Adafactor *and* converges better.
 
 ms/step is dominated by the UNet here, so the optimizer choice barely moves it
 (AdaMuon-int8 ~8% slower from the int8 quant tax; AdaMuon-**bf16** measured ~tied at
-~466 ms). AdaMuon reaches a lower floor AdamW never touches, and reaches the shared
-0.0945 mark in 123 s vs AdamW's 140 s, at **1/3 the optimizer memory**.
+~466 ms). In this run AdaMuon reaches a lower floor than AdamW (0.0900 vs 0.0928) and
+hits the shared 0.0945 mark in 123 s vs AdamW's 140 s, at **1/3 the optimizer memory**.
+
+> Evidence strength: this is **one configuration, 2 seeds, 500 steps** on a single
+> objective-probe metric. "Lower floor" is the observed end-of-run gap here, not a
+> proven asymptotic ceiling — treat it as a promising signal, not a settled result.
+> The real fine-detail comparison (perceptual quality on SDXL/Flux) is still pending.
 
 ## Verdict (when AdamW's quality is already "good enough")
 
-| regime | per-step speed | time-to-your-quality | switch? |
-|---|---|---|---|
-| SDXL LoRA | AdaMuon-bf16 ~tied / int8 ~+8% | ~1.1–1.6× faster + lower floor, 1/3 memory | Pareto-positive, **modest** |
-| full training from scratch | ~1.9× slower | **~2× faster** | yes |
-| memory-bound full fine-tune (vs Adafactor) | Adafusion faster, AdaMuon ~+15% | **~2.8× faster** | **yes** |
+| regime | per-step speed | time-to-your-quality | switch? | evidence |
+|---|---|---|---|---|
+| SDXL LoRA | AdaMuon-bf16 ~tied / int8 ~+8% | ~1.1–1.6× faster + lower floor, 1/3 memory | Pareto-positive, **modest** | real SDXL (1 cfg, 2 seeds) |
+| full training from scratch | ~1.9× slower | **~2× faster** | yes | synthetic pixel-DDPM |
+| memory-bound full fine-tune (vs Adafactor) | Adafusion faster, AdaMuon ~+15% | **~2.8× faster** | likely (unverified) | **synthetic proxy only** |
+
+> The last row is an **extrapolation from the §1 pixel-DDPM proxy**, not a measured
+> SDXL/Flux full fine-tune (which the test box's VRAM can't run). It is the most
+> consequential claim in this file and the least directly evidenced — read "~2.8×" as
+> "the proxy suggests a large win," pending a real full-FT run.
 
 - **Raw ms/step**: `AdamW(fused=True)` is the king (hand-written kernel). AdaMuon-bf16
   ties it on UNet-bound LoRA; int8 trades ~8% step time for half the momentum bytes.
@@ -59,7 +69,11 @@ ms/step is dominated by the UNet here, so the optimizer choice barely moves it
 - **Memory**: AdaMuon/Adafusion sit in the Adafactor class (~1–2 B/param). For full FT
   where AdamW (even 8-bit) OOMs, they are usable *and* beat plain Adafactor.
 
-Bottom line: the clear win is **full fine-tuning** (you are forced onto Adafactor by
-VRAM — AdaMuon/Adafusion give ~2–3× less time-to-quality at equal-or-less memory).
-For LoRA the gain is real but modest; AdaMuon-bf16 if you want to keep AdamW-fused's
-per-step speed, int8/4bit if you want the memory back.
+Bottom line: the **most promising** win is **full fine-tuning** (you are forced onto
+Adafactor by VRAM — and on the synthetic proxy AdaMuon/Adafusion give ~2–3× less
+time-to-quality at equal-or-less memory). That full-FT advantage is **proxy-derived and
+not yet confirmed on a real SDXL/Flux full fine-tune** — the one measurement we have on a
+real model is the SDXL **LoRA** run above, where the gain is real but modest. So: switch
+with confidence for LoRA (modest, Pareto-positive); treat full-FT as the high-upside bet
+to validate next. AdaMuon-bf16 if you want to keep AdamW-fused's per-step speed,
+int8/4bit if you want the memory back.
