@@ -16,6 +16,11 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
 - **`Muon`** — an orthogonalized-momentum optimizer (Newton-Schulz) with an AdamW
   fallback for 1-D/embedding params. Highest convergence quality, at half of
   AdamW's state. → [docs/muon.md](docs/muon.md)
+- **`AdaMuon`** — **Muon's orthogonalized momentum + an Adafactor-style factored,
+  quantized second moment** of the orthogonalized update. Aims to beat AdamW on
+  convergence/precision at **near-Adafactor memory** (~1–2 B/param, int8/4bit dial).
+  Tuned defaults `ns_steps=2`, `cautious=True`; optional `compile=True` (whole-step
+  `torch.compile`, AdaMuon-only). → [docs/adamuon.md](docs/adamuon.md)
 - **`KProdigy`** — a memory-efficient **Prodigy** (parameter-free D-adaptation):
   train at `lr=1.0` and the optimizer finds the effective LR itself. Matches
   reference Prodigy bit-for-bit at its defaults, then adds the koptim memory
@@ -29,7 +34,7 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   as `AdaptiveAdafusion` / `AdafusionProdigy`, both kept as aliases.)
   → [docs/autofusion.md](docs/autofusion.md)
 
-`Adafusion` and `Muon` are standard `torch.optim.Optimizer`s that work
+`Adafusion`, `Muon`, and `AdaMuon` are standard `torch.optim.Optimizer`s that work
 one-parameter-at-a-time, so they drop into per-parameter / gradient-release
 training loops unchanged. `KProdigy` needs a global reduction over all parameters
 each step (the D estimate), so it is a normal two-pass `step()` optimizer (no
@@ -68,6 +73,15 @@ opt = Muon(model.parameters(), lr=2e-2, momentum_dtype="bfloat16")
 ```
 
 ```python
+from koptim import AdaMuon
+
+# Orthogonalized momentum + factored quantized 2nd moment; cautious + ns_steps=2
+# are the tuned defaults. lr is Muon-scale: start ~1e-3 for diffusion (the API
+# default 2e-2 is LLM/Muon-scale — see docs/adamuon.md). int8/4bit dial the memory.
+opt = AdaMuon(model.parameters(), lr=1e-3, momentum_dtype="int8")
+```
+
+```python
 from koptim import KProdigy
 
 # Parameter-free: lr stays 1.0; D adapts. For SDXL UNet+TE, pass two param
@@ -97,6 +111,7 @@ opt = Autofusion(
 | **AdamW-quality, low memory** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="bfloat16")` |
 | **Lion8bit-class memory + momentum** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="int8")` |
 | **Best convergence (memory available)** | `Muon(..., lr=2e-2, momentum_dtype="bfloat16")` |
+| **Beat-AdamW precision at Adafactor memory** | `AdaMuon(..., lr=1e-3, momentum_dtype="int8")` — orthogonalized momentum + factored 2nd moment; `ns_steps=2`/`cautious=True` defaults, optional `compile=True` |
 | **No LR to tune (SDXL UNet+TE)** | `KProdigy([{"params": unet, "lr": 1.0}, {"params": te, "lr": 1.0}])` |
 | **Parameter-free + minimum VRAM** | `KProdigy(..., second_moment="factored", momentum_dtype="bfloat16", slice_p=11)` |
 | **No LR to tune + ~free after warmup** | `Autofusion(..., bf16_method="stochastic_rounding")` — auto-discovers the LR, then freezes to plain Adafusion |
@@ -109,6 +124,8 @@ opt = Autofusion(
   the minimal API + the one advanced knob, and the campaign results.
 - [docs/kprodigy.md](docs/kprodigy.md) — memory-efficient Prodigy design + API.
 - [docs/muon.md](docs/muon.md) — Muon design + API.
+- [docs/adamuon.md](docs/adamuon.md) — AdaMuon design, the `clip_threshold`/`lr`
+  validation, `compile=True`, and the pixel-DDPM evaluation.
 - [docs/foreach-batching.md](docs/foreach-batching.md) — multi-tensor batching of
   the step (`foreach_batch_cutoff` / `foreach_stack_budget`).
 - [docs/momentum.md](docs/momentum.md) — the cheap-momentum dial (int8 / bf16 /

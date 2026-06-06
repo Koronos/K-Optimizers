@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`AdaMuon`** — Muon's Newton-Schulz orthogonalized momentum + an Adafactor-style
+  **factored, quantized second moment of the orthogonalized update**. Targets
+  beating AdamW on convergence/precision at **near-Adafactor memory** (~1–2 B/param;
+  reuses Adafusion's int8/4bit momentum codec, foreach batching, stochastic rounding,
+  dtype-safe checkpointing). See [docs/adamuon.md](docs/adamuon.md).
+  - Tuned defaults `ns_steps=2`, `cautious=True`, `betas=(0.95, 0.999)`; a single
+    `lr` governs 2-D and 1-D params (all RMS-normalized to applied RMS ≈ `0.2·lr`).
+    `lr` is Muon-scale — start ~`1e-3` for diffusion (the API default `2e-2` is
+    LLM-scale).
+  - `clip_threshold=1.0` validated as the optimum and **load-bearing** (an RMS ceiling
+    on the *normalized update*, Adafactor-style — not gradient clipping; off ≈ +24%).
+  - Optional `compile=True` — whole-step `torch.compile` (AdaMuon-only by design);
+    workload-dependent, benchmark it.
+  - Reproducible harnesses + evaluation under `benchmarks/adamuon/`.
 - **`Autofusion`** — a parameter-free learning rate on Adafusion's update via a
   [Mechanic](https://arxiv.org/abs/2306.00144) scalar tuner (an update-agnostic
   online LR tuner — **Mechanic, *not* Prodigy**), with a **freeze-to-free**
