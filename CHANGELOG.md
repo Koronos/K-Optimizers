@@ -45,9 +45,9 @@ All notable changes to this project will be documented in this file.
     the weights); `Delta` is reconstructed on the fly as `(p-ref)/sum(s)`.
   - `adafusion_betas` passthrough sets the inner momentum betas (the tuner `betas`
     kwarg shadows them); all other Adafusion knobs forward through `**kwargs`.
-  - **Naming:** shipped as `Autofusion`, with `AdaptiveAdafusion` and the older
-    `AdafusionProdigy` (a misnomer — it is Mechanic, not Prodigy) both kept
-    importable as back-compat aliases.
+  - **Naming:** the optimizer is `Autofusion`. (It went through the working names
+    `AdafusionProdigy` — a misnomer, it is Mechanic, not Prodigy — and
+    `AdaptiveAdafusion` during development; neither shipped, both are removed.)
 - **KProdigy now reuses Adafusion's full update engine.** KProdigy's pass-2 weight
   update (previously a per-parameter Python loop) is now backed by Adafusion's
   foreach batching, momentum codec (`float32`/`bfloat16`/`int8`/`4bit`), cautious

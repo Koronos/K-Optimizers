@@ -2,10 +2,6 @@
 update rule, via a Mechanic-style online scale tuner, with a **freeze-to-free**
 handoff that turns it into plain Adafusion after warmup.
 
-(Shipped earlier as ``AdaptiveAdafusion`` / ``AdafusionProdigy`` — the latter a
-misnomer, it is Mechanic, not Prodigy. Both old names remain importable as
-back-compat aliases.)
-
 Motivation
 ----------
 A matched-effective-LR ablation found that ``KProdigy`` (Prodigy's Adam-form
@@ -103,7 +99,7 @@ from torch import Tensor
 
 from koptim.adafusion import Adafusion
 
-__all__ = ["AdafusionProdigy", "AdaptiveAdafusion", "Autofusion"]
+__all__ = ["Autofusion"]
 
 # Mechanic's default tuner betas (arXiv:2306.00144, Alg. 1): n=6 parallel
 # coin-betting tuners with geometrically spaced recency horizons, summed.
@@ -668,10 +664,3 @@ class Autofusion(torch.optim.Optimizer):
         # 7) decide whether to freeze (and become plain Adafusion) for next step.
         self._maybe_freeze(new_s_sum, mech["iter"])
         return loss
-
-
-# Back-compat aliases: the optimizer shipped earlier as ``AdaptiveAdafusion`` and,
-# before that, as ``AdafusionProdigy`` (a misnomer — it is Mechanic, not Prodigy).
-# Keep both old names importable.
-AdaptiveAdafusion = Autofusion
-AdafusionProdigy = Autofusion

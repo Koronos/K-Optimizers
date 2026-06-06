@@ -5,9 +5,6 @@
 > Adafusion at the discovered LR. Train at `lr=1.0`, never tune an LR, pay
 > ~nothing once it freezes.
 
-`Autofusion` shipped earlier as `AdaptiveAdafusion` (and before that as
-`AdafusionProdigy`); both old names remain importable as back-compat aliases.
-
 ## How it works
 
 `Autofusion` does **not** estimate a distance-to-solution like Prodigy. It uses

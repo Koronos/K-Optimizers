@@ -1,7 +1,6 @@
 """Tests for Autofusion (Mechanic LR tuner on Adafusion, freeze-to-free).
 
-Covers the base Mechanic behavior, the back-compat ``AdaptiveAdafusion`` /
-``AdafusionProdigy`` aliases, the on-the-fly ``Delta`` reconstruction, and the
+Covers the base Mechanic behavior, the on-the-fly ``Delta`` reconstruction, and the
 ``lr_freeze`` (int / "auto") handoff that turns the optimizer into plain Adafusion
 after warmup.
 
@@ -18,16 +17,18 @@ import inspect
 import pytest
 import torch
 
-from koptim import AdafusionProdigy, AdaptiveAdafusion, Autofusion
+from koptim import Autofusion
 from koptim.adafusion import Adafusion
 
 from .conftest import train_steps
 
 
-def test_aliases_are_same_class() -> None:
-    """AdaptiveAdafusion and AdafusionProdigy are back-compat aliases of Autofusion."""
-    assert AdaptiveAdafusion is Autofusion
-    assert AdafusionProdigy is Autofusion
+def test_legacy_aliases_are_removed() -> None:
+    """``AdaptiveAdafusion`` / ``AdafusionProdigy`` were purged (alpha, no back-compat)."""
+    import koptim
+
+    assert not hasattr(koptim, "AdaptiveAdafusion")
+    assert not hasattr(koptim, "AdafusionProdigy")
 
 
 def test_purged_knobs_are_not_public() -> None:

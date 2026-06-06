@@ -22,15 +22,13 @@ Quickstart::
 from koptim._version import __version__
 from koptim.adafusion import Adafusion
 from koptim.adamuon import AdaMuon
-from koptim.autofusion import AdafusionProdigy, AdaptiveAdafusion, Autofusion
+from koptim.autofusion import Autofusion
 from koptim.kprodigy import KProdigy
 from koptim.muon import Muon
 
 __all__ = [
     "AdaMuon",
     "Adafusion",
-    "AdafusionProdigy",
-    "AdaptiveAdafusion",
     "Autofusion",
     "KProdigy",
     "Muon",

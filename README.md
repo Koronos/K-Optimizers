@@ -30,8 +30,7 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   Prodigy): train at `lr=1.0` and it auto-discovers the LR, keeping Adafusion's
   exact update. Its headline is **freeze-to-free** (`lr_freeze`): after warmup it
   folds the discovered LR into the base, frees the tuner's `ref` buffer, and
-  becomes **byte-for-byte and speed-for-speed plain Adafusion**. (Shipped earlier
-  as `AdaptiveAdafusion` / `AdafusionProdigy`, both kept as aliases.)
+  becomes **byte-for-byte and speed-for-speed plain Adafusion**.
   → [docs/autofusion.md](docs/autofusion.md)
 
 `Adafusion`, `Muon`, and `AdaMuon` are standard `torch.optim.Optimizer`s that work
