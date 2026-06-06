@@ -7,6 +7,7 @@ Optimizers:
     KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
     Autofusion: parameter-free LR on Adafusion via a Mechanic tuner (freeze-to-free).
     Liofusion: Lion sign-momentum on Adafusion's quantized-momentum backend (experimental).
+    Gemini: AdEMAMix two-EMA (fast+slow first moment) on the factored/quantized backend (experimental).
 
 Quickstart::
 
@@ -24,6 +25,7 @@ from koptim._version import __version__
 from koptim.adafusion import Adafusion
 from koptim.adamuon import AdaMuon
 from koptim.autofusion import Autofusion
+from koptim.gemini import Gemini
 from koptim.kprodigy import KProdigy
 from koptim.liofusion import Liofusion
 from koptim.muon import Muon
@@ -32,6 +34,7 @@ __all__ = [
     "AdaMuon",
     "Adafusion",
     "Autofusion",
+    "Gemini",
     "KProdigy",
     "Liofusion",
     "Muon",
