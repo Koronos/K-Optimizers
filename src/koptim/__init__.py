@@ -2,6 +2,8 @@
 
 Optimizers:
     Adafusion: conv-aware factored optimizer (AdamW-quality at Adafactor memory).
+    AdafusionEx: Adafusion + first-class weight EMA + optional MSAM (generalization
+        experiment vehicle; bit-comparable to Adafusion with the techniques off).
     Muon: orthogonalized-momentum optimizer with an AdamW fallback (hybrid).
     AdaMuon: orthogonalized momentum + factored quantized variance (Adafactor memory).
     KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
@@ -21,6 +23,7 @@ Quickstart::
 
 from koptim._version import __version__
 from koptim.adafusion import Adafusion
+from koptim.adafusionex import AdafusionEx
 from koptim.adamuon import AdaMuon
 from koptim.autofusion import Autofusion
 from koptim.kprodigy import KProdigy
@@ -29,6 +32,7 @@ from koptim.muon import Muon
 __all__ = [
     "AdaMuon",
     "Adafusion",
+    "AdafusionEx",
     "Autofusion",
     "KProdigy",
     "Muon",
