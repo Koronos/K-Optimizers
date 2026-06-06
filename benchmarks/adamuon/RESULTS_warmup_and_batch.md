@@ -333,6 +333,77 @@ reusable takeaway: **hold the LR high and decay it (cosine) over the final/detai
 beats both a constant LR and a from-zero cosine, and a single well-timed decay beats
 per-tier restarts.
 
+## 9. LR-schedule *shape*, explored end-to-end (waypoint scheduler) → just use REX
+
+§8 settled that the schedule shape matters; this section maps the shape space properly.
+A general **waypoint scheduler** (piecewise smoothstep/cosine interpolation through
+control points `(t, lr_frac∈[0,1])`, scaled by the swept peak LR) realizes arbitrary
+shapes, so we can test the hand-drawn family directly:
+
+- **#1 trapezoid** — stable plateau then an S-decay (= §8's `stable→cosine`).
+- **#2 prodigy_bell** — a left-skewed warmup *bell* (quick ramp to an early peak ~p=0.22,
+  long decay tail), imitating the effective-LR curve Prodigy produces by d-adaptation.
+- **#3 waypoint_2hump** — dip early → peak at the resolution switch → tail.
+- plus **REX** (`lr_max·(1−p)/((1−d)+d(1−p))`, d=0.9 — high plateau, *sharper-than-cosine*
+  final drop), plain **cosine**, and **constant**.
+
+AdaMuon, bs8 fixed, 2 seeds, LR swept per arm, eval @64². Two regimes:
+**(a)** resolution curriculum 32²→64² at the midpoint; **(b)** single fixed 64² resolution.
+
+| shape | (a) curriculum 32²→64² | (b) single-res 64² |
+|---|---|---|
+| **rex** | 0.0630 | **0.0619** |
+| waypoint_2hump | 0.0634 | 0.0624 |
+| hump_rextail (#3 front + REX tail) | **0.0629** | 0.0627 |
+| trapezoid (#1) | 0.0644 | 0.0631 |
+| prodigy_bell (#2) | 0.0673 | 0.0644 |
+| cosine | 0.0690 | 0.0651 |
+| constant | 0.0665 | 0.0655 |
+
+**The one principle that orders the whole table:** *hold the LR high for most of training,
+then let it fall to ~0 at the very end.* REX is the cleanest realization and **wins in
+both regimes** — and it's the simplest (no curriculum-aware tuning, no waypoints).
+**Practical recommendation: just use REX.**
+
+- **REX is regime-robust.** It tops both the curriculum (0.0630) and the single-resolution
+  (0.0619) runs, and refines §8 (REX > `stable→cosine`/trapezoid in both). It needs no
+  switch to align to, unlike the 2-hump shapes whose mid-training peak only meant
+  something next to the resolution switch.
+- **The only ordering that flips between regimes is `const` vs `cosine`.** In the
+  curriculum, `const` (0.0665) **beats** `cosine` (0.0690) because a from-step-0 cosine has
+  decayed to ~half LR by the time the high-res/detail phase begins, starving it (the §7
+  effect). At single resolution that reverses — `cosine` (0.0651) beats `const` (0.0655)
+  because there's no detail phase to starve, so decaying-to-0 helps the final settle. REX
+  satisfies the curriculum rule automatically (it holds high until ~85%, so its decay lands
+  *after* the switch).
+
+**Negative results worth recording (each kills a tempting idea):**
+
+- **Imposing Prodigy's bell as a *fixed* schedule does NOT reproduce Prodigy** (#2 =
+  0.0673, near the bottom in the curriculum). The early peak wastes the high LR on the
+  coarse phase. Prodigy's benefit is *adaptation* (the effective peak tracks the data
+  scale and would re-rise at a distribution shift), not the static shape — an argument for
+  **KProdigy** (in-repo), not a hand-drawn bell.
+- **A non-zero LR floor at the end hurts.** `rex_plateau` (hold 0.15·peak for the last 15 %
+  instead of decaying to 0) scored 0.0644 vs REX's 0.0630 — the tail must reach ~0 so the
+  fine detail *settles* (echoes §4: late non-zero LR jitters the minimum and blurs detail).
+- **Warm restarts / double-hump are *neutral*, not helpful.** Two REX humps (warm restart)
+  with monotonic resolution = 0.0631 (to-zero restart) / 0.0632 (high-valley restart) ≈
+  single REX 0.0630. The extra hump neither helps nor hurts on this task.
+- **…unless you couple the restart with resolution *cycling*, which hurts.** Two REX cycles
+  over res 32²→64²→32²→64² scored 0.066 (vs 0.063 monotonic) — returning to low-res in the
+  second cycle erases the detail learned in the first (the §6 large→small effect). Keep
+  resolution **monotonic small→large**; restart the LR over it if you like, but never cycle
+  the resolution back down.
+- **The hand-drawn #3 + REX tail (`hump_rextail`) is the marginal best in the curriculum
+  (0.0629)** but ties REX within seed noise (±0.0002) and loses the simplicity — not worth
+  the waypoints over plain REX.
+
+Caveat: synthetic 64² task, conv U-Net, 2 seeds, AdaMuon — directional. Reusable takeaway:
+**REX (or any hold-high-then-decay-to-zero shape) over a monotonic small→large curriculum;
+avoid from-step-0 cosine if you run a curriculum, avoid a non-zero LR floor, and don't cycle
+resolution.**
+
 ## Bottom line (all of the above)
 
 - **Warmup (§1):** AdaMuon doesn't need it — the orthogonalization caps the update
@@ -367,3 +438,11 @@ per-tier restarts.
   best return per unit of memory *and* wall-clock — but it still doesn't reach a real big
   batch (0.060) if you can afford the VRAM. Confirms §5's caveat: the dynamic-batch
   "win" was largely the √batch LR coupling, not the batch schedule.
+- **LR shape, fully mapped (§9): just use REX.** Across a waypoint-scheduler sweep of the
+  whole shape family (trapezoid, a Prodigy-style warmup bell, custom 2-hump, REX, cosine,
+  constant), **REX wins in both the curriculum *and* single-resolution regimes** (0.0630 /
+  0.0619) and is the simplest. One principle orders everything: *hold LR high for most of
+  training, fall to ~0 at the very end.* Don't impose Prodigy's bell as a fixed shape (its
+  magic is adaptation → use KProdigy), don't leave a non-zero LR floor (the detail must
+  settle), and warm restarts are neutral *unless* you cycle resolution back down (which
+  erases detail — keep it monotonic small→large).
