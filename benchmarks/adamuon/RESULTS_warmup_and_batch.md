@@ -381,9 +381,11 @@ both regimes** — and it's the simplest (no curriculum-aware tuning, no waypoin
 
 - **Imposing Prodigy's bell as a *fixed* schedule does NOT reproduce Prodigy** (#2 =
   0.0673, near the bottom in the curriculum). The early peak wastes the high LR on the
-  coarse phase. Prodigy's benefit is *adaptation* (the effective peak tracks the data
-  scale and would re-rise at a distribution shift), not the static shape — an argument for
-  **KProdigy** (in-repo), not a hand-drawn bell.
+  coarse phase. Prodigy's benefit is *adaptation* (it auto-tunes the LR magnitude online),
+  not the static shape — an argument for **KProdigy** (in-repo), not a hand-drawn bell. But
+  note (§9.1): that adaptation would *not* push the LR **up** at the high-res switch — the
+  optimal LR is resolution-invariant here — so KProdigy's value is removing the LR sweep,
+  not finding a higher LR for detail.
 - **A non-zero LR floor at the end hurts.** `rex_plateau` (hold 0.15·peak for the last 15 %
   instead of decaying to 0) scored 0.0644 vs REX's 0.0630 — the tail must reach ~0 so the
   fine detail *settles* (echoes §4: late non-zero LR jitters the minimum and blurs detail).
@@ -403,6 +405,32 @@ Caveat: synthetic 64² task, conv U-Net, 2 seeds, AdaMuon — directional. Reusa
 **REX (or any hold-high-then-decay-to-zero shape) over a monotonic small→large curriculum;
 avoid from-step-0 cosine if you run a curriculum, avoid a non-zero LR floor, and don't cycle
 resolution.**
+
+### 9.1 Does higher resolution want a higher LR? (no — the optimum is ~flat)
+
+A natural follow-up (and a correction of a hypothesis floated above): if entering the
+high-res tier shifted the optimal LR *up*, that would argue for re-warming the LR at the
+switch. So we swept the LR at each single fixed resolution (REX, AdaMuon bs8, 600 steps,
+2 seeds, eval at the training resolution):
+
+| train resolution | best LR | LR sweep (val, `*`=best) |
+|---|---|---|
+| 16² | 2.4e-3 | 3e-4:.157 6e-4:.146 1.2e-3:.142 **2.4e-3:.141** 4.8e-3:.146 |
+| 32² | 1.2e-3 | 3e-4:.146 6e-4:.134 **1.2e-3:.127** 2.4e-3:.128 4.8e-3:.135 |
+| 64² | 1.2e-3 | 3e-4:.069 6e-4:.065 **1.2e-3:.062** 2.4e-3:.063 4.8e-3:.068 |
+
+- **No.** Higher resolution does *not* prefer a higher LR — if anything the optimum drifts
+  slightly *down* (16²→2.4e-3, 32²/64²→1.2e-3) then stabilizes. **1.2e-3 is near-optimal at
+  all three resolutions**; the optimum is essentially resolution-invariant.
+- **Why:** AdaMuon's update is **RMS-normalized** (orthogonalization + factored second
+  moment → applied RMS ≈ 0.2·lr regardless of gradient scale). That normalization decouples
+  the optimal LR from gradient magnitude/noise — exactly what resolution changes — so the
+  "more pixels = bigger effective batch = higher LR" (§3) argument is cancelled. (A
+  non-normalized optimizer like AdamW might behave differently; not tested.)
+- **Consequence for the curriculum:** the rule is *hold the LR **high** through the switch*,
+  not *raise* it — consistent with `rex` (holds high) tying `waypoint_2hump` (peaks at the
+  switch). And KProdigy over a curriculum would auto-tune the single, resolution-stable LR
+  (removing the sweep), **not** discover a higher LR for the detail phase.
 
 ## Bottom line (all of the above)
 
@@ -445,4 +473,7 @@ resolution.**
   training, fall to ~0 at the very end.* Don't impose Prodigy's bell as a fixed shape (its
   magic is adaptation → use KProdigy), don't leave a non-zero LR floor (the detail must
   settle), and warm restarts are neutral *unless* you cycle resolution back down (which
-  erases detail — keep it monotonic small→large).
+  erases detail — keep it monotonic small→large). **And the optimal LR is
+  resolution-invariant (§9.1)** — AdaMuon's RMS-normalized update decouples it from gradient
+  scale, so higher resolution does *not* want a higher LR; hold it high through the switch,
+  don't raise it.
