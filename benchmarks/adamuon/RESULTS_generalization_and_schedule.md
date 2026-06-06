@@ -14,26 +14,46 @@ out, resolutions 64/48/32 = 1024/768/512-analog), eval @64², 2 seeds.
 > usable proxy signal; **the real model is the arbiter** — use the live `val/gap` metric
 > (shipped in renga-flow) on a real run to find the operating point.
 
-## TL;DR — recommended config (proxy scale; user maps LR to real scale)
+## TL;DR — recommended recipe (proxy scale; user maps LR to real scale)
 
-**Optimizer — pick by which problem dominates:**
+**Optimizer:** for small-data LoRA where overfitting is the enemy, **`Adafusion` with no
+momentum** is the fit — it consistently held the lowest train–val gap *and* won a real
+visual A/B (even from its "worst" config). `AdaMuon` is **not** a good fit *here*: its
+strength (fast convergence / low loss) is a liability when the risk is memorization, and it
+never out-generalized Adafusion-nomom (§3, §5). AdaMuon shines in the *opposite* regime —
+underfitting / abundant data / when you want fast convergence — not on a small LoRA.
 
-| pick | optimizer | when |
+```python
+# Adafusion, no momentum — the small-LoRA recommendation
+Adafusion(params, lr=<real-scale>, betas=(0.0, 0.999),
+          cautious=False, momentum_dtype="bfloat16")
+```
+(If you do use AdaMuon — only when underfitting — keep its momentum: `betas=(0.95,0.999),
+cautious=True, ns_steps=2`. Its momentum is load-bearing; never `beta1=0` (§3). Regularize
+it via the mixed/progressive resolution schedule, not by disabling momentum.)
+
+**Schedule:** **REX `rex_d=0.9`**, no warmup, `lr_min=0` (decay to ~0). Cosine is the
+more-regularizing alternative (flatter gap, slightly higher loss).
+
+**Resolution — a progressive-floor curriculum (raise the minimum resolution over training,
+ending on the detail target), final 20% at large-only.** Two recipes by priority (§6):
+
+| priority | resolution schedule (frac of training) | Adafusion-nomom test/gap |
 |---|---|---|
-| **A — max generality** | `Adafusion(betas=(0.0, 0.999), cautious=False, momentum_dtype="bfloat16")` — **no momentum** | overfitting is the enemy; small data; perceptual quality matters (won a real visual A/B even from its "worst" config) |
-| **B — more detail** | `AdaMuon(betas=(0.95, 0.999), cautious=True, ns_steps=2, momentum_dtype="bfloat16")` — **keep momentum** | you need sharper detail and can spend a little generality |
+| **loss** | `512+1024 [40%] → 768+1024 [40%] → 1024 [20%]` | **0.0878 / +0.0040** |
+| **gap** | `512+768+1024 [40%] → 768+1024 [40%] → 1024 [20%]` | 0.0908 / **+0.0038** |
 
-**Schedule (both):** **REX `rex_d=0.9`**, no warmup, `lr_min=0` (decay to ~0). Cosine is
-the more-regularizing alternative (flatter gap, slightly higher loss).
+Both **Pareto-beat a flat mix**. The loss recipe (start at the 2× floor 512+1024) is the
+all-round pick — for Adafusion it is *also* near gap-optimal. The gap recipe (start with all
+three resolutions = max scale diversity) shaves the gap further at a small loss cost; for
+**AdaMuon** the gap pick is `512+768+1024 [60%] → 768+1024 [20%] → 1024 [20%]` (gap +0.0075).
+Map 512/768/1024 to your real bucket sizes; the **80% earlier vs 20% final-detail split** and
+the **progressive narrowing** are what matter.
 
-**Resolution (both):** **phased `~80% mix → ~20% big`** — a long mixed-resolution phase
-(shuffled small+large, regularizes) then a short large-only phase (consolidates detail; the
-REX decay lands here). REX optimum ~20% big; cosine ~30%.
-
-**LR at this proxy scale:** **≈1.2e-3** for both (Adafusion-nomom tolerated 6e-4–1.2e-3;
-AdaMuon liked 1.2e-3–2.4e-3). **Do not copy this number to a real run** — it is proxy-scale.
-The transferable relation: **AdaMuon's optimum ≈ AdamW's ÷5** (measured), Adafusion similar
-scale; the optimal LR is otherwise ~resolution-invariant (RMS-normalized update).
+**LR at this proxy scale:** **≈1.2e-3** (Adafusion-nomom tolerated 6e-4–1.2e-3; AdaMuon
+1.2e-3–2.4e-3). **Do not copy this number to a real run** — it is proxy-scale. Transferable
+relation: **AdaMuon's optimum ≈ AdamW's ÷5** (measured), Adafusion ~AdamW scale; the optimal
+LR is otherwise ~resolution-invariant (RMS-normalized update).
 
 ---
 
@@ -140,8 +160,38 @@ a short large-only phase**. Sweeping the big-phase fraction (REX/cosine, lr1.2e-
   (cosine's gap stays flatter longer → can push big% to ~30–35%; higher absolute loss).
 - For AdaMuon, **pure-big (100%) is the worst** (biggest gap) — the mix phase is essential.
 
-This solves *both* of the user's problems at once: the long mix phase fights overfitting, the
-short final big phase (with the REX decay landing on it) restores fine detail.
+This solves *both* problems at once: the long mix phase fights overfitting, the short final
+big phase (with the REX decay landing on it) restores fine detail.
+
+### 6.1 Progressive floor beats a flat mix (the final schedule)
+
+Going further: instead of a *fixed* mix composition, **raise the minimum resolution over
+training** (widest scale diversity early, narrow toward the target, end large-only). All
+schedules end with 20% large-only@1024; REX `rex_d=0.9`, lr1.2e-3, 2 seeds. (512=32², 768=48²,
+1024=64².)
+
+| schedule | Adafusion-nomom test/gap | AdaMuon-mom test/gap |
+|---|---|---|
+| flat `512+1024 → 1024` (80/20) | 0.0885 / +0.0050 | 0.0767 / +0.0088 |
+| flat `512+768+1024 → 1024` (80/20) | 0.0905 / +0.0044 | 0.0775 / +0.0077 |
+| **prog `512+1024 → 768+1024 → 1024` (40/40/20)** | **0.0878 / +0.0040** | **0.0753 / +0.0085** |
+| **prog `512+768+1024 → 768+1024 → 1024` (40/40/20)** | 0.0908 / **+0.0038** | 0.0749 / +0.0089 |
+| prog `512+768+1024 → 768+1024 → 1024` (60/20/20) | 0.0901 / +0.0041 | 0.0764 / **+0.0075** |
+
+- **The progressive floor Pareto-beats every flat mix** for both optimizers — it is a smooth
+  general→detail curriculum (regularize when plastic, sharpen late).
+- **Loss-priority:** start at the 2× floor `512+1024 → 768+1024 → 1024 (40/40/20)` — best loss
+  (0.0878), and for Adafusion *also* near gap-optimal. The all-round pick.
+- **Gap-priority:** start with **all three** resolutions (max scale diversity = more
+  augmentation = lower gap). Adafusion-nomom `3→768→1024 (40/40/20)` → gap +0.0038 (lowest in
+  the whole campaign); AdaMuon `3→768→1024 (60/20/20)` → gap +0.0075.
+- **The valuable coarse tier is the 2× one (512), not the 1.33× one (768):** dropping 768
+  (`512+1024`) keeps the best loss; dropping 512 is strictly worse. 768 only earns its place
+  as an intermediate *step* in the progressive narrowing.
+
+(Differences are small, ~2-seed noise; the robust directions are: progressive ≥ flat; "start
+with all 3" lowers the gap; "start at 512+1024" lowers the loss; always end on a short
+large-only phase.)
 
 ## 7. Fast generalization metric (what to actually measure)
 
