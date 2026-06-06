@@ -72,6 +72,8 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["N802", "N803"]
+# Benchmark/research scripts use torch idioms (F, H, W, conv channel names).
+"benchmarks/*" = ["N802", "N803", "N806", "N812"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
