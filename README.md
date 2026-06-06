@@ -21,6 +21,10 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   convergence/precision at **near-Adafactor memory** (~1–2 B/param, int8/4bit dial).
   Tuned defaults `ns_steps=2`, `cautious=True`; optional `compile=True` (whole-step
   `torch.compile`, AdaMuon-only). → [docs/adamuon.md](docs/adamuon.md)
+- **`Liofusion`** — **Lion's sign-momentum** (one buffer, no second moment) on
+  Adafusion's backend (codec, stochastic-rounding bf16, cautious, foreach). Lightest
+  state in the family — **~1 B (int8) / 0.5 B (4bit) per param** — with Lion's implicit
+  regularization. `betas` are a loss↔generalization dial. → [docs/liofusion.md](docs/liofusion.md)
 - **`KProdigy`** — a memory-efficient **Prodigy** (parameter-free D-adaptation):
   train at `lr=1.0` and the optimizer finds the effective LR itself. Matches
   reference Prodigy bit-for-bit at its defaults, then adds the koptim memory
@@ -33,7 +37,7 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   becomes **byte-for-byte and speed-for-speed plain Adafusion**.
   → [docs/autofusion.md](docs/autofusion.md)
 
-`Adafusion`, `Muon`, and `AdaMuon` are standard `torch.optim.Optimizer`s that work
+`Adafusion`, `Muon`, `AdaMuon`, and `Liofusion` are standard `torch.optim.Optimizer`s that work
 one-parameter-at-a-time, so they drop into per-parameter / gradient-release
 training loops unchanged. `KProdigy` needs a global reduction over all parameters
 each step (the D estimate), so it is a normal two-pass `step()` optimizer (no
@@ -81,6 +85,14 @@ opt = AdaMuon(model.parameters(), lr=1e-3, momentum_dtype="int8")
 ```
 
 ```python
+from koptim import Liofusion
+
+# Lion sign-momentum, lightest state (no second moment). lr is Lion-scale (~AdamW/5).
+# betas are a loss<->generalization dial: (0.95,0.98) for loss, higher beta2 for less overfit.
+opt = Liofusion(model.parameters(), lr=2e-4, betas=(0.95, 0.98), momentum_dtype="4bit")
+```
+
+```python
 from koptim import KProdigy
 
 # Parameter-free: lr stays 1.0; D adapts. For SDXL UNet+TE, pass two param
@@ -111,6 +123,7 @@ opt = Autofusion(
 | **Lion8bit-class memory + momentum** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="int8")` |
 | **Best convergence (memory available)** | `Muon(..., lr=2e-2, momentum_dtype="bfloat16")` |
 | **Beat-AdamW precision at Adafactor memory** | `AdaMuon(..., lr=1e-3, momentum_dtype="int8")` — orthogonalized momentum + factored 2nd moment; `ns_steps=2`/`cautious=True` defaults, optional `compile=True` |
+| **Absolute minimum state (no 2nd moment)** | `Liofusion(..., lr=2e-4, betas=(0.95,0.98), momentum_dtype="4bit")` — Lion sign-momentum at 0.5 B/param; implicit regularization for small-data fine-tuning |
 | **No LR to tune (SDXL UNet+TE)** | `KProdigy([{"params": unet, "lr": 1.0}, {"params": te, "lr": 1.0}])` |
 | **Parameter-free + minimum VRAM** | `KProdigy(..., second_moment="factored", momentum_dtype="bfloat16", slice_p=11)` |
 | **No LR to tune + ~free after warmup** | `Autofusion(..., bf16_method="stochastic_rounding")` — auto-discovers the LR, then freezes to plain Adafusion |
@@ -123,6 +136,8 @@ opt = Autofusion(
   the minimal API + the one advanced knob, and the campaign results.
 - [docs/kprodigy.md](docs/kprodigy.md) — memory-efficient Prodigy design + API.
 - [docs/muon.md](docs/muon.md) — Muon design + API.
+- [docs/liofusion.md](docs/liofusion.md) — Liofusion (Lion sign-momentum) design, the
+  betas loss↔generalization dial, memory, and the proxy evaluation.
 - [docs/adamuon.md](docs/adamuon.md) — AdaMuon design, the `clip_threshold`/`lr`
   validation, `compile=True`, and the pixel-DDPM evaluation.
 - [docs/foreach-batching.md](docs/foreach-batching.md) — multi-tensor batching of
