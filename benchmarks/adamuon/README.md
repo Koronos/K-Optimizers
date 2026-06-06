@@ -99,6 +99,14 @@ ms/step is identical (UNet-bound). **AdaMuon-int8 matches bf16 quality at 61% of
 Adafusion's optimizer memory** → Pareto-dominant (≥ convergence, tied speed, less
 memory).
 
+> **But lower loss ≠ better samples on small data.** For LoRA-scale fine-tuning the
+> train loss *overfits*: the lowest-loss config can produce worse samples. The
+> train–val **gap** is the right signal, and the choice of optimizer/schedule flips
+> toward regularization. See
+> [RESULTS_generalization_and_schedule.md](RESULTS_generalization_and_schedule.md)
+> for the full campaign (loss-vs-gap Pareto, the `mix→big` phased schedule, why
+> AdaMuon's momentum is load-bearing, and the recommended recipe).
+
 ## Known limitations (please scrutinize)
 
 * **SDXL margin is small** (~0.6% final objective vs ~7% on the synthetic task) —
