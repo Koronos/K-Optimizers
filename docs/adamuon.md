@@ -45,8 +45,16 @@ shape-independent applied RMS of `0.2`. In AdaMuon the factored `inv_sqrt(v̂)`
 already brings `u` to RMS `≈1` (its `c_factor ≈ √max(R,C)`), so reapplying
 `√max(R,C)` would double-count the shape and make the update grow with layer
 size. AdaMuon therefore scales by the **constant** `0.2` only. `clip_threshold`
-(default `1.0`) is an RMS ceiling in the RMS≈1 domain — load-bearing for the first
-few steps while the factored second moment warms up, a near no-op thereafter.
+(default `1.0`) is an RMS ceiling in the RMS≈1 domain. It is **load-bearing, not
+cosmetic**: a proxy sweep (REX, no warmup) showed that turning it *off* costs **+24 %**
+final val even at the optimal lr — the early steps (cold factored `v̂`, full lr) spike
+the update RMS and clip catches exactly those; at a 16×-too-high lr, off nearly diverges
+(0.158 vs 0.064). It is near a no-op only in true steady state. `clip` and `lr` are
+**coupled** — clip caps the applied RMS at `≈ clip·0.2·lr`, so `clip<1` at a good lr just
+lowers the effective lr (measured: `clip 0.5 ≡ lr/2`, `clip 0.25 ≡ lr/4`) and a tight
+clip *rescues* a too-high lr. **Tune lr; leave `clip=1.0`** (it sits exactly at the
+RMS≈1 knee — beats both 0.5, which throttles, and 2.0, which lets early spikes through).
+See the evaluation note for the numbers.
 
 ### Momentum semantics ≠ `Muon`
 
@@ -139,6 +147,19 @@ seed, LR swept per arm, held-out val MSE). Not real SDXL/Flux — a first signal
   - final quality — floors at ~0.065 vs Adafusion's ~0.069 (which it never beats);
   - memory — tie (2.03 B/param).
 - Comfortably beats AdamW8bit (0.0762) / Lion8bit (0.0767) / fp32 AdamW (~0.088).
+- **`clip_threshold` / `lr` re-validation** (single-res 64², REX, bs8, 2 seeds, eval@64²):
+
+  | lr @ clip=1.0 | val | | clip @ lr=1.2e-3 | val | clip @ lr=1e-2 (stress) | val |
+  |---|---|---|---|---|---|---|
+  | 6e-4 | 0.0649 | | 0.25 | 0.0685 | 0.25 | 0.0635 |
+  | **1.2e-3** | **0.0619** | | 0.50 | 0.0649 | 0.50 | 0.0681 |
+  | 2.4e-3 | 0.0628 | | **1.00** | **0.0619** | 1.00 | 0.0715 |
+  | 1e-2 | 0.0715 | | 2.00 | 0.0629 | 2.00 | 0.0773 |
+  | 2e-2 (API default) | 0.0776 | | off | 0.0770 | off | 0.1577 |
+
+  Reads: proxy `lr*=1.2e-3` (default 2e-2 is ~16× high, +25%); `clip=1.0` is the optimum
+  *and* load-bearing (off = +24% at the good lr, near-divergence at high lr); `clip<1`
+  acts as an effective-lr cap (0.5≡lr/2, 0.25≡lr/4); tune lr, keep `clip=1.0`.
 - Open work: claw back the per-step gap (lower the non-NS overhead, bf16 the
   post-NS factored region) and re-find the sweet spot at scale.
 
@@ -147,8 +168,13 @@ seed, LR swept per arm, held-out val MSE). Not real SDXL/Flux — a first signal
 - All "beats AdamW" evidence is **LLM, not diffusion** — validate fine-detail
   fidelity empirically on SDXL/Flux LoRA before claiming the result.
 - The factored second moment is computed on `O` (near-orthonormal, small
-  magnitude); its mean scale differs from gradient-based Adafusion, so re-validate
-  `clip_threshold` / `lr` on a real run rather than copying Adafusion's tuning.
+  magnitude); its mean scale differs from gradient-based Adafusion. **Re-validated on
+  the synthetic proxy** (single-res 64², REX, 2 seeds): `clip_threshold=1.0` is the
+  optimum (load-bearing, see above) and the proxy `lr*≈1.2e-3` — note the **API default
+  `lr=2e-2` is Muon/LLM-scale, ~16× high for this diffusion proxy** (val 0.078 vs 0.062
+  at 1.2e-3; it degrades gracefully, never diverges — the §1 robustness). Lower the lr
+  by ~10–16× from the Muon default for diffusion-scale work; still re-confirm on a real
+  SDXL/Flux run (proxy ≠ real model).
 - Newton-Schulz on tiny LoRA matrices is launch-bound; the batched `bmm` path
   mitigates it but the crossover vs `foreach=False` should be profiled per GPU.
 
