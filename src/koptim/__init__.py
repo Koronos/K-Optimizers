@@ -7,6 +7,7 @@ Optimizers:
     KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
     Autofusion: parameter-free LR on Adafusion via a Mechanic tuner (freeze-to-free).
     Liofusion: Lion sign-momentum on Adafusion's quantized-momentum backend (experimental).
+    Orphan: ADOPT (arXiv:2411.02853) on the factored-quantized backend (experimental code name).
 
 Quickstart::
 
@@ -27,6 +28,7 @@ from koptim.autofusion import Autofusion
 from koptim.kprodigy import KProdigy
 from koptim.liofusion import Liofusion
 from koptim.muon import Muon
+from koptim.orphan import Orphan
 
 __all__ = [
     "AdaMuon",
@@ -35,5 +37,6 @@ __all__ = [
     "KProdigy",
     "Liofusion",
     "Muon",
+    "Orphan",
     "__version__",
 ]
