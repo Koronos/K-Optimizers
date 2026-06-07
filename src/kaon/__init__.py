@@ -13,6 +13,7 @@ Optimizers:
     Adan: adaptive Nesterov momentum (grad + grad-difference EMAs) on the factored backend (candidate).
     ScheduleFree: Schedule-Free AdamW (iterate averaging, no LR schedule) on the factored backend (candidate).
     ADOPT: modified Adam that converges with any beta2 (v-lag + normalize-then-momentum) (candidate).
+    Grams: Adam's magnitude with the update direction set by sign(current gradient) (candidate).
 
 Quickstart::
 
@@ -35,6 +36,7 @@ from kaon.adapnm import AdaPNM
 from kaon.ademamix import AdEMAMix
 from kaon.adopt import ADOPT
 from kaon.autokaon import Autokaon
+from kaon.grams import Grams
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
 from kaon.mars import MARS
@@ -49,6 +51,7 @@ __all__ = [
     "Adakaon",
     "Adan",
     "Autokaon",
+    "Grams",
     "KProdigy",
     "Lion",
     "MARS",
