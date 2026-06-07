@@ -65,7 +65,7 @@ from kaon._momentum_codec import (
     _MomentumCodec,
     load_state_dict_preserving_dtypes,
 )
-from kaon._stochastic_rounding import add_stochastic_
+from kaon._stochastic_rounding import add_stochastic_, subtract_batched_
 from kaon.muon import zeropower_via_newtonschulz5
 
 __all__ = ["AdaMuon"]
@@ -470,10 +470,7 @@ class AdaMuon(Optimizer):
             denom = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view(N, 1, 1)
             delta = delta.mul_(mask).div_(denom)
 
-        pviews = [mat(p.data) for p in plist]
-        weights = torch.stack(pviews)                                     # [N, R, C], param dtype
-        self._apply_subtract_batched(weights, delta, bf16_method)
-        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -529,21 +526,7 @@ class AdaMuon(Optimizer):
             denom = mask.mean(dim=1).clamp_(min=1e-8).view(N, 1)
             delta = delta.mul_(mask).div_(denom)
 
-        pviews = [p.data for p in plist]
-        weights = torch.stack(pviews)                                     # [N, L], param dtype
-        self._apply_subtract_batched(weights, delta, bf16_method)
-        torch._foreach_copy_(pviews, list(weights.unbind(0)))
-
-    @staticmethod
-    def _apply_subtract_batched(weights: Tensor, delta_fp32: Tensor, bf16_method: str) -> None:
-        if (
-            _is_low_precision(weights)
-            and bf16_method == "stochastic_rounding"
-            and weights.dtype == torch.bfloat16
-        ):
-            add_stochastic_(weights, delta_fp32, alpha=-1.0)
-        else:
-            weights.sub_(delta_fp32.to(weights.dtype))
+        subtract_batched_([p.data for p in plist], delta, bf16_method)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:

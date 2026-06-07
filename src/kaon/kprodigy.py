@@ -63,7 +63,7 @@ from kaon._momentum_codec import (
     _quant_int8,
     load_state_dict_preserving_dtypes,
 )
-from kaon._stochastic_rounding import add_stochastic_
+from kaon._stochastic_rounding import add_stochastic_, subtract_batched_
 
 __all__ = ["KProdigy"]
 
@@ -930,10 +930,7 @@ class KProdigy(Optimizer):
             denom = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view(N, 1, 1)
             delta = delta.mul_(mask).div_(denom)
 
-        pviews = [mat(p.data) for p in plist]
-        weights = torch.stack(pviews)                                       # [N, R, C]
-        self._apply_subtract_batched(weights, delta, bf16_method)
-        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
 
     @torch.no_grad()
     def _full_bucket(
@@ -963,10 +960,7 @@ class KProdigy(Optimizer):
             md = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view([N] + [1] * len(shape))
             delta = delta.mul_(mask).div_(md)
 
-        pviews = [p.data for p in plist]
-        weights = torch.stack(pviews)
-        self._apply_subtract_batched(weights, delta, bf16_method)
-        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+        subtract_batched_([p.data for p in plist], delta, bf16_method)
 
     @torch.no_grad()
     def _flat_full_bucket(
@@ -992,14 +986,3 @@ class KProdigy(Optimizer):
         else:
             p.data.sub_(delta_fp32.to(p.dtype))
 
-    @staticmethod
-    def _apply_subtract_batched(weights: Tensor, delta_fp32: Tensor, bf16_method: str) -> None:
-        """Stacked counterpart of :meth:`_apply_subtract` (no kahan/fp16 here)."""
-        if (
-            _is_low_precision(weights)
-            and bf16_method == "stochastic_rounding"
-            and weights.dtype == torch.bfloat16
-        ):
-            add_stochastic_(weights, delta_fp32, alpha=-1.0)
-        else:
-            weights.sub_(delta_fp32.to(weights.dtype))

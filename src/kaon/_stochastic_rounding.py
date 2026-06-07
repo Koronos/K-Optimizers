@@ -32,7 +32,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-__all__ = ["add_stochastic_"]
+__all__ = ["add_stochastic_", "subtract_batched_"]
 
 
 @torch.no_grad()
@@ -101,3 +101,30 @@ def _add_stochastic_bf16_(
     # contiguous cast, so the straightforward cast wins. A fused Triton kernel
     # for the whole add+round remains the real optimization — see CHANGELOG.)
     target_bf16.copy_(result_fp32.to(torch.bfloat16))
+
+
+@torch.no_grad()
+def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str) -> None:
+    """In-place ``p -= delta`` over a foreach bucket of (matrixized) param views.
+
+    ``pviews`` is the list of N same-shape param views (each ``[*shape]``); ``delta`` is
+    the stacked fp32 step ``[N, *shape]`` (row i applies to ``pviews[i]``). Shared by every
+    kaon optimizer's foreach buckets.
+
+    Only the **bf16 + stochastic-rounding** case needs a materialized stacked-weights
+    tensor (``add_stochastic_`` operates on the stack). Every other case — notably the
+    fp32 regime, including LoRA's many-tiny-tensor buckets — subtracts the delta slices
+    straight into the param views with ``_foreach_sub_``, skipping *both* the stack-weights
+    allocation and the copy-back, which are pure overhead in the launch-bound regime.
+
+    Bit-exact with the previous ``stack -> sub_ -> _foreach_copy_`` path (same arithmetic).
+    """
+    p0 = pviews[0]
+    if p0.dtype == torch.bfloat16 and bf16_method == "stochastic_rounding":
+        weights = torch.stack(pviews)
+        add_stochastic_(weights, delta, alpha=-1.0)
+        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+    elif p0.dtype == delta.dtype:
+        torch._foreach_sub_(pviews, list(delta.unbind(0)))
+    else:
+        torch._foreach_sub_(pviews, [d.to(p0.dtype) for d in delta.unbind(0)])

@@ -131,7 +131,7 @@ from kaon._momentum_codec import (
     _quant_int8_stacked,
     load_state_dict_preserving_dtypes,
 )
-from kaon._stochastic_rounding import add_stochastic_
+from kaon._stochastic_rounding import add_stochastic_, subtract_batched_
 
 __all__ = ["AdaPNM"]
 
@@ -612,7 +612,7 @@ class AdaPNM(Optimizer):
             denom = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view(N, 1, 1)
             delta = delta.mul_(mask).div_(denom)
 
-        self._write_back([mat(p.data) for p in plist], delta, bf16_method)
+        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -663,7 +663,7 @@ class AdaPNM(Optimizer):
             denom = mask.mean(dim=1).clamp_(min=1e-8).view(N, 1)
             delta = delta.mul_(mask).div_(denom)
 
-        self._write_back([p.data for p in plist], delta, bf16_method)
+        subtract_batched_([p.data for p in plist], delta, bf16_method)
 
     def _pn_stacked(
         self,
@@ -697,30 +697,6 @@ class AdaPNM(Optimizer):
         """In-place decoupled WD ``p *= (1 - factor)`` on the (matrixized) weights."""
         scale = 1.0 - factor
         torch._foreach_mul_([mat(p.data) for p in plist], scale)
-
-    @staticmethod
-    def _write_back(pviews: list[Tensor], delta: Tensor, bf16_method: str) -> None:
-        """Apply ``p -= delta`` to a bucket of (matrixized) param views ``[N, *shape]``.
-
-        Only the bf16 + stochastic-rounding path needs a materialized stacked-weights
-        tensor (``add_stochastic_`` works on the stack); every other case subtracts the
-        delta slices straight into the param views with ``_foreach_sub_`` — skipping the
-        stack-weights allocation *and* the copy-back, which is pure overhead in the
-        many-tiny-tensor (LoRA) regime.
-        """
-        p0 = pviews[0]
-        if (
-            _is_low_precision(p0)
-            and bf16_method == "stochastic_rounding"
-            and p0.dtype == torch.bfloat16
-        ):
-            weights = torch.stack(pviews)
-            add_stochastic_(weights, delta, alpha=-1.0)
-            torch._foreach_copy_(pviews, list(weights.unbind(0)))
-        elif p0.dtype == delta.dtype:
-            torch._foreach_sub_(pviews, list(delta.unbind(0)))
-        else:
-            torch._foreach_sub_(pviews, [d.to(p0.dtype) for d in delta.unbind(0)])
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()

@@ -82,7 +82,7 @@ from kaon._momentum_codec import (
     _quant_int8_stacked,
     load_state_dict_preserving_dtypes,
 )
-from kaon._stochastic_rounding import add_stochastic_
+from kaon._stochastic_rounding import add_stochastic_, subtract_batched_
 
 __all__ = ["Lion"]
 
@@ -453,21 +453,7 @@ class Lion(Optimizer):
             delta = delta.mul_(mask).div_(denom)
 
         delta.mul_(lr)
-        pviews = [p.data.reshape(length) for p in plist]
-        weights = torch.stack(pviews)                                        # [N, L]
-        self._apply_subtract_batched(weights, delta, bf16_method)
-        torch._foreach_copy_(pviews, list(weights.unbind(0)))
-
-    @staticmethod
-    def _apply_subtract_batched(weights: Tensor, delta_fp32: Tensor, bf16_method: str) -> None:
-        if (
-            _is_low_precision(weights)
-            and bf16_method == "stochastic_rounding"
-            and weights.dtype == torch.bfloat16
-        ):
-            add_stochastic_(weights, delta_fp32, alpha=-1.0)
-        else:
-            weights.sub_(delta_fp32.to(weights.dtype))
+        subtract_batched_([p.data.reshape(length) for p in plist], delta, bf16_method)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
