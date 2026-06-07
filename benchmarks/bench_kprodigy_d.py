@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 
-from koptim import KProdigy
+from kaon import KProdigy
 
 STEPS = 200
 

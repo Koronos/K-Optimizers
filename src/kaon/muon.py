@@ -35,7 +35,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from koptim._stochastic_rounding import add_stochastic_
+from kaon._stochastic_rounding import add_stochastic_
 
 __all__ = ["Muon"]
 

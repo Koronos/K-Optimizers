@@ -1,15 +1,16 @@
-"""Liofusion — Lion's sign-momentum update on Adafusion's precision/memory backend.
+"""Lion — sign-momentum update on Adafusion's precision/memory backend.
 
-Liofusion (provisional name) marries **Lion** (Chen et al. 2023, *Symbolic
-Discovery of Optimization Algorithms*, arXiv:2302.06675) — a sign-of-momentum
-optimizer that keeps a **single** momentum buffer and **no second moment** — to
-the precision and memory machinery already proven in
-:class:`~koptim.adafusion.Adafusion`. It is a deliberate generalization /
-ablation vehicle: same quantized-momentum store, same bf16-correct stochastic
-rounding, same cautious masking and foreach batching as Adafusion, but with
-Lion's update rule instead of the factored-second-moment Adam-style step. Keeping
-it a separate class lets it be A/B'd against Adafusion cleanly (Adafusion is left
-byte-for-byte unchanged).
+Lion (Chen et al. 2023, *Symbolic Discovery of Optimization Algorithms*,
+arXiv:2302.06675) — a sign-of-momentum optimizer that keeps a **single** momentum
+buffer and **no second moment** — implemented on top of the precision and memory
+machinery already proven in :class:`~kaon.adafusion.Adafusion`. It is a
+deliberate generalization / ablation vehicle: same quantized-momentum store, same
+bf16-correct stochastic rounding, same cautious masking and foreach batching as
+Adafusion, but with Lion's update rule instead of the factored-second-moment
+Adam-style step. Keeping it a separate class lets it be A/B'd against Adafusion
+cleanly (Adafusion is left byte-for-byte unchanged).
+
+(Developed under the provisional code name *Liofusion*.)
 
 **The update (per parameter, decoupled weight decay):**
 
@@ -31,7 +32,7 @@ Adafusion (which takes momentum of the already-normalized update).
   optimizer state of Adam/Adafusion-with-momentum before quantization.
 * That single buffer is stored through the **shared momentum codec layout**
   (``bfloat16`` ~2 B/param, ``int8`` ~1 B/param, ``4bit`` ~0.5 B/param), so
-  Liofusion's optimizer-state floor is Lion-class or better.
+  Lion's optimizer-state floor is Lion-class or better.
 * The step itself is a ``sign`` plus two cheap EMAs — no ``rsqrt``, no factored
   reconstruction, no RMS clip.
 
@@ -48,14 +49,14 @@ uses. With pure sign updates this is a per-coordinate agreement filter between
 the momentum-interpolated direction and the instantaneous gradient.
 
 **What is reused vs new.** Reused from Adafusion's backend: the momentum storage
-layout and the quant/dequant primitives in :mod:`koptim._momentum_codec`
+layout and the quant/dequant primitives in :mod:`kaon._momentum_codec`
 (int8 per-row absmax; 4-bit per-block absmax, nibble-packed), the
-stochastic-rounding bf16 weight update (:func:`koptim._stochastic_rounding.add_stochastic_`),
+stochastic-rounding bf16 weight update (:func:`kaon._stochastic_rounding.add_stochastic_`),
 ``load_state_dict_preserving_dtypes`` for dtype-safe checkpoint resume, and the
 bucketed foreach batching pattern for many small tensors. New here: the Lion
 sign-momentum update rule and its dual-beta momentum handling (the shared codec's
 ``ema_*`` helpers do an Adam-style *momentum-of-update* and so cannot be reused
-verbatim; Liofusion dequants the momentum, computes the Lion direction and the
+verbatim; Lion dequants the momentum, computes the Lion direction and the
 ``beta2`` EMA itself, then requants through the same storage layout).
 
 It is a standard ``torch.optim.Optimizer`` with a single per-parameter step, so
@@ -71,7 +72,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from koptim._momentum_codec import (
+from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
     _dequant_4bit_stacked,
@@ -81,9 +82,9 @@ from koptim._momentum_codec import (
     _quant_int8_stacked,
     load_state_dict_preserving_dtypes,
 )
-from koptim._stochastic_rounding import add_stochastic_
+from kaon._stochastic_rounding import add_stochastic_
 
-__all__ = ["Liofusion"]
+__all__ = ["Lion"]
 
 _LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
@@ -103,7 +104,7 @@ def _is_low_precision(t: Tensor) -> bool:
     return t.dtype in _LOW_PRECISION
 
 
-class Liofusion(Optimizer):
+class Lion(Optimizer):
     """Lion sign-momentum optimizer on Adafusion's quantized-momentum backend.
 
     Args:
@@ -204,7 +205,7 @@ class Liofusion(Optimizer):
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
         """Allocate the single momentum buffer in the configured storage layout.
 
-        Layout matches :mod:`koptim._momentum_codec` exactly (per-row int8 scale,
+        Layout matches :mod:`kaon._momentum_codec` exactly (per-row int8 scale,
         per-block 4-bit scale, zero == nibble 8) so checkpoint resume and
         ``load_state_dict_preserving_dtypes`` behave identically to Adafusion.
         """
@@ -324,7 +325,7 @@ class Liofusion(Optimizer):
             params = [p for p in group["params"] if p.grad is not None]
             for p in params:
                 if p.grad.is_sparse:
-                    raise RuntimeError("Liofusion does not support sparse gradients")
+                    raise RuntimeError("Lion does not support sparse gradients")
             if self._foreach and self._group_foreach_eligible(group):
                 chunk_budget = self._foreach_budget(params[0].device)
                 cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)

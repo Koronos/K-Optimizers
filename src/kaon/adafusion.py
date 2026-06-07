@@ -35,8 +35,8 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from koptim._factored import factored_inv_sqrt_factors, update_factored_state
-from koptim._momentum_codec import (
+from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
     _dequant_4bit_stacked,
@@ -53,13 +53,13 @@ from koptim._momentum_codec import (
     _unpack_nibbles,
     load_state_dict_preserving_dtypes,
 )
-from koptim._stochastic_rounding import add_stochastic_
+from kaon._stochastic_rounding import add_stochastic_
 
 __all__ = ["Adafusion"]
 
-# Re-exported codec internals (kept importable from ``koptim.adafusion`` for
+# Re-exported codec internals (kept importable from ``kaon.adafusion`` for
 # backwards compatibility with existing tests/benchmarks). The implementations
-# now live in :mod:`koptim._momentum_codec`, shared with KProdigy.
+# now live in :mod:`kaon._momentum_codec`, shared with KProdigy.
 _ = (
     _dequant_4bit, _dequant_4bit_stacked, _FloatCodec, _FourBitCodec, _Int8Codec,
     _MomentumCodec, _pack_nibbles, _quant_4bit, _quant_4bit_stacked, _quant_int8,
@@ -169,7 +169,7 @@ class Adafusion(Optimizer):
     ``torch.compile`` was measured ~neutral on most shapes here and a slight loss on
     trivial steps (Adafusion's step has little fusable elementwise math), so it is
     not worth the API surface — Adafusion stays lean. The flag lives on
-    :class:`~koptim.adamuon.AdaMuon`, whose heavy Newton-Schulz math it actually
+    :class:`~kaon.adamuon.AdaMuon`, whose heavy Newton-Schulz math it actually
     speeds up.
     """
 

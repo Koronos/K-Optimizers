@@ -1,10 +1,12 @@
-# Liofusion — Lion's sign-momentum on Adafusion's memory/precision backend
+# Lion — sign-momentum on Adafusion's memory/precision backend
+
+<!-- Developed under the provisional code name "Liofusion". -->
 
 > **Lion** (Chen et al., *Symbolic Discovery of Optimization Algorithms*, arXiv:2302.06675)
 > — a sign-of-momentum update with a single momentum buffer (no second moment) — running on
 > **Adafusion's** quantized-momentum codec, stochastic-rounding bf16 weights, cautious masking,
 > and foreach batching. The result: Lion's minimal state at **bf16/int8/4bit** momentum, with
-> Adafusion's precision and the koptim memory toolkit.
+> Adafusion's precision and the kaon memory toolkit.
 
 ## Why
 
@@ -12,8 +14,8 @@ Lion drops the second moment entirely (just one momentum buffer → half of Adam
 its sign update has a known *implicit-regularization* flavour. For small-data diffusion
 fine-tuning — where the enemy is memorization, not raw loss (see
 [RESULTS_generalization_and_schedule.md](../benchmarks/adamuon/RESULTS_generalization_and_schedule.md))
-— that regularization is exactly what you want. Liofusion is the vehicle to test "Lion's memory
-+ implicit regularization" inside the koptim framework, A/B-comparable to Adafusion.
+— that regularization is exactly what you want. Lion is the vehicle to test "Lion's memory
++ implicit regularization" inside the kaon framework, A/B-comparable to Adafusion.
 
 ## The update (per parameter, decoupled weight decay)
 
@@ -33,7 +35,7 @@ there is no preconditioner blow-up to clip; each step is bounded by construction
 ## Memory & the no-second-moment win
 
 One momentum buffer, no second moment: **~2 B/param (bf16) / ~1 B (int8) / ~0.5 B (4bit)**.
-The 4bit path (0.5 B/param) is Liofusion's signature — lighter than Adafusion (which still
+The 4bit path (0.5 B/param) is Lion's signature — lighter than Adafusion (which still
 keeps a small factored second moment) and far under AdamW (8 B). Memory is its strongest axis.
 
 ## Reused from Adafusion (shared backend — no duplication)
@@ -55,7 +57,7 @@ keeps a small factored second moment) and far under AdamW (8 B). Memory is its s
 ## API
 
 ```python
-Liofusion(
+Lion(
     params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0, *,
     cautious=True, momentum_dtype="bfloat16", momentum_4bit_block=128,
     bf16_method="stochastic_rounding", foreach=True,
@@ -79,7 +81,7 @@ Liofusion(
 ## Evaluation (synthetic pixel-DDPM proxy — directional)
 
 On the registered proxy ([proxy_dataset.py](../benchmarks/adamuon/proxy_dataset.py),
-train=32 / test=96, REX + progressive-resolution recipe), tuned Liofusion `(0.95, 0.98)` is
+train=32 / test=96, REX + progressive-resolution recipe), tuned Lion `(0.95, 0.98)` is
 **Pareto-competitive**: at the larger C=128 / 2500-step setting it reached **AdaMuon's loss at
 roughly half AdaMuon's train–val gap**, and beat the no-momentum Adafusion baseline on both
 axes — at the lightest memory. The sign-momentum's implicit regularization shows *more* at the
@@ -91,7 +93,7 @@ objective-overfitting, not perceptual fidelity.
 
 ## See also
 
-- [adafusion.md](adafusion.md) — the backend Liofusion reuses.
+- [adafusion.md](adafusion.md) — the backend Lion reuses.
 - [momentum.md](momentum.md) — the int8/4bit momentum codec.
 - [foreach-batching.md](foreach-batching.md) — the multi-tensor batching.
 - [RESULTS_generalization_and_schedule.md](../benchmarks/adamuon/RESULTS_generalization_and_schedule.md)

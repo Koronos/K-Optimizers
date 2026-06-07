@@ -52,7 +52,7 @@ APOLLO) are memory-savers — we already have that, not the goal.
    SAM's 2× cost).
 4. (optional) **MADGRAD** — the "zero weight decay" dual-claim is distinctive.
 
-All are ≤1-extra-buffer → drop into Liofusion/Adafusion's quantized + foreach + cautious backend.
+All are ≤1-extra-buffer → drop into Lion/Adafusion's quantized + foreach + cautious backend.
 Falsify each on the registered proxy (train-val gap) + a real LoRA (FID/KID), vs tuned AdamW —
 NOT loss.
 

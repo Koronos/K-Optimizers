@@ -8,7 +8,7 @@ at near-Adafactor memory.
 The pipeline (2-D / conv weights) is, in order:
 
 1. **First moment of the RAW gradient** — an EMA ``m = β1·m + (1-β1)·g`` kept in a
-   quantized codec (bf16/int8/4bit) exactly like :class:`~koptim.adafusion.Adafusion`.
+   quantized codec (bf16/int8/4bit) exactly like :class:`~kaon.adafusion.Adafusion`.
 2. **Orthogonalize** ``m`` with a 5-step Newton-Schulz iteration → ``O ≈ U·Vᵀ``.
 3. **Factored second moment OF ``O``** (Adafactor row+col EMA) → ``u = O·inv_sqrt(v̂)``.
 4. **RMS scaling** to a shape-independent target (see below) → apply at ``lr``.
@@ -28,9 +28,9 @@ get a shape-independent applied RMS of ``0.2``. In AdaMuon the factored
 make the update grow with layer size. We therefore scale by the **constant**
 ``_UPDATE_RMS`` (0.2) only. Every parameter — 2-D and 1-D alike — is normalized to
 an applied RMS of ``≈ 0.2·lr``, so a single ``lr`` governs the whole model (no
-separate Adam LR for biases/norms, unlike :class:`~koptim.muon.Muon`).
+separate Adam LR for biases/norms, unlike :class:`~kaon.muon.Muon`).
 
-**Momentum semantics differ from :class:`~koptim.muon.Muon`.** ``Muon`` uses a
+**Momentum semantics differ from :class:`~kaon.muon.Muon`.** ``Muon`` uses a
 heavy-ball buffer (``m = momentum·m + g``) with optional Nesterov; AdaMuon uses an
 Adam-style EMA lerp (``m = β1·m + (1-β1)·g``), which is the canonical AdaMuon form
 and what the shared momentum codec implements — giving int8/4bit momentum and
@@ -58,15 +58,15 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from koptim._factored import factored_inv_sqrt_factors, update_factored_state
-from koptim._momentum_codec import (
+from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _make_codec,
     _MomentumCodec,
     load_state_dict_preserving_dtypes,
 )
-from koptim._stochastic_rounding import add_stochastic_
-from koptim.muon import zeropower_via_newtonschulz5
+from kaon._stochastic_rounding import add_stochastic_
+from kaon.muon import zeropower_via_newtonschulz5
 
 __all__ = ["AdaMuon"]
 
@@ -98,7 +98,7 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
 
     ``grad`` is ``[N, R, C]`` (all slices share ``R, C``). Returns ``[N, R, C]``
     bf16 orthogonal factors, one per slice — element-for-element the per-slice
-    :func:`~koptim.muon.zeropower_via_newtonschulz5` but with a single ``bmm`` per
+    :func:`~kaon.muon.zeropower_via_newtonschulz5` but with a single ``bmm`` per
     iteration instead of ``N`` matmuls (the LoRA throughput win). Each slice is
     normalized by its own Frobenius norm and transposed to its smaller inner
     dimension (uniform across the bucket since all slices share the shape).

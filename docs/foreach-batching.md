@@ -135,7 +135,7 @@ uv run ktune --model /path/to/transformer.safetensors --momentum bf16 --wd 0.01
 
 It prints the per-param-loop baseline, the foreach speedup, a cutoff sweep, and a
 verdict like `==> Keep the default` or `==> Consider foreach_batch_cutoff=…`.
-Equivalent without the console script: `python -m koptim.tune --model …`.
+Equivalent without the console script: `python -m kaon.tune --model …`.
 
 ## Tuning cheat-sheet
 

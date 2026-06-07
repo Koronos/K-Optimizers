@@ -1,4 +1,4 @@
-"""K-Optimizers (``koptim``) — memory-efficient PyTorch optimizers for diffusion.
+"""K-Optimizers (``kaon``) — memory-efficient PyTorch optimizers for diffusion.
 
 Optimizers:
     Adafusion: conv-aware factored optimizer (AdamW-quality at Adafactor memory).
@@ -6,11 +6,11 @@ Optimizers:
     AdaMuon: orthogonalized momentum + factored quantized variance (Adafactor memory).
     KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
     Autofusion: parameter-free LR on Adafusion via a Mechanic tuner (freeze-to-free).
-    Liofusion: Lion sign-momentum on Adafusion's quantized-momentum backend (experimental).
+    Lion: sign-momentum (EvoLved Sign Momentum) on Adafusion's quantized-momentum backend (experimental).
 
 Quickstart::
 
-    from koptim import Adafusion, Muon
+    from kaon import Adafusion, Muon
 
     optimizer = Adafusion(
         model.parameters(),
@@ -20,20 +20,20 @@ Quickstart::
     )
 """
 
-from koptim._version import __version__
-from koptim.adafusion import Adafusion
-from koptim.adamuon import AdaMuon
-from koptim.autofusion import Autofusion
-from koptim.kprodigy import KProdigy
-from koptim.liofusion import Liofusion
-from koptim.muon import Muon
+from kaon._version import __version__
+from kaon.adafusion import Adafusion
+from kaon.adamuon import AdaMuon
+from kaon.autofusion import Autofusion
+from kaon.kprodigy import KProdigy
+from kaon.lion import Lion
+from kaon.muon import Muon
 
 __all__ = [
     "AdaMuon",
     "Adafusion",
     "Autofusion",
     "KProdigy",
-    "Liofusion",
+    "Lion",
     "Muon",
     "__version__",
 ]

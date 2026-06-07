@@ -4,7 +4,7 @@ Prodigy (Mishchenko & Defazio, 2023, arXiv:2306.06101) estimates the distance
 ``D`` to the solution on the fly and uses it as the effective learning rate, so
 you train at ``lr=1.0`` and the optimizer finds the scale itself.
 
-This is a clean reimplementation aimed at koptim's thesis — *memory-efficient
+This is a clean reimplementation aimed at kaon's thesis — *memory-efficient
 bf16 diffusion fine-tuning* — fixing the issues that plagued the original
 ``KProdigy`` research repo (whose shipped defaults, ``d_update_freq=5`` and
 ``use_bias_correction=True``, starved the D-bootstrap and made the effective LR
@@ -55,15 +55,15 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from koptim._factored import factored_inv_sqrt_factors, update_factored_state
-from koptim._momentum_codec import (
+from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _make_codec,
     _MomentumCodec,
     _quant_int8,
     load_state_dict_preserving_dtypes,
 )
-from koptim._stochastic_rounding import add_stochastic_
+from kaon._stochastic_rounding import add_stochastic_
 
 __all__ = ["KProdigy"]
 

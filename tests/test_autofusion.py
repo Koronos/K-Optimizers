@@ -17,18 +17,18 @@ import inspect
 import pytest
 import torch
 
-from koptim import Autofusion
-from koptim.adafusion import Adafusion
+from kaon import Autofusion
+from kaon.adafusion import Adafusion
 
 from .conftest import train_steps
 
 
 def test_legacy_aliases_are_removed() -> None:
     """``AdaptiveAdafusion`` / ``AdafusionProdigy`` were purged (alpha, no back-compat)."""
-    import koptim
+    import kaon
 
-    assert not hasattr(koptim, "AdaptiveAdafusion")
-    assert not hasattr(koptim, "AdafusionProdigy")
+    assert not hasattr(kaon, "AdaptiveAdafusion")
+    assert not hasattr(kaon, "AdafusionProdigy")
 
 
 def test_purged_knobs_are_not_public() -> None:
@@ -60,7 +60,7 @@ def test_lr_freeze_defaults_to_auto() -> None:
 def test_internal_constants_unchanged() -> None:
     """The purged knobs are pinned to the exact values they defaulted to before, so
     behavior is identical to the old defaults."""
-    from koptim import autofusion as af
+    from kaon import autofusion as af
 
     assert af._S_INIT_REL == 3e-3
     assert af._SCALE_FLOOR_FRAC == 0.5

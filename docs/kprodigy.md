@@ -2,7 +2,7 @@
 
 > A memory-efficient **Prodigy** (parameter-free D-adaptation): train at `lr=1.0`
 > and the optimizer finds the effective LR itself. Matches reference Prodigy
-> bit-for-bit at its defaults, then adds the koptim memory toolkit.
+> bit-for-bit at its defaults, then adds the kaon memory toolkit.
 
 ## Why
 

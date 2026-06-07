@@ -33,8 +33,8 @@ from collections.abc import Sequence
 
 import torch
 
-from koptim import Adafusion
-from koptim.adafusion import _FOREACH_BATCH_CUTOFF
+from kaon import Adafusion
+from kaon.adafusion import _FOREACH_BATCH_CUTOFF
 
 
 def _read_safetensors_shapes(path: str, prefix: str | None) -> list[tuple[int, ...]]:

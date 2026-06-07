@@ -1,4 +1,4 @@
-"""Tests for the Liofusion (Lion sign-momentum on Adafusion's backend) optimizer."""
+"""Tests for the Lion (Lion sign-momentum on Adafusion's backend) optimizer."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from koptim import Liofusion
+from kaon import Lion
 
 from .conftest import train_steps
 
@@ -24,10 +24,10 @@ def _ref_lion_step(
     weight_decay: float,
     cautious: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Reference numpy Lion step mirroring Liofusion's fp32 per-param path.
+    """Reference numpy Lion step mirroring Lion's fp32 per-param path.
 
     Returns ``(new_p, new_m)``. Cautious masking and decoupled weight decay
-    follow the same order Liofusion uses (WD folded into the delta, then the
+    follow the same order Lion uses (WD folded into the delta, then the
     cautious mask on ``delta * g``), so this is bit-comparable up to fp rounding.
     """
     c = beta1 * m + (1.0 - beta1) * g
@@ -49,7 +49,7 @@ def test_construct_and_step():
         torch.nn.Parameter(torch.randn(5)),
         torch.nn.Parameter(torch.randn(3, 2, 3, 3)),
     ]
-    opt = Liofusion(params, lr=1e-4, betas=(0.9, 0.99))
+    opt = Lion(params, lr=1e-4, betas=(0.9, 0.99))
     for p in params:
         p.grad = torch.randn_like(p)
     opt.step()  # must not raise
@@ -64,7 +64,7 @@ def test_matches_numpy_reference(cautious, weight_decay):
     torch.manual_seed(0)
     lr, b1, b2 = 0.01, 0.9, 0.99
     p = torch.nn.Parameter(torch.randn(16, 7, dtype=torch.float64).float())
-    opt = Liofusion(
+    opt = Lion(
         [p], lr=lr, betas=(b1, b2), weight_decay=weight_decay,
         momentum_dtype="float32", cautious=cautious, foreach=False,
     )
@@ -90,7 +90,7 @@ def test_update_is_sign_of_interpolated_momentum():
     p = torch.nn.Parameter(torch.zeros(64))
     g = torch.randn(64)
     g[g.abs() < 1e-3] = 0.5  # avoid exact-zero coords so sign is unambiguous
-    opt = Liofusion([p], lr=1.0, betas=(0.9, 0.99), weight_decay=0.0,
+    opt = Lion([p], lr=1.0, betas=(0.9, 0.99), weight_decay=0.0,
                     momentum_dtype="float32", cautious=False, foreach=False)
     p.grad = g.clone()
     opt.step()
@@ -108,7 +108,7 @@ def test_cautious_masks_disagreeing_coords():
     torch.manual_seed(0)
     n = 100
     p = torch.nn.Parameter(torch.zeros(n))
-    opt = Liofusion([p], lr=1.0, betas=(0.5, 0.99), weight_decay=0.0,
+    opt = Lion([p], lr=1.0, betas=(0.5, 0.99), weight_decay=0.0,
                     momentum_dtype="float32", cautious=True, foreach=False)
     # Seed momentum opposite to the gradient on the first half of the coords.
     g = torch.ones(n)
@@ -133,7 +133,7 @@ def test_momentum_dtype_variants_construct_and_step(momentum_dtype):
     """Every momentum_dtype constructs, steps without NaN, and stores the buffer."""
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn(32, 16))
-    opt = Liofusion([p], lr=1e-3, betas=(0.9, 0.99), momentum_dtype=momentum_dtype)
+    opt = Lion([p], lr=1e-3, betas=(0.9, 0.99), momentum_dtype=momentum_dtype)
     for _ in range(5):
         p.grad = torch.randn_like(p)
         opt.step()
@@ -149,7 +149,7 @@ def test_momentum_dtype_variants_construct_and_step(momentum_dtype):
 def test_4bit_is_half_byte_per_param():
     """The 4-bit store is a real ~0.5 B/param packed buffer."""
     p = torch.nn.Parameter(torch.randn(256, 256))
-    opt = Liofusion([p], betas=(0.9, 0.99), momentum_dtype="4bit", momentum_4bit_block=128)
+    opt = Lion([p], betas=(0.9, 0.99), momentum_dtype="4bit", momentum_4bit_block=128)
     p.grad = torch.randn_like(p)
     opt.step()
     st = opt.state[p]
@@ -159,16 +159,16 @@ def test_4bit_is_half_byte_per_param():
 
 def test_int8_is_one_byte_per_param():
     p = torch.nn.Parameter(torch.randn(128, 128))
-    opt = Liofusion([p], betas=(0.9, 0.99), momentum_dtype="int8")
+    opt = Lion([p], betas=(0.9, 0.99), momentum_dtype="int8")
     p.grad = torch.randn_like(p)
     opt.step()
     assert opt.state[p]["m"].numel() == p.numel()  # one int8 byte per param
 
 
 def test_single_momentum_buffer_no_second_moment():
-    """Liofusion keeps ONE momentum buffer and NO second moment (the memory win)."""
+    """Lion keeps ONE momentum buffer and NO second moment (the memory win)."""
     p = torch.nn.Parameter(torch.randn(64, 64))
-    opt = Liofusion([p], lr=1e-3, betas=(0.9, 0.99), momentum_dtype="float32")
+    opt = Lion([p], lr=1e-3, betas=(0.9, 0.99), momentum_dtype="float32")
     p.grad = torch.randn_like(p)
     opt.step()
     tensor_keys = {k for k, v in opt.state[p].items() if torch.is_tensor(v)}
@@ -205,8 +205,8 @@ def test_foreach_matches_per_param(cfg):
     """foreach=True is element-for-element equal to the per-parameter path (fp32)."""
     pa = _parity_params()
     pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
-    oa = Liofusion(pa, foreach=True, **cfg)
-    ob = Liofusion(pb, foreach=False, **cfg)
+    oa = Lion(pa, foreach=True, **cfg)
+    ob = Lion(pb, foreach=False, **cfg)
     gg = torch.Generator().manual_seed(7)
     for _ in range(10):
         for a, b in zip(pa, pb, strict=False):
@@ -223,9 +223,9 @@ def test_foreach_chunking_is_exact():
     the result must still equal the per-parameter path exactly (int8 + WD)."""
     pa = _parity_params()
     pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
-    oa = Liofusion(pa, lr=1e-3, betas=(0.9, 0.99), momentum_dtype="int8",
+    oa = Lion(pa, lr=1e-3, betas=(0.9, 0.99), momentum_dtype="int8",
                    weight_decay=0.02, foreach=True, foreach_stack_budget=200)
-    ob = Liofusion(pb, lr=1e-3, betas=(0.9, 0.99), momentum_dtype="int8",
+    ob = Lion(pb, lr=1e-3, betas=(0.9, 0.99), momentum_dtype="int8",
                    weight_decay=0.02, foreach=False)
     gg = torch.Generator().manual_seed(7)
     for _ in range(8):
@@ -241,7 +241,7 @@ def test_foreach_chunking_is_exact():
 def test_overfits_regression():
     torch.manual_seed(0xC0DE)
     model = torch.nn.Sequential(torch.nn.Linear(32, 64), torch.nn.GELU(), torch.nn.Linear(64, 8))
-    opt = Liofusion(model.parameters(), lr=3e-3, betas=(0.9, 0.99))
+    opt = Lion(model.parameters(), lr=3e-3, betas=(0.9, 0.99))
     x = torch.randn(64, 32)
     y = torch.randn(64, 8)
     initial = (model(x) - y).pow(2).mean().item()
@@ -255,7 +255,7 @@ def test_bf16_weights_train_no_nan():
     model = torch.nn.Sequential(
         torch.nn.Linear(32, 64), torch.nn.GELU(), torch.nn.Linear(64, 8)
     ).to(torch.bfloat16)
-    opt = Liofusion(model.parameters(), lr=3e-3, betas=(0.9, 0.99),
+    opt = Lion(model.parameters(), lr=3e-3, betas=(0.9, 0.99),
                     bf16_method="stochastic_rounding")
     x = torch.randn(64, 32, dtype=torch.bfloat16)
     y = torch.randn(64, 8, dtype=torch.bfloat16)
@@ -272,14 +272,14 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
     """torch.save/load resumes BIT-EXACTLY and keeps the configured momentum dtype.
 
     torch's default load_state_dict upcasts state to the param dtype (fp32);
-    Liofusion overrides load_state_dict to restore the stored dtype.
+    Lion overrides load_state_dict to restore the stored dtype.
     """
     torch.manual_seed(0)
     p_ref = torch.randn(16, 8)
     grads = [torch.randn(16, 8) for _ in range(10)]
 
     a = torch.nn.Parameter(p_ref.clone())
-    opt_a = Liofusion([a], lr=1e-3, betas=(0.9, 0.99), momentum_dtype=momentum_dtype)
+    opt_a = Lion([a], lr=1e-3, betas=(0.9, 0.99), momentum_dtype=momentum_dtype)
     for g in grads[:5]:
         a.grad = g.clone()
         opt_a.step()
@@ -290,7 +290,7 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
     sd = torch.load(buf, weights_only=False)
 
     b = torch.nn.Parameter(a.detach().clone())
-    opt_b = Liofusion([b], lr=1e-3, betas=(0.9, 0.99), momentum_dtype=momentum_dtype)
+    opt_b = Lion([b], lr=1e-3, betas=(0.9, 0.99), momentum_dtype=momentum_dtype)
     opt_b.load_state_dict(sd)
 
     assert opt_b.state[b]["m"].dtype == opt_a.state[a]["m"].dtype
@@ -306,22 +306,22 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
 def test_invalid_args_rejected():
     p = [torch.nn.Parameter(torch.randn(4, 4))]
     with pytest.raises(ValueError):
-        Liofusion(p, momentum_dtype="2bit")
+        Lion(p, momentum_dtype="2bit")
     with pytest.raises(ValueError):
-        Liofusion(p, betas=(1.0, 0.99))
+        Lion(p, betas=(1.0, 0.99))
     with pytest.raises(ValueError):
-        Liofusion(p, betas=(0.9, 1.0))
+        Lion(p, betas=(0.9, 1.0))
     with pytest.raises(ValueError):
-        Liofusion(p, lr=-1.0)
+        Lion(p, lr=-1.0)
     with pytest.raises(ValueError):
-        Liofusion(p, bf16_method="bogus")
+        Lion(p, bf16_method="bogus")
 
 
 def test_kahan_runs():
     """bf16 + kahan path (per-param, +shift buffer) steps without NaN."""
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn(8, 8, dtype=torch.bfloat16))
-    opt = Liofusion([p], lr=1e-3, betas=(0.9, 0.99), bf16_method="kahan")
+    opt = Lion([p], lr=1e-3, betas=(0.9, 0.99), bf16_method="kahan")
     for _ in range(5):
         p.grad = torch.randn_like(p)
         opt.step()
@@ -331,7 +331,7 @@ def test_kahan_runs():
 
 def test_sparse_grad_rejected():
     p = torch.nn.Parameter(torch.randn(4, 4))
-    opt = Liofusion([p], lr=1e-3, betas=(0.9, 0.99))
+    opt = Lion([p], lr=1e-3, betas=(0.9, 0.99))
     p.grad = torch.sparse_coo_tensor(torch.tensor([[0], [0]]), torch.tensor([1.0]), (4, 4))
     with pytest.raises(RuntimeError):
         opt.step()
@@ -343,7 +343,7 @@ def test_conv_net_trains_no_nan():
         torch.nn.Conv2d(4, 16, 3, padding=1), torch.nn.GELU(),
         torch.nn.Conv2d(16, 4, 3, padding=1),
     )
-    opt = Liofusion(net.parameters(), lr=1e-3, betas=(0.9, 0.99))
+    opt = Lion(net.parameters(), lr=1e-3, betas=(0.9, 0.99))
     x = torch.randn(8, 4, 16, 16)
     y = torch.randn(8, 4, 16, 16)
     for _ in range(30):

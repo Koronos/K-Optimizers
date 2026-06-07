@@ -1,6 +1,6 @@
 # Research notes — finding the next optimizer for diffusion fine-tuning
 
-Forward-looking research that directs koptim's optimizer roadmap. Distinct from the *results*
+Forward-looking research that directs kaon's optimizer roadmap. Distinct from the *results*
 docs (what we measured, in `benchmarks/`): these are *what to build next and why*, synthesized
 from fan-out, adversarially-verified web research.
 
@@ -17,7 +17,7 @@ from fan-out, adversarially-verified web research.
    research. The diffusion-MEASURED generalization wins are optimizer-level *techniques*
    (flat-minima / SAM, weight-averaging / EMA), but all that evidence is from-scratch low-res
    pixel models (FID), not bf16 LoRA — so it's extrapolated. Our own proxy then showed the
-   **base optimizer also matters** for the gap (Liofusion), which the techniques alone don't
+   **base optimizer also matters** for the gap (Lion), which the techniques alone don't
    capture on synthetic data.
 
 3. **Candidate catalog**
@@ -37,7 +37,7 @@ from fan-out, adversarially-verified web research.
 
 ## Status of what's already built from this
 
-- **Liofusion** (Lion sign-momentum on the koptim backend) — shipped (`docs/liofusion.md`); the
+- **Lion** (Lion sign-momentum on the kaon backend) — shipped (`docs/lion.md`); the
   proof that a regularizing base optimizer wins on the gap.
 - **AdafusionEx** (Adafusion + EMA/MSAM techniques) — parked on `feat/adafusionex`; the techniques
   are not provable on the synthetic proxy (need a real run / FID).

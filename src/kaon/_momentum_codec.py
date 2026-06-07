@@ -1,9 +1,9 @@
-"""Shared first-moment (momentum) codecs for koptim optimizers.
+"""Shared first-moment (momentum) codecs for kaon optimizers.
 
 A *momentum codec* owns, for one ``momentum_dtype``, the entire
 dequant -> fp32 EMA -> requant cycle and the underlying storage layout, so the
 optimizer step functions never re-implement any quantization detail. Both
-:class:`~koptim.adafusion.Adafusion` and :class:`~koptim.kprodigy.KProdigy`
+:class:`~kaon.adafusion.Adafusion` and :class:`~kaon.kprodigy.KProdigy`
 import these classes — Adafusion uses the EMA entry points (it folds the EMA into
 the update), while KProdigy does its (``d``-scaled) EMA itself in pass 1 and only
 needs the codec's storage + *read-only dequant* in pass 2. The read-only
@@ -406,7 +406,7 @@ def load_state_dict_preserving_dtypes(
     """Restore optimizer state WITHOUT torch's lossy momentum upcast.
 
     ``torch.optim.Optimizer.load_state_dict`` casts every per-param state tensor
-    to the *param's* dtype (fp32) on load. For koptim's quantized first moment
+    to the *param's* dtype (fp32) on load. For kaon's quantized first moment
     that silently inflates bf16/int8/4bit momentum back to fp32 on resume —
     discarding the memory-efficient representation the user configured (e.g. int8
     -> fp32 is 4x the momentum bytes, defeating the point) AND breaking bit-exact

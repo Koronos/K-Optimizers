@@ -1,6 +1,6 @@
 # Research charter — the best optimizer for diffusion fine-tuning
 
-Purpose: direct a research workflow to find/design the next optimizer for `koptim`, now that
+Purpose: direct a research workflow to find/design the next optimizer for `kaon`, now that
 we know what to actually optimize for. This corrects the premise AdaMuon was built on.
 
 ## What we learned (the premise that was wrong)
@@ -104,10 +104,10 @@ diffusion specifically vs only LLMs? interaction with bf16 + LoRA?
 6. For full-FT (the memory-bound, underfit regime), what changes — is a *different* optimizer
    warranted there, or one optimizer with a regime knob?
 
-## Constraints (koptim context)
+## Constraints (kaon context)
 
 - Consumer GPUs (≤16 GB), bf16 weights, LoRA + full-FT; Adafactor-class memory is the budget.
-- Must compose with the koptim toolkit (foreach batching, momentum codec int8/4bit, stochastic
+- Must compose with the kaon toolkit (foreach batching, momentum codec int8/4bit, stochastic
   rounding, dtype-safe checkpointing).
 - Deliverables should be falsifiable on the live `val/gap` metric (renga-flow) + a real visual
   A/B, not on a synthetic loss leaderboard.

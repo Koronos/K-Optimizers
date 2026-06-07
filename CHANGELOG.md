@@ -5,14 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-- **`Liofusion`** — **Lion's sign-momentum** update (`sign(β1·m+(1-β1)·g)`, single momentum
+- **`Lion`** — **Lion's sign-momentum** update (`sign(β1·m+(1-β1)·g)`, single momentum
   buffer, **no second moment**) on Adafusion's backend: the shared int8/4bit momentum codec,
   stochastic-rounding bf16 weight update, cautious masking, and **foreach batching** (bit-exact
   vs the per-param path). Lightest state in the family — **~1 B (int8) / 0.5 B (4bit) per
   param** — targeting Lion's implicit regularization for small-data diffusion fine-tuning.
   `lr` is Lion-scale (~AdamW/5); `betas` are a measured loss↔generalization dial
   (`(0.95,0.98)` for loss, higher β2 for a lower train–val gap). No `eps`/`clip_threshold`
-  (the sign update is unit-magnitude — nothing to clip). See [docs/liofusion.md](docs/liofusion.md).
+  (the sign update is unit-magnitude — nothing to clip). See [docs/lion.md](docs/lion.md).
 - **`AdaMuon`** — Muon's Newton-Schulz orthogonalized momentum + an Adafactor-style
   **factored, quantized second moment of the orthogonalized update**. Targets
   beating AdamW on convergence/precision at **near-Adafactor memory** (~1–2 B/param;
@@ -69,7 +69,7 @@ All notable changes to this project will be documented in this file.
     `foreach` (default `True`), `foreach_batch_cutoff`, `foreach_stack_budget`,
     `momentum_4bit_block`.
   - The momentum codecs + quant helpers were extracted from `adafusion.py` into a
-    shared `koptim._momentum_codec` module (re-exported from `koptim.adafusion` for
+    shared `kaon._momentum_codec` module (re-exported from `kaon.adafusion` for
     backwards compatibility) — no duplicated implementations.
   - foreach == per-param: **bit-exact on fp32 weights (CPU and CUDA)** across
     `momentum_dtype ∈ {float32, bfloat16, int8, 4bit}`, cautious on/off, on 2-D +
@@ -172,7 +172,7 @@ All notable changes to this project will be documented in this file.
   reimplemented natively rather than vendored from the research repo:
   - Exact D-estimation math: the full second moment + fp32 momentum path
     reproduces reference `prodigyopt.Prodigy` to ~1e-4 on the D estimate.
-  - koptim memory toolkit: `momentum_dtype` (`float32`/`bfloat16`/`int8`),
+  - kaon memory toolkit: `momentum_dtype` (`float32`/`bfloat16`/`int8`),
     `second_moment="factored"` (Adafactor row+col; experimental — inflates D),
     `slice_p` (sliced D statistics), and stochastic-rounding / Kahan bf16 weight
     updates (`bf16_method`).
@@ -187,7 +187,7 @@ All notable changes to this project will be documented in this file.
 
 ## [0.1.0] - 2026-06
 
-Initial release of `koptim` (K-Optimizers).
+Initial release of `kaon` (K-Optimizers).
 
 ### Added
 - `Adafusion` — conv-aware factored optimizer:

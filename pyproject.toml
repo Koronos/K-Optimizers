@@ -1,5 +1,5 @@
 [project]
-name = "koptim"
+name = "kaon"
 description = "K-Optimizers: memory-efficient PyTorch optimizers for bf16 diffusion fine-tuning (Adafusion, Muon)."
 authors = [
     { name = "Koronos" }
@@ -40,7 +40,7 @@ Repository = "https://github.com/Koronos/K-Optimizers"
 Issues = "https://github.com/Koronos/K-Optimizers/issues"
 
 [project.scripts]
-ktune = "koptim.tune:main"
+ktune = "kaon.tune:main"
 
 [dependency-groups]
 dev = [
@@ -53,13 +53,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "src/koptim/_version.py"
+path = "src/kaon/_version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/koptim"]
+packages = ["src/kaon"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/koptim", "tests", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"]
+include = ["src/kaon", "tests", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"]
 
 [tool.ruff]
 line-length = 100

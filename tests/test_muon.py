@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from koptim import Muon
-from koptim.muon import zeropower_via_newtonschulz5
+from kaon import Muon
+from kaon.muon import zeropower_via_newtonschulz5
 
 from .conftest import train_steps
 

@@ -10,8 +10,8 @@ Two harnesses:
 
 | script | data | what it measures | needs |
 |---|---|---|---|
-| `pixel_ddpm_ab.py` | **synthetic** (generated in-process) | convergence (held-out val MSE) of a from-scratch conv U-Net | `torch`, `koptim` |
-| `sdxl_lora_ab.py` | your images + an SDXL checkpoint | LoRA-finetune convergence (deterministic objective probe) | `torch`, `diffusers`, `peft`, `koptim` |
+| `pixel_ddpm_ab.py` | **synthetic** (generated in-process) | convergence (held-out val MSE) of a from-scratch conv U-Net | `torch`, `kaon` |
+| `sdxl_lora_ab.py` | your images + an SDXL checkpoint | LoRA-finetune convergence (deterministic objective probe) | `torch`, `diffusers`, `peft`, `kaon` |
 
 No paths are hard-coded; the SDXL harness reads everything from env vars.
 
@@ -41,7 +41,7 @@ No paths are hard-coded; the SDXL harness reads everything from env vars.
 ## Run
 
 ```bash
-pip install -e .            # installs koptim
+pip install -e .            # installs kaon
 
 # Synthetic, self-contained (no downloads). Reproduces the headline table:
 python benchmarks/adamuon/pixel_ddpm_ab.py --preset headline

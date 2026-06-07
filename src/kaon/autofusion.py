@@ -28,7 +28,7 @@ only ever sees the gradient and the base optimizer's update vector
 
 Design (mirrors the reference ``mechanize`` wrapper, arXiv:2306.00144 Alg. 1)
 ----------------------------------------------------------------------------
-The base optimizer is an internal :class:`~koptim.adafusion.Adafusion` at
+The base optimizer is an internal :class:`~kaon.adafusion.Adafusion` at
 ``lr=1``. Each step (while adapting): snapshot ``p``, run the base step to get
 ``u_t = p_after - p_before``, recompute ``Delta_t`` on the fly from
 ``(p - ref)/sum(s)``, form the Mechanic gradient
@@ -97,7 +97,7 @@ from typing import Any, Literal
 import torch
 from torch import Tensor
 
-from koptim.adafusion import Adafusion
+from kaon.adafusion import Adafusion
 
 __all__ = ["Autofusion"]
 
@@ -173,7 +173,7 @@ class Autofusion(torch.optim.Optimizer):
             well as the lr (exact for fp32/int8/4bit, rounding-exact for bf16) so the
             handoff has no boundary jump either; see ``_freeze`` / the module docstring.
         **adafusion_kwargs: forwarded verbatim to the internal
-            :class:`~koptim.adafusion.Adafusion` base (``clip_threshold``,
+            :class:`~kaon.adafusion.Adafusion` base (``clip_threshold``,
             ``cautious``, ``momentum_dtype``, ``bf16_method``, ``foreach``,
             ``weight_decay``...). NB: pass momentum betas via ``adafusion_betas``,
             not here — ``betas`` is the tuner's.

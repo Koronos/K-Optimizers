@@ -30,7 +30,7 @@ Method notes (so others can reproduce AND critique)
   column). Convergence-per-step therefore equals convergence-per-second.
 * Small study by design (few images, low rank, few seeds). A signal, not a proof.
 
-Requires: torch, diffusers, peft, koptim. Run with an env that has working
+Requires: torch, diffusers, peft, kaon. Run with an env that has working
 diffusers single-file loading for your checkpoint.
 """
 from __future__ import annotations
@@ -160,7 +160,7 @@ def probe(unet, recs, idxs, ati, ac, reps, seed):
 
 
 def make_optimizer(name, params, lr):
-    from koptim import AdaMuon, Adafusion
+    from kaon import AdaMuon, Adafusion
     md = {"adamuon": "bfloat16", "adamuon_int8": "int8", "adamuon_4bit": "4bit"}
     if name.startswith("adamuon"):
         return AdaMuon(params, lr=lr, betas=(0.95, 0.999), clip_threshold=1.0, ns_steps=2,

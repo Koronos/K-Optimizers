@@ -23,7 +23,7 @@ Reproduce the headline:
 Single arm / custom sweep:
     python pixel_ddpm_ab.py --optims "adamuon:1e-3:cos,adafusion:1e-3:cos" --steps 800 --seeds 3
 
-Requires only: torch, koptim (pip install -e . at the repo root).
+Requires only: torch, kaon (pip install -e . at the repo root).
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from koptim import AdaMuon, Adafusion
+from kaon import AdaMuon, Adafusion
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 DT = torch.float32

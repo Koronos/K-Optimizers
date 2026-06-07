@@ -60,7 +60,7 @@ LoRA rank at high (noisy) timesteps to fight memorization.
 
 ## The charter questions the literature did NOT answer (our differentiated research)
 
-These are open — *nobody published them* — so they're where koptim can contribute, settled by
+These are open — *nobody published them* — so they're where kaon can contribute, settled by
 our own gap+FID test (not by more lit search):
 
 1. **Why does β1=0 / no-momentum generalize better in diffusion fine-tuning?** No primary

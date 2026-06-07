@@ -14,7 +14,7 @@ import io
 import pytest
 import torch
 
-from koptim import KProdigy
+from kaon import KProdigy
 
 from .conftest import train_steps
 

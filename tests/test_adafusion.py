@@ -8,7 +8,7 @@ import math
 import pytest
 import torch
 
-from koptim import Adafusion
+from kaon import Adafusion
 
 from .conftest import train_steps
 
@@ -207,7 +207,7 @@ def test_foreach_4bit_chunking_is_exact():
 def test_4bit_pack_roundtrip():
     """Nibble pack/unpack round-trips for even and odd element counts, and
     dequant(quant(m)) stays within the ~1/7 absmax 4-bit grid error."""
-    from koptim.adafusion import (
+    from kaon.adafusion import (
         _dequant_4bit,
         _pack_nibbles,
         _quant_4bit,
