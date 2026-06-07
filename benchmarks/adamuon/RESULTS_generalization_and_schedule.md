@@ -122,6 +122,31 @@ regularizes and stays strong — the gap champion).
   marginally higher — the curriculum barely earns its keep. For the overfitter AdaMuon-mom,
   large-only is *worst* (biggest gap); the curriculum is what tames it.
 
+### 4.1 Who *depends* on the curriculum noise — AdaPNM vs Adakaon vs Lion
+
+The resolution curriculum is **data-side noise**; an optimizer with its own **gradient-side**
+regularization (AdaPNM's positive-negative momentum) should need it less. Single-resolution
+(all-1024) vs the `512+1024 → 768+1024 → 1024` (40/40/20) curriculum, everything else fixed
+(REX d=0.9, C=128 / 2500, eval@64, 2 seeds):
+
+| optimizer | single (test/gap) | prog (test/gap) | Δgap | Δloss |
+|---|---|---|---|---|
+| **AdaPNM** (β1=0.8, β0=0.5) | 0.0839 / **+0.0146** | 0.0802 / **+0.0070** | −0.0076 | −0.0037 |
+| Adakaon-nomom | 0.1012 / +0.0501 | 0.0836 / +0.0196 | −0.0305 | −0.0176 |
+| Lion (0.95,0.98) | 0.1053 / +0.0549 | 0.0769 / +0.0125 | −0.0424 | −0.0284 |
+
+- **Everyone benefits** (all Δ negative — the curriculum is free regularization, never harmful;
+  use it regardless of optimizer).
+- **Dependence (Δgap magnitude):** Lion (−0.0424) > Adakaon-nomom (−0.0305) ≫ **AdaPNM (−0.0076)**.
+  Adakaon/Lion *overfit catastrophically* single-resolution (gap ~0.05) — the curriculum is their
+  only regularizer (load-bearing). AdaPNM barely needs it: its single-res gap (0.0146) is already
+  ~3.5× lower than the others' best.
+- **Absolute gap (the objective):** AdaPNM wins in **both** regimes (single 0.0146 vs 0.05+;
+  prog 0.0070 vs 0.0125 / 0.0196). The data-noise (curriculum) and gradient-noise (PNM)
+  regularizers **stack** — different axes, additive.
+- **Takeaway:** Adakaon/Lion are the kings of *depending on* the curriculum noise; **AdaPNM is the
+  king of generalizing with or without it**, and stacking the curriculum still helps it for free.
+
 ## 5. Master sweep — Pareto front (loss vs gap)
 
 108 configs (optimizer × momentum × cautious × scheduler{cosine,rex0.9,rex0.5} ×

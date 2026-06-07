@@ -190,11 +190,21 @@ from **318 ms → 15 ms** (1.45× of fused AdamW; was 28×). Full fine-tunes see
 
 ## Reproduce
 
-The harnesses and full result tables live under
-[`benchmarks/adamuon/`](../benchmarks/adamuon/):
+**The cross-optimizer control battery** ranks every optimizer across all these dimensions and
+regenerates its tables incrementally — see
+[`benchmarks/control/RANKINGS.md`](../benchmarks/control/RANKINGS.md) (and
+[`battery.py`](../benchmarks/control/battery.py) to run it / add a contender).
 
-- `proxy_dataset.py` — the registered deterministic synthetic dataset (train=32 / test=96) that
-  all the train–val-gap numbers use.
+The shared, optimizer-agnostic proxy lives under
+[`benchmarks/proxy/`](../benchmarks/proxy/):
+
+- `dataset.py` — the registered deterministic synthetic dataset (train=32 / test=96) that all the
+  train–val-gap numbers use.
+- `harness.py` — the pixel-DDPM U-Net + loss model/loss core (plus the LoRA-like adapter-bag
+  speed proxy).
+
+Deeper, optimizer-specific deep-dives stay under [`benchmarks/adamuon/`](../benchmarks/adamuon/):
+
 - `pixel_ddpm_ab.py` — synthetic full-training A/B harness (pixel-DDPM U-Net).
 - `sdxl_lora_ab.py` — real SDXL LoRA A/B harness (`adamw_fused` / `adafactor` arms included).
 - `RESULTS_vs_adamw_adafactor.md`, `RESULTS_generalization_and_schedule.md` — the full tables.

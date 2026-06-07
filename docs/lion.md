@@ -80,7 +80,7 @@ Lion(
 
 ## Evaluation (synthetic pixel-DDPM proxy — directional)
 
-On the registered proxy ([proxy_dataset.py](../benchmarks/adamuon/proxy_dataset.py),
+On the registered proxy ([dataset.py](../benchmarks/proxy/dataset.py),
 train=32 / test=96, REX + progressive-resolution recipe), tuned Lion `(0.95, 0.98)` is
 **Pareto-competitive**: at the larger C=128 / 2500-step setting it reached **AdaMuon's loss at
 roughly half AdaMuon's train–val gap**, and beat the no-momentum Adakaon baseline on both

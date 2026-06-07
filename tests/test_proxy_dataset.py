@@ -7,7 +7,7 @@ from pathlib import Path
 
 _SPEC = importlib.util.spec_from_file_location(
     "proxy_dataset",
-    Path(__file__).resolve().parents[1] / "benchmarks" / "adamuon" / "proxy_dataset.py",
+    Path(__file__).resolve().parents[1] / "benchmarks" / "proxy" / "dataset.py",
 )
 proxy_dataset = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(proxy_dataset)

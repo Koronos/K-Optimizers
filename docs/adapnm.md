@@ -154,7 +154,7 @@ AdaPNM(
 ## Evaluation (synthetic pixel-DDPM proxy — directional)
 
 All numbers above are from the registered proxy
-([proxy_dataset.py](../benchmarks/adamuon/proxy_dataset.py), train=32 / test=96, ranked by the
+([dataset.py](../benchmarks/proxy/dataset.py), train=32 / test=96, ranked by the
 deterministic train–val eps-MSE **gap**, not loss). AdaPNM is the proxy's **generalization
 champion**: best gap among the usable-loss optimizers, and the clear winner at constant LR.
 

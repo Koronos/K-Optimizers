@@ -48,6 +48,10 @@ training loops unchanged. `KProdigy` needs a global reduction over all parameter
 each step (the D estimate), so it is a normal two-pass `step()` optimizer (no
 gradient-release).
 
+📊 **Head-to-head rankings** across speed / convergence / generalization / memory / constant-LR
+robustness live in the reproducible **[control battery](benchmarks/control/RANKINGS.md)** — and
+adding a new optimizer to the tables is a one-liner (see [benchmarks/README.md](benchmarks/README.md)).
+
 ## Install
 
 ```bash
