@@ -76,6 +76,22 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
     net = H.UNet(C=channels).to(DEV).to(H.DT)
     params = [p for p in net.parameters() if p.requires_grad]
     opt = make(params, lr)
+    # Schedule-Free-style optimizers expose train()/eval() to swap params between the
+    # y-iterate (gradients are taken here) and the x-average (evaluate/checkpoint here).
+    # torch.optim.Optimizer has no such methods, so this guard leaves every other
+    # optimizer's run bit-identical; for SF it computes grads at y and evals at x.
+    sf = callable(getattr(opt, "train", None)) and callable(getattr(opt, "eval", None))
+
+    def evloss(*a):
+        if sf:
+            opt.eval()
+        r = H.eval_loss(*a)
+        if sf:
+            opt.train()
+        return r
+
+    if sf:
+        opt.train()
     g = torch.Generator(device=DEV); g.manual_seed(seed + 12345)
     pos = 0; traj = []
     ckpt_every = max(1, n // checkpoints) if checkpoints else 0
@@ -91,12 +107,12 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
         H.batch_loss(net, data[Rr], torch.tensor(idx, device=DEV), ac, g).backward()
         opt.step()
         if ckpt_every and (it + 1) % ckpt_every == 0:
-            traj.append((it + 1, H.eval_loss(net, data[64], te, ac)))
+            traj.append((it + 1, evloss(net, data[64], te, ac)))
     if DEV == "cuda":
         torch.cuda.synchronize()
     ms_step = (time.time() - t0) / n * 1000.0
-    tr_loss = H.eval_loss(net, data[64], tr, ac)
-    te_loss = H.eval_loss(net, data[64], te, ac)
+    tr_loss = evloss(net, data[64], tr, ac)
+    te_loss = evloss(net, data[64], te, ac)
     bpp = H.opt_state_bytes_per_param(opt, params)
     return dict(tr=tr_loss, te=te_loss, gap=te_loss - tr_loss, ms=ms_step, bpp=bpp, traj=traj)
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from kaon import Adakaon, AdaMuon, AdaPNM, Lion
+from kaon import MARS, AdaBelief, Adakaon, AdaMuon, Adan, AdaPNM, AdEMAMix, Lion, ScheduleFree
 
 OPTIMIZERS = {
     # --- reference baseline ---
@@ -61,5 +61,31 @@ OPTIMIZERS = {
         make=lambda p, lr: AdaMuon(p, lr=lr, betas=(0.95, 0.999), ns_steps=2, cautious=True, momentum_dtype="int8"),
         lr=2.4e-3, lr_const=2.4e-3, family="published",
         blurb="orthogonalized momentum + factored 2nd moment (convergence)",
+    ),
+    # --- candidates-v2 (under evaluation; tuned on the C96/N800 proxy, ranked by held-out loss) ---
+    "AdaBelief": dict(
+        make=lambda p, lr: AdaBelief(p, lr=lr, betas=(0.9, 0.95), cautious=True, momentum_dtype="bfloat16"),
+        lr=5e-4, lr_const=5e-4, family="published",
+        blurb="Adam on the variance of (g-m) — belief in the gradient (light, generalizing)",
+    ),
+    "MARS": dict(
+        make=lambda p, lr: MARS(p, lr=lr, gamma=0.025, cautious=True, momentum_dtype="bfloat16"),
+        lr=1e-3, lr_const=1e-3, family="published",
+        blurb="variance-reduction corrected gradient feeding AdamW (convergence)",
+    ),
+    "AdEMAMix": dict(
+        make=lambda p, lr: AdEMAMix(p, lr=lr, alpha=5.0, cautious=True, momentum_dtype="bfloat16"),
+        lr=5e-4, lr_const=5e-4, family="published",
+        blurb="two-EMA momentum (fast + slow long-horizon) — generalization on long runs",
+    ),
+    "Adan": dict(
+        make=lambda p, lr: Adan(p, lr=lr, cautious=True, momentum_dtype="int8"),
+        lr=1.5e-3, lr_const=1.5e-3, family="published",
+        blurb="adaptive Nesterov momentum (grad + grad-difference EMAs); int8 (3 buffers)",
+    ),
+    "ScheduleFree": dict(
+        make=lambda p, lr: ScheduleFree(p, lr=lr, warmup_steps=100, cautious=True, momentum_dtype="bfloat16"),
+        lr=5e-3, lr_const=5e-3, family="published",
+        blurb="iterate-averaging AdamW, no LR schedule (constant-LR / resumable)",
     ),
 }
