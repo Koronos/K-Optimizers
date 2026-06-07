@@ -25,14 +25,11 @@
 > A measurement fix shipped with them: `opt_state_bytes_per_param` now traverses a wrapper's inner/
 > base optimizer (it previously under-counted wrappers — Lookahead read 2.00 not ~4.06, SAM 0.00 not ~2.06).
 
-> ⚠️ **Battery-integrity caveat (read before the convergence table).** The battery's common
-> convergence target = "the worst optimizer's best held-out loss". Several candidates here
-> (ADOPT, Grams, Adai) deliberately or structurally **underfit** (high loss) → they raise that
-> common target → the **convergence / time×quality** dimension gets compressed and unreliable for
-> the whole field once they're in it. The **gap, loss, memory, and constant-LR continuity tables
-> are absolute and unaffected — trust those.** For convergence, use the clean **11-optimizer run
-> (target ≤ 0.0813)** where **ScheduleFree was decisively #1** (1125 steps / 15.89 s, beating fused
-> AdamW). A battery fix (fixed/percentile target) is a separate TODO.
+> ✅ **Battery fix applied (2026-06-07).** The convergence target was "the worst optimizer's best
+> loss", which let underfitting optimizers inflate the bar and distort the convergence/time×quality
+> dimension. It is now the **field's MEDIAN best-loss** (`battery.py`), so a few underfitters can't
+> move it — "steps/time to the field's median final quality". The 17-optimizer table below is the
+> clean, consistent global run (all non-frozen optimizers re-measured fresh at best config).
 
 ## TL;DR
 - **11 candidates** — 9 standalone (AdaBelief, MARS, AdEMAMix, Adan, ScheduleFree, ADOPT, Grams, AdamP, Adai) + 2 wrappers (Lookahead, SAM) — built on the shared backend (codec momentum + factored quantized 2nd moment +
@@ -57,32 +54,51 @@ Tuned on the C96/N800 proxy (ranked by held-out loss); the battery runs them at 
 on the REX + progressive-resolution recipe. **Lower is better everywhere.** Full tables:
 [`RANKINGS.md`](RANKINGS.md); cache: [`results.json`](results.json).
 
-### Overall (mean rank — a weak picker, and the convergence component is distorted; read the 🥇 wins + caveat). Field of 18.
-| # | optimizer | mean rank | 🥇 rank-1 |
-|---|---|---|---|
-| 1 | Lion | 4.6 | — |
-| 2 | Adakaon-nomom | 5.0 | 🥇 memory (+convergence*) |
-| 3 | Adakaon-bf16 | 7.6 | — |
-| 4 | **ADOPT** | 7.6 | **🥇 generalization** |
-| 5 | AdaBelief-b999 | 8.3 | — |
-| 6 | torch.AdamW (fused) | 8.4 | 🥇 iter/LoRA-speed |
-| 7 | **ScheduleFree** | 8.9 | **🥇 convergence*** (clean 11-field run; masked here by the target caveat) |
-| 8 | AdaBelief | 9.4 | — |
-| 9 | AdaPNM | 9.7 | 🥇 constant-LR |
-| 10 | MARS | 9.7 | — |
-| 11 | AdaMuon | 9.9 | — |
-| 12 | AdamP | 10.1 | — |
-| 13 | **Lookahead** | 10.1 | **🥇 loss** |
-| 14 | AdEMAMix | 11.6 | — |
-| 15 | Adan | 12.3 | — |
-| 16 | **SAM** | 12.3 | — (moves the loss↔gap *frontier* — see Round-2 headline; mean rank dragged by the 2× cost) |
-| 17 | Grams | 12.7 | — |
-| 18 | Adai | 12.9 | — |
+### Overall — clean global run, field of 17 (median convergence target). Mean rank is a weak picker; read the 🥇 wins.
+| # | optimizer | mean rank | 🥇 rank-1 | family |
+|---|---|---|---|---|
+| 1 | Lion | 4.6 | — | in-house |
+| 2 | Adakaon-nomom | 5.9 | 🥇 memory | in-house |
+| 3 | **ADOPT** | 6.9 | **🥇 generalization** | candidate |
+| 4 | Adakaon-bf16 | 7.1 | 🥇 convergence | in-house |
+| 5 | torch.AdamW (fused) | 7.4 | 🥇 iter/LoRA-speed | reference |
+| 6 | **AdaBelief** | 7.6 | — | candidate |
+| 7 | **AdamP** | 8.3 | — | candidate |
+| 8 | AdaPNM | 8.4 | 🥇 constant-LR | in-house |
+| 9 | **ScheduleFree** | 8.4 | — | candidate |
+| 10 | **Lookahead** | 8.4 | **🥇 loss** | candidate |
+| 11 | **MARS** | 8.9 | — | candidate |
+| 12 | AdaMuon | 10.6 | — | in-house |
+| 13 | **Adan** | 11.7 | — | candidate |
+| 14 | **AdEMAMix** | 12.0 | — | candidate |
+| 15 | **Grams** | 12.0 | — | candidate |
+| 16 | **Adai** | 12.0 | — | candidate |
+| 17 | **SAM** | 12.9 | — (frontier-mover; mean rank misjudges it — see below) | candidate |
 
-`*` convergence rank moves with the common target (see the caveat above) — Adakaon-nomom's
-"🥇 convergence" here is an artifact of the underfitting optimizers raising the bar; ScheduleFree
-owns convergence on the clean field. **Three candidates now hold a rank-1 axis: ADOPT (generalization),
-Lookahead (loss), ScheduleFree (convergence, clean field)** — plus SAM as the only frontier-*mover*.
+**Two candidates take a rank-1 axis outright: ADOPT (generalization) and Lookahead (loss).** ADOPT is
+the best candidate overall (3rd). The in-house Lion/Adakaon/AdaPNM still own the top of the mean rank;
+no candidate dethrones them on the average, but several beat them on a specific axis.
+
+### 💪 Strengths & weaknesses (per candidate, at best config)
+| candidate | overall | strongest axis | weakest axis | one-line verdict |
+|---|---|---|---|---|
+| **ADOPT** | 3rd | 🥇 **gap +0.0070** (best of all 17); #2 constant-LR; light 2 B/p; fast | loss 0.0920 (worst — underfits) → poor convergence | the gap/regularizer specialist; underfit is by-design → **real-FID test** |
+| **AdaBelief** | 6th | low loss 0.0780 + light 2 B/p + balanced | mid gap +0.0155 | the best-rounded light candidate; solid all-rounder |
+| **AdamP** | 7th | loss 0.0747 (#2 of all 17) + good gap +0.0132 + good continuity | slow (16.6 ms / 7.45 ms LoRA — the projection) | great quality, pays in speed; projection ~no-ops on the proxy |
+| **ScheduleFree** | 9th | low loss 0.0763 + #3 convergence + light + no-schedule | **gap +0.0185 (13th) & worst-ish continuity** | fast & light, but the gap is its weakness (ironic for constant-LR) |
+| **Lookahead** | 10th | 🥇 **loss 0.0718** (best of all 17) + #2 time×quality + fast LoRA | mid gap +0.0188 (14th); heavier 4 B/p (φ buffer) | the loss/convergence specialist; pay 2 B/p for the best loss |
+| **MARS** | 11th | low loss 0.0752 (#4) | heavier 4 B/p; slow LoRA 6.73 ms; mid gap | middling — competent loss, ordinary elsewhere |
+| **Adan** | 13th | decent gap +0.0133 | heavy 3 B/p; slow (17.5 ms / 12.5 ms LoRA) | weak — the cost isn't repaid |
+| **AdEMAMix** | 14th | — (nothing standout on the proxy) | heavy 4 B/p; mid everything | under-served by the short proxy (slow EMA wants long runs) — re-judge long |
+| **Grams** | 15th | decent loss 0.0806 | **gap +0.0210 (2nd worst) — memorizes**; worst continuity | weak for the gap thesis (drives loss down, gap up) |
+| **Adai** | 16th | low gap +0.0073 (but pure underfit) | heaviest 6 B/p; worst loss 0.117; **LoRA 48 ms (10×)** | clear negative — global-reduction class misfits launch-bound LoRA |
+| **SAM** | 17th | **moves the (loss,gap) FRONTIER** (−20% gap vs its base Adakaon) — not captured by field-relative ranks | 2× cost → worst time×quality; mid *absolute* gap | mean rank misjudges it; its value is the *mechanism* → **real-FID test** |
+
+> **Why SAM ranks last but matters most.** The overall is *field-relative*: SAM's gap (+0.0163) is mid-pack
+> in absolute terms, and its 2× cost tanks the speed/convergence axes. But the controlled A/B (SAM vs the
+> SAME Adakaon, matched init/batch/LR) shows SAM **lowers the gap 14–31%** — a real flat-minima effect.
+> The proxy mean rank can't see that; a real-LoRA FID can. Same for ADOPT/Adai: their low gap is the
+> underfit kind — only FID separates "flat-minima good" from "underfit bad".
 
 ### Per-candidate verdict
 | candidate | tuned config (proxy) | te / gap @ C128 | B/p | LoRA ms | verdict |

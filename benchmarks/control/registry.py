@@ -80,14 +80,11 @@ OPTIMIZERS = {
     ),
     # --- candidates-v2 (under evaluation; tuned on the C96/N800 proxy, ranked by held-out loss) ---
     "AdaBelief": dict(
-        make=lambda p, lr: AdaBelief(p, lr=lr, betas=(0.9, 0.95), cautious=True, momentum_dtype="bfloat16"),
-        lr=5e-4, lr_const=5e-4, family="published",
-        blurb="Adam on the variance of (g-m) — belief in the gradient (light, generalizing)",
-    ),
-    "AdaBelief-b999": dict(  # gap-aimed variant: high beta2 (the proxy-loss tune chose 0.95 -> gap-worst at scale)
+        # best config: beta2=0.999 (the loss-tuned 0.95 was gap-worst at scale; 0.999 is the better
+        # all-rounder -- similar loss, ~35% lower gap). This IS AdaBelief's best overall config.
         make=lambda p, lr: AdaBelief(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16"),
         lr=1e-3, lr_const=1e-3, family="published",
-        blurb="AdaBelief at beta2=0.999 (smoother 2nd moment — gap-aimed)",
+        blurb="Adam on the variance of (g-m) — belief in the gradient (light, generalizing)",
     ),
     "ADOPT": dict(
         make=lambda p, lr: ADOPT(p, lr=lr, betas=(0.9, 0.9999), cautious=True, momentum_dtype="bfloat16"),

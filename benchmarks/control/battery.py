@@ -231,8 +231,14 @@ def render(store, cfg, quick):
     if len(active) < 2:
         print(f"render: only {len(active)} entries at sig {cfg['sig']} — need >=2 to rank.", flush=True)
         return
-    # common convergence target = the worst optimizer's best held-out loss (everyone reaches it)
-    T = max(min(v for _, v in m["traj"]) for m in active.values())
+    # Common convergence target = the field's MEDIAN best-achieved held-out loss.
+    # (The old "max of per-optimizer best" = the worst optimizer's best, which let a single
+    # underfitting optimizer inflate the bar and compress the whole convergence ranking. The
+    # median is robust: ~half the field reaches it, optimizers that never do get max steps and
+    # are correctly penalized on the convergence axis. Read it as "steps/time to the field's
+    # median final quality".)
+    best_losses = sorted(min(v for _, v in m["traj"]) for m in active.values())
+    T = best_losses[len(best_losses) // 2]
     for m in active.values():
         m["conv"] = next((s for s, v in m["traj"] if v <= T), m["traj"][-1][0])
         m["ttq"] = m["ms"] * m["conv"] / 1000.0
