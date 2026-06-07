@@ -212,12 +212,18 @@ def render(store, cfg, quick):
              "recommendations); metrics rank objective overfitting/convergence, not perceptual quality — "
              "confirm on a real LoRA with FID/KID.\n")
 
-    L.append("## 🏁 Overall (mean rank across the 7 ranked metrics)\n")
-    rows = [[f"**{i+1}**", f"**{n}**", f"{comp[n]:.1f}", active[n]["family"], active[n]["blurb"]]
+    L.append("## 🏁 Overall — but read this first\n")
+    L.append("> **Mean rank is the wrong way to pick an optimizer.** These are *specialists*: a "
+             "gap-champion that trades loss will rank low on loss/convergence (which are correlated) "
+             "and look mediocre on the mean — yet be exactly right for small-data LoRA. The **🥇 wins** "
+             "column shows where each one is rank #1; pick by the axis you care about, not the average.\n")
+    friendly = {"ms": "iter-speed", "lms": "LoRA-speed", "conv": "convergence", "te": "loss",
+                "gap": "generalization", "bpp": "memory", "cgap": "constant-LR"}
+    wins = {n: [friendly[k] for k in friendly if rk[k][n] == 1] for n in active}
+    rows = [[f"{i+1}", f"**{n}**", f"{comp[n]:.1f}", "🥇 " + ", ".join(wins[n]) if wins[n] else "—",
+             active[n]["blurb"]]
             for i, n in enumerate(sorted(active, key=lambda n: comp[n]))]
-    L.append(fmt_table(["#", "optimizer", "mean rank", "family", "identity"], rows))
-    L.append("\n> Optimizers **specialize** — the mean rank hides that. Read the per-dimension tables "
-             "for the axis you actually care about.\n")
+    L.append(fmt_table(["#", "optimizer", "mean rank", "🥇 wins (rank 1)", "identity"], rows))
 
     L.append("## 🎯 Loss × generalization (scheduled, progressive curriculum)\n")
     L.append("The headline for small-data fine-tuning: rank by the **train–val gap**, not the loss.\n")

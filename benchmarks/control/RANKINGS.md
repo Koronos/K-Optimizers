@@ -4,27 +4,26 @@
 
 > Add a contender: drop it into `registry.py`, run `python battery.py --only <Name>`, and it joins every table. Proxy LRs are ~100x real-training LRs (relative knobs, not recommendations); metrics rank objective overfitting/convergence, not perceptual quality — confirm on a real LoRA with FID/KID.
 
-## 🏁 Overall (mean rank across the 7 ranked metrics)
+## 🏁 Overall — but read this first
 
-| # | optimizer | mean rank | family | identity |
+> **Mean rank is the wrong way to pick an optimizer.** These are *specialists*: a gap-champion that trades loss will rank low on loss/convergence (which are correlated) and look mediocre on the mean — yet be exactly right for small-data LoRA. The **🥇 wins** column shows where each one is rank #1; pick by the axis you care about, not the average.
+
+| # | optimizer | mean rank | 🥇 wins (rank 1) | identity |
 |---|---|---|---|---|
-| **1** | **Adakaon-nomom** | 2.3 | in-house | factored Adam, no momentum (minimum VRAM, regularizing) |
-| **2** | **Lion** | 3.0 | published | sign-momentum, no 2nd moment (lightest state) |
-| **3** | **AdamW** | 4.1 | reference | torch AdamW (full fp32 moments, 8 B/param) |
-| **4** | **AdaMuon** | 4.3 | published | orthogonalized momentum + factored 2nd moment (convergence) |
-| **5** | **Adakaon-bf16** | 4.6 | in-house | factored Adam, bf16 momentum (AdamW-quality, low memory) |
-| **6** | **AdaPNM** | 4.6 | published | positive-negative momentum (best generalization / constant-LR) |
-| **7** | **Muon** | 5.1 | published | orthogonalized momentum + AdamW fallback (convergence ceiling) |
-
-> Optimizers **specialize** — the mean rank hides that. Read the per-dimension tables for the axis you actually care about.
-
+| 1 | **Adakaon-nomom** | 2.7 | 🥇 LoRA-speed, memory | factored Adam, no momentum (minimum VRAM, regularizing) |
+| 2 | **Lion** | 3.0 | — | sign-momentum, no 2nd moment (lightest state) |
+| 3 | **AdamW** | 4.1 | 🥇 iter-speed | torch AdamW (full fp32 moments, 8 B/param) |
+| 4 | **AdaMuon** | 4.1 | 🥇 loss | orthogonalized momentum + factored 2nd moment (convergence) |
+| 5 | **Adakaon-bf16** | 4.4 | 🥇 convergence | factored Adam, bf16 momentum (AdamW-quality, low memory) |
+| 6 | **AdaPNM** | 4.6 | 🥇 generalization, constant-LR | positive-negative momentum (best generalization / constant-LR) |
+| 7 | **Muon** | 5.0 | — | orthogonalized momentum + AdamW fallback (convergence ceiling) |
 ## 🎯 Loss × generalization (scheduled, progressive curriculum)
 
 The headline for small-data fine-tuning: rank by the **train–val gap**, not the loss.
 
 | # (by gap) | optimizer | held-out loss | train–val gap |
 |---|---|---|---|
-| 1 | AdaPNM | 0.0848 | +0.0065 |
+| 1 | AdaPNM | 0.0844 | +0.0063 |
 | 2 | AdamW | 0.0808 | +0.0115 |
 | 3 | Lion | 0.0791 | +0.0130 |
 | 4 | Adakaon-nomom | 0.0793 | +0.0148 |
@@ -32,19 +31,19 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 6 | Muon | 0.0786 | +0.0206 |
 | 7 | Adakaon-bf16 | 0.0803 | +0.0217 |
 
-## ⏱️ Convergence speed & time×quality (target held-out loss ≤ 0.0848)
+## ⏱️ Convergence speed & time×quality (target held-out loss ≤ 0.0844)
 
 `steps→target` = how fast it reaches the common quality bar; `time→target` folds in the per-step cost (the metric that actually matters in wall-clock).
 
 | # (by time×quality) | optimizer | steps→target | ms/step | time→target (s) |
 |---|---|---|---|---|
-| 1 | Adakaon-nomom | 1625 | 13.4 | 21.84 |
-| 2 | Adakaon-bf16 | 1625 | 14.1 | 22.99 |
+| 1 | Adakaon-bf16 | 1625 | 14.1 | 22.99 |
+| 2 | Adakaon-nomom | 1750 | 13.4 | 23.52 |
 | 3 | AdamW | 1875 | 12.8 | 23.93 |
 | 4 | Lion | 1750 | 13.7 | 23.96 |
 | 5 | AdaMuon | 1625 | 17.0 | 27.70 |
 | 6 | Muon | 1625 | 17.1 | 27.79 |
-| 7 | AdaPNM | 2000 | 14.6 | 29.23 |
+| 7 | AdaPNM | 2000 | 14.4 | 28.81 |
 
 ## ⚡ Per-iteration speed
 
@@ -56,7 +55,7 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 2 | Adakaon-nomom | 13.4 | 2.44 |
 | 3 | Lion | 13.7 | 2.80 |
 | 4 | Adakaon-bf16 | 14.1 | 2.98 |
-| 5 | AdaPNM | 14.6 | 4.91 |
+| 5 | AdaPNM | 14.4 | 4.91 |
 | 6 | AdaMuon | 17.0 | 6.58 |
 | 7 | Muon | 17.1 | 222.21 |
 
@@ -78,7 +77,7 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 
 | # (by const gap) | optimizer | const-LR gap | Δ vs scheduled |
 |---|---|---|---|
-| 1 | AdaPNM | +0.0042 | -0.0022 |
+| 1 | AdaPNM | +0.0037 | -0.0026 |
 | 2 | Lion | +0.0070 | -0.0060 |
 | 3 | Adakaon-nomom | +0.0080 | -0.0068 |
 | 4 | AdamW | +0.0106 | -0.0009 |

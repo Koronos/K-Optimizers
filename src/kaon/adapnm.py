@@ -612,10 +612,7 @@ class AdaPNM(Optimizer):
             denom = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view(N, 1, 1)
             delta = delta.mul_(mask).div_(denom)
 
-        pviews = [mat(p.data) for p in plist]
-        weights = torch.stack(pviews)
-        self._apply_subtract_batched(weights, delta, bf16_method)
-        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+        self._write_back([mat(p.data) for p in plist], delta, bf16_method)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -666,10 +663,7 @@ class AdaPNM(Optimizer):
             denom = mask.mean(dim=1).clamp_(min=1e-8).view(N, 1)
             delta = delta.mul_(mask).div_(denom)
 
-        pviews = [p.data for p in plist]
-        weights = torch.stack(pviews)
-        self._apply_subtract_batched(weights, delta, bf16_method)
-        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+        self._write_back([p.data for p in plist], delta, bf16_method)
 
     def _pn_stacked(
         self,
@@ -693,7 +687,9 @@ class AdaPNM(Optimizer):
         m_neg = self._dequant_stacked(states, neg, md, shape).reshape((n, *shape))
         m_pos.mul_(c["beta1_sq"]).add_(grad, alpha=1.0 - c["beta1_sq"])
         self._store_stacked(states, pos, md, m_pos.reshape((n, *shape)))
-        pn = m_pos.mul(1.0 + c["beta0"]).add_(m_neg, alpha=-c["beta0"]).mul_(1.0 / c["noise_norm"])
+        # m_pos is a fresh stacked tensor (torch.stack copies) and is already stored, so
+        # the pos-neg mix can run in-place on it — no extra [N, *shape] allocation.
+        pn = m_pos.mul_(1.0 + c["beta0"]).add_(m_neg, alpha=-c["beta0"]).mul_(1.0 / c["noise_norm"])
         return pn
 
     @torch.no_grad()
@@ -703,15 +699,28 @@ class AdaPNM(Optimizer):
         torch._foreach_mul_([mat(p.data) for p in plist], scale)
 
     @staticmethod
-    def _apply_subtract_batched(weights: Tensor, delta_fp32: Tensor, bf16_method: str) -> None:
+    def _write_back(pviews: list[Tensor], delta: Tensor, bf16_method: str) -> None:
+        """Apply ``p -= delta`` to a bucket of (matrixized) param views ``[N, *shape]``.
+
+        Only the bf16 + stochastic-rounding path needs a materialized stacked-weights
+        tensor (``add_stochastic_`` works on the stack); every other case subtracts the
+        delta slices straight into the param views with ``_foreach_sub_`` — skipping the
+        stack-weights allocation *and* the copy-back, which is pure overhead in the
+        many-tiny-tensor (LoRA) regime.
+        """
+        p0 = pviews[0]
         if (
-            _is_low_precision(weights)
+            _is_low_precision(p0)
             and bf16_method == "stochastic_rounding"
-            and weights.dtype == torch.bfloat16
+            and p0.dtype == torch.bfloat16
         ):
-            add_stochastic_(weights, delta_fp32, alpha=-1.0)
+            weights = torch.stack(pviews)
+            add_stochastic_(weights, delta, alpha=-1.0)
+            torch._foreach_copy_(pviews, list(weights.unbind(0)))
+        elif p0.dtype == delta.dtype:
+            torch._foreach_sub_(pviews, list(delta.unbind(0)))
         else:
-            weights.sub_(delta_fp32.to(weights.dtype))
+            torch._foreach_sub_(pviews, [d.to(p0.dtype) for d in delta.unbind(0)])
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
