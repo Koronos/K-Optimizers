@@ -20,10 +20,13 @@ from kaon import Adakaon, AdaMuon, AdaPNM, Lion
 
 OPTIMIZERS = {
     # --- reference baseline ---
-    "AdamW": dict(
-        make=lambda p, lr: torch.optim.AdamW(p, lr=lr, betas=(0.9, 0.999)),
+    "torch.AdamW (fused)": dict(
+        make=lambda p, lr: torch.optim.AdamW(p, lr=lr, betas=(0.9, 0.999), fused=True),
         lr=1.2e-3, lr_const=1.2e-3, family="reference",
-        blurb="torch AdamW (full fp32 moments, 8 B/param)",
+        blurb="torch.optim.AdamW, fused kernel — the EXTERNAL reference (not a kaon optimizer)",
+        # frozen: external torch optimizer, unaffected by kaon changes -> a full run keeps its
+        # cached numbers (re-measured only if missing or the settings signature changes).
+        frozen=True,
     ),
     # --- in-house (kaon family) ---
     "Adakaon-nomom": dict(

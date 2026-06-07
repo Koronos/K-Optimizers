@@ -289,7 +289,11 @@ def main():
         elif A.new:
             targets = [n for n in OPTIMIZERS if store.get(n, {}).get("sig") != cfg["sig"]]
         else:
-            targets = list(OPTIMIZERS)
+            # full run skips 'frozen' optimizers (e.g. external AdamW) already cached at this
+            # settings signature -- they don't change with kaon edits. Re-measured only if
+            # missing/stale; always re-measured when named via --only.
+            targets = [n for n, spec in OPTIMIZERS.items()
+                       if not (spec.get("frozen") and store.get(n, {}).get("sig") == cfg["sig"])]
         print(f"BATTERY sig={cfg['sig']} | measuring: {targets or '(none)'}", flush=True)
         for name in targets:
             if name not in OPTIMIZERS:
