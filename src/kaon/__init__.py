@@ -14,6 +14,7 @@ Optimizers:
     ScheduleFree: Schedule-Free AdamW (iterate averaging, no LR schedule) on the factored backend (candidate).
     ADOPT: modified Adam that converges with any beta2 (v-lag + normalize-then-momentum) (candidate).
     Grams: Adam's magnitude with the update direction set by sign(current gradient) (candidate).
+    AdamP: AdamW minus the radial update component on scale-invariant weights (candidate).
 
 Quickstart::
 
@@ -30,6 +31,7 @@ Quickstart::
 from kaon._version import __version__
 from kaon.adabelief import AdaBelief
 from kaon.adakaon import Adakaon
+from kaon.adamp import AdamP
 from kaon.adamuon import AdaMuon
 from kaon.adan import Adan
 from kaon.adapnm import AdaPNM
@@ -50,6 +52,7 @@ __all__ = [
     "AdaPNM",
     "Adakaon",
     "Adan",
+    "AdamP",
     "Autokaon",
     "Grams",
     "KProdigy",
