@@ -6,10 +6,12 @@ benchmarks/
 │   ├── dataset.py          #   the registered deterministic synthetic dataset (train=32/test=96)
 │   └── harness.py          #   pixel-DDPM U-Net + DDPM loss + the LoRA-like adapter-bag speed probe
 ├── control/                # the cross-optimizer CONTROL BATTERY  ← start here
-│   ├── registry.py         #   every optimizer + its best config (add a contender here)
-│   ├── battery.py          #   runs the battery, caches results, regenerates the rankings
-│   ├── results.json        #   the per-optimizer cache (git-tracked so rankings are reproducible)
-│   └── RANKINGS.md         #   the generated ranked tables  ← read here
+│   ├── registry.py         #   every optimizer + its best config (+ optional `variants` to probe)
+│   ├── battery.py          #   RANKS the field: measure → cache → regenerate RANKINGS.md
+│   ├── results.json        #   the per-optimizer ranking cache (git-tracked, reproducible)
+│   ├── RANKINGS.md         #   the generated ranked tables  ← read here
+│   ├── profiler.py         #   PROFILES one optimizer: "what does it like?" (LR/sched/warmup/…)
+│   └── profiles/<Name>.md  #   the generated per-optimizer profile
 └── adamuon/                # optimizer-specific deep-dives (historical campaign)
     ├── pixel_ddpm_ab.py     #   AdaMuon-vs-Adakaon convergence A/B (CLI, presets)
     ├── sdxl_lora_ab.py      #   real SDXL LoRA A/B (adamw_fused / adafactor arms)
@@ -56,6 +58,28 @@ python benchmarks/control/battery.py --quick    # smaller/faster settings (smoke
 
 Only entries measured at the *same* settings signature (`C`/`N`/seeds/dataset-fingerprint) are
 ranked together; the battery flags any stale entries to re-run.
+
+## The profiler — "what does this optimizer like?"
+
+The battery ranks each optimizer at **one** best config. The **profiler**
+([`control/profiler.py`](control/profiler.py)) does the opposite: it explores configs for **one**
+optimizer to discover its preferences — the diagnostic probes you always run on a new contender
+but that aren't part of the ranking. By greedy coordinate search (each step fixes the previous
+winner, ranked by **held-out loss**, with the gap shown as the overfit diagnostic):
+
+1. **ideal LR** — sweep around the registry LR (loss-best vs gap-best may differ).
+2. **schedule** — constant vs REX vs cosine vs linear: which decay does it want? (does it live on a constant LR?)
+3. **warmup** — none / short / longer: does it help?
+4. **curriculum** — single-resolution vs progressive: how much data-noise regularization it leans on.
+5. **knobs** — any optimizer-specific constructor variations declared in the registry's optional
+   `variants` field (e.g. AdaPNM's `cautious` on/off, `beta0`).
+
+```bash
+python benchmarks/control/profiler.py --opt AdaPNM     # -> profiles/AdaPNM.md
+```
+
+To probe an optimizer's own knobs, add a `variants={label: make, …}` dict to its `registry.py`
+entry (see AdaPNM for the pattern); the profiler A/Bs them automatically.
 
 ## Caveats (read before trusting a ranking)
 

@@ -46,6 +46,13 @@ OPTIMIZERS = {
         make=lambda p, lr: AdaPNM(p, lr=lr, betas=(0.8, 0.999), beta0=0.5, cautious=True, momentum_dtype="bfloat16"),
         lr=2.4e-3, lr_const=2.4e-3, family="published",
         blurb="positive-negative momentum (best generalization / constant-LR)",
+        # optional: constructor knobs the profiler A/Bs ("what does it like?")
+        variants={
+            "cautious=on": lambda p, lr: AdaPNM(p, lr=lr, betas=(0.8, 0.999), beta0=0.5, cautious=True, momentum_dtype="bfloat16"),
+            "cautious=off": lambda p, lr: AdaPNM(p, lr=lr, betas=(0.8, 0.999), beta0=0.5, cautious=False, momentum_dtype="bfloat16"),
+            "beta0=0 (PNM off)": lambda p, lr: AdaPNM(p, lr=lr, betas=(0.8, 0.999), beta0=0.0, cautious=True, momentum_dtype="bfloat16"),
+            "beta0=1 (full PNM)": lambda p, lr: AdaPNM(p, lr=lr, betas=(0.8, 0.999), beta0=1.0, cautious=True, momentum_dtype="bfloat16"),
+        },
     ),
     "AdaMuon": dict(
         make=lambda p, lr: AdaMuon(p, lr=lr, betas=(0.95, 0.999), ns_steps=2, cautious=True, momentum_dtype="int8"),
