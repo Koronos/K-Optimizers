@@ -15,6 +15,7 @@ Optimizers:
     ADOPT: modified Adam that converges with any beta2 (v-lag + normalize-then-momentum) (candidate).
     Grams: Adam's magnitude with the update direction set by sign(current gradient) (candidate).
     AdamP: AdamW minus the radial update component on scale-invariant weights (candidate).
+    Adai: adaptive per-coordinate inertia (momentum) from the global-normalized variance (candidate).
 
 Quickstart::
 
@@ -30,6 +31,7 @@ Quickstart::
 
 from kaon._version import __version__
 from kaon.adabelief import AdaBelief
+from kaon.adai import Adai
 from kaon.adakaon import Adakaon
 from kaon.adamp import AdamP
 from kaon.adamuon import AdaMuon
@@ -48,6 +50,7 @@ __all__ = [
     "ADOPT",
     "AdEMAMix",
     "AdaBelief",
+    "Adai",
     "AdaMuon",
     "AdaPNM",
     "Adakaon",
