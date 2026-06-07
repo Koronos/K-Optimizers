@@ -19,16 +19,18 @@ import torch
 from kaon import (
     ADOPT,
     MARS,
-    Adai,
+    SAM,
     AdaBelief,
+    Adai,
     Adakaon,
-    AdaMuon,
     AdamP,
+    AdaMuon,
     Adan,
     AdaPNM,
     AdEMAMix,
     Grams,
     Lion,
+    Lookahead,
     ScheduleFree,
 )
 
@@ -106,6 +108,19 @@ OPTIMIZERS = {
         make=lambda p, lr: Adai(p, lr=lr, cautious=True, momentum_dtype="bfloat16"),
         lr=1.6e-2, lr_const=1.2e-2, family="published",
         blurb="adaptive per-coord inertia (flat-minima); heavy (fp32 beta1_prod), SGD-scale LR",
+    ),
+    # --- wrappers over Adakaon (gap-frontier techniques; ~2x cost for SAM) ---
+    "Lookahead": dict(
+        make=lambda p, lr: Lookahead(p, lr=lr, k=5, alpha=0.5, betas=(0.9, 0.999),
+                                     cautious=True, momentum_dtype="bfloat16"),
+        lr=2.4e-3, lr_const=2.4e-3, family="published",
+        blurb="k-step slow-weight averaging over Adakaon (weight-averaging regularizer)",
+    ),
+    "SAM": dict(
+        make=lambda p, lr: SAM(p, lr=lr, rho=0.05, betas=(0.9, 0.999),
+                               cautious=True, momentum_dtype="bfloat16"),
+        lr=1.2e-3, lr_const=1.2e-3, family="published",
+        blurb="sharpness-aware (flat minima) over Adakaon; 2x cost, lowers the gap",
     ),
     "MARS": dict(
         make=lambda p, lr: MARS(p, lr=lr, gamma=0.025, cautious=True, momentum_dtype="bfloat16"),

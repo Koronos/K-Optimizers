@@ -95,11 +95,26 @@ def eval_loss(net, x, idx, ac, reps=8, seed0=5000):
 
 # ----------------------------- memory -----------------------------
 def opt_state_bytes_per_param(opt, params):
+    # Sum the optimizer's own state AND any wrapped inner/base optimizer's state, so
+    # wrappers (Lookahead -> .inner, SAM -> .base_optimizer) report their TRUE footprint
+    # (the wrapped optimizer keeps its factored/momentum state in a separate .state dict).
+    seen = set()
     b = 0
-    for st in opt.state.values():
-        for v in st.values():
-            if torch.is_tensor(v):
-                b += v.numel() * v.element_size()
+    opts = []
+    stack = [opt]
+    while stack:
+        o = stack.pop()
+        if o is None or id(o) in seen or not hasattr(o, "state"):
+            continue
+        seen.add(id(o))
+        opts.append(o)
+        stack.append(getattr(o, "inner", None))
+        stack.append(getattr(o, "base_optimizer", None))
+    for o in opts:
+        for st in o.state.values():
+            for v in st.values():
+                if torch.is_tensor(v):
+                    b += v.numel() * v.element_size()
     nparam = sum(p.numel() for p in params)
     return b / max(1, nparam)
 
