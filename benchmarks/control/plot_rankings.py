@@ -88,7 +88,7 @@ def main():
     fig.suptitle(f"kaon control battery — {len(a)} optimizers @ {sig}  (each at best config; lower=better)",
                  fontsize=13, y=0.975)
     fig.tight_layout(rect=(0, 0, 1, 0.955))
-    fig.savefig(f"{HERE}/plots/dashboard.png", dpi=90)
+    fig.savefig(f"{HERE}/plots/dashboard.png", dpi=150)
     plt.close(fig)
 
     # ---------- headline scatter: loss vs gap ----------
@@ -108,7 +108,7 @@ def main():
                for f, c in GRP_COLOR.items()]
     ax.legend(handles=handles, fontsize=10, loc="upper right")
     fig.tight_layout()
-    fig.savefig(f"{HERE}/plots/loss_vs_gap.png", dpi=90)
+    fig.savefig(f"{HERE}/plots/loss_vs_gap.png", dpi=150)
     plt.close(fig)
     print(f"wrote dashboard.png + loss_vs_gap.png ({len(a)} optimizers, target<={t:.4f})")
 
