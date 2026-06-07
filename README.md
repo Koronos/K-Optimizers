@@ -143,6 +143,8 @@ opt = Autofusion(
 - [docs/muon.md](docs/muon.md) — Muon design + API.
 - [docs/lion.md](docs/lion.md) — Lion (sign-momentum) design, the
   betas loss↔generalization dial, memory, and the proxy evaluation.
+- [docs/adapnm.md](docs/adapnm.md) — AdaPNM (Positive-Negative Momentum) design, the
+  beta1 loss↔gap frontier, the constant-LR robustness result, memory, and API.
 - [docs/adamuon.md](docs/adamuon.md) — AdaMuon design, the `clip_threshold`/`lr`
   validation, `compile=True`, and the pixel-DDPM evaluation.
 - [docs/foreach-batching.md](docs/foreach-batching.md) — multi-tensor batching of

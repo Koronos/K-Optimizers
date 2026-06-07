@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
   synthetic gap proxy it reaches ~Lion/AdamW loss at **36–44% lower train–val gap**, and
   it is the **most gap-robust optimizer at constant LR** (no schedule needed — resumable;
   35–43% lower gap than the field). Developed under the code name *Janus*.
+  See [docs/adapnm.md](docs/adapnm.md).
 - **`Lion`** — **Lion's sign-momentum** update (`sign(β1·m+(1-β1)·g)`, single momentum
   buffer, **no second moment**) on Adafusion's backend: the shared int8/4bit momentum codec,
   stochastic-rounding bf16 weight update, cautious masking, and **foreach batching** (bit-exact
