@@ -7,6 +7,7 @@ Optimizers:
     Autokaon: parameter-free LR on Adakaon via a Mechanic tuner (freeze-to-free).
     Lion: sign-momentum (EvoLved Sign Momentum) on Adakaon's quantized-momentum backend (experimental).
     AdaPNM: Adam + positive-negative momentum on the factored/quantized backend (experimental).
+    AdaBelief: Adam on the variance of the gradient residual (g - m) on the factored backend (candidate).
 
 Quickstart::
 
@@ -21,6 +22,7 @@ Quickstart::
 """
 
 from kaon._version import __version__
+from kaon.adabelief import AdaBelief
 from kaon.adakaon import Adakaon
 from kaon.adamuon import AdaMuon
 from kaon.adapnm import AdaPNM
@@ -29,6 +31,7 @@ from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
 
 __all__ = [
+    "AdaBelief",
     "AdaMuon",
     "AdaPNM",
     "Adakaon",
