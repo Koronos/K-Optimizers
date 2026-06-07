@@ -9,9 +9,9 @@ import torch
 
 from kaon import AdaMuon
 from kaon.adamuon import (
+    zeropower_via_newtonschulz5,
     zeropower_via_newtonschulz5_stacked,
 )
-from kaon.muon import zeropower_via_newtonschulz5
 
 from .conftest import train_steps
 

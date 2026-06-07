@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from kaon import Adakaon, AdaMuon, AdaPNM, Lion, Muon
+from kaon import Adakaon, AdaMuon, AdaPNM, Lion
 
 OPTIMIZERS = {
     # --- reference baseline ---
@@ -58,10 +58,5 @@ OPTIMIZERS = {
         make=lambda p, lr: AdaMuon(p, lr=lr, betas=(0.95, 0.999), ns_steps=2, cautious=True, momentum_dtype="int8"),
         lr=2.4e-3, lr_const=2.4e-3, family="published",
         blurb="orthogonalized momentum + factored 2nd moment (convergence)",
-    ),
-    "Muon": dict(
-        make=lambda p, lr: Muon(p, lr=lr, momentum_dtype="bfloat16"),
-        lr=2e-2, lr_const=2e-2, family="published",
-        blurb="orthogonalized momentum + AdamW fallback (convergence ceiling)",
     ),
 }

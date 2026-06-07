@@ -87,19 +87,6 @@ Real SDXL LoRA — lower floor than AdamW (**0.0900 vs 0.0928**) at **1/3 the op
 → [docs/adamuon.md](adamuon.md),
 [RESULTS_vs_adamw_adafactor.md](../benchmarks/adamuon/RESULTS_vs_adamw_adafactor.md).
 
-### Best convergence quality (when memory is available)
-
-```python
-from kaon import Muon
-
-opt = Muon(model.parameters(), lr=2e-2, momentum_dtype="bfloat16")
-```
-
-Orthogonalized momentum with an AdamW fallback for 1-D/embedding params; half of AdamW's state.
-
-**Evidence:** the convergence-quality ceiling of the family; AdaMuon is its near-Adafactor-memory
-descendant (above). → [docs/muon.md](muon.md).
-
 ### AdamW-quality at a fraction of AdamW's memory
 
 ```python

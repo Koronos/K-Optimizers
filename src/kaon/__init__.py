@@ -2,7 +2,6 @@
 
 Optimizers:
     Adakaon: conv-aware factored optimizer (AdamW-quality at Adafactor memory).
-    Muon: orthogonalized-momentum optimizer with an AdamW fallback (hybrid).
     AdaMuon: orthogonalized momentum + factored quantized variance (Adafactor memory).
     KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
     Autokaon: parameter-free LR on Adakaon via a Mechanic tuner (freeze-to-free).
@@ -11,7 +10,7 @@ Optimizers:
 
 Quickstart::
 
-    from kaon import Adakaon, Muon
+    from kaon import Adakaon
 
     optimizer = Adakaon(
         model.parameters(),
@@ -28,7 +27,6 @@ from kaon.adapnm import AdaPNM
 from kaon.autokaon import Autokaon
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
-from kaon.muon import Muon
 
 __all__ = [
     "AdaMuon",
@@ -37,6 +35,5 @@ __all__ = [
     "Autokaon",
     "KProdigy",
     "Lion",
-    "Muon",
     "__version__",
 ]

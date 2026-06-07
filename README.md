@@ -13,9 +13,6 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   at a fraction of AdamW's optimizer memory**, with bf16-correct weight updates
   (stochastic rounding — *no* Kahan buffer, *no* CPU offload).
   → [docs/adakaon.md](docs/adakaon.md)
-- **`Muon`** — an orthogonalized-momentum optimizer (Newton-Schulz) with an AdamW
-  fallback for 1-D/embedding params. Highest convergence quality, at half of
-  AdamW's state. → [docs/muon.md](docs/muon.md)
 - **`AdaMuon`** — **Muon's orthogonalized momentum + an Adafactor-style factored,
   quantized second moment** of the orthogonalized update. Aims to beat AdamW on
   convergence/precision at **near-Adafactor memory** (~1–2 B/param, int8/4bit dial).
@@ -42,7 +39,7 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   becomes **byte-for-byte and speed-for-speed plain Adakaon**.
   → [docs/autokaon.md](docs/autokaon.md)
 
-`Adakaon`, `Muon`, `AdaMuon`, and `Lion` are standard `torch.optim.Optimizer`s that work
+`Adakaon`, `AdaMuon`, and `Lion` are standard `torch.optim.Optimizer`s that work
 one-parameter-at-a-time, so they drop into per-parameter / gradient-release
 training loops unchanged. `KProdigy` needs a global reduction over all parameters
 each step (the D estimate), so it is a normal two-pass `step()` optimizer (no
@@ -76,12 +73,6 @@ opt = Adakaon(
 for batch in loader:
     loss = model(batch); loss.backward()
     opt.step(); opt.zero_grad()
-```
-
-```python
-from kaon import Muon
-
-opt = Muon(model.parameters(), lr=2e-2, momentum_dtype="bfloat16")
 ```
 
 ```python
@@ -146,13 +137,10 @@ Adakaon(model.parameters(), lr=1e-4, betas=(0.0, 0.999), bf16_method="stochastic
 **Maximum quality / fastest convergence-to-quality:**
 
 ```python
-from kaon import AdaMuon, Muon, Adakaon
+from kaon import AdaMuon, Adakaon
 
 # Beat AdamW on convergence at Adafactor memory (~1 B/param int8; ns_steps=2/cautious defaults):
 AdaMuon(model.parameters(), lr=1e-3, momentum_dtype="int8")
-
-# Best convergence quality when memory is available:
-Muon(model.parameters(), lr=2e-2, momentum_dtype="bfloat16")
 
 # AdamW-quality at 1/4–1/8 the memory (bf16 = 2 B/param; int8 = ~1 B/param, near-lossless):
 Adakaon(model.parameters(), lr=1e-4, betas=(0.9, 0.999), momentum_dtype="bfloat16")
@@ -187,7 +175,6 @@ a 1434-adapter SDXL UNet. See [docs/foreach-batching.md](docs/foreach-batching.m
 - [docs/autokaon.md](docs/autokaon.md) — the Mechanic LR tuner, freeze-to-free,
   the minimal API + the one advanced knob, and the campaign results.
 - [docs/kprodigy.md](docs/kprodigy.md) — memory-efficient Prodigy design + API.
-- [docs/muon.md](docs/muon.md) — Muon design + API.
 - [docs/lion.md](docs/lion.md) — Lion (sign-momentum) design, the
   betas loss↔generalization dial, memory, and the proxy evaluation.
 - [docs/adapnm.md](docs/adapnm.md) — AdaPNM (Positive-Negative Momentum) design, the

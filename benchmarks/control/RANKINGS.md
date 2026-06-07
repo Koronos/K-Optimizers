@@ -10,13 +10,12 @@
 
 | # | optimizer | mean rank | 🥇 wins (rank 1) | identity |
 |---|---|---|---|---|
-| 1 | **Adakaon-nomom** | 2.7 | 🥇 LoRA-speed, memory | factored Adam, no momentum (minimum VRAM, regularizing) |
-| 2 | **Lion** | 3.0 | — | sign-momentum, no 2nd moment (lightest state) |
-| 3 | **AdamW** | 4.1 | 🥇 iter-speed | torch AdamW (full fp32 moments, 8 B/param) |
-| 4 | **AdaMuon** | 4.1 | 🥇 loss | orthogonalized momentum + factored 2nd moment (convergence) |
-| 5 | **Adakaon-bf16** | 4.4 | 🥇 convergence | factored Adam, bf16 momentum (AdamW-quality, low memory) |
-| 6 | **AdaPNM** | 4.6 | 🥇 generalization, constant-LR | positive-negative momentum (best generalization / constant-LR) |
-| 7 | **Muon** | 5.0 | — | orthogonalized momentum + AdamW fallback (convergence ceiling) |
+| 1 | **Adakaon-nomom** | 2.4 | 🥇 LoRA-speed, memory | factored Adam, no momentum (minimum VRAM, regularizing) |
+| 2 | **Lion** | 2.7 | — | sign-momentum, no 2nd moment (lightest state) |
+| 3 | **AdamW** | 3.7 | 🥇 iter-speed | torch AdamW (full fp32 moments, 8 B/param) |
+| 4 | **Adakaon-bf16** | 4.0 | 🥇 convergence | factored Adam, bf16 momentum (AdamW-quality, low memory) |
+| 5 | **AdaMuon** | 4.0 | 🥇 loss | orthogonalized momentum + factored 2nd moment (convergence) |
+| 6 | **AdaPNM** | 4.1 | 🥇 generalization, constant-LR | positive-negative momentum (best generalization / constant-LR) |
 ## 🎯 Loss × generalization (scheduled, progressive curriculum)
 
 The headline for small-data fine-tuning: rank by the **train–val gap**, not the loss.
@@ -28,8 +27,7 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 3 | Lion | 0.0791 | +0.0130 |
 | 4 | Adakaon-nomom | 0.0793 | +0.0148 |
 | 5 | AdaMuon | 0.0769 | +0.0196 |
-| 6 | Muon | 0.0786 | +0.0206 |
-| 7 | Adakaon-bf16 | 0.0803 | +0.0217 |
+| 6 | Adakaon-bf16 | 0.0803 | +0.0217 |
 
 ## ⏱️ Convergence speed & time×quality (target held-out loss ≤ 0.0844)
 
@@ -42,8 +40,7 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 3 | AdamW | 1875 | 12.8 | 23.93 |
 | 4 | Lion | 1750 | 13.7 | 23.96 |
 | 5 | AdaMuon | 1625 | 17.0 | 27.70 |
-| 6 | Muon | 1625 | 17.1 | 27.79 |
-| 7 | AdaPNM | 2000 | 14.4 | 28.81 |
+| 6 | AdaPNM | 2000 | 14.4 | 28.81 |
 
 ## ⚡ Per-iteration speed
 
@@ -57,7 +54,6 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 4 | Adakaon-bf16 | 14.1 | 2.98 |
 | 5 | AdaPNM | 14.4 | 4.91 |
 | 6 | AdaMuon | 17.0 | 6.58 |
-| 7 | Muon | 17.1 | 222.21 |
 
 ## 💾 Memory (measured optimizer state)
 
@@ -66,10 +62,9 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 1 | Adakaon-nomom | 0.03 |
 | 2 | AdaMuon | 1.04 |
 | 3 | Lion | 2.00 |
-| 4 | Muon | 2.01 |
-| 5 | Adakaon-bf16 | 2.03 |
-| 6 | AdaPNM | 4.03 |
-| 7 | AdamW | 8.00 |
+| 4 | Adakaon-bf16 | 2.03 |
+| 5 | AdaPNM | 4.03 |
+| 6 | AdamW | 8.00 |
 
 ## 🔁 Continuity — robustness at constant LR (resumable, no schedule)
 
@@ -82,5 +77,4 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 3 | Adakaon-nomom | +0.0080 | -0.0068 |
 | 4 | AdamW | +0.0106 | -0.0009 |
 | 5 | Adakaon-bf16 | +0.0173 | -0.0043 |
-| 6 | Muon | +0.0180 | -0.0026 |
-| 7 | AdaMuon | +0.0184 | -0.0012 |
+| 6 | AdaMuon | +0.0184 | -0.0012 |

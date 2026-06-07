@@ -21,7 +21,7 @@ This product includes software / algorithms derived from or inspired by:
 - Muon — Keller Jordan's "Muon" (https://kellerjordan.github.io/posts/muon/)
   and MoonshotAI's "Muon is Scalable for LLM Training" (arXiv:2502.16982),
   whose Newton-Schulz iteration and `0.2*sqrt(max(A,B))` RMS-matching scaling
-  the `Muon` class follows.
+  `AdaMuon` builds on.
 
 - torchastic (lodestone-rock/torchastic) — the stochastic-rounding primitive
   reference used by `_stochastic_rounding`.

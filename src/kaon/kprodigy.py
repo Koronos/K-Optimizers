@@ -36,7 +36,7 @@ Memory at ``beta1=0`` (no momentum), ``second_moment="factored"``, ``slice_p=11`
 is well under AdamW; even the full-precision default (bf16 momentum + full fp32
 second moment) is ~6 B/param vs AdamW's 8.
 
-Unlike ``Adakaon``/``Muon``, Prodigy needs a **global reduction over all
+Unlike ``Adakaon``/``AdaMuon``, Prodigy needs a **global reduction over all
 parameters** each step (the D estimate), so it is a two-pass optimizer and does
 **not** support the per-parameter / gradient-release loop. Use it as a normal
 ``optimizer.step()`` optimizer.

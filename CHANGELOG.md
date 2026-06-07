@@ -171,6 +171,12 @@ All notable changes to this project will be documented in this file.
   remain bit-for-bit identical (existing parity tests pass unchanged).
 
 ### Removed
+- **Removed the plain `Muon` optimizer.** It keeps a full-precision momentum buffer with
+  an AdamW fallback for 1-D params (~2 B/param, no quantization) — it does not fit a
+  memory-efficient library, and `AdaMuon` (orthogonalized momentum + a factored, quantized
+  second moment) supersedes it. Its Newton-Schulz kernel (`zeropower_via_newtonschulz5`,
+  the only piece `AdaMuon` used) moved into `adamuon.py`; the `Muon` class, `docs/muon.md`,
+  and the tests are gone.
 - Removed `decay_rate`, `factor_conv_as_matrix`, and `compile` (alpha cleanup —
   no reliable benefit / superseded).
   - `decay_rate` (HF Adafactor adaptive `beta2_t = 1 - step**decay_rate`): a

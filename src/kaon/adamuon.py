@@ -28,9 +28,9 @@ get a shape-independent applied RMS of ``0.2``. In AdaMuon the factored
 make the update grow with layer size. We therefore scale by the **constant**
 ``_UPDATE_RMS`` (0.2) only. Every parameter — 2-D and 1-D alike — is normalized to
 an applied RMS of ``≈ 0.2·lr``, so a single ``lr`` governs the whole model (no
-separate Adam LR for biases/norms, unlike :class:`~kaon.muon.Muon`).
+separate Adam LR for biases/norms, unlike plain Muon).
 
-**Momentum semantics differ from :class:`~kaon.muon.Muon`.** ``Muon`` uses a
+**Momentum semantics differ from plain Muon** (Jordan et al.). Muon uses a
 heavy-ball buffer (``m = momentum·m + g``) with optional Nesterov; AdaMuon uses an
 Adam-style EMA lerp (``m = β1·m + (1-β1)·g``), which is the canonical AdaMuon form
 and what the shared momentum codec implements — giving int8/4bit momentum and
@@ -71,7 +71,6 @@ from kaon._momentum_codec import (
     _MomentumCodec,
     load_state_dict_preserving_dtypes,
 )
-from kaon.muon import zeropower_via_newtonschulz5
 
 __all__ = ["AdaMuon"]
 
@@ -97,12 +96,36 @@ def _rms(t: Tensor) -> Tensor:
     return t.norm(2) / math.sqrt(max(t.numel(), 1))
 
 
+def zeropower_via_newtonschulz5(grad: Tensor, steps: int) -> Tensor:
+    """Newton-Schulz quintic iteration: approximate the orthogonal factor of ``grad``.
+
+    Returns ``U`` (≈ ``U @ V.T`` of ``grad = U S V.T``) in bf16. Runs in bf16 for
+    speed/memory — the iteration is robust to it. ``grad`` must be 2-D. (Muon's
+    orthogonalization, Jordan et al.; the per-parameter path uses it directly, the
+    foreach path the batched ``_stacked`` variant below.)
+    """
+    assert grad.ndim == 2, "Newton-Schulz expects a 2-D matrix"
+    a, b, c = 3.4445, -4.7750, 2.0315
+    x = grad.bfloat16()
+    transposed = x.size(0) > x.size(1)
+    if transposed:  # iterate on the smaller inner dimension
+        x = x.mT
+    x = x / (x.norm() + 1e-7)
+    for _ in range(steps):
+        aa = x @ x.mT
+        bb = b * aa + c * (aa @ aa)
+        x = a * x + bb @ x
+    if transposed:
+        x = x.mT
+    return x
+
+
 def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
     """Batched Newton-Schulz quintic iteration over a stack of 2-D matrices.
 
     ``grad`` is ``[N, R, C]`` (all slices share ``R, C``). Returns ``[N, R, C]``
     bf16 orthogonal factors, one per slice — element-for-element the per-slice
-    :func:`~kaon.muon.zeropower_via_newtonschulz5` but with a single ``bmm`` per
+    :func:`zeropower_via_newtonschulz5` but with a single ``bmm`` per
     iteration instead of ``N`` matmuls (the LoRA throughput win). Each slice is
     normalized by its own Frobenius norm and transposed to its smaller inner
     dimension (uniform across the bucket since all slices share the shape).
