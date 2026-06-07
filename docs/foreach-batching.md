@@ -1,6 +1,6 @@
-# Adafusion `foreach` batching — design & tuning
+# Adakaon `foreach` batching — design & tuning
 
-`Adafusion` steps parameters with multi-tensor (stacked) ops instead of a
+`Adakaon` steps parameters with multi-tensor (stacked) ops instead of a
 per-parameter Python loop (`foreach=True`, the default). This note explains how it
 works, the two knobs that control it, and the measurements behind their defaults.
 

@@ -1,4 +1,4 @@
-"""Shared pytest fixtures and helpers for the adafusion test suite."""
+"""Shared pytest fixtures and helpers for the adakaon test suite."""
 
 from __future__ import annotations
 

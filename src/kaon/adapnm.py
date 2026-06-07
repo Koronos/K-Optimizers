@@ -4,10 +4,10 @@ AdaPNM — the adaptive variant of **Positive-Negative Momentum** (Xie et al. 20
 *Positive-Negative Momentum: Manipulating Stochastic Gradient Noise to Improve
 Generalization*, ICML 2021, arXiv:2103.17182) — implemented on top of the
 precision and memory machinery already proven in
-:class:`~kaon.adafusion.Adafusion`. It is the **generalization-bucket**
+:class:`~kaon.adakaon.Adakaon`. It is the **generalization-bucket**
 optimizer: an *implicit regularizer* that improves flat-minima / train-val-gap
 behaviour **without** the extra forward-backward of SAM. Keeping it a separate
-class lets it be A/B'd against Adafusion cleanly (Adafusion is left byte-for-byte
+class lets it be A/B'd against Adakaon cleanly (Adakaon is left byte-for-byte
 unchanged).
 
 (Developed under the provisional code name *Janus*.)
@@ -57,10 +57,10 @@ of the alternation) momentum that gets subtracted. ``beta0`` is kozistr's
 ``beta3`` (the pos-neg coefficient); their default ``beta3 = 1.0`` gives
 ``pn = (2*m_pos - m_neg)/sqrt(5)``.
 
-**The factored second moment.** ``v`` reuses Adafusion's backend exactly:
+**The factored second moment.** ``v`` reuses Adakaon's backend exactly:
 ``ndim >= 2`` weights factor ``v`` into row+column EMAs (conv kernels matrixized
 to ``[out, in*kh*kw]`` first), ``ndim == 1`` keeps a full per-coordinate ``v``.
-The denominator is Adafusion's ``r_factor * c_factor`` reconstruction of
+The denominator is Adakaon's ``r_factor * c_factor`` reconstruction of
 ``1/sqrt(v_hat)`` with the same RMS-clip; ``eps`` is added Adafactor-style via the
 factored ``eps1`` (the kozistr scalar ``eps`` on the denominator has no factored
 analogue, so it is exposed as ``eps`` and applied on the non-factored path /
@@ -80,7 +80,7 @@ deliberate deviation from the kozistr default, made for the factored backend; th
 **Cautious masking and the pos-neg direction.** Cautious (Liang et al. 2024) zeroes
 the update coordinates whose sign disagrees with the *current* gradient
 (``delta * g <= 0``), rescaling survivors to preserve the mean magnitude — the same
-semantics Adafusion/Lion use, applied here to the **final** ``delta`` (the
+semantics Adakaon/Lion use, applied here to the **final** ``delta`` (the
 pos-neg-mixed, denominator-divided, WD-folded step) against the raw gradient. Note
 the tension: PNM's amplified ``-beta0 * m_neg`` term is *designed* to let the step
 oppose the instantaneous gradient on noisy coordinates (that is the
@@ -89,10 +89,10 @@ so it partially damps the implicit regularizer. We keep ``cautious=True`` by def
 for consistency with the rest of kaon and because the rescale preserves step
 size, but **this is the knob to ablate first** when measuring AdaPNM's
 generalization benefit — try ``cautious=False`` to let the pos-neg mechanism run
-unmasked. Like Adafusion, with momentum effectively always on here the mask is not
+unmasked. Like Adakaon, with momentum effectively always on here the mask is not
 a no-op.
 
-**What is reused vs new.** Reused from Adafusion's backend: the factored
+**What is reused vs new.** Reused from Adakaon's backend: the factored
 second-moment helpers (:mod:`kaon._factored`), the momentum **storage layout**
 and quant/dequant primitives in :mod:`kaon._momentum_codec` (int8 per-row
 absmax; 4-bit per-block absmax, nibble-packed), the stochastic-rounding bf16
@@ -138,11 +138,11 @@ __all__ = ["AdaPNM"]
 _LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
-# Performance / memory knobs mirror Adafusion (see that module for the rationale).
+# Performance / memory knobs mirror Adakaon (see that module for the rationale).
 _FOREACH_BATCH_CUTOFF = 2_000_000
 _DEFAULT_STACK_ELEMS = 64_000_000
 _STACK_SAFETY_FRACTION = 0.10
-_STACK_BYTES_PER_ELEM = 64  # two momenta + factored v: a touch above Adafusion's 48
+_STACK_BYTES_PER_ELEM = 64  # two momenta + factored v: a touch above Adakaon's 48
 _MIN_STACK_ELEMS = 262_144
 
 
@@ -155,7 +155,7 @@ def _is_low_precision(t: Tensor) -> bool:
 
 
 class AdaPNM(Optimizer):
-    """AdaPNM (Adam + Positive-Negative Momentum) on Adafusion's memory backend.
+    """AdaPNM (Adam + Positive-Negative Momentum) on Adakaon's memory backend.
 
     Args:
         params: parameters or param-group dicts.
@@ -183,7 +183,7 @@ class AdaPNM(Optimizer):
         weight_decay: decoupled (AdamW-style) weight decay. Applied multiplicatively
             ``p *= (1 - lr*weight_decay)`` *before* the moment updates, matching
             kozistr's ``weight_decouple=True`` default (not folded into the cautious
-            delta — so cautious does not gate weight decay, unlike Adafusion).
+            delta — so cautious does not gate weight decay, unlike Adakaon).
         cautious: cautious masking (Liang et al. 2024) on the final pos-neg step vs
             the gradient. **On by default.** See the class docstring: it interacts
             with — and partially damps — PNM's noise-manipulation mechanism; ablate
@@ -194,7 +194,7 @@ class AdaPNM(Optimizer):
         momentum_dtype: storage for **both** momentum buffers — ``"bfloat16"``
             (default, ~2 B/param each), ``"float32"`` (4 B/param each), ``"int8"``
             (~1 B/param each, per-row absmax), or ``"4bit"`` (~0.5 B/param each,
-            per-block absmax, nibble-packed). Same layout as Adafusion's first
+            per-block absmax, nibble-packed). Same layout as Adakaon's first
             moment, so checkpoints resume bit-exactly via ``load_state_dict``. Note
             AdaPNM carries *two* momenta, so its momentum floor is ~2x a
             single-momentum optimizer at the same dtype (the price of PNM).

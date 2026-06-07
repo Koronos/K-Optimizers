@@ -1,4 +1,4 @@
-# Cheap momentum in Adafusion
+# Cheap momentum in Adakaon
 
 > Design notes + the experiments behind why **int8 is the recommended cheap
 > momentum**, and why every cheaper/simpler idea we tried was rejected. Read this
@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-Adafusion factors the **second** moment for ~free (Adafactor row+col). The
+Adakaon factors the **second** moment for ~free (Adafactor row+col). The
 **first** moment (momentum) is the only real state cost. The dial, cheapest → safest:
 
 | `momentum_dtype` | state | quality | use it when |
@@ -26,7 +26,7 @@ OOMs. Below int8 you trade away nothing measurable on quality *if* you use 4-bit
 ## Why momentum is the expensive part
 
 An optimizer does two separable jobs: **(1)** normalize the per-coordinate step
-scale, and **(2)** smooth the descent direction over time. Adafusion gets (1) from
+scale, and **(2)** smooth the descent direction over time. Adakaon gets (1) from
 the factored second moment (non-negative + low-rank → compresses to ~0 state) and
 (2) from the first-moment EMA. The second moment compresses to almost nothing
 because it has exploitable structure; the **first moment does not** — it is signed
@@ -38,7 +38,7 @@ clever factorization removes. That asymmetry is the whole story below.
 `momentum_dtype="int8"` quantizes the first moment to int8 with a **per-row
 absmax scale** (`scale = absmax/127`), foreach-batched in both the factored
 `[N,R,C]` and non-factored `[N,L]` paths. It is *not* the same as a "bitsandbytes
-8-bit Adam": 8-bit Adam quantizes **both** moments (2 B/param), while Adafusion
+8-bit Adam": 8-bit Adam quantizes **both** moments (2 B/param), while Adakaon
 factors the second moment (~0) and only quantizes the first (1 B/param total) —
 half the state at similar quality.
 
@@ -70,7 +70,7 @@ RTN 4-bit does not degrade at this scale, and SR costs +21% on full-FT (a
 ### FP8 (E4M3) — native low-bit float, "conversion = one cast" (1.0 B/param)
 The most elegant idea: a native float needs **no scale tensor and no packing**, so
 the per-step "conversion" collapses to a single cast. **Rejected — and the reason
-is the most instructive result here.** Real Adafusion momentum is *tiny*
+is the most instructive result here.** Real Adakaon momentum is *tiny*
 (absmax ≈ 1e-4, mean|m| ≈ 1.6e-5), and E4M3's smallest representable value is
 ≈ 2.4e-4. So **100% of momentum coordinates fall below the fp8 floor**: no-scale
 rounding freezes the whole buffer to 0 (convergence *worse* than no momentum),
@@ -93,7 +93,7 @@ memory), and it measures as only ~5–13% over fp32-momentum traffic. The real l
 is *bytes moved*, not the arithmetic — which is why compression helps and why
 "avoid the conversion" optimizes a cost that isn't the bottleneck.
 
-So: where the math had structure (the second moment), Adafusion already takes the
+So: where the math had structure (the second moment), Adakaon already takes the
 order-of-magnitude win (factoring). The first moment has no such structure — it
 needs ~8 bits + a scale, full stop.
 

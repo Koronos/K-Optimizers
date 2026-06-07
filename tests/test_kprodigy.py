@@ -187,7 +187,7 @@ def test_state_dict_roundtrip():
     assert opt2.param_groups[0]["d"] == opt.param_groups[0]["d"]
 
 
-# -- Adafusion-engine update backend (foreach) -----------------------------
+# -- Adakaon-engine update backend (foreach) -----------------------------
 
 def _mixed_params(dtype=torch.float32):
     """2-D + conv (4-D) + 1-D params -> exercises factored, full and flat buckets."""

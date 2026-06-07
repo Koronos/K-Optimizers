@@ -1,4 +1,4 @@
-"""Tests for the Adafusion optimizer."""
+"""Tests for the Adakaon optimizer."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import math
 import pytest
 import torch
 
-from kaon import Adafusion
+from kaon import Adakaon
 
 from .conftest import train_steps
 
@@ -20,7 +20,7 @@ def test_conv_factoring_reduces_state():
     row+col EMAs (out + in*kh*kw floats), far below the full out*in*kh*kw numel.
     """
     p = torch.nn.Parameter(torch.randn(64, 32, 3, 3))
-    opt = Adafusion([p], lr=1e-3, betas=(0.0, 0.999))
+    opt = Adakaon([p], lr=1e-3, betas=(0.0, 0.999))
     p.grad = torch.randn_like(p)
     opt.step()
     state_floats = sum(v.numel() for v in opt.state[p].values() if torch.is_tensor(v))
@@ -32,7 +32,7 @@ def test_bf16_momentum_is_half_state():
     """bf16 momentum buffer is half the bytes of fp32 momentum."""
     def mom_bytes(dtype: str) -> int:
         p = torch.nn.Parameter(torch.randn(128, 128))
-        opt = Adafusion([p], lr=1e-3, betas=(0.9, 0.999), momentum_dtype=dtype)
+        opt = Adakaon([p], lr=1e-3, betas=(0.9, 0.999), momentum_dtype=dtype)
         p.grad = torch.randn_like(p)
         opt.step()
         return opt.state[p]["m"].numel() * opt.state[p]["m"].element_size()
@@ -43,7 +43,7 @@ def test_bf16_momentum_is_half_state():
 def test_overfits_regression():
     torch.manual_seed(0xC0DE)
     model = torch.nn.Sequential(torch.nn.Linear(32, 64), torch.nn.GELU(), torch.nn.Linear(64, 8))
-    opt = Adafusion(model.parameters(), lr=3e-3, betas=(0.9, 0.999))
+    opt = Adakaon(model.parameters(), lr=3e-3, betas=(0.9, 0.999))
     x = torch.randn(64, 32)
     y = torch.randn(64, 8)
     initial = (model(x) - y).pow(2).mean().item()
@@ -58,7 +58,7 @@ def test_conv_net_trains_no_nan():
         torch.nn.Conv2d(4, 16, 3, padding=1), torch.nn.GELU(),
         torch.nn.Conv2d(16, 4, 3, padding=1),
     )
-    opt = Adafusion(net.parameters(), lr=3e-3, betas=(0.9, 0.999))
+    opt = Adakaon(net.parameters(), lr=3e-3, betas=(0.9, 0.999))
     x = torch.randn(8, 4, 16, 16)
     y = torch.randn(8, 4, 16, 16)
     for _ in range(30):
@@ -72,7 +72,7 @@ def test_conv_net_trains_no_nan():
 def test_bf16_weights_train_no_nan():
     torch.manual_seed(0)
     model = torch.nn.Sequential(torch.nn.Linear(32, 64), torch.nn.GELU(), torch.nn.Linear(64, 8)).to(torch.bfloat16)
-    opt = Adafusion(model.parameters(), lr=3e-3, betas=(0.9, 0.999), bf16_method="stochastic_rounding")
+    opt = Adakaon(model.parameters(), lr=3e-3, betas=(0.9, 0.999), bf16_method="stochastic_rounding")
     x = torch.randn(64, 32, dtype=torch.bfloat16)
     y = torch.randn(64, 8, dtype=torch.bfloat16)
     for _ in range(30):
@@ -86,7 +86,7 @@ def test_bf16_weights_train_no_nan():
 def test_cautious_runs():
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 16)
-    opt = Adafusion(model.parameters(), lr=1e-3, betas=(0.9, 0.999), cautious=True)
+    opt = Adakaon(model.parameters(), lr=1e-3, betas=(0.9, 0.999), cautious=True)
     x = torch.randn(8, 16)
     (model(x)).pow(2).mean().backward()
     opt.step()  # must not raise
@@ -132,8 +132,8 @@ def test_foreach_matches_per_param(cfg):
     """
     pa = _parity_params()
     pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
-    oa = Adafusion(pa, foreach=True, **cfg)
-    ob = Adafusion(pb, foreach=False, **cfg)
+    oa = Adakaon(pa, foreach=True, **cfg)
+    ob = Adakaon(pb, foreach=False, **cfg)
     gg = torch.Generator().manual_seed(7)
     for _ in range(10):
         for a, b in zip(pa, pb, strict=False):
@@ -152,8 +152,8 @@ def test_foreach_chunking_is_exact():
     pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
     # budget=200 elems: every 2-D shape splits into many chunks and the larger
     # tensors fall to the per-param branch — a stress test of both code paths.
-    oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), foreach=True, foreach_stack_budget=200)
-    ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), foreach=False)
+    oa = Adakaon(pa, lr=1e-3, betas=(0.9, 0.999), foreach=True, foreach_stack_budget=200)
+    ob = Adakaon(pb, lr=1e-3, betas=(0.9, 0.999), foreach=False)
     gg = torch.Generator().manual_seed(7)
     for _ in range(8):
         for a, b in zip(pa, pb, strict=False):
@@ -170,9 +170,9 @@ def test_foreach_int8_chunking_is_exact():
     to the per-param loop — the batched int8 requant must still match per-param."""
     pa = _parity_params()
     pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
-    oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8",
+    oa = Adakaon(pa, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8",
                    foreach=True, foreach_stack_budget=200)
-    ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8", foreach=False)
+    ob = Adakaon(pb, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="int8", foreach=False)
     gg = torch.Generator().manual_seed(7)
     for _ in range(8):
         for a, b in zip(pa, pb, strict=False):
@@ -190,9 +190,9 @@ def test_foreach_4bit_chunking_is_exact():
     match the per-param path bit-for-bit."""
     pa = _parity_params()
     pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
-    oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit",
+    oa = Adakaon(pa, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit",
                    foreach=True, foreach_stack_budget=200)
-    ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit", foreach=False)
+    ob = Adakaon(pb, lr=1e-3, betas=(0.9, 0.999), momentum_dtype="4bit", foreach=False)
     gg = torch.Generator().manual_seed(7)
     for _ in range(8):
         for a, b in zip(pa, pb, strict=False):
@@ -207,7 +207,7 @@ def test_foreach_4bit_chunking_is_exact():
 def test_4bit_pack_roundtrip():
     """Nibble pack/unpack round-trips for even and odd element counts, and
     dequant(quant(m)) stays within the ~1/7 absmax 4-bit grid error."""
-    from kaon.adafusion import (
+    from kaon.adakaon import (
         _dequant_4bit,
         _pack_nibbles,
         _quant_4bit,
@@ -231,7 +231,7 @@ def test_4bit_pack_roundtrip():
 def test_4bit_memory_is_half_byte_per_param():
     """The 4-bit store is a real 0.5 B/param packed buffer plus small block scales."""
     p = torch.nn.Parameter(torch.randn(512, 512))
-    opt = Adafusion([p], betas=(0.9, 0.999), momentum_dtype="4bit", momentum_4bit_block=128)
+    opt = Adakaon([p], betas=(0.9, 0.999), momentum_dtype="4bit", momentum_4bit_block=128)
     p.grad = torch.randn_like(p)
     opt.step()
     st = opt.state[p]
@@ -249,7 +249,7 @@ def test_4bit_trains_no_nan():
     x = torch.randn(256, 16)
     y = x @ torch.randn(16, 1)
     model = torch.nn.Linear(16, 1)
-    opt = Adafusion(model.parameters(), lr=1e-2, betas=(0.9, 0.999), momentum_dtype="4bit")
+    opt = Adakaon(model.parameters(), lr=1e-2, betas=(0.9, 0.999), momentum_dtype="4bit")
     first = last = None
     for _ in range(200):
         opt.zero_grad()
@@ -264,15 +264,15 @@ def test_4bit_trains_no_nan():
 def test_4bit_invalid_momentum_dtype_rejected():
     p = [torch.nn.Parameter(torch.randn(4, 4))]
     with pytest.raises(ValueError):
-        Adafusion(p, momentum_dtype="2bit")
+        Adakaon(p, momentum_dtype="2bit")
 
 
 def test_foreach_batch_cutoff_validation():
     p = [torch.nn.Parameter(torch.randn(4, 4))]
-    Adafusion(p, foreach_batch_cutoff=1)
-    Adafusion(p, foreach_batch_cutoff=5_000_000)
+    Adakaon(p, foreach_batch_cutoff=1)
+    Adakaon(p, foreach_batch_cutoff=5_000_000)
     with pytest.raises(ValueError):
-        Adafusion(p, foreach_batch_cutoff=0)
+        Adakaon(p, foreach_batch_cutoff=0)
 
 
 def test_foreach_budget_capped_at_4x_cutoff():
@@ -280,10 +280,10 @@ def test_foreach_budget_capped_at_4x_cutoff():
     and scales with the cutoff. Deterministic on CPU (no VRAM read)."""
     cpu = torch.device("cpu")
     p = [torch.nn.Parameter(torch.randn(4, 4))]
-    assert Adafusion(p, foreach_batch_cutoff=2_000_000)._foreach_budget(cpu) == 8_000_000
-    assert Adafusion(p, foreach_batch_cutoff=5_000_000)._foreach_budget(cpu) == 20_000_000
+    assert Adakaon(p, foreach_batch_cutoff=2_000_000)._foreach_budget(cpu) == 8_000_000
+    assert Adakaon(p, foreach_batch_cutoff=5_000_000)._foreach_budget(cpu) == 20_000_000
     # an explicit budget is respected verbatim (not capped)
-    assert Adafusion(p, foreach_stack_budget=99_000_000)._foreach_budget(cpu) == 99_000_000
+    assert Adakaon(p, foreach_stack_budget=99_000_000)._foreach_budget(cpu) == 99_000_000
 
 
 def test_foreach_batch_cutoff_routes_large_to_loop_exactly():
@@ -299,9 +299,9 @@ def test_foreach_batch_cutoff_routes_large_to_loop_exactly():
         torch.nn.Parameter(torch.randn(200, 200) * 0.02),    # bucket-mate
     ]
     pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
-    oa = Adafusion(pa, lr=1e-3, betas=(0.9, 0.999), foreach=True,
+    oa = Adakaon(pa, lr=1e-3, betas=(0.9, 0.999), foreach=True,
                    foreach_batch_cutoff=1_000_000, foreach_stack_budget=10**9)
-    ob = Adafusion(pb, lr=1e-3, betas=(0.9, 0.999), foreach=False)
+    ob = Adakaon(pb, lr=1e-3, betas=(0.9, 0.999), foreach=False)
     gg = torch.Generator().manual_seed(1)
     for _ in range(6):
         for a, b in zip(pa, pb, strict=False):
@@ -316,7 +316,7 @@ def test_foreach_batch_cutoff_routes_large_to_loop_exactly():
 def test_foreach_single_param_uses_fallback():
     """A lone eligible param (e.g. gradient-release) still steps correctly."""
     p = torch.nn.Parameter(torch.randn(16, 16))
-    opt = Adafusion([p], lr=1e-3, betas=(0.9, 0.999), foreach=True)
+    opt = Adakaon([p], lr=1e-3, betas=(0.9, 0.999), foreach=True)
     p.grad = torch.randn_like(p)
     before = p.detach().clone()
     opt.step()
@@ -330,7 +330,7 @@ def test_foreach_bf16_weights_train_no_nan():
         torch.nn.Linear(32, 64), torch.nn.GELU(), torch.nn.Linear(64, 32), torch.nn.GELU(),
         torch.nn.Linear(32, 8),
     ).to(torch.bfloat16)
-    opt = Adafusion(model.parameters(), lr=3e-3, betas=(0.0, 0.999),
+    opt = Adakaon(model.parameters(), lr=3e-3, betas=(0.0, 0.999),
                     bf16_method="stochastic_rounding", foreach=True)
     x = torch.randn(64, 32, dtype=torch.bfloat16)
     y = torch.randn(64, 8, dtype=torch.bfloat16)
@@ -350,7 +350,7 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
     torch's default ``Optimizer.load_state_dict`` upcasts every state tensor to
     the param's dtype (fp32), which would silently inflate a quantized first
     moment back to fp32 on resume (int8 -> fp32 is 4x the momentum bytes —
-    defeating ``momentum_dtype``) and break exact resume. ``Adafusion`` overrides
+    defeating ``momentum_dtype``) and break exact resume. ``Adakaon`` overrides
     ``load_state_dict`` to restore the stored dtype.
     """
     torch.manual_seed(0)
@@ -358,7 +358,7 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
     grads = [torch.randn(16, 8) for _ in range(10)]
 
     a = torch.nn.Parameter(p_ref.clone())
-    opt_a = Adafusion([a], lr=1e-3, betas=(0.9, 0.999), momentum_dtype=momentum_dtype)
+    opt_a = Adakaon([a], lr=1e-3, betas=(0.9, 0.999), momentum_dtype=momentum_dtype)
     for g in grads[:5]:
         a.grad = g.clone()
         opt_a.step()
@@ -370,7 +370,7 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
     sd = torch.load(buf, weights_only=False)
 
     b = torch.nn.Parameter(a.detach().clone())
-    opt_b = Adafusion([b], lr=1e-3, betas=(0.9, 0.999), momentum_dtype=momentum_dtype)
+    opt_b = Adakaon([b], lr=1e-3, betas=(0.9, 0.999), momentum_dtype=momentum_dtype)
     opt_b.load_state_dict(sd)
 
     # Momentum kept its configured storage dtype (not silently upcast to fp32).

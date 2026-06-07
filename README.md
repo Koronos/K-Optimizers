@@ -9,10 +9,10 @@
 `kaon` is a small collection of optimizers aimed at training diffusion models on
 commodity GPUs, where optimizer state is precious and weights are bf16.
 
-- **`Adafusion`** — a conv-aware factored optimizer. Reaches **AdamW-level quality
+- **`Adakaon`** — a conv-aware factored optimizer. Reaches **AdamW-level quality
   at a fraction of AdamW's optimizer memory**, with bf16-correct weight updates
   (stochastic rounding — *no* Kahan buffer, *no* CPU offload).
-  → [docs/adafusion.md](docs/adafusion.md)
+  → [docs/adakaon.md](docs/adakaon.md)
 - **`Muon`** — an orthogonalized-momentum optimizer (Newton-Schulz) with an AdamW
   fallback for 1-D/embedding params. Highest convergence quality, at half of
   AdamW's state. → [docs/muon.md](docs/muon.md)
@@ -22,7 +22,7 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   Tuned defaults `ns_steps=2`, `cautious=True`; optional `compile=True` (whole-step
   `torch.compile`, AdaMuon-only). → [docs/adamuon.md](docs/adamuon.md)
 - **`Lion`** — **Lion's sign-momentum** (one buffer, no second moment) on
-  Adafusion's backend (codec, stochastic-rounding bf16, cautious, foreach). Lightest
+  Adakaon's backend (codec, stochastic-rounding bf16, cautious, foreach). Lightest
   state in the family — **~1 B (int8) / 0.5 B (4bit) per param** — with Lion's implicit
   regularization. `betas` are a loss↔generalization dial. → [docs/lion.md](docs/lion.md)
 - **`AdaPNM`** — **Adam + Positive-Negative Momentum** (Xie et al. 2021) on the kaon
@@ -34,15 +34,15 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   train at `lr=1.0` and the optimizer finds the effective LR itself. Matches
   reference Prodigy bit-for-bit at its defaults, then adds the kaon memory
   toolkit. → [docs/kprodigy.md](docs/kprodigy.md)
-- **`Autofusion`** — a parameter-free LR on **Adafusion's** update via a
+- **`Autofusion`** — a parameter-free LR on **Adakaon's** update via a
   [Mechanic](https://arxiv.org/abs/2306.00144) scalar tuner (Mechanic, *not*
-  Prodigy): train at `lr=1.0` and it auto-discovers the LR, keeping Adafusion's
+  Prodigy): train at `lr=1.0` and it auto-discovers the LR, keeping Adakaon's
   exact update. Its headline is **freeze-to-free** (`lr_freeze`): after warmup it
   folds the discovered LR into the base, frees the tuner's `ref` buffer, and
-  becomes **byte-for-byte and speed-for-speed plain Adafusion**.
+  becomes **byte-for-byte and speed-for-speed plain Adakaon**.
   → [docs/autofusion.md](docs/autofusion.md)
 
-`Adafusion`, `Muon`, `AdaMuon`, and `Lion` are standard `torch.optim.Optimizer`s that work
+`Adakaon`, `Muon`, `AdaMuon`, and `Lion` are standard `torch.optim.Optimizer`s that work
 one-parameter-at-a-time, so they drop into per-parameter / gradient-release
 training loops unchanged. `KProdigy` needs a global reduction over all parameters
 each step (the D estimate), so it is a normal two-pass `step()` optimizer (no
@@ -59,10 +59,10 @@ uv pip install -e .
 ## Quickstart
 
 ```python
-from kaon import Adafusion
+from kaon import Adakaon
 
 # Minimum-VRAM recipe (replaces "Adafactor beta1=0 + Kahan offloaded to CPU"):
-opt = Adafusion(
+opt = Adakaon(
     model.parameters(),
     lr=1e-4,
     betas=(0.0, 0.999),                  # beta1=0 -> no momentum (near-zero state)
@@ -108,13 +108,13 @@ opt = KProdigy(model.parameters(), lr=1.0, momentum_dtype="bfloat16")
 ```python
 from kaon import Autofusion
 
-# Parameter-free Adafusion: lr stays 1.0; a Mechanic tuner finds the LR. By
+# Parameter-free Adakaon: lr stays 1.0; a Mechanic tuner finds the LR. By
 # default (lr_freeze="auto") it freezes on an LR plateau, frees the tuner state,
-# and runs as pure Adafusion at the discovered LR (free thereafter). The common
-# case is just Autofusion(params, **adafusion_kwargs).
+# and runs as pure Adakaon at the discovered LR (free thereafter). The common
+# case is just Autofusion(params, **adakaon_kwargs).
 opt = Autofusion(
     model.parameters(),
-    bf16_method="stochastic_rounding",   # adafusion_betas=(0.0, 0.999) by default
+    bf16_method="stochastic_rounding",   # adakaon_betas=(0.0, 0.999) by default
 )                                        # => bit-exact freeze
 ```
 
@@ -122,20 +122,20 @@ opt = Autofusion(
 
 | Goal | Configuration |
 |---|---|
-| **Minimum VRAM** (large model) | `Adafusion(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` |
-| **LoRA / LoKr adapters** (many small weights) | `Adafusion(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` — `foreach=True` (default) batches the hundreds of adapter tensors |
-| **AdamW-quality, low memory** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="bfloat16")` |
-| **Lion8bit-class memory + momentum** | `Adafusion(..., betas=(0.9,0.999), momentum_dtype="int8")` |
+| **Minimum VRAM** (large model) | `Adakaon(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` |
+| **LoRA / LoKr adapters** (many small weights) | `Adakaon(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` — `foreach=True` (default) batches the hundreds of adapter tensors |
+| **AdamW-quality, low memory** | `Adakaon(..., betas=(0.9,0.999), momentum_dtype="bfloat16")` |
+| **Lion8bit-class memory + momentum** | `Adakaon(..., betas=(0.9,0.999), momentum_dtype="int8")` |
 | **Best convergence (memory available)** | `Muon(..., lr=2e-2, momentum_dtype="bfloat16")` |
 | **Beat-AdamW precision at Adafactor memory** | `AdaMuon(..., lr=1e-3, momentum_dtype="int8")` — orthogonalized momentum + factored 2nd moment; `ns_steps=2`/`cautious=True` defaults, optional `compile=True` |
 | **Absolute minimum state (no 2nd moment)** | `Lion(..., lr=2e-4, betas=(0.95,0.98), momentum_dtype="4bit")` — Lion sign-momentum at 0.5 B/param; implicit regularization for small-data fine-tuning |
 | **No LR to tune (SDXL UNet+TE)** | `KProdigy([{"params": unet, "lr": 1.0}, {"params": te, "lr": 1.0}])` |
 | **Parameter-free + minimum VRAM** | `KProdigy(..., second_moment="factored", momentum_dtype="bfloat16", slice_p=11)` |
-| **No LR to tune + ~free after warmup** | `Autofusion(..., bf16_method="stochastic_rounding")` — auto-discovers the LR, then freezes to plain Adafusion |
+| **No LR to tune + ~free after warmup** | `Autofusion(..., bf16_method="stochastic_rounding")` — auto-discovers the LR, then freezes to plain Adakaon |
 
 ## Docs
 
-- [docs/adafusion.md](docs/adafusion.md) — Adafusion design, validated results,
+- [docs/adakaon.md](docs/adakaon.md) — Adakaon design, validated results,
   full API.
 - [docs/autofusion.md](docs/autofusion.md) — the Mechanic LR tuner, freeze-to-free,
   the minimal API + the one advanced knob, and the campaign results.

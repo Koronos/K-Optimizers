@@ -1,7 +1,7 @@
-# AdaMuon vs Adafusion — reproducible benchmarks
+# AdaMuon vs Adakaon — reproducible benchmarks
 
 These scripts back the claim that **AdaMuon** (orthogonalized momentum + factored
-quantized variance) is competitive with / better than **Adafusion** on diffusion
+quantized variance) is competitive with / better than **Adakaon** on diffusion
 training, at equal-or-less optimizer memory. They are intentionally small and
 self-documenting so others can **reproduce them and point out flaws** in the
 method or conclusions.
@@ -32,7 +32,7 @@ No paths are hard-coded; the SDXL harness reads everything from env vars.
     eps-MSE on the train set at a *fixed* set of (timestep, noise) draws — a
     low-variance estimate of the objective being minimized.
 * **Speed.** On SDXL the step is **UNet-bound**; the optimizer is <1% of wall
-  time (check the `ms/step` column — AdaMuon and Adafusion match). So
+  time (check the `ms/step` column — AdaMuon and Adakaon match). So
   convergence-per-step == convergence-per-second there. On the tiny pixel U-Net
   the optimizer is a larger fraction, so AdaMuon's Newton-Schulz shows a per-step
   cost — but it still wins time-to-quality via faster convergence.
@@ -46,7 +46,7 @@ pip install -e .            # installs kaon
 # Synthetic, self-contained (no downloads). Reproduces the headline table:
 python benchmarks/adamuon/pixel_ddpm_ab.py --preset headline
 python benchmarks/adamuon/pixel_ddpm_ab.py --preset memory_ladder
-python benchmarks/adamuon/pixel_ddpm_ab.py --optims "adamuon:1e-3:cos,adafusion:1e-3:cos"
+python benchmarks/adamuon/pixel_ddpm_ab.py --optims "adamuon:1e-3:cos,adakaon:1e-3:cos"
 
 # Real SDXL LoRA (needs a single-file SDXL checkpoint + a folder of images):
 export ADAMUON_SDXL_CKPT=/path/to/sdxl.safetensors
@@ -64,7 +64,7 @@ not need it.
 ## Results we obtained
 
 Hardware: single RTX 4080. AdaMuon config: `ns_steps=2, cautious=True,
-betas=(0.95,0.999), clip_threshold=1.0`. Adafusion: `betas=(0.9,0.999),
+betas=(0.95,0.999), clip_threshold=1.0`. Adakaon: `betas=(0.9,0.999),
 cautious=True`. Both at their swept-best LR (1e-3 here).
 
 **Synthetic pixel-DDPM** (U-Net C=128, 3 seeds, 800 steps, val MSE):
@@ -75,13 +75,13 @@ cautious=True`. Both at their swept-best LR (1e-3 here).
 | AdaMuon (constant) | 0.0677 | 2.03 |
 | AdaMuon int8 + cosine | ~0.065 | 1.04 |
 | AdaMuon 4bit | 0.0694 | 0.56 |
-| Adafusion + cosine | 0.0701 | 2.03 |
-| Adafusion (constant) | 0.0717 | 2.03 |
+| Adakaon + cosine | 0.0701 | 2.03 |
+| Adakaon (constant) | 0.0717 | 2.03 |
 | AdamW8bit / Lion8bit / AdamW | 0.076 / 0.077 / 0.088 | 2.06 / 1.03 / 8.0 |
 
 * `ns_steps=2` beats the LLM-standard 5 (5 over-orthogonalizes — slower *and*
   worse). `cautious=True` and a cosine schedule each help. int8 momentum ties
-  bf16; even 4bit (0.56 B/param) beats Adafusion-bf16. No-momentum (beta1=0,
+  bf16; even 4bit (0.56 B/param) beats Adakaon-bf16. No-momentum (beta1=0,
   ~0.03 B/param) is a near-stateless extreme but clearly worse — momentum helps.
 
 **Real SDXL LoRA** (Illustrious-XL, rank 16, +cosine, 2 seeds, 500 steps,
@@ -92,11 +92,11 @@ deterministic objective):
 | AdaMuon-bf16 + cos | **0.09003** | 466.6 | 2.25 |
 | AdaMuon-int8 + cos | 0.09015 | 474.1 | **1.37** |
 | AdaMuon-4bit + cos | 0.09098 | 473.7 | **0.78** |
-| Adafusion + cos | 0.09057 | 466.7 | 2.25 |
+| Adakaon + cos | 0.09057 | 466.7 | 2.25 |
 
 AdaMuon reaches a lower objective (and `train<=0.0918` in 350 vs 400 steps);
 ms/step is identical (UNet-bound). **AdaMuon-int8 matches bf16 quality at 61% of
-Adafusion's optimizer memory** → Pareto-dominant (≥ convergence, tied speed, less
+Adakaon's optimizer memory** → Pareto-dominant (≥ convergence, tied speed, less
 memory).
 
 > **But lower loss ≠ better samples on small data.** For LoRA-scale fine-tuning the

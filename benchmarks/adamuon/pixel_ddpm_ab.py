@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Self-contained convergence A/B for AdaMuon vs Adafusion (and AdamW) on a small
+"""Self-contained convergence A/B for AdaMuon vs Adakaon (and AdamW) on a small
 pixel-space DDPM with PROCEDURALLY GENERATED data — no external models or data.
 
 Why this exists
@@ -21,7 +21,7 @@ Protocol (fair, paired)
 Reproduce the headline:
     python pixel_ddpm_ab.py --preset headline
 Single arm / custom sweep:
-    python pixel_ddpm_ab.py --optims "adamuon:1e-3:cos,adafusion:1e-3:cos" --steps 800 --seeds 3
+    python pixel_ddpm_ab.py --optims "adamuon:1e-3:cos,adakaon:1e-3:cos" --steps 800 --seeds 3
 
 Requires only: torch, kaon (pip install -e . at the repo root).
 """
@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kaon import AdaMuon, Adafusion
+from kaon import AdaMuon, Adakaon
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 DT = torch.float32
@@ -128,7 +128,7 @@ def val_loss(net, x, vidx, ac, reps=6):
 
 # ----------------------------- optimizer factories -----------------------------
 def make_optimizer(name, params, lr):
-    """name in {adamuon, adamuon_int8, adamuon_4bit, adamuon_nomom, adafusion, adafusion_int8, adamw}."""
+    """name in {adamuon, adamuon_int8, adamuon_4bit, adamuon_nomom, adakaon, adakaon_int8, adamw}."""
     if name == "adamuon":
         return AdaMuon(params, lr=lr, betas=(0.95, 0.999), clip_threshold=1.0, ns_steps=2, cautious=True)
     if name == "adamuon_int8":
@@ -137,10 +137,10 @@ def make_optimizer(name, params, lr):
         return AdaMuon(params, lr=lr, betas=(0.95, 0.999), ns_steps=2, cautious=True, momentum_dtype="4bit")
     if name == "adamuon_nomom":
         return AdaMuon(params, lr=lr, betas=(0.0, 0.999), ns_steps=2, cautious=True)
-    if name == "adafusion":
-        return Adafusion(params, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16")
-    if name == "adafusion_int8":
-        return Adafusion(params, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="int8")
+    if name == "adakaon":
+        return Adakaon(params, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16")
+    if name == "adakaon_int8":
+        return Adakaon(params, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="int8")
     if name == "adamw":
         return torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.999))
     if name == "adamw_fused":
@@ -188,10 +188,10 @@ PRESETS = {
     # name: list of "optim:lr:[cos]"
     "headline": [
         "adamuon:1e-3:cos", "adamuon_int8:1e-3:cos", "adamuon_4bit:1e-3:cos",
-        "adafusion:1e-3:cos", "adamuon:1e-3", "adafusion:1e-3", "adamw:1e-3",
+        "adakaon:1e-3:cos", "adamuon:1e-3", "adakaon:1e-3", "adamw:1e-3",
     ],
     "lr_sweep_adamuon": [f"adamuon:{lr}" for lr in ("3e-4", "1e-3", "3e-3")],
-    "lr_sweep_adafusion": [f"adafusion:{lr}" for lr in ("3e-4", "1e-3", "3e-3")],
+    "lr_sweep_adakaon": [f"adakaon:{lr}" for lr in ("3e-4", "1e-3", "3e-3")],
     "memory_ladder": ["adamuon:1e-3:cos", "adamuon_int8:1e-3:cos", "adamuon_4bit:1e-3:cos", "adamuon_nomom:1e-3:cos"],
 }
 
@@ -205,10 +205,10 @@ def main():
     ap.add_argument("--n-images", type=int, default=80)
     ap.add_argument("--preset", choices=list(PRESETS), default=None)
     ap.add_argument("--optims", type=str, default=None,
-                    help='comma list of "optim:lr[:cos]", e.g. "adamuon:1e-3:cos,adafusion:1e-3:cos"')
+                    help='comma list of "optim:lr[:cos]", e.g. "adamuon:1e-3:cos,adakaon:1e-3:cos"')
     A = ap.parse_args()
 
-    arms_spec = PRESETS[A.preset] if A.preset else (A.optims or "adamuon:1e-3:cos,adafusion:1e-3:cos").split(",")
+    arms_spec = PRESETS[A.preset] if A.preset else (A.optims or "adamuon:1e-3:cos,adakaon:1e-3:cos").split(",")
     x = gen_data(A.n_images, seed=7).to(DEV).to(DT)
     ntr = int(A.n_images * 0.75); tr = list(range(ntr)); va = list(range(ntr, A.n_images))
     ac = make_alphas()

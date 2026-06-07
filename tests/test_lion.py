@@ -1,4 +1,4 @@
-"""Tests for the Lion (Lion sign-momentum on Adafusion's backend) optimizer."""
+"""Tests for the Lion (Lion sign-momentum on Adakaon's backend) optimizer."""
 
 from __future__ import annotations
 

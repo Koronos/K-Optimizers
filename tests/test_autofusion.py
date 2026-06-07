@@ -1,7 +1,7 @@
-"""Tests for Autofusion (Mechanic LR tuner on Adafusion, freeze-to-free).
+"""Tests for Autofusion (Mechanic LR tuner on Adakaon, freeze-to-free).
 
 Covers the base Mechanic behavior, the on-the-fly ``Delta`` reconstruction, and the
-``lr_freeze`` (int / "auto") handoff that turns the optimizer into plain Adafusion
+``lr_freeze`` (int / "auto") handoff that turns the optimizer into plain Adakaon
 after warmup.
 
 Autofusion's empirical scaffolding (``store_delta``, ``s_init_rel``,
@@ -18,17 +18,17 @@ import pytest
 import torch
 
 from kaon import Autofusion
-from kaon.adafusion import Adafusion
+from kaon.adakaon import Adakaon
 
 from .conftest import train_steps
 
 
 def test_legacy_aliases_are_removed() -> None:
-    """``AdaptiveAdafusion`` / ``AdafusionProdigy`` were purged (alpha, no back-compat)."""
+    """``AdaptiveAdakaon`` / ``AdakaonProdigy`` were purged (alpha, no back-compat)."""
     import kaon
 
-    assert not hasattr(kaon, "AdaptiveAdafusion")
-    assert not hasattr(kaon, "AdafusionProdigy")
+    assert not hasattr(kaon, "AdaptiveAdakaon")
+    assert not hasattr(kaon, "AdakaonProdigy")
 
 
 def test_purged_knobs_are_not_public() -> None:
@@ -45,7 +45,7 @@ def test_purged_knobs_are_not_public() -> None:
     ):
         assert gone not in params, f"{gone} should no longer be a public kwarg"
     # And the headline / advanced knobs that survived the purge are still public.
-    for kept in ("lr_freeze", "scale_cap", "scale_cap_rel", "adafusion_betas"):
+    for kept in ("lr_freeze", "scale_cap", "scale_cap_rel", "adakaon_betas"):
         assert kept in params, f"{kept} must stay public"
 
 
@@ -131,13 +131,13 @@ def test_only_ref_buffer_allocated() -> None:
     assert len(opt._mech["ref"]) == 1, "exactly one ref buffer (for the one param)"
 
 
-def test_forwards_adafusion_kwargs() -> None:
-    """Adafusion knobs (clip_threshold, cautious, momentum_dtype) forward to base."""
+def test_forwards_adakaon_kwargs() -> None:
+    """Adakaon knobs (clip_threshold, cautious, momentum_dtype) forward to base."""
     p = torch.nn.Parameter(torch.randn(16, 16))
     opt = Autofusion(
         [p],
         betas=(0.9, 0.99),  # tuner betas
-        adafusion_betas=(0.9, 0.999),  # base momentum betas (explicit passthrough)
+        adakaon_betas=(0.9, 0.999),  # base momentum betas (explicit passthrough)
         clip_threshold=0.5,
         cautious=False,
         momentum_dtype="float32",
@@ -150,7 +150,7 @@ def test_forwards_adafusion_kwargs() -> None:
 
 
 def test_default_base_betas_no_momentum() -> None:
-    """Default inner Adafusion has beta1=0 (no momentum) — exact-freeze regime."""
+    """Default inner Adakaon has beta1=0 (no momentum) — exact-freeze regime."""
     p = torch.nn.Parameter(torch.randn(8, 8))
     opt = Autofusion([p])
     assert opt.param_groups[0]["betas"] == (0.0, 0.999)
@@ -220,9 +220,9 @@ def test_auto_freeze_on_plateau() -> None:
 
 
 def test_frozen_step_delegates_to_base() -> None:
-    """After freezing, step() routes straight to the inner Adafusion (no overhead).
+    """After freezing, step() routes straight to the inner Adakaon (no overhead).
 
-    Post-freeze the optimizer IS plain Adafusion at lr=S: a frozen step must produce
+    Post-freeze the optimizer IS plain Adakaon at lr=S: a frozen step must produce
     exactly the same weights as calling the inner ``base.step()`` directly, and must
     not touch any Mechanic bookkeeping.
     """
@@ -239,7 +239,7 @@ def test_frozen_step_delegates_to_base() -> None:
 
     # A frozen step on the wrapper == the inner base.step() on a forked copy.
     p_fork = torch.nn.Parameter(p.detach().clone())
-    base_fork = Adafusion([p_fork], lr=s, momentum_dtype="float32", bf16_method="none")
+    base_fork = Adakaon([p_fork], lr=s, momentum_dtype="float32", bf16_method="none")
     # Copy the base optimizer's EMA state into the fork so they start identical.
     import copy as _copy
 
@@ -251,8 +251,8 @@ def test_frozen_step_delegates_to_base() -> None:
     p_fork.grad = g.clone()
     iters_before = opt._mech["iter"]
     opt.step()          # frozen -> base.step()
-    base_fork.step()    # plain Adafusion at lr=S
-    assert torch.equal(p.detach(), p_fork.detach()), "frozen step != Adafusion(lr=S) step"
+    base_fork.step()    # plain Adakaon at lr=S
+    assert torch.equal(p.detach(), p_fork.detach()), "frozen step != Adakaon(lr=S) step"
     assert opt._mech["iter"] == iters_before, "frozen step must not advance the tuner"
 
 
@@ -260,7 +260,7 @@ def test_frozen_step_delegates_to_base() -> None:
 def test_auto_s_init_is_data_relative() -> None:
     """s_init='auto' seeds the initial effective LR at _S_INIT_REL * RMS(p).
 
-    Adafusion's lr=1 update is unit-RMS, so the LARS trust ratio ||p||/||u_lr1|| ==
+    Adakaon's lr=1 update is unit-RMS, so the LARS trust ratio ||p||/||u_lr1|| ==
     RMS(p); the auto seed lands the step-1 effective LR at _S_INIT_REL * RMS(p).
     """
     torch.manual_seed(0)
@@ -560,7 +560,7 @@ def test_lr_scheduler_compatibility() -> None:
         p.grad = torch.randn(8, 8)
         opt.step()
         sched.step()  # must not raise
-    # after freeze the scheduler drives the (now plain-Adafusion) lr
+    # after freeze the scheduler drives the (now plain-Adakaon) lr
     assert opt.is_frozen()
     assert len(sched.get_last_lr()) == len(opt.param_groups)
 
@@ -582,7 +582,7 @@ def test_freeze_folds_momentum_into_lr(momentum_dtype, rtol):
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn(16, 8))
     opt = Autofusion(
-        [p], lr_freeze=None, adafusion_betas=(0.9, 0.999), momentum_dtype=momentum_dtype
+        [p], lr_freeze=None, adakaon_betas=(0.9, 0.999), momentum_dtype=momentum_dtype
     )
     for _ in range(6):
         p.grad = torch.randn(16, 8)
@@ -611,7 +611,7 @@ def test_freeze_with_momentum_no_celebration_jump():
     p = torch.nn.Parameter(torch.randn(64, 32) * 0.1)
     target = torch.randn(64, 32)
     opt = Autofusion(
-        [p], lr_freeze=12, adafusion_betas=(0.9, 0.999), momentum_dtype="float32"
+        [p], lr_freeze=12, adakaon_betas=(0.9, 0.999), momentum_dtype="float32"
     )
     norms = []
     prev = p.detach().clone()

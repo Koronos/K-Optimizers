@@ -14,8 +14,8 @@ D-estimation math but:
 
 - stores the first moment in **bf16 / int8 / 4bit** and (optionally) the second
   moment **factored** (Adafactor row+col), with **stochastic-rounding** bf16
-  weight updates — the same toolkit as `Adafusion` (its pass-2 update is now backed
-  by Adafusion's full engine), so D-adaptation no longer costs more memory than
+  weight updates — the same toolkit as `Adakaon` (its pass-2 update is now backed
+  by Adakaon's full engine), so D-adaptation no longer costs more memory than
   AdamW;
 - ships **sane defaults** (`d_update_freq=1`, `use_bias_correction=False`). The
   original research repo defaulted these the other way and it *starved the
@@ -58,15 +58,15 @@ KProdigy(
 `torch.save(opt.state_dict())` → `load_state_dict` resumes **bit-exactly**: the
 **D estimate** (`d` / `d_numerator` / `d_max` / `d_hat`) rides along in
 `param_groups`, and the first moment keeps its configured `momentum_dtype`.
-KProdigy overrides `load_state_dict` for the same reason as Adafusion — torch's
+KProdigy overrides `load_state_dict` for the same reason as Adakaon — torch's
 default upcasts the quantized momentum to fp32 on load (e.g. `int8` → `fp32`, 4×
 the bytes), so it restores the stored dtype instead. (Same `state_dict()`
-live-reference caveat as Adafusion — `torch.save` to freeze a snapshot.)
+live-reference caveat as Adakaon — `torch.save` to freeze a snapshot.)
 
 ## See also
 
-- [adafusion.md](adafusion.md) — the update engine KProdigy's pass-2 reuses.
-- [momentum.md](momentum.md) — the cheap-momentum dial shared with Adafusion.
+- [adakaon.md](adakaon.md) — the update engine KProdigy's pass-2 reuses.
+- [momentum.md](momentum.md) — the cheap-momentum dial shared with Adakaon.
 - [autofusion.md](autofusion.md) — the *other* parameter-free optimizer here
-  (Mechanic on Adafusion, not Prodigy), and why its update ordering converges
+  (Mechanic on Adakaon, not Prodigy), and why its update ordering converges
   better than Prodigy's Adam-form D-adaptation.

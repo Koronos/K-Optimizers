@@ -39,7 +39,7 @@ from fan-out, adversarially-verified web research.
 
 - **Lion** (Lion sign-momentum on the kaon backend) — shipped (`docs/lion.md`); the
   proof that a regularizing base optimizer wins on the gap.
-- **AdafusionEx** (Adafusion + EMA/MSAM techniques) — parked on `feat/adafusionex`; the techniques
+- **AdakaonEx** (Adakaon + EMA/MSAM techniques) — parked on `feat/adakaonex`; the techniques
   are not provable on the synthetic proxy (need a real run / FID).
 - **Next round**: port ADOPT / AdEMAMix / a generalization-bucket method (PNM/PAdam), test by
   gap + FID. See the catalog's "recommended next round".

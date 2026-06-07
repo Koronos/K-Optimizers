@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Real SDXL LoRA optimizer A/B: AdaMuon vs Adafusion on a pretrained SDXL UNet.
+"""Real SDXL LoRA optimizer A/B: AdaMuon vs Adakaon on a pretrained SDXL UNet.
 
 Two subcommands:
   precompute  Encode images to VAE latents (cached) + a FIXED text embedding.
@@ -160,13 +160,13 @@ def probe(unet, recs, idxs, ati, ac, reps, seed):
 
 
 def make_optimizer(name, params, lr):
-    from kaon import AdaMuon, Adafusion
+    from kaon import AdaMuon, Adakaon
     md = {"adamuon": "bfloat16", "adamuon_int8": "int8", "adamuon_4bit": "4bit"}
     if name.startswith("adamuon"):
         return AdaMuon(params, lr=lr, betas=(0.95, 0.999), clip_threshold=1.0, ns_steps=2,
                        cautious=True, momentum_dtype=md[name])
-    if name == "adafusion":
-        return Adafusion(params, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16")
+    if name == "adakaon":
+        return Adakaon(params, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16")
     if name == "adamw":
         return torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.999))
     if name == "adamw_fused":
@@ -264,7 +264,7 @@ def main():
     p = sub.add_parser("precompute"); p.add_argument("--res", type=int, default=512); p.set_defaults(fn=cmd_precompute)
     a = sub.add_parser("ab")
     a.add_argument("--optims", type=str,
-                   default="adamuon:1e-3,adamuon_int8:1e-3,adamuon_4bit:1e-3,adafusion:1e-3")
+                   default="adamuon:1e-3,adamuon_int8:1e-3,adamuon_4bit:1e-3,adakaon:1e-3")
     a.add_argument("--steps", type=int, default=500); a.add_argument("--seeds", type=int, default=2)
     a.add_argument("--every", type=int, default=50); a.add_argument("--bs", type=int, default=2)
     a.add_argument("--rank", type=int, default=16); a.add_argument("--cosine", action="store_true")

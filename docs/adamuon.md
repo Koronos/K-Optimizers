@@ -3,7 +3,7 @@
 > Muon's Newton-Schulz orthogonalized momentum + an Adafactor-style **factored,
 > quantized second moment of the orthogonalized update**. Aims to beat AdamW on
 > precision at near-Adafactor memory. Separate from `Muon` (the simpler
-> heavy-ball hybrid) and from `Adafusion` (whose backend it reuses).
+> heavy-ball hybrid) and from `Adakaon` (whose backend it reuses).
 
 ## Why
 
@@ -16,13 +16,13 @@ published evidence is on LLMs, not diffusion: the fine-detail-fidelity advantage
 for SDXL/Flux is the hypothesis this optimizer is built to test, not an
 established fact.
 
-AdaMuon clones ~90% of `Adafusion`'s backend (factored second moment, int8/4bit
+AdaMuon clones ~90% of `Adakaon`'s backend (factored second moment, int8/4bit
 momentum codec, foreach batching, stochastic rounding, dtype-safe checkpointing)
 and inserts the orthogonalization.
 
-## Pipeline (and how it differs from Adafusion)
+## Pipeline (and how it differs from Adakaon)
 
-`Adafusion`: factor the second moment of the **gradient** → normalize → take
+`Adakaon`: factor the second moment of the **gradient** → normalize → take
 momentum of the **normalized update**.
 
 `AdaMuon` reverses the order for ≥2-D weights:
@@ -34,7 +34,7 @@ momentum of the **normalized update**.
 4. **RMS scale** to a shape-independent target, then apply at `lr`.
 
 1-D params (biases, norm scales) are **not** orthogonalized — they use
-Adafusion's non-factored Adam-style path (full per-coordinate second moment, same
+Adakaon's non-factored Adam-style path (full per-coordinate second moment, same
 quantized momentum), RMS-normalized to the same target so one `lr` governs the
 whole model.
 
@@ -86,7 +86,7 @@ AdaMuon(
 - `betas=(β1, β2)`: `β1` first-moment EMA (`β1=0` → no momentum buffer); `β2`
   factored second-moment decay.
 - `cautious` is **on by default** (validated): a paired pixel-DDPM sweep showed it
-  flips AdaMuon from a loss to a win vs Adafusion (~2% on all seeds). `ns_steps` is
+  flips AdaMuon from a loss to a win vs Adakaon (~2% on all seeds). `ns_steps` is
   **2** by default, not the LLM-standard 5 — 5 over-orthogonalizes here (slower AND
   worse); 2 was the sweet spot (faster + better). Both re-tune per task; see the
   evaluation note below.
@@ -119,9 +119,9 @@ recommended on CPU (inconsistent).
 
 Note: compiling *only* the Newton-Schulz does **not** help on LoRA-rank matrices
 (too small — wrapper overhead exceeds the fusion gain); the win is the whole-step
-fusion. This flag is **AdaMuon-only by design**: [`Adafusion`](adafusion.md) has
+fusion. This flag is **AdaMuon-only by design**: [`Adakaon`](adakaon.md) has
 little fusable elementwise math (no orthogonalization), so a whole-step compile was
-~neutral there and not worth the API surface — Adafusion stays lean.
+~neutral there and not worth the API surface — Adakaon stays lean.
 
 ## Checkpointing
 
@@ -131,20 +131,20 @@ preserving both the memory and bit-exact resume.
 
 ## Evaluation (v1, self-contained pixel-DDPM proxy)
 
-Paired-seed A/B vs `Adafusion` (and `AdamW8bit` / `Lion8bit` / fp32 AdamW) on a
+Paired-seed A/B vs `Adakaon` (and `AdamW8bit` / `Lion8bit` / fp32 AdamW) on a
 small pixel-space DDPM (conv UNet, C=128, 3 seeds, identical init/data/noise per
 seed, LR swept per arm, held-out val MSE). Not real SDXL/Flux — a first signal.
 
 - **Defaults matter.** With the *original* defaults (`ns_steps=5`, `cautious=False`)
-  AdaMuon **lost** to Adafusion (0.0710 vs 0.0697). Two changes flipped it:
+  AdaMuon **lost** to Adakaon (0.0710 vs 0.0697). Two changes flipped it:
   `cautious=True` (helps ~2%, all seeds) and `ns_steps=2` (5 over-orthogonalizes —
   slower *and* worse). Both are now the defaults.
 - **Tuned (`ns_steps=2`, `cautious=True`, lr 1e-3) AdaMuon wins on everything that
   matters:**
   - convergence/step — reaches each val target in ~35 % fewer steps;
-  - convergence/wall-clock — reaches `val≤0.070` in ~7.9 s vs Adafusion ~9.6 s,
+  - convergence/wall-clock — reaches `val≤0.070` in ~7.9 s vs Adakaon ~9.6 s,
     *despite* ~12 vs ~9.4 ms/step (faster convergence beats slower steps);
-  - final quality — floors at ~0.065 vs Adafusion's ~0.069 (which it never beats);
+  - final quality — floors at ~0.065 vs Adakaon's ~0.069 (which it never beats);
   - memory — tie (2.03 B/param).
 - Comfortably beats AdamW8bit (0.0762) / Lion8bit (0.0767) / fp32 AdamW (~0.088).
 - **`clip_threshold` / `lr` re-validation** (single-res 64², REX, bs8, 2 seeds, eval@64²):
@@ -168,7 +168,7 @@ seed, LR swept per arm, held-out val MSE). Not real SDXL/Flux — a first signal
 - All "beats AdamW" evidence is **LLM, not diffusion** — validate fine-detail
   fidelity empirically on SDXL/Flux LoRA before claiming the result.
 - The factored second moment is computed on `O` (near-orthonormal, small
-  magnitude); its mean scale differs from gradient-based Adafusion. **Re-validated on
+  magnitude); its mean scale differs from gradient-based Adakaon. **Re-validated on
   the synthetic proxy** (single-res 64², REX, 2 seeds): `clip_threshold=1.0` is the
   optimum (load-bearing, see above) and the proxy `lr*≈1.2e-3` — note the **API default
   `lr=2e-2` is Muon/LLM-scale, ~16× high for this diffusion proxy** (val 0.078 vs 0.062
@@ -181,12 +181,12 @@ seed, LR swept per arm, held-out val MSE). Not real SDXL/Flux — a first signal
 ## Follow-ups (not in v1)
 
 - Schedule-free / Prodigy parameter-free LR (kill scheduler dependence for fine
-  detail) — analogous to the `Adafusion → Autofusion` relationship.
+  detail) — analogous to the `Adakaon → Autofusion` relationship.
 
 ## See also
 
 - [muon.md](muon.md) — the simpler heavy-ball Muon hybrid this builds on.
-- [adafusion.md](adafusion.md), [kprodigy.md](kprodigy.md),
+- [adakaon.md](adakaon.md), [kprodigy.md](kprodigy.md),
   [autofusion.md](autofusion.md), [foreach-batching.md](foreach-batching.md),
   [momentum.md](momentum.md).
 ```

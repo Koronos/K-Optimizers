@@ -1,10 +1,10 @@
-# AdaPNM — Adam + Positive-Negative Momentum on Adafusion's memory/precision backend
+# AdaPNM — Adam + Positive-Negative Momentum on Adakaon's memory/precision backend
 
 <!-- Developed under the provisional code name "Janus". -->
 
 > **AdaPNM** — the adaptive variant of **Positive-Negative Momentum** (Xie et al. 2021,
 > *Positive-Negative Momentum: Manipulating Stochastic Gradient Noise to Improve
-> Generalization*, ICML 2021, arXiv:2103.17182) — running on **Adafusion's** factored
+> Generalization*, ICML 2021, arXiv:2103.17182) — running on **Adakaon's** factored
 > quantized second moment, int8/4bit momentum codec, stochastic-rounding bf16 weights,
 > cautious masking, and foreach batching. It is the **generalization-bucket** optimizer: a
 > built-in *implicit regularizer* (flat-minima seeking) that lowers the **train–val gap**
@@ -97,7 +97,7 @@ used to provide. Best-gap per optimizer at constant LR (no schedule, C=128 / 250
 | **AdaPNM** | **0.0847** | **+0.0065** |
 | AdamW | 0.0852 | +0.0101 |
 | Lion | 0.0843 | +0.0103 |
-| Adafusion (β1=0) | 0.0839 | +0.0114 |
+| Adakaon (β1=0) | 0.0839 | +0.0114 |
 
 AdaPNM has **35–43 % lower gap than the entire field at constant LR**, at equal loss — and its
 gap even *improves* vs the scheduled run (`+0.0073 → +0.0065`). Its sweet spot is a **high**
@@ -112,7 +112,7 @@ so: **~4 B/param (bf16) / ~2 B (int8) / ~1 B (4bit)** for momentum, plus the sma
 (row+column EMAs, ~0 for 2-D weights). Heavier than Lion (one buffer) but far under AdamW (8 B);
 the cost buys the gap behaviour.
 
-## Reused from Adafusion (shared backend — no duplication)
+## Reused from Adakaon (shared backend — no duplication)
 
 - **Factored second moment** (`kaon._factored`) — row+column EMAs for `ndim≥2`, full `v` for
   `ndim==1`; conv kernels matrixized to `[out, in·kh·kw]`; Adafactor-style RMS-clipped
@@ -164,7 +164,7 @@ the live `val/gap` metric + FID/KID before claiming a perceptual win.
 
 ## See also
 
-- [adafusion.md](adafusion.md) — the backend AdaPNM reuses.
+- [adakaon.md](adakaon.md) — the backend AdaPNM reuses.
 - [lion.md](lion.md) — the sibling "lightest state" sign-momentum optimizer.
 - [momentum.md](momentum.md) — the int8/4bit momentum codec.
 - [RESULTS_generalization_and_schedule.md](../benchmarks/adamuon/RESULTS_generalization_and_schedule.md)

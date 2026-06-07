@@ -1,19 +1,19 @@
 """AdaMuon — orthogonalized momentum with factored, quantized variance adaptation.
 
 AdaMuon is Muon's Newton-Schulz orthogonalization (Jordan et al.; Si et al.,
-*AdaMuon: Adaptive Muon Optimizer*, arXiv:2507.11005) grafted onto Adafusion's
+*AdaMuon: Adaptive Muon Optimizer*, arXiv:2507.11005) grafted onto Adakaon's
 memory backend. It targets **AdamW-beating precision** for diffusion fine-tuning
 at near-Adafactor memory.
 
 The pipeline (2-D / conv weights) is, in order:
 
 1. **First moment of the RAW gradient** — an EMA ``m = β1·m + (1-β1)·g`` kept in a
-   quantized codec (bf16/int8/4bit) exactly like :class:`~kaon.adafusion.Adafusion`.
+   quantized codec (bf16/int8/4bit) exactly like :class:`~kaon.adakaon.Adakaon`.
 2. **Orthogonalize** ``m`` with a 5-step Newton-Schulz iteration → ``O ≈ U·Vᵀ``.
 3. **Factored second moment OF ``O``** (Adafactor row+col EMA) → ``u = O·inv_sqrt(v̂)``.
 4. **RMS scaling** to a shape-independent target (see below) → apply at ``lr``.
 
-This is the key difference from Adafusion, which factors the second moment of the
+This is the key difference from Adakaon, which factors the second moment of the
 *gradient* and takes momentum of the *normalized update*. AdaMuon reverses the
 order: momentum is on the raw gradient (it feeds Newton-Schulz), and the factored
 second moment is computed on the *orthogonalized* signal ``O`` — that variance
@@ -40,7 +40,7 @@ transfer directly.
 State cost: factored second moment (row+col, ~0) + one quantized first moment
 (~2 B/param bf16, ~1 B int8, ~0.5 B 4bit) — Adafactor-class memory, well under
 AdamW. 1-D params (biases, norm scales) are not orthogonalized; they use
-Adafusion's non-factored Adam-style path (full per-coordinate second moment, same
+Adakaon's non-factored Adam-style path (full per-coordinate second moment, same
 quantized momentum), RMS-normalized to the same ``0.2·lr`` target.
 
 It is a standard ``torch.optim.Optimizer``. ``foreach=True`` (default) batches the
@@ -79,8 +79,8 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 # why ``√max(R,C)`` is NOT reapplied here.
 _UPDATE_RMS = 0.2
 
-# Foreach batching knobs — mirror Adafusion's (kept local so AdaMuon is a
-# standalone module, not coupled to adafusion.py internals). See
+# Foreach batching knobs — mirror Adakaon's (kept local so AdaMuon is a
+# standalone module, not coupled to adakaon.py internals). See
 # docs/foreach-batching.md for the rationale behind each constant.
 _STACK_SAFETY_FRACTION = 0.10
 _STACK_BYTES_PER_ELEM = 48
@@ -144,9 +144,9 @@ class AdaMuon(Optimizer):
             the momentum's singular spectrum too hard discards useful curvature, so
             ``2`` was both faster (~0.9 ms/step per saved iteration) AND lower val
             than ``5`` — a strict win. ``1`` under-orthogonalizes (loses the edge over
-            Adafusion); ``2`` was the sweet spot. Re-tune per task/model.
+            Adakaon); ``2`` was the sweet spot. Re-tune per task/model.
         clip_threshold: RMS ceiling on the normalized update (``rms(u) <= thr``).
-            Applied in the RMS≈1 domain, so ``1.0`` matches Adafusion's semantics
+            Applied in the RMS≈1 domain, so ``1.0`` matches Adakaon's semantics
             and is load-bearing for the first few steps (before the factored second
             moment warms up). Steady-state it is a near no-op.
         momentum_dtype: storage for the first moment when ``beta1>0`` —
@@ -159,7 +159,7 @@ class AdaMuon(Optimizer):
             whose sign disagrees with the *raw gradient*. **On by default**:
             initially left off (its interaction with orthogonalized updates was
             unvalidated for the Muon family), but a paired sweep showed it helps
-            substantially — it flips AdaMuon from a loss to a win vs Adafusion (~2%
+            substantially — it flips AdaMuon from a loss to a win vs Adakaon (~2%
             on all seeds). Set ``False`` to recover the un-masked Muon-family update.
         bf16_method: low-precision weight-update strategy —
             ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
@@ -327,7 +327,7 @@ class AdaMuon(Optimizer):
 
     # ----------------------------------------------------------------- foreach
     def _foreach_budget(self, device: torch.device) -> int:
-        """Max elements per stacked chunk (mirrors Adafusion's adaptive budget)."""
+        """Max elements per stacked chunk (mirrors Adakaon's adaptive budget)."""
         if self._foreach_stack_budget is not None:
             return self._foreach_stack_budget
         cap = 4 * self._foreach_batch_cutoff

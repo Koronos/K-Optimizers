@@ -10,7 +10,7 @@ showed that is **false for diffusion fine-tuning**:
 
 - On a small-data LoRA, **train loss is a misleading objective** — the config that minimizes
   loss does so by *overfitting/memorizing*, and produces **worse samples**.
-- Empirically, a real visual A/B was won by **Adafusion with no momentum** (its "weakest"
+- Empirically, a real visual A/B was won by **Adakaon with no momentum** (its "weakest"
   config) over AdaMuon (its best), despite AdaMuon's lower loss. The proxy reproduced the
   ranking only via the **train–val gap**, not absolute loss.
 - AdaMuon's strength (fast convergence, low loss via orthogonalized momentum) is a **liability**
@@ -20,8 +20,8 @@ showed that is **false for diffusion fine-tuning**:
   the overfitting gap**; every regularizing knob (no-momentum, mixed/progressive resolution,
   cosine/low `rex_d`) lowers the gap at a small loss cost. **The knobs are substitutes** — once
   the optimizer regularizes, piling on more gives diminishing returns.
-- Adafusion's momentum is *dispensable* (β1=0 regularizes and stays strong); AdaMuon's is
-  load-bearing (it IS the orthogonalization). That structural difference is why Adafusion fits.
+- Adakaon's momentum is *dispensable* (β1=0 regularizes and stays strong); AdaMuon's is
+  load-bearing (it IS the orthogonalization). That structural difference is why Adakaon fits.
 
 **Corrected objective:** not "lowest loss fastest" but **best generalization / perceptual
 sample quality per unit of compute & memory**, with overfitting/memorization as the primary
@@ -51,7 +51,7 @@ in either.
 ## Desiderata for the optimizer (ranked)
 
 1. **Generalization-first / memorization-resistant.** Built-in implicit regularization
-   (the property that let Adafusion-nomom win). Should reach good *samples*, not just low loss.
+   (the property that let Adakaon-nomom win). Should reach good *samples*, not just low loss.
 2. **Pareto-efficient loss↔gap.** For a target sample quality, the lowest memorization; ideally
    moves the whole (loss, gap) frontier, not just trades along it.
 3. **Memory-efficient.** Adafactor-class state (~1–2 B/param), bf16-correct updates (stochastic
@@ -68,7 +68,7 @@ in either.
 For each: does it improve *generalization/samples* (not just loss)? memory cost? evidence on
 diffusion specifically vs only LLMs? interaction with bf16 + LoRA?
 
-- **Implicit-regularization-first optimizers** — why does removing momentum (Adafusion β1=0)
+- **Implicit-regularization-first optimizers** — why does removing momentum (Adakaon β1=0)
   help generalization? Generalize this: weak/decoupled momentum, gradient noise injection,
   label/target smoothing on the eps/v target.
 - **Sharpness-aware minimization (SAM and efficient variants: ASAM, ESAM, LookSAM, SAF).**
@@ -79,7 +79,7 @@ diffusion specifically vs only LLMs? interaction with bf16 + LoRA?
   with the above.
 - **Schedule-free & parameter-free LR (Defazio schedule-free, Prodigy, Mechanic/Autofusion).**
   Kill the LR/scheduler babysitting — but re-tune their target toward generalization, not just
-  fast convergence (our `Autofusion` already does freeze-to-free on Adafusion).
+  fast convergence (our `Autofusion` already does freeze-to-free on Adakaon).
 - **Diffusion-specific loss/timestep handling baked into the optimizer or training:** min-SNR /
   sigmoid / soft-min-SNR weighting, mid-SNR emphasis (where the gap lives), immiscible/optimal-
   transport noise pairing, REPA-style representation alignment — do these reduce the gap?
@@ -93,7 +93,7 @@ diffusion specifically vs only LLMs? interaction with bf16 + LoRA?
 
 1. Among published optimizers, which have **measured generalization/sample-quality** evidence on
    *diffusion fine-tuning* (not just LLM loss)? Cite and rank.
-2. Is there an optimizer that **moves the (loss, gap) Pareto frontier** vs Adafusion-nomom, or do
+2. Is there an optimizer that **moves the (loss, gap) Pareto frontier** vs Adakaon-nomom, or do
    all just slide along the same tradeoff?
 3. Does **SAM / flat-minima** seeking beat implicit regularization (no-momentum) on diffusion
    LoRA samples, and at what compute cost?
@@ -114,7 +114,7 @@ diffusion specifically vs only LLMs? interaction with bf16 + LoRA?
 
 ## Baseline to beat
 
-`Adafusion(betas=(0.0,0.999), cautious=False, bf16 stochastic-rounding)` + REX `rex_d=0.9` +
+`Adakaon(betas=(0.0,0.999), cautious=False, bf16 stochastic-rounding)` + REX `rex_d=0.9` +
 progressive-floor resolution curriculum (`512+1024 → 768+1024 → 1024`, 40/40/20, final 20%
 large-only) — the current best generalization-at-good-loss recipe (see
 `benchmarks/adamuon/RESULTS_generalization_and_schedule.md`). A new optimizer must beat this on

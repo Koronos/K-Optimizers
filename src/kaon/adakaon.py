@@ -1,5 +1,10 @@
-"""Adafusion — a conv-aware factored optimizer aimed at AdamW quality at
+"""Adakaon — a conv-aware factored optimizer aimed at AdamW quality at
 Adafactor memory, for bf16 diffusion fine-tuning.
+
+Adakaon is the flagship of the library and the optimizer that most fully exercises
+the **kaon** shared backend (factored second moment, quantized momentum codec,
+stochastic rounding, foreach, cautious) — hence the name. Every other optimizer in
+the package reuses pieces of Adakaon's machinery. (Formerly named *Adafusion*.)
 
 Design (validated by benchmarks/bench_convergence-style experiments):
 
@@ -55,9 +60,9 @@ from kaon._momentum_codec import (
 )
 from kaon._stochastic_rounding import add_stochastic_
 
-__all__ = ["Adafusion"]
+__all__ = ["Adakaon"]
 
-# Re-exported codec internals (kept importable from ``kaon.adafusion`` for
+# Re-exported codec internals (kept importable from ``kaon.adakaon`` for
 # backwards compatibility with existing tests/benchmarks). The implementations
 # now live in :mod:`kaon._momentum_codec`, shared with KProdigy.
 _ = (
@@ -72,7 +77,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 # Stacking a foreach bucket allocates several transient copies of the stacked
 # tensor (grad fp32, the reconstruction, the SR intermediate, ...), so an unbounded
 # bucket of large weights can OOM a full fine-tune — which would undercut
-# Adafusion's whole memory story. We therefore cap the per-chunk element count and
+# Adakaon's whole memory story. We therefore cap the per-chunk element count and
 # split bigger buckets. The cap is **adaptive to free VRAM** rather than a fixed
 # constant: a card with lots of headroom batches whole buckets (and even stacks
 # large weights), while a constrained card shrinks the chunk and stays safe. The
@@ -105,7 +110,7 @@ def _rms(t: Tensor) -> Tensor:
     return t.norm(2) / math.sqrt(max(t.numel(), 1))
 
 
-class Adafusion(Optimizer):
+class Adakaon(Optimizer):
     """Conv-aware factored optimizer with optional bf16 momentum.
 
     Args:
@@ -165,10 +170,10 @@ class Adafusion(Optimizer):
             a hard ceiling on a shared GPU). Decoupled from ``foreach_batch_cutoff``
             so raising it never pulls large weights into stacking.
 
-    Note: Adafusion deliberately exposes **no** ``compile`` flag. A whole-step
+    Note: Adakaon deliberately exposes **no** ``compile`` flag. A whole-step
     ``torch.compile`` was measured ~neutral on most shapes here and a slight loss on
-    trivial steps (Adafusion's step has little fusable elementwise math), so it is
-    not worth the API surface — Adafusion stays lean. The flag lives on
+    trivial steps (Adakaon's step has little fusable elementwise math), so it is
+    not worth the API surface — Adakaon stays lean. The flag lives on
     :class:`~kaon.adamuon.AdaMuon`, whose heavy Newton-Schulz math it actually
     speeds up.
     """
@@ -274,7 +279,7 @@ class Adafusion(Optimizer):
             params = [p for p in group["params"] if p.grad is not None]
             for p in params:
                 if p.grad.is_sparse:
-                    raise RuntimeError("Adafusion does not support sparse gradients")
+                    raise RuntimeError("Adakaon does not support sparse gradients")
             if self._foreach and self._group_foreach_eligible(group):
                 chunk_budget = self._foreach_budget(params[0].device)
                 # Effective cutoff = the performance threshold, lowered only if the

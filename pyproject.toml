@@ -1,6 +1,6 @@
 [project]
 name = "kaon"
-description = "K-Optimizers: memory-efficient PyTorch optimizers for bf16 diffusion fine-tuning (Adafusion, Muon)."
+description = "K-Optimizers: memory-efficient PyTorch optimizers for bf16 diffusion fine-tuning (Adakaon, Muon)."
 authors = [
     { name = "Koronos" }
 ]

@@ -134,7 +134,7 @@ def test_foreach_matches_per_param(cfg):
     """foreach=True matches the per-parameter path within bf16 Newton-Schulz
     tolerance.
 
-    Unlike Adafusion (all-fp32 math, bit-exact), AdaMuon's 2-D path runs NS in
+    Unlike Adakaon (all-fp32 math, bit-exact), AdaMuon's 2-D path runs NS in
     bf16, and the batched bmm reduces in a different order than per-slice matmul —
     so the two paths agree closely but not bit-for-bit. 1-D buckets and all the
     fp32 ops are exact; the residual is the bf16 NS on the 2-D weights.
@@ -259,5 +259,5 @@ def test_compile_step_matches_eager():
     eager, compiled = run(False), run(True)
     for e, c in zip(eager, compiled, strict=True):
         assert torch.isfinite(c).all()
-        # AdaMuon runs Newton-Schulz in bf16 internally -> looser tol than Adafusion
+        # AdaMuon runs Newton-Schulz in bf16 internally -> looser tol than Adakaon
         assert torch.allclose(e, c, rtol=3e-2, atol=2e-3)

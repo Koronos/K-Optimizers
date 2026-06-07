@@ -3,12 +3,12 @@
 A *momentum codec* owns, for one ``momentum_dtype``, the entire
 dequant -> fp32 EMA -> requant cycle and the underlying storage layout, so the
 optimizer step functions never re-implement any quantization detail. Both
-:class:`~kaon.adafusion.Adafusion` and :class:`~kaon.kprodigy.KProdigy`
-import these classes — Adafusion uses the EMA entry points (it folds the EMA into
+:class:`~kaon.adakaon.Adakaon` and :class:`~kaon.kprodigy.KProdigy`
+import these classes — Adakaon uses the EMA entry points (it folds the EMA into
 the update), while KProdigy does its (``d``-scaled) EMA itself in pass 1 and only
 needs the codec's storage + *read-only dequant* in pass 2. The read-only
 ``dequant_*`` methods were added for KProdigy and are a no-op extension of the
-Adafusion-era API (the EMA paths are byte-for-byte unchanged).
+Adakaon-era API (the EMA paths are byte-for-byte unchanged).
 
 The first-moment EMA is always *worked on* as an fp32 tensor in the "effective"
 layout — matricized ``[R, C]`` (factored) / flat ``[L]`` (non-factored) per
@@ -184,7 +184,7 @@ class _MomentumCodec:
     """Base momentum codec. Subclasses own one ``momentum_dtype``'s storage AND the
     full dequant -> fp32 EMA -> requant cycle.
 
-    EMA entry points (Adafusion; perform ``m.lerp_(update, 1-beta1)`` and return
+    EMA entry points (Adakaon; perform ``m.lerp_(update, 1-beta1)`` and return
     the fp32 first-moment as the step delta):
 
     * ``ema_one``     — per-param.

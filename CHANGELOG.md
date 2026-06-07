@@ -17,7 +17,7 @@ All notable changes to this project will be documented in this file.
   35–43% lower gap than the field). Developed under the code name *Janus*.
   See [docs/adapnm.md](docs/adapnm.md).
 - **`Lion`** — **Lion's sign-momentum** update (`sign(β1·m+(1-β1)·g)`, single momentum
-  buffer, **no second moment**) on Adafusion's backend: the shared int8/4bit momentum codec,
+  buffer, **no second moment**) on Adakaon's backend: the shared int8/4bit momentum codec,
   stochastic-rounding bf16 weight update, cautious masking, and **foreach batching** (bit-exact
   vs the per-param path). Lightest state in the family — **~1 B (int8) / 0.5 B (4bit) per
   param** — targeting Lion's implicit regularization for small-data diffusion fine-tuning.
@@ -27,7 +27,7 @@ All notable changes to this project will be documented in this file.
 - **`AdaMuon`** — Muon's Newton-Schulz orthogonalized momentum + an Adafactor-style
   **factored, quantized second moment of the orthogonalized update**. Targets
   beating AdamW on convergence/precision at **near-Adafactor memory** (~1–2 B/param;
-  reuses Adafusion's int8/4bit momentum codec, foreach batching, stochastic rounding,
+  reuses Adakaon's int8/4bit momentum codec, foreach batching, stochastic rounding,
   dtype-safe checkpointing). See [docs/adamuon.md](docs/adamuon.md).
   - Tuned defaults `ns_steps=2`, `cautious=True`, `betas=(0.95, 0.999)`; a single
     `lr` governs 2-D and 1-D params (all RMS-normalized to applied RMS ≈ `0.2·lr`).
@@ -38,22 +38,22 @@ All notable changes to this project will be documented in this file.
   - Optional `compile=True` — whole-step `torch.compile` (AdaMuon-only by design);
     workload-dependent, benchmark it.
   - Reproducible harnesses + evaluation under `benchmarks/adamuon/`.
-- **`Autofusion`** — a parameter-free learning rate on Adafusion's update via a
+- **`Autofusion`** — a parameter-free learning rate on Adakaon's update via a
   [Mechanic](https://arxiv.org/abs/2306.00144) scalar tuner (an update-agnostic
   online LR tuner — **Mechanic, *not* Prodigy**), with a **freeze-to-free**
   handoff. See [docs/autofusion.md](docs/autofusion.md) for the full design,
   the minimal API, and the validated campaign results.
   - Train at `lr=1.0`; the tuner discovers the effective LR (read via `get_d()`),
-    keeping Adafusion's exact normalize-then-momentum update verbatim.
+    keeping Adakaon's exact normalize-then-momentum update verbatim.
   - `lr_freeze` (default `"auto"`; also `int N` / `None`) ends adaptation: it folds
-    the discovered LR `S` into the inner Adafusion's `lr`, **frees the Mechanic
+    the discovered LR `S` into the inner Adakaon's `lr`, **frees the Mechanic
     `ref` buffer**, and routes every later `step()` straight to the base — so after
-    freeze it is **byte-for-byte and speed-for-speed plain Adafusion at `lr=S`**.
-    With the default `adafusion_betas=(0.0, 0.999)` (beta1=0) the handoff is
-    bit-exact (Adafusion's update is then linear in `lr`); `"auto"` freezes on an
+    freeze it is **byte-for-byte and speed-for-speed plain Adakaon at `lr=S`**.
+    With the default `adakaon_betas=(0.0, 0.999)` (beta1=0) the handoff is
+    bit-exact (Adakaon's update is then linear in `lr`); `"auto"` freezes on an
     LR plateau.
   - **Minimal, parameter-free API:** the common case is
-    `Autofusion(params, **adafusion_kwargs)`. The empirical scaffolding that
+    `Autofusion(params, **adakaon_kwargs)`. The empirical scaffolding that
     accumulated across iterations (`store_delta`, `s_init_rel`, `scale_floor_frac`,
     the auto-freeze `tol`/`patience`/`max_frac`) was collapsed to internal
     constants once iteration-3 validated on a real SDXL LoRA that the data-relative
@@ -62,13 +62,13 @@ All notable changes to this project will be documented in this file.
     needed.
   - Only per-param state while adapting is the irreducible `ref` (one extra copy of
     the weights); `Delta` is reconstructed on the fly as `(p-ref)/sum(s)`.
-  - `adafusion_betas` passthrough sets the inner momentum betas (the tuner `betas`
-    kwarg shadows them); all other Adafusion knobs forward through `**kwargs`.
+  - `adakaon_betas` passthrough sets the inner momentum betas (the tuner `betas`
+    kwarg shadows them); all other Adakaon knobs forward through `**kwargs`.
   - **Naming:** the optimizer is `Autofusion`. (It went through the working names
-    `AdafusionProdigy` — a misnomer, it is Mechanic, not Prodigy — and
-    `AdaptiveAdafusion` during development; neither shipped, both are removed.)
-- **KProdigy now reuses Adafusion's full update engine.** KProdigy's pass-2 weight
-  update (previously a per-parameter Python loop) is now backed by Adafusion's
+    `AdakaonProdigy` — a misnomer, it is Mechanic, not Prodigy — and
+    `AdaptiveAdakaon` during development; neither shipped, both are removed.)
+- **KProdigy now reuses Adakaon's full update engine.** KProdigy's pass-2 weight
+  update (previously a per-parameter Python loop) is now backed by Adakaon's
   foreach batching, momentum codec (`float32`/`bfloat16`/`int8`/`4bit`), cautious
   masking, conv-aware matrixized factoring, and stochastic-rounding bf16 weights —
   with Prodigy's effective learning rate (`lr × D`) folded into the update.
@@ -76,23 +76,23 @@ All notable changes to this project will be documented in this file.
   `slice_p`, `independent_d`, `d_coef` etc. produce a bit-identical D trajectory and
   final weights vs the previous release (verified on CPU fp32 across every
   dtype/second-moment combo).
-  - New KProdigy args mirroring Adafusion: `momentum_dtype="4bit"`, `cautious`,
+  - New KProdigy args mirroring Adakaon: `momentum_dtype="4bit"`, `cautious`,
     `foreach` (default `True`), `foreach_batch_cutoff`, `foreach_stack_budget`,
     `momentum_4bit_block`.
-  - The momentum codecs + quant helpers were extracted from `adafusion.py` into a
-    shared `kaon._momentum_codec` module (re-exported from `kaon.adafusion` for
+  - The momentum codecs + quant helpers were extracted from `adakaon.py` into a
+    shared `kaon._momentum_codec` module (re-exported from `kaon.adakaon` for
     backwards compatibility) — no duplicated implementations.
   - foreach == per-param: **bit-exact on fp32 weights (CPU and CUDA)** across
     `momentum_dtype ∈ {float32, bfloat16, int8, 4bit}`, cautious on/off, on 2-D +
     conv + 1-D params. New foreach-parity/4bit/cautious tests.
   - Update-backend speedup (foreach vs the old per-param loop): **~1.8× on a
     LoRA-like distribution**, **~1.5× on the SDXL full-FT distribution**. (Smaller
-    than Adafusion's because KProdigy's pass-1 D-reduction is per-parameter in both
+    than Adakaon's because KProdigy's pass-1 D-reduction is per-parameter in both
     arms — only the pass-2 update is batched.)
   - Memory on the SDXL UNet shape distribution (bytes/param): factored/4bit +
-    `slice_p=11` = **1.27 B/param** (vs Adafusion 4bit 0.54, AdamW-class 8–14).
+    `slice_p=11` = **1.27 B/param** (vs Adakaon 4bit 0.54, AdamW-class 8–14).
     The Prodigy D-state (`s`+`p0`) dominates at `slice_p=1`; `slice_p` is the lever.
-- `Adafusion(foreach=True)` (now the default) — multi-tensor batching of the
+- `Adakaon(foreach=True)` (now the default) — multi-tensor batching of the
   step. Params are bucketed by shape, each bucket stacked into one tensor, and
   the entire update (EMA + reconstruction + RMS clip + momentum + weight decay +
   cautious + stochastic rounding) runs as a handful of batched kernels per bucket
@@ -147,12 +147,19 @@ All notable changes to this project will be documented in this file.
   and bit-exact vs the per-parameter path on CPU.
 
 ### Changed
+- **Renamed `Adafusion` → `Adakaon`.** The flagship optimizer is the one that most
+  fully exercises the shared **kaon** backend (factored second moment + quantized
+  momentum codec + stochastic rounding + foreach + cautious) — every other optimizer
+  reuses its machinery — so it now carries the framework's name. Class, module
+  (`kaon.adafusion` → `kaon.adakaon`), tests, and docs (`docs/adafusion.md` →
+  `docs/adakaon.md`) renamed; `Autofusion`'s `adafusion_*` kwargs are now
+  `adakaon_*`. No behaviour change.
 - `cautious` now defaults to **`True`**. Measured on a mini pixel-DDPM (8 paired
   seeds, per-arm best LR): with momentum it lowers held-out val loss ~1.4% (paired
   t=−4.07, p<0.05); it is a literal no-op without momentum (the mask is all-ones —
   mask-active fraction ≈ 0). Set `cautious=False` for no-momentum configs to skip
   the then-useless masking op.
-- Refactored Adafusion's momentum handling into a unified per-dtype **momentum
+- Refactored Adakaon's momentum handling into a unified per-dtype **momentum
   codec** (`init_state` / `ema_one` / `ema_stacked`). The dequant → fp32 EMA →
   requant logic for each `momentum_dtype` now lives in exactly one place instead of
   being copy-pasted across the per-parameter step and the two foreach buckets; the
@@ -201,7 +208,7 @@ All notable changes to this project will be documented in this file.
 Initial release of `kaon` (K-Optimizers).
 
 ### Added
-- `Adafusion` — conv-aware factored optimizer:
+- `Adakaon` — conv-aware factored optimizer:
   - Factored second moment with the **conv-aware fix** (reshape 4-D conv kernels
     to 2-D before factoring → near-zero state vs ~0.4 B/param for the last-dims
     variant on a diffusion UNet).

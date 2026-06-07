@@ -11,7 +11,7 @@ bf16 diffusion fine-tuning* — fixing the issues that plagued the original
 fail to rise). The D-estimation math here matches the reference Prodigy bit for
 bit at the defaults; the *enhancements* are orthogonal memory savings:
 
-* **bf16 / int8 / 4bit first moment** (``momentum_dtype``) — like ``Adafusion``.
+* **bf16 / int8 / 4bit first moment** (``momentum_dtype``) — like ``Adakaon``.
 * **factored second moment** (``second_moment="factored"``) — Adafactor-style
   row+column EMA, ~0 state on convs/attention. Experimental: it uses the
   current-``d`` convention for the second moment (the historical-``d`` scaling
@@ -26,7 +26,7 @@ bit at the defaults; the *enhancements* are orthogonal memory savings:
 **Engine.** KProdigy is a two-pass optimizer: pass 1 accumulates the global D
 statistics + computes the new D, pass 2 applies the weight update. The D math
 (pass 1) is the validated reference Prodigy; the *update backend* (pass 2) reuses
-``Adafusion``'s full engine — its **foreach batching**, its **momentum codec**
+``Adakaon``'s full engine — its **foreach batching**, its **momentum codec**
 (float32/bfloat16/int8/4bit), **cautious** masking, **conv-aware matrixized
 factoring**, and **stochastic-rounding** bf16 weights — with Prodigy's effective
 learning rate (``lr × D``) folded into the update. Set ``foreach=False`` for the
@@ -36,7 +36,7 @@ Memory at ``beta1=0`` (no momentum), ``second_moment="factored"``, ``slice_p=11`
 is well under AdamW; even the full-precision default (bf16 momentum + full fp32
 second moment) is ~6 B/param vs AdamW's 8.
 
-Unlike ``Adafusion``/``Muon``, Prodigy needs a **global reduction over all
+Unlike ``Adakaon``/``Muon``, Prodigy needs a **global reduction over all
 parameters** each step (the D estimate), so it is a two-pass optimizer and does
 **not** support the per-parameter / gradient-release loop. Use it as a normal
 ``optimizer.step()`` optimizer.
@@ -71,7 +71,7 @@ _LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 SecondMoment = Literal["full", "factored"]
 
-# Reuse Adafusion's adaptive-VRAM foreach stacking constants so a KProdigy chunk
+# Reuse Adakaon's adaptive-VRAM foreach stacking constants so a KProdigy chunk
 # budget never OOMs a full fine-tune (same engine, same safety story).
 _STACK_SAFETY_FRACTION = 0.10
 _STACK_BYTES_PER_ELEM = 48
@@ -138,13 +138,13 @@ class KProdigy(Optimizer):
         factor_conv_as_matrix: reshape 4-D conv kernels to 2-D before factoring
             (the conv-aware fix). Default ``True``.
         foreach: batch the pass-2 update across parameters with multi-tensor
-            (stacked) ops — Adafusion's engine — instead of a per-parameter
+            (stacked) ops — Adakaon's engine — instead of a per-parameter
             Python loop. Default ``True``. The D-estimation pass-1 is always
             per-parameter (it is a global reduction); only the update backend is
             batched. Set ``False`` to force the per-parameter update path.
         foreach_batch_cutoff: per-tensor element count above which a weight is
             updated by the per-parameter loop instead of being stacked (a
-            performance knob; default 2_000_000, mirroring Adafusion).
+            performance knob; default 2_000_000, mirroring Adakaon).
         foreach_stack_budget: max elements in a single stacked foreach chunk.
             ``None`` (default) adapts to free VRAM; an int pins a fixed cap.
     """
@@ -235,7 +235,7 @@ class KProdigy(Optimizer):
         # Auto: independent D when the user gave more than one param group
         # (e.g. SDXL UNet + Text Encoder), unless explicitly overridden.
         self._independent_d = (len(self.param_groups) > 1) if independent_d is None else independent_d
-        # Adafusion-engine foreach knobs for the pass-2 update backend.
+        # Adakaon-engine foreach knobs for the pass-2 update backend.
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
@@ -244,7 +244,7 @@ class KProdigy(Optimizer):
         # benchmarks can isolate the pass-1 batching speedup. The result is
         # bit-identical either way, so this never affects numerics.
         self._foreach_pass1 = foreach
-        # One momentum codec per dtype string, shared with Adafusion. The codec
+        # One momentum codec per dtype string, shared with Adakaon. The codec
         # owns storage + dequant; KProdigy does its own d-scaled EMA in pass 1
         # and reads the momentum back (dequant) in pass 2.
         self._codecs: dict[str, _MomentumCodec] = {}
@@ -278,7 +278,7 @@ class KProdigy(Optimizer):
 
         if beta1 > 0:
             # Momentum storage is owned by the shared codec (float/bf16/int8/4bit),
-            # exactly as Adafusion allocates it.
+            # exactly as Adakaon allocates it.
             self._codec(group).init_state(state, p, group)
 
         if group["second_moment"] == "factored" and p.ndim >= 2:
@@ -390,7 +390,7 @@ class KProdigy(Optimizer):
         # the next step, and the momentum/second-moment were scaled by the old d,
         # so the d-cancellation in the Adam ratio stays consistent.
 
-        # ---- pass 2: apply updates (Adafusion engine) -----------------------
+        # ---- pass 2: apply updates (Adakaon engine) -----------------------
         for group in groups:
             params = [p for p in group["params"] if p.grad is not None]
             for p in params:
@@ -482,7 +482,7 @@ class KProdigy(Optimizer):
         """Batched pass 1: every elementwise op (the D-estimation inner products
         and ``s`` buffer, the d-scaled momentum EMA, and the full/factored
         second-moment EMA) is computed with stacked / ``torch._foreach_*`` kernels,
-        bucketed by effective shape the same way pass 2 / Adafusion are.
+        bucketed by effective shape the same way pass 2 / Adakaon are.
 
         The *scalar* numerator/denominator accumulation is still folded in the
         exact original per-parameter order (a cheap left-fold over an ``[N]``
@@ -698,12 +698,12 @@ class KProdigy(Optimizer):
             torch._foreach_copy_([records[i][2]["row"] for i in idxs], list(rows.unbind(0)))
             torch._foreach_copy_([records[i][2]["col"] for i in idxs], list(cols.unbind(0)))
 
-    # -- pass-2 update backend (Adafusion engine) --------------------------
+    # -- pass-2 update backend (Adakaon engine) --------------------------
 
     def _apply_updates(self, params: list[Tensor], group: dict[str, Any], d: float, dlr: float) -> None:
         """Apply the Prodigy weight update for every param in ``group``.
 
-        Routes to the batched foreach engine (Adafusion's bucketing) when
+        Routes to the batched foreach engine (Adakaon's bucketing) when
         eligible; falls back per-param otherwise. The Prodigy-specific math
         (d-scaled denominator, dlr scaling, decoupled WD, eps floor) is identical
         in both paths.
@@ -728,7 +728,7 @@ class KProdigy(Optimizer):
             for p in params:
                 self._update_one_param(p, group, d, dlr)
 
-    # -- foreach eligibility / budget (mirrors Adafusion) ------------------
+    # -- foreach eligibility / budget (mirrors Adakaon) ------------------
 
     def _foreach_budget(self, device: torch.device) -> int:
         if self._foreach_stack_budget is not None:
@@ -843,14 +843,14 @@ class KProdigy(Optimizer):
 
         self._apply_subtract(p, delta, state, bf16_method)
 
-    # -- foreach update (Adafusion bucketing) ------------------------------
+    # -- foreach update (Adakaon bucketing) ------------------------------
 
     @torch.no_grad()
     def _update_foreach(
         self, params: list[Tensor], group: dict[str, Any], d: float, dlr: float, budget: int
     ) -> None:
         """Batched pass-2 update: bucket params by effective shape and step each
-        bucket with a handful of stacked kernels (Adafusion's foreach engine),
+        bucket with a handful of stacked kernels (Adakaon's foreach engine),
         applying Prodigy's d-scaled update math."""
         factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
         flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}

@@ -1,4 +1,4 @@
-"""``ktune`` — check whether Adafusion's ``foreach`` knobs need tuning on *your*
+"""``ktune`` — check whether Adakaon's ``foreach`` knobs need tuning on *your*
 GPU and *your* model.
 
 The defaults (``foreach_batch_cutoff=2_000_000``, adaptive ``foreach_stack_budget``)
@@ -33,8 +33,8 @@ from collections.abc import Sequence
 
 import torch
 
-from kaon import Adafusion
-from kaon.adafusion import _FOREACH_BATCH_CUTOFF
+from kaon import Adakaon
+from kaon.adakaon import _FOREACH_BATCH_CUTOFF
 
 
 def _read_safetensors_shapes(path: str, prefix: str | None) -> list[tuple[int, ...]]:
@@ -99,7 +99,7 @@ def _time_step(params, opt_kwargs, *, foreach, cutoff=None, iters=40, warmup=12)
     kw = dict(opt_kwargs, foreach=foreach)
     if foreach and cutoff is not None:
         kw["foreach_batch_cutoff"] = cutoff
-    opt = Adafusion(params, **kw)
+    opt = Adakaon(params, **kw)
     try:
         for _ in range(warmup):
             opt.step()
@@ -133,7 +133,7 @@ def _time_step(params, opt_kwargs, *, foreach, cutoff=None, iters=40, warmup=12)
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="ktune",
-        description="Check whether Adafusion's foreach cutoff needs tuning on your GPU/model.",
+        description="Check whether Adakaon's foreach cutoff needs tuning on your GPU/model.",
     )
     ap.add_argument("--model", required=True, help="path to a .safetensors checkpoint (header is read for shapes)")
     ap.add_argument("--gpu", type=int, default=0, help="CUDA device index (default 0)")
@@ -175,7 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         name = "cpu"
 
-    print("=== ktune: Adafusion foreach cutoff check ===")
+    print("=== ktune: Adakaon foreach cutoff check ===")
     print(f"model   : {args.model}")
     print(f"shapes  : {len(shapes)} tensors, {n_params/1e9:.2f} B params  [{kind}]")
     print(f"device  : {device} ({name})")

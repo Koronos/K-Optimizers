@@ -1,21 +1,21 @@
-"""Autofusion — a parameter-free learning rate on top of *Adafusion's*
+"""Autofusion — a parameter-free learning rate on top of *Adakaon's*
 update rule, via a Mechanic-style online scale tuner, with a **freeze-to-free**
-handoff that turns it into plain Adafusion after warmup.
+handoff that turns it into plain Adakaon after warmup.
 
 Motivation
 ----------
 A matched-effective-LR ablation found that ``KProdigy`` (Prodigy's Adam-form
-D-adaptation) converges ~2x worse than ``Adafusion`` on the mini pixel-DDPM, and
+D-adaptation) converges ~2x worse than ``Adakaon`` on the mini pixel-DDPM, and
 the gap isolates entirely to **first-moment placement relative to the √v
 normalization**:
 
 * KProdigy / Adam / Prodigy: ``delta = ema(d·g) / √v`` — momentum of the *raw*
   gradient, then normalize.
-* Adafusion / Adafactor-with-momentum: ``delta = ema(clip(g / √v))`` —
+* Adakaon / Adafactor-with-momentum: ``delta = ema(clip(g / √v))`` —
   normalize + RMS-clip first, *then* momentum.
 
-Adafusion's ordering is the better one. We want a *parameter-free* optimizer that
-keeps Adafusion's update verbatim but auto-discovers the learning rate. Prodigy's
+Adakaon's ordering is the better one. We want a *parameter-free* optimizer that
+keeps Adakaon's update verbatim but auto-discovers the learning rate. Prodigy's
 D-estimator is derived for the Adam form, so it does not transplant cleanly onto
 the normalize-then-momentum update.
 
@@ -28,7 +28,7 @@ only ever sees the gradient and the base optimizer's update vector
 
 Design (mirrors the reference ``mechanize`` wrapper, arXiv:2306.00144 Alg. 1)
 ----------------------------------------------------------------------------
-The base optimizer is an internal :class:`~kaon.adafusion.Adafusion` at
+The base optimizer is an internal :class:`~kaon.adakaon.Adakaon` at
 ``lr=1``. Each step (while adapting): snapshot ``p``, run the base step to get
 ``u_t = p_after - p_before``, recompute ``Delta_t`` on the fly from
 ``(p - ref)/sum(s)``, form the Mechanic gradient
@@ -39,7 +39,7 @@ The discovered effective LR is ``sum(s)``; read it with :meth:`get_d`.
 
 Memory
 ------
-The only irreducible per-parameter cost over plain Adafusion is **``ref`` (one
+The only irreducible per-parameter cost over plain Adakaon is **``ref`` (one
 extra copy of the weights, in param dtype)** — matching the reference Mechanic
 ("at minimum one extra slot of memory"). ``Delta`` is reconstructed on the fly
 from ``(p - ref) / sum(s)`` (the reference Mechanic does the same, reporting
@@ -54,19 +54,19 @@ the ``ref`` buffer are pure waste. ``lr_freeze`` ends adaptation:
 * ``"auto"`` (default) — freeze when ``sum(s)`` plateaus: relative change below
   ``_LR_FREEZE_TOL`` for ``_LR_FREEZE_PATIENCE`` consecutive near-max steps.
 * ``int N`` — freeze after ``N`` steps.
-* ``None`` — never freeze (plain Mechanic-tuned Adafusion).
+* ``None`` — never freeze (plain Mechanic-tuned Adakaon).
 
-On freeze we record ``S = sum(s)``, **set the base Adafusion's ``lr`` to ``S``**,
+On freeze we record ``S = sum(s)``, **set the base Adakaon's ``lr`` to ``S``**,
 **free ``ref``/tuner scalars**, and route every subsequent ``step()``
 straight to ``base.step()``. After freeze the optimizer **is** the inner plain
-Adafusion at ``lr=S`` — same memory (ref gone), same speed (no wrapper
+Adakaon at ``lr=S`` — same memory (ref gone), same speed (no wrapper
 passes), same update — *by construction*, because ``step()`` literally calls
 ``base.step()``.
 
 Bit-exactness of the *handoff* (does ``lr=S`` reproduce the pre-freeze
 ``p = ref + S·Delta`` extrapolation?) depends on the momentum setting:
 
-* **``beta1 == 0`` (the default ``adafusion_betas=(0.0, 0.999)``):** the update is
+* **``beta1 == 0`` (the default ``adakaon_betas=(0.0, 0.999)``):** the update is
   ``delta = update`` with ``update`` linear in ``lr`` (RMS-clip + cautious mask are
   computed pre-``lr``; the second-moment EMA is ``lr``-independent). So
   ``base.step(lr=1)`` then ``p = ref + S·Δstep`` equals ``base.step(lr=S)``
@@ -85,7 +85,7 @@ CUDA note: this env SIGFPEs on ``torch.dot`` for CUDA tensors, so every inner
 product is ``(a * b).sum()``.
 
 Based on Mechanic by Ashok Cutkosky, Aaron Defazio & Harsh Mehta
-(https://github.com/optimizedlearning/mechanic), and Adafusion's update engine.
+(https://github.com/optimizedlearning/mechanic), and Adakaon's update engine.
 """
 
 from __future__ import annotations
@@ -97,7 +97,7 @@ from typing import Any, Literal
 import torch
 from torch import Tensor
 
-from kaon.adafusion import Adafusion
+from kaon.adakaon import Adakaon
 
 __all__ = ["Autofusion"]
 
@@ -109,7 +109,7 @@ _DEFAULT_BETAS: tuple[float, ...] = (0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999
 # defaults generalize, so they are frozen here rather than exposed in __init__).
 # Changing them is a source edit, not a call-site option.
 #: multiplier on the global param RMS for the data-relative ``s_init="auto"`` seed
-#: (Adafusion's lr=1 update is unit-RMS, so trust ratio ||p||/||u|| == RMS(p)).
+#: (Adakaon's lr=1 update is unit-RMS, so trust ratio ||p||/||u|| == RMS(p)).
 _S_INIT_REL: float = 3e-3
 #: floor the effective ``sum(s)`` at this fraction of its running max (anti-collapse).
 _SCALE_FLOOR_FRAC: float = 0.5
@@ -123,8 +123,8 @@ _LR_FREEZE_MAX_FRAC: float = 0.9
 
 
 class Autofusion(torch.optim.Optimizer):
-    """Parameter-free LR on Adafusion's update via a Mechanic scale tuner, with a
-    freeze-to-pure-Adafusion handoff.
+    """Parameter-free LR on Adakaon's update via a Mechanic scale tuner, with a
+    freeze-to-pure-Adakaon handoff.
 
     Args:
         params: parameters or param-group dicts.
@@ -133,19 +133,19 @@ class Autofusion(torch.optim.Optimizer):
         s_init: Mechanic's initial scale seed. The paper default is ``1e-8``; on
             short fine-tuning runs the bootstrap is slow there (short-horizon bias).
             Default ``"auto"`` — a data-relative LARS-style seed set on the first
-            step from the global param RMS (Adafusion's ``lr=1`` update is unit-RMS,
+            step from the global param RMS (Adakaon's ``lr=1`` update is unit-RMS,
             so the trust ratio ``||p||/||u_lr1|| == RMS(p)``); the seed is
             ``_S_INIT_REL * RMS(p)``, landing the initial effective LR at a
             data-relative scale instead of ramping there over ~100 steps. Pass a
             float to pin a fixed seed (e.g. ``1e-8`` for very long runs).
-        lr_freeze: when to stop adapting and become plain Adafusion at the frozen
+        lr_freeze: when to stop adapting and become plain Adakaon at the frozen
             LR. **The headline feature.** Default ``"auto"`` — freezes on a
             ``sum(s)`` plateau (validated robust; iteration-3 showed freeze does not
             hurt and is the value prop). ``int N`` freezes after ``N`` steps.
-            ``None`` never freezes (plain Mechanic-tuned Adafusion). On freeze, the
-            Mechanic ``ref``/tuner scalars are freed and the inner Adafusion runs at
+            ``None`` never freezes (plain Mechanic-tuned Adakaon). On freeze, the
+            Mechanic ``ref``/tuner scalars are freed and the inner Adakaon runs at
             ``lr = sum(s)_frozen`` — from then on it is byte-for-byte and
-            speed-for-speed plain Adafusion.
+            speed-for-speed plain Adakaon.
         scale_cap: hard cap on the effective ``sum(s)`` (the discovered LR). Default
             ``"auto"`` — set on the first step to ``scale_cap_rel`` times the
             data-relative seed, so the ceiling tracks the problem's LR scale. **This
@@ -163,7 +163,7 @@ class Autofusion(torch.optim.Optimizer):
         s_decay: Mechanic's ``lambda`` weight-decay-esque tuner term (default
             ``0.01``). Set ``0`` to disable.
         eps: tuner numerical floor.
-        adafusion_betas: the inner Adafusion's ``(beta1, beta2)`` momentum /
+        adakaon_betas: the inner Adakaon's ``(beta1, beta2)`` momentum /
             second-moment EMAs. Distinct from this class's tuner ``betas`` (which is
             shadowed by the keyword above, so this is the *only* way to set the base
             momentum). Default ``(0.0, 0.999)`` — **no first-moment EMA**, which is
@@ -172,10 +172,10 @@ class Autofusion(torch.optim.Optimizer):
             ``lr``-scaled update, and freeze folds ``S`` into the stored momentum as
             well as the lr (exact for fp32/int8/4bit, rounding-exact for bf16) so the
             handoff has no boundary jump either; see ``_freeze`` / the module docstring.
-        **adafusion_kwargs: forwarded verbatim to the internal
-            :class:`~kaon.adafusion.Adafusion` base (``clip_threshold``,
+        **adakaon_kwargs: forwarded verbatim to the internal
+            :class:`~kaon.adakaon.Adakaon` base (``clip_threshold``,
             ``cautious``, ``momentum_dtype``, ``bf16_method``, ``foreach``,
-            ``weight_decay``...). NB: pass momentum betas via ``adafusion_betas``,
+            ``weight_decay``...). NB: pass momentum betas via ``adakaon_betas``,
             not here — ``betas`` is the tuner's.
     """
 
@@ -191,9 +191,9 @@ class Autofusion(torch.optim.Optimizer):
         betas: tuple[float, ...] = _DEFAULT_BETAS,
         s_decay: float = 0.01,
         eps: float = 1e-8,
-        adafusion_betas: tuple[float, float] = (0.0, 0.999),
+        adakaon_betas: tuple[float, float] = (0.0, 0.999),
         foreach_warmup: bool = True,
-        **adafusion_kwargs: Any,
+        **adakaon_kwargs: Any,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"lr must be >= 0, got {lr}")
@@ -217,11 +217,11 @@ class Autofusion(torch.optim.Optimizer):
         # The base optimizer holds the param_groups and does the real update at
         # lr=1.0 (the Mechanic scale is applied by THIS class, on top) until freeze,
         # after which its lr is set to the frozen scale and it runs alone.
-        self.base = Adafusion(param_list, lr=1.0, betas=adafusion_betas, **adafusion_kwargs)
+        self.base = Adakaon(param_list, lr=1.0, betas=adakaon_betas, **adakaon_kwargs)
         # Register as a *proper* torch Optimizer (step/state-dict hooks, _step_count,
         # profiling) so external machinery attaches cleanly: LR schedulers (e.g. a
         # CosineAnnealingLR for the post-freeze decay) and accelerate/deepspeed step
-        # hooks. We then SHARE the base Adafusion's param_groups/state/defaults so
+        # hooks. We then SHARE the base Adakaon's param_groups/state/defaults so
         # there is a single source of truth — the LR a scheduler writes lands on the
         # base that does the update, and opt.state introspection sees the base state.
         super().__init__(param_list, {"lr": 1.0})
@@ -232,7 +232,7 @@ class Autofusion(torch.optim.Optimizer):
         self._lr = float(lr)
         self._betas = torch.tensor(betas, dtype=torch.float32)
         # s_init: a fixed float, or "auto" (data-relative LARS-style seed set on the
-        # first step from the param RMS — Adafusion's lr=1 update is unit-RMS, so the
+        # first step from the param RMS — Adakaon's lr=1 update is unit-RMS, so the
         # trust ratio ||p||/||u_lr1|| == RMS(p); seed = s_init_rel * RMS(p)).
         self._s_init_auto = s_init == "auto"
         self._s_init = 0.0 if self._s_init_auto else float(s_init)
@@ -241,7 +241,7 @@ class Autofusion(torch.optim.Optimizer):
         self._eps = float(eps)
         # Phase-C: batch the wrapper's per-param warmup passes (displacement,
         # inner-product partials, ref + S*delta writeback) with torch._foreach_*
-        # to cut the ~15x launch overhead over plain Adafusion on many small
+        # to cut the ~15x launch overhead over plain Adakaon on many small
         # tensors (LoRA). Numerically identical to the per-param path.
         self._foreach_warmup = bool(foreach_warmup)
 
@@ -259,7 +259,7 @@ class Autofusion(torch.optim.Optimizer):
         self._scale_cap_rel = float(scale_cap_rel)
         self._s_sum_max = 0.0  # running max of the effective sum(s)
 
-        # Freeze ("become Adafusion") config + bookkeeping.
+        # Freeze ("become Adakaon") config + bookkeeping.
         self._lr_freeze = lr_freeze
         self._lr_freeze_tol = _LR_FREEZE_TOL
         self._lr_freeze_patience = _LR_FREEZE_PATIENCE
@@ -300,7 +300,7 @@ class Autofusion(torch.optim.Optimizer):
         return self._mech["s"].detach().cpu().clone()
 
     def is_frozen(self) -> bool:
-        """Whether the LR has frozen (now running as plain Adafusion)."""
+        """Whether the LR has frozen (now running as plain Adakaon)."""
         return self._frozen
 
     @property
@@ -313,7 +313,7 @@ class Autofusion(torch.optim.Optimizer):
 
     # -- checkpointing -----------------------------------------------------
     def state_dict(self) -> dict[str, Any]:
-        """Full state: base Adafusion + the Mechanic tuner + freeze bookkeeping.
+        """Full state: base Adakaon + the Mechanic tuner + freeze bookkeeping.
 
         Without serializing the tuner state, a checkpoint taken mid-warmup would
         cold-start the LR adaptation on resume, and a *frozen* optimizer would
@@ -390,7 +390,7 @@ class Autofusion(torch.optim.Optimizer):
     def _freeze(self) -> None:
         """Stop adapting: fold ``sum(s)`` into the base lr and free Mechanic state.
 
-        Adafusion's update is linear in ``lr``, so running the base at
+        Adakaon's update is linear in ``lr``, so running the base at
         ``lr = sum(s)`` reproduces the frozen ``p = ref + sum(s)·Delta`` trajectory
         exactly (up to unbiased bf16/SR rounding) — see module docstring. We freeze
         at the *effective* (floor/cap-clamped) sum(s) the model is actually walking
@@ -421,7 +421,7 @@ class Autofusion(torch.optim.Optimizer):
         for group in self.param_groups:
             group["lr"] = s_sum
         # Free the wrapper's per-param buffers and tuner scalars — post-freeze the
-        # optimizer is byte-for-byte plain Adafusion.
+        # optimizer is byte-for-byte plain Adakaon.
         self._mech["ref"].clear()
         for k in ("s", "v", "reward", "max_product"):
             self._mech[k] = torch.zeros(0)
@@ -508,7 +508,7 @@ class Autofusion(torch.optim.Optimizer):
     # -- step --------------------------------------------------------------
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:  # noqa: C901
-        # Post-freeze: pure Adafusion, single update, no wrapper overhead.
+        # Post-freeze: pure Adakaon, single update, no wrapper overhead.
         if self._frozen:
             return self.base.step(closure)
 
@@ -547,7 +547,7 @@ class Autofusion(torch.optim.Optimizer):
             for k in ("s", "v", "reward", "max_product"):
                 mech[k] = mech[k].to(dev)
             betas = self._betas = betas.to(dev)
-            # Data-relative (LARS-style) seed: Adafusion's lr=1 update is unit-RMS,
+            # Data-relative (LARS-style) seed: Adakaon's lr=1 update is unit-RMS,
             # so the trust ratio ||p|| / ||u_lr1|| == RMS(p). Seeding s_init from the
             # global param RMS lands the *initial* effective LR at a data-relative
             # scale instead of a fixed 1e-8/1e-4 that has to ramp there over ~100
@@ -567,7 +567,7 @@ class Autofusion(torch.optim.Optimizer):
             if self._scale_cap_auto:
                 self._scale_cap = self._scale_cap_rel * max(self._s_init, 1e-8)
 
-        # 2) run the base Adafusion step (the real normalize-then-momentum update
+        # 2) run the base Adakaon step (the real normalize-then-momentum update
         #    at lr=1). u_t = p_after - p_before is the base update vector.
         self.base.step()
 
@@ -661,6 +661,6 @@ class Autofusion(torch.optim.Optimizer):
                 p.copy_((ref.float() + new_s_sum * delta).to(p.dtype))
 
         mech["iter"] += 1
-        # 7) decide whether to freeze (and become plain Adafusion) for next step.
+        # 7) decide whether to freeze (and become plain Adakaon) for next step.
         self._maybe_freeze(new_s_sum, mech["iter"])
         return loss

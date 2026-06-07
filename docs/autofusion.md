@@ -1,8 +1,8 @@
-# Autofusion — parameter-free LR on Adafusion (Mechanic, *not* Prodigy)
+# Autofusion — parameter-free LR on Adakaon (Mechanic, *not* Prodigy)
 
-> A scalar learning-rate tuner wrapped around Adafusion's update, with a
+> A scalar learning-rate tuner wrapped around Adakaon's update, with a
 > **freeze-to-free** handoff: after warmup it becomes byte-for-byte plain
-> Adafusion at the discovered LR. Train at `lr=1.0`, never tune an LR, pay
+> Adakaon at the discovered LR. Train at `lr=1.0`, never tune an LR, pay
 > ~nothing once it freezes.
 
 ## How it works
@@ -15,7 +15,7 @@ multiplier `s` on the base update by coin-betting / reward maximisation. It is
 update-agnostic *by construction*: it only ever sees the gradient and the base
 optimizer's update vector `Delta`, never how that update was formed.
 
-The base optimizer here is an internal `Adafusion` run at `lr=1`. Each step
+The base optimizer here is an internal `Adakaon` run at `lr=1`. Each step
 (while adapting):
 
 1. snapshot `p`, run `base.step()` to get the base update `u_t = p_after − p_before`;
@@ -30,18 +30,18 @@ The discovered effective LR is `sum(s)`, read with `get_d()`.
 ### Why Mechanic and not Prodigy
 
 A matched-effective-LR ablation found `KProdigy` (Prodigy's Adam-form
-D-adaptation) converges ~2× worse than `Adafusion` on a mini pixel-DDPM, and the
+D-adaptation) converges ~2× worse than `Adakaon` on a mini pixel-DDPM, and the
 gap isolates entirely to **first-moment placement relative to the √v
 normalization**:
 
 - KProdigy / Adam / Prodigy: `delta = ema(d·g) / √v` — momentum of the *raw*
   gradient, then normalize.
-- Adafusion: `delta = ema(clip(g / √v))` — normalize + RMS-clip first, *then*
+- Adakaon: `delta = ema(clip(g / √v))` — normalize + RMS-clip first, *then*
   momentum.
 
-Adafusion's ordering is the better one, and Prodigy's D-estimator is derived for
+Adakaon's ordering is the better one, and Prodigy's D-estimator is derived for
 the Adam form, so it doesn't transplant cleanly. Mechanic sidesteps the problem:
-because it only sees `Delta` and `g`, it keeps **Adafusion's update verbatim** and
+because it only sees `Delta` and `g`, it keeps **Adakaon's update verbatim** and
 just auto-discovers its scale.
 
 ## Freeze-to-free (the headline)
@@ -53,15 +53,15 @@ pure waste. `lr_freeze` ends adaptation:
 - `"auto"` (**default**) — freeze when `sum(s)` plateaus (relative change stays
   small and near the running max for a number of consecutive steps).
 - `int N` — freeze after `N` steps.
-- `None` — never freeze (plain Mechanic-tuned Adafusion).
+- `None` — never freeze (plain Mechanic-tuned Adakaon).
 
-On freeze, `Autofusion` records `S = sum(s)`, **sets the inner Adafusion's `lr` to
+On freeze, `Autofusion` records `S = sum(s)`, **sets the inner Adakaon's `lr` to
 `S`**, frees `ref` and the tuner scalars, and routes every later `step()` straight
-to `base.step()`. After freeze it **is** plain Adafusion at `lr=S` — same memory
+to `base.step()`. After freeze it **is** plain Adakaon at `lr=S` — same memory
 (`ref` gone), same speed (no wrapper passes), same update — *by construction*.
 
-With the default `adafusion_betas=(0.0, 0.999)` (beta1=0, the minimum-VRAM
-config), Adafusion's update is linear in `lr`, so the handoff is **bit-exact**:
+With the default `adakaon_betas=(0.0, 0.999)` (beta1=0, the minimum-VRAM
+config), Adakaon's update is linear in `lr`, so the handoff is **bit-exact**:
 `base.step(lr=1)` then `p = ref + S·Δ` equals `base.step(lr=S)`.
 
 With `beta1 > 0` (momentum) the first-moment EMA is also linear in `lr` but
@@ -105,7 +105,7 @@ Cosine anneals it — no manual peak-LR tuning. (A scheduler that reads
 ### Checkpointing
 
 `state_dict()` / `load_state_dict()` capture the **full** optimizer — the base
-Adafusion *and* the Mechanic tuner (`s`/`v`/`reward`/`max_product`/`ref`/seeds)
+Adakaon *and* the Mechanic tuner (`s`/`v`/`reward`/`max_product`/`ref`/seeds)
 *and* the freeze bookkeeping — so a checkpoint taken **mid-warmup** resumes the LR
 adaptation exactly (no cold-start re-bootstrap), and a **frozen** checkpoint
 resumes frozen (no disruptive un-freeze + re-warmup). The snapshot is independent:
@@ -123,13 +123,13 @@ Autofusion(
     scale_cap_rel=6.0,              # advanced / rarely needed (see below)
     betas=(0.9, ..., 0.999999),     # the 6 Mechanic tuner recency horizons
     s_decay=0.01, eps=1e-8,
-    adafusion_betas=(0.0, 0.999),   # inner Adafusion momentum betas (beta1=0 => bit-exact freeze)
+    adakaon_betas=(0.0, 0.999),   # inner Adakaon momentum betas (beta1=0 => bit-exact freeze)
     foreach_warmup=True,            # batch the warmup passes (LoRA: many small tensors)
-    **adafusion_kwargs,             # clip_threshold, cautious, momentum_dtype, bf16_method, foreach, ...
+    **adakaon_kwargs,             # clip_threshold, cautious, momentum_dtype, bf16_method, foreach, ...
 )
 ```
 
-**The common case is just `Autofusion(params, **adafusion_kwargs)`** — minimal and
+**The common case is just `Autofusion(params, **adakaon_kwargs)`** — minimal and
 parameter-free. The empirical scaffolding that accumulated across the tuning
 campaign (`store_delta`, `s_init_rel`, `scale_floor_frac`, the auto-freeze
 `tol`/`patience`/`max_frac`) is now **internal constants** at their validated
@@ -148,17 +148,17 @@ power user training a very LR-sensitive model who wants a tighter/looser ceiling
 ## Validated results (the campaign)
 
 - **Real SDXL LoRA.** The auto-discovered LR is **1.66e-3, stable across seeds**,
-  and lands the model **within ~1.8% of tuned Adafusion's val loss** — no LR
+  and lands the model **within ~1.8% of tuned Adakaon's val loss** — no LR
   search. The data-relative cap **generalizes**: validation is flat across
   `scale_cap_rel` 3–12.
-- **Freeze == Adafusion.** After freeze the optimizer is plain Adafusion: measured
-  **1.04× the speed** of (i.e. essentially identical to) plain Adafusion, at
+- **Freeze == Adakaon.** After freeze the optimizer is plain Adakaon: measured
+  **1.04× the speed** of (i.e. essentially identical to) plain Adakaon, at
   **0.5 B/param** extra state during the short warmup only, on the real LoRA.
 - **Honest caveats:**
   - The warmup step is ~**8× the cost of one optimizer step** (it runs the base
     step plus the foreach-batched Mechanic passes). It is short and then frozen, so
     in practice it is ~2× a full step **during warmup only**, then free.
-  - It **matches but does not beat** tuned Adafusion — the value prop is "no LR to
+  - It **matches but does not beat** tuned Adakaon — the value prop is "no LR to
     tune," not better quality.
   - The real-LoRA task wasn't very LR-sensitive, which is part of why the cap
     generalized so flatly; a more LR-sensitive model is exactly where
@@ -174,8 +174,8 @@ full-FT users get freeze-to-free without the warmup-time VRAM bump.
 
 ## See also
 
-- [adafusion.md](adafusion.md) — the base optimizer's design and API.
+- [adakaon.md](adakaon.md) — the base optimizer's design and API.
 - [foreach-batching.md](foreach-batching.md) — the multi-tensor batching reused for
   the warmup passes.
-- [momentum.md](momentum.md) — the cheap-momentum dial (`adafusion_betas` /
+- [momentum.md](momentum.md) — the cheap-momentum dial (`adakaon_betas` /
   `momentum_dtype`).

@@ -1,14 +1,14 @@
-"""Lion — sign-momentum update on Adafusion's precision/memory backend.
+"""Lion — sign-momentum update on Adakaon's precision/memory backend.
 
 Lion (Chen et al. 2023, *Symbolic Discovery of Optimization Algorithms*,
 arXiv:2302.06675) — a sign-of-momentum optimizer that keeps a **single** momentum
 buffer and **no second moment** — implemented on top of the precision and memory
-machinery already proven in :class:`~kaon.adafusion.Adafusion`. It is a
+machinery already proven in :class:`~kaon.adakaon.Adakaon`. It is a
 deliberate generalization / ablation vehicle: same quantized-momentum store, same
 bf16-correct stochastic rounding, same cautious masking and foreach batching as
-Adafusion, but with Lion's update rule instead of the factored-second-moment
-Adam-style step. Keeping it a separate class lets it be A/B'd against Adafusion
-cleanly (Adafusion is left byte-for-byte unchanged).
+Adakaon, but with Lion's update rule instead of the factored-second-moment
+Adam-style step. Keeping it a separate class lets it be A/B'd against Adakaon
+cleanly (Adakaon is left byte-for-byte unchanged).
 
 (Developed under the provisional code name *Liofusion*.)
 
@@ -24,12 +24,12 @@ cleanly (Adafusion is left byte-for-byte unchanged).
 The direction uses the *old* momentum interpolated with the current gradient at
 ``beta1``; the stored momentum is then advanced with the (usually larger)
 ``beta2``. This is exactly Lion. Note the EMA is on the **raw gradient**, unlike
-Adafusion (which takes momentum of the already-normalized update).
+Adakaon (which takes momentum of the already-normalized update).
 
 **Why this is cheap (the headline):**
 
 * **One** state buffer (the momentum), **no** second moment — half the live
-  optimizer state of Adam/Adafusion-with-momentum before quantization.
+  optimizer state of Adam/Adakaon-with-momentum before quantization.
 * That single buffer is stored through the **shared momentum codec layout**
   (``bfloat16`` ~2 B/param, ``int8`` ~1 B/param, ``4bit`` ~0.5 B/param), so
   Lion's optimizer-state floor is Lion-class or better.
@@ -37,18 +37,18 @@ Adafusion (which takes momentum of the already-normalized update).
   reconstruction, no RMS clip.
 
 **lr is Lion-scale.** Lion's sign update has unit magnitude per coordinate, so a
-good ``lr`` is typically **~3-10x smaller** than the AdamW/Adafusion lr for the
+good ``lr`` is typically **~3-10x smaller** than the AdamW/Adakaon lr for the
 same model. Weight decay is decoupled (AdamW-style) and Lion usually wants it a
 bit larger than Adam to compensate for the unit-magnitude steps.
 
 **Cautious masking** (Liang et al. 2024) is supported and on by default. The
 update is already ``sign(c)``; cautious zeroes the coordinates where that sign
 disagrees with the current gradient sign (``update * g <= 0``) and rescales the
-survivors to preserve the mean step magnitude — the same semantics Adafusion
+survivors to preserve the mean step magnitude — the same semantics Adakaon
 uses. With pure sign updates this is a per-coordinate agreement filter between
 the momentum-interpolated direction and the instantaneous gradient.
 
-**What is reused vs new.** Reused from Adafusion's backend: the momentum storage
+**What is reused vs new.** Reused from Adakaon's backend: the momentum storage
 layout and the quant/dequant primitives in :mod:`kaon._momentum_codec`
 (int8 per-row absmax; 4-bit per-block absmax, nibble-packed), the
 stochastic-rounding bf16 weight update (:func:`kaon._stochastic_rounding.add_stochastic_`),
@@ -89,7 +89,7 @@ __all__ = ["Lion"]
 _LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
-# Performance cutoff (mirrors Adafusion): weights larger than this loop instead
+# Performance cutoff (mirrors Adakaon): weights larger than this loop instead
 # of being stacked — batching only pays off while per-tensor kernel-launch
 # overhead dominates (small tensors); a large weight's sign step is
 # bandwidth-bound, so stacking just adds copy traffic.
@@ -105,12 +105,12 @@ def _is_low_precision(t: Tensor) -> bool:
 
 
 class Lion(Optimizer):
-    """Lion sign-momentum optimizer on Adafusion's quantized-momentum backend.
+    """Lion sign-momentum optimizer on Adakaon's quantized-momentum backend.
 
     Args:
         params: parameters or param-group dicts.
         lr: learning rate. **Lion-scale** — typically ~3-10x smaller than the
-            AdamW/Adafusion lr for the same model (the sign update has unit
+            AdamW/Adakaon lr for the same model (the sign update has unit
             magnitude per coordinate).
         betas: ``(beta1, beta2)``. ``beta1`` interpolates the *direction*
             (``sign(beta1*m + (1-beta1)*g)``); ``beta2`` is the momentum EMA decay
@@ -120,7 +120,7 @@ class Lion(Optimizer):
         momentum_dtype: storage for the single momentum buffer — ``"bfloat16"``
             (default, ~2 B/param), ``"float32"`` (4 B/param), ``"int8"`` (~1
             B/param, per-row absmax), or ``"4bit"`` (~0.5 B/param, per-block
-            absmax, nibble-packed). Same storage layout as Adafusion's first
+            absmax, nibble-packed). Same storage layout as Adakaon's first
             moment, so checkpoints resume bit-exactly via ``load_state_dict``.
         momentum_4bit_block: block size for ``momentum_dtype="4bit"`` (consecutive
             flattened elements sharing one absmax scale). Default ``128``.
@@ -207,7 +207,7 @@ class Lion(Optimizer):
 
         Layout matches :mod:`kaon._momentum_codec` exactly (per-row int8 scale,
         per-block 4-bit scale, zero == nibble 8) so checkpoint resume and
-        ``load_state_dict_preserving_dtypes`` behave identically to Adafusion.
+        ``load_state_dict_preserving_dtypes`` behave identically to Adakaon.
         """
         grad = p.grad
         md = group["momentum_dtype"]
