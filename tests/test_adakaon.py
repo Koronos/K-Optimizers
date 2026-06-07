@@ -278,12 +278,13 @@ def test_foreach_batch_cutoff_validation():
 def test_foreach_budget_capped_at_4x_cutoff():
     """The adaptive chunk budget never exceeds 4x the cutoff (over-stacking guard)
     and scales with the cutoff. Deterministic on CPU (no VRAM read)."""
+    from kaon._backend import foreach_budget
+
     cpu = torch.device("cpu")
-    p = [torch.nn.Parameter(torch.randn(4, 4))]
-    assert Adakaon(p, foreach_batch_cutoff=2_000_000)._foreach_budget(cpu) == 8_000_000
-    assert Adakaon(p, foreach_batch_cutoff=5_000_000)._foreach_budget(cpu) == 20_000_000
+    assert foreach_budget(None, 2_000_000, 48, cpu) == 8_000_000
+    assert foreach_budget(None, 5_000_000, 48, cpu) == 20_000_000
     # an explicit budget is respected verbatim (not capped)
-    assert Adakaon(p, foreach_stack_budget=99_000_000)._foreach_budget(cpu) == 99_000_000
+    assert foreach_budget(99_000_000, 2_000_000, 48, cpu) == 99_000_000
 
 
 def test_foreach_batch_cutoff_routes_large_to_loop_exactly():

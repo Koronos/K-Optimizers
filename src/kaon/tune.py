@@ -34,7 +34,7 @@ from collections.abc import Sequence
 import torch
 
 from kaon import Adakaon
-from kaon.adakaon import _FOREACH_BATCH_CUTOFF
+from kaon._backend import FOREACH_BATCH_CUTOFF
 
 
 def _read_safetensors_shapes(path: str, prefix: str | None) -> list[tuple[int, ...]]:
@@ -187,11 +187,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     opt_kwargs = _opt_kwargs(args)
 
     loop_ms = _time_step(params, opt_kwargs, foreach=False)
-    default_ms = _time_step(params, opt_kwargs, foreach=True, cutoff=_FOREACH_BATCH_CUTOFF)
+    default_ms = _time_step(params, opt_kwargs, foreach=True, cutoff=FOREACH_BATCH_CUTOFF)
     print(f"per-param loop            : {loop_ms:8.1f} ms/step")
     if default_ms:
         speed = loop_ms / default_ms
-        print(f"foreach @ default ({_FOREACH_BATCH_CUTOFF//1000}k)  : {default_ms:8.1f} ms/step  ({speed:.2f}x vs loop)")
+        print(f"foreach @ default ({FOREACH_BATCH_CUTOFF//1000}k)  : {default_ms:8.1f} ms/step  ({speed:.2f}x vs loop)")
     print()
 
     cutoffs = [int(x) for x in args.cutoffs.split(",")]
@@ -201,7 +201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ms = _time_step(params, opt_kwargs, foreach=True, cutoff=c)
         results.append((c, ms))
         tag = "OOM" if ms is None else f"{ms:8.1f} ms"
-        star = "  <- default" if c == _FOREACH_BATCH_CUTOFF else ""
+        star = "  <- default" if c == FOREACH_BATCH_CUTOFF else ""
         print(f"  cutoff {c//1000:>6}k : {tag}{star}")
 
     ok = [(c, ms) for c, ms in results if ms is not None]
@@ -211,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     best_c, best_ms = min(ok, key=lambda r: r[1])
     print()
     if default_ms is not None and best_ms >= default_ms * 0.95:
-        print(f"==> Keep the default: foreach_batch_cutoff={_FOREACH_BATCH_CUTOFF} "
+        print(f"==> Keep the default: foreach_batch_cutoff={FOREACH_BATCH_CUTOFF} "
               f"(within ~5% of the best, {best_c//1000}k).")
     else:
         print(f"==> Consider foreach_batch_cutoff={best_c} on this GPU "

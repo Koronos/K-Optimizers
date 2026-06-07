@@ -59,7 +59,9 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kaon._backend import (
+    FOREACH_BATCH_CUTOFF,
     cautious_batched_,
+    foreach_budget,
     is_low_precision,
     subtract_batched_,
     subtract_one_,
@@ -85,11 +87,7 @@ _UPDATE_RMS = 0.2
 # Foreach batching knobs — mirror Adakaon's (kept local so AdaMuon is a
 # standalone module, not coupled to adakaon.py internals). See
 # docs/foreach-batching.md for the rationale behind each constant.
-_STACK_SAFETY_FRACTION = 0.10
 _STACK_BYTES_PER_ELEM = 48
-_MIN_STACK_ELEMS = 262_144
-_DEFAULT_STACK_ELEMS = 64_000_000
-_FOREACH_BATCH_CUTOFF = 2_000_000
 
 
 def _rms(t: Tensor) -> Tensor:
@@ -230,7 +228,7 @@ class AdaMuon(Optimizer):
         cautious: bool = True,
         bf16_method: str = "stochastic_rounding",
         foreach: bool = True,
-        foreach_batch_cutoff: int = _FOREACH_BATCH_CUTOFF,
+        foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
         compile: bool = False,  # noqa: A002 — public kwarg name
     ) -> None:
@@ -325,7 +323,7 @@ class AdaMuon(Optimizer):
                 if p.grad.is_sparse:
                     raise RuntimeError("AdaMuon does not support sparse gradients")
             if self._foreach and self._group_foreach_eligible(group):
-                chunk_budget = self._foreach_budget(params[0].device)
+                chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
                 cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)
                 fast: list[Tensor] = []
                 slow: list[Tensor] = []
@@ -353,16 +351,6 @@ class AdaMuon(Optimizer):
         load_state_dict_preserving_dtypes(self, state_dict)
 
     # ----------------------------------------------------------------- foreach
-    def _foreach_budget(self, device: torch.device) -> int:
-        """Max elements per stacked chunk (mirrors Adakaon's adaptive budget)."""
-        if self._foreach_stack_budget is not None:
-            return self._foreach_stack_budget
-        cap = 4 * self._foreach_batch_cutoff
-        if device.type == "cuda":
-            free_bytes = torch.cuda.mem_get_info(device)[0]
-            adaptive = int(free_bytes * _STACK_SAFETY_FRACTION / _STACK_BYTES_PER_ELEM)
-            return max(_MIN_STACK_ELEMS, min(adaptive, cap))
-        return min(_DEFAULT_STACK_ELEMS, cap)
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:

@@ -41,8 +41,10 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kaon._backend import (
+    FOREACH_BATCH_CUTOFF,
     cautious_batched_,
     cautious_one_,
+    foreach_budget,
     is_low_precision,
     subtract_batched_,
     subtract_one_,
@@ -88,15 +90,12 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 # large weights), while a constrained card shrinks the chunk and stays safe. The
 # budget is `free_bytes * SAFETY_FRACTION / BYTES_PER_ELEM`; the divisor accounts
 # for the ~handful of simultaneous transient copies a chunk touches at peak.
-_STACK_SAFETY_FRACTION = 0.10   # use at most ~10% of currently-free VRAM per chunk
 # Peak transient bytes per stacked element. This is a property of the optimizer's
 # intermediate tensors, NOT of the model: measured byte-for-byte identical on SDXL
 # and Cosmos shapes. It depends only on the path and config — 2-D factored 24 B
 # (common) / 38 B (momentum+wd+cautious), 1-D non-factored 28 B / 42 B (it also
 # stacks the full second-moment state). 48 = worst measured (42.1) + margin.
 _STACK_BYTES_PER_ELEM = 48
-_MIN_STACK_ELEMS = 262_144      # still batch small tensors even under memory pressure
-_DEFAULT_STACK_ELEMS = 64_000_000  # CPU / unknown device: no VRAM limit to respect
 
 # Per-tensor element count above which a weight is stepped by the per-parameter
 # loop instead of being stacked. This is a PERFORMANCE threshold, deliberately
@@ -108,7 +107,6 @@ _DEFAULT_STACK_ELEMS = 64_000_000  # CPU / unknown device: no VRAM limit to resp
 # models — i.e. the crossover is an absolute element count, NOT a fraction of
 # VRAM (so it must not scale with the card). 2 M sits in the middle of that
 # plateau. See docs/foreach-batching.md.
-_FOREACH_BATCH_CUTOFF = 2_000_000
 
 
 def _rms(t: Tensor) -> Tensor:
@@ -197,7 +195,7 @@ class Adakaon(Optimizer):
         cautious: bool = True,
         bf16_method: str = "stochastic_rounding",
         foreach: bool = True,
-        foreach_batch_cutoff: int = _FOREACH_BATCH_CUTOFF,
+        foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
@@ -286,7 +284,7 @@ class Adakaon(Optimizer):
                 if p.grad.is_sparse:
                     raise RuntimeError("Adakaon does not support sparse gradients")
             if self._foreach and self._group_foreach_eligible(group):
-                chunk_budget = self._foreach_budget(params[0].device)
+                chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
                 # Effective cutoff = the performance threshold, lowered only if the
                 # memory budget can't fit two of a tensor in a chunk (so batching
                 # would be a wasteful stack-of-1). Roomy card -> cutoff wins;
@@ -320,27 +318,6 @@ class Adakaon(Optimizer):
         load_state_dict_preserving_dtypes(self, state_dict)
 
     # ----------------------------------------------------------------- foreach
-    def _foreach_budget(self, device: torch.device) -> int:
-        """Max elements per stacked chunk.
-
-        An explicit ``foreach_stack_budget`` int is returned verbatim. Otherwise the
-        chunk is ``min(adaptive_to_free_VRAM, 4 * batch_cutoff)``:
-
-        * the VRAM term shrinks the chunk when a big model already fills the card
-          (OOM safety) and grows it on a roomy card;
-        * the ``4 * batch_cutoff`` cap stops over-stacking — beyond a few
-          cutoff-sized tensors, stacking medium weights just adds copy bandwidth and
-          is slower (measured on full FT). Tying the cap to the cutoff keeps a single
-          performance knob, and a roomy card no longer over-stacks.
-        """
-        if self._foreach_stack_budget is not None:
-            return self._foreach_stack_budget
-        cap = 4 * self._foreach_batch_cutoff
-        if device.type == "cuda":
-            free_bytes = torch.cuda.mem_get_info(device)[0]
-            adaptive = int(free_bytes * _STACK_SAFETY_FRACTION / _STACK_BYTES_PER_ELEM)
-            return max(_MIN_STACK_ELEMS, min(adaptive, cap))
-        return min(_DEFAULT_STACK_ELEMS, cap)
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:

@@ -18,9 +18,14 @@ from torch import Tensor
 from kaon._stochastic_rounding import add_stochastic_
 
 __all__ = [
+    "DEFAULT_STACK_ELEMS",
+    "FOREACH_BATCH_CUTOFF",
     "LOW_PRECISION",
+    "MIN_STACK_ELEMS",
+    "STACK_SAFETY_FRACTION",
     "cautious_batched_",
     "cautious_one_",
+    "foreach_budget",
     "is_low_precision",
     "subtract_batched_",
     "subtract_one_",
@@ -31,6 +36,36 @@ LOW_PRECISION = (torch.bfloat16, torch.float16)
 
 def is_low_precision(t: Tensor) -> bool:
     return t.dtype in LOW_PRECISION
+
+
+# ----------------------------- foreach budget -----------------------------
+# Shared foreach-batching knobs (the per-optimizer ``bytes_per_elem`` differs and is
+# passed in; everything else is identical across optimizers). See docs/foreach-batching.md.
+FOREACH_BATCH_CUTOFF = 2_000_000   # per-tensor element cap above which a weight loops (perf)
+STACK_SAFETY_FRACTION = 0.10       # use at most ~10% of currently-free VRAM per stacked chunk
+MIN_STACK_ELEMS = 262_144          # still batch small tensors even under memory pressure
+DEFAULT_STACK_ELEMS = 64_000_000   # CPU / unknown device: no VRAM limit to respect
+
+
+def foreach_budget(stack_budget: int | None, batch_cutoff: int, bytes_per_elem: int,
+                   device: torch.device) -> int:
+    """Max elements per stacked chunk for the foreach path.
+
+    An explicit ``stack_budget`` is returned verbatim. Otherwise the chunk is
+    ``min(adaptive_to_free_VRAM, 4 * batch_cutoff)``: the VRAM term shrinks the chunk when a
+    big model already fills the card (OOM safety) and grows it on a roomy one; the
+    ``4 * batch_cutoff`` cap stops over-stacking (beyond a few cutoff-sized tensors, stacking
+    medium weights just adds copy bandwidth). ``bytes_per_elem`` is the optimizer's stacked
+    working-set estimate per element (more momenta -> larger).
+    """
+    if stack_budget is not None:
+        return stack_budget
+    cap = 4 * batch_cutoff
+    if device.type == "cuda":
+        free_bytes = torch.cuda.mem_get_info(device)[0]
+        adaptive = int(free_bytes * STACK_SAFETY_FRACTION / bytes_per_elem)
+        return max(MIN_STACK_ELEMS, min(adaptive, cap))
+    return min(DEFAULT_STACK_ELEMS, cap)
 
 
 # ----------------------------- weight write: p -= delta -----------------------------

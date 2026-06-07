@@ -56,8 +56,10 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kaon._backend import (
+    FOREACH_BATCH_CUTOFF,
     cautious_batched_,
     cautious_one_,
+    foreach_budget,
     is_low_precision,
     subtract_batched_,
     subtract_one_,
@@ -78,11 +80,7 @@ SecondMoment = Literal["full", "factored"]
 
 # Reuse Adakaon's adaptive-VRAM foreach stacking constants so a KProdigy chunk
 # budget never OOMs a full fine-tune (same engine, same safety story).
-_STACK_SAFETY_FRACTION = 0.10
 _STACK_BYTES_PER_ELEM = 48
-_MIN_STACK_ELEMS = 262_144
-_DEFAULT_STACK_ELEMS = 64_000_000
-_FOREACH_BATCH_CUTOFF = 2_000_000
 
 
 def _rms(t: Tensor) -> Tensor:
@@ -176,7 +174,7 @@ class KProdigy(Optimizer):
         bf16_method: str = "stochastic_rounding",
         factor_conv_as_matrix: bool = True,
         foreach: bool = True,
-        foreach_batch_cutoff: int = _FOREACH_BATCH_CUTOFF,
+        foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
@@ -712,7 +710,7 @@ class KProdigy(Optimizer):
         if not params:
             return
         if self._foreach and self._group_foreach_eligible(group):
-            chunk_budget = self._foreach_budget(params[0].device)
+            chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
             cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)
             fast: list[Tensor] = []
             slow: list[Tensor] = []
@@ -731,15 +729,6 @@ class KProdigy(Optimizer):
 
     # -- foreach eligibility / budget (mirrors Adakaon) ------------------
 
-    def _foreach_budget(self, device: torch.device) -> int:
-        if self._foreach_stack_budget is not None:
-            return self._foreach_stack_budget
-        cap = 4 * self._foreach_batch_cutoff
-        if device.type == "cuda":
-            free_bytes = torch.cuda.mem_get_info(device)[0]
-            adaptive = int(free_bytes * _STACK_SAFETY_FRACTION / _STACK_BYTES_PER_ELEM)
-            return max(_MIN_STACK_ELEMS, min(adaptive, cap))
-        return min(_DEFAULT_STACK_ELEMS, cap)
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
