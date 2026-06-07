@@ -6,7 +6,7 @@
 > live anchor with the blow-by-blow is `tmp/CANDIDATES_V2_PLAN.md` (gitignored).**
 
 ## TL;DR
-- **7 candidates** (AdaBelief, MARS, AdEMAMix, Adan, ScheduleFree, ADOPT, Grams) built on the shared backend (codec momentum + factored quantized 2nd moment +
+- **8 candidates** (AdaBelief, MARS, AdEMAMix, Adan, ScheduleFree, ADOPT, Grams, AdamP) built on the shared backend (codec momentum + factored quantized 2nd moment +
   bit-exact foreach + cautious + GC + dtype-safe checkpoint), each with **bit-exact foreach↔per-param
   parity** across {fp32, bf16, int8, 4bit} and a reference-correctness test. ~210 new tests, all green.
 - **Two candidates win a rank-1 axis** in the 13-optimizer control battery (C=128, N=2000, 2-seed):
@@ -28,23 +28,24 @@ Tuned on the C96/N800 proxy (ranked by held-out loss); the battery runs them at 
 on the REX + progressive-resolution recipe. **Lower is better everywhere.** Full tables:
 [`RANKINGS.md`](RANKINGS.md); cache: [`results.json`](results.json).
 
-### Overall (mean rank — a weak picker; read the 🥇 wins). Field of 14.
+### Overall (mean rank — a weak picker; read the 🥇 wins). Field of 15.
 | # | optimizer | mean rank | 🥇 rank-1 |
 |---|---|---|---|
-| 1 | Lion | 4.6 | — |
-| 2 | Adakaon-nomom | 4.9 | 🥇 memory |
-| 3 | Adakaon-bf16 | 6.3 | 🥇 loss |
-| 4 | torch.AdamW (fused) | 6.6 | 🥇 iter/LoRA-speed |
-| 5 | **ScheduleFree** | 6.6 | **🥇 convergence** |
-| 6 | **ADOPT** | 6.9 | **🥇 generalization** |
-| 7 | AdaBelief-b999 | 7.1 | — |
-| 8 | AdaBelief | 7.7 | — |
-| 9 | AdaPNM | 8.1 | 🥇 constant-LR |
-| 10 | MARS | 8.1 | — |
-| 11 | AdaMuon | 8.4 | — |
-| 12 | AdEMAMix | 9.1 | — |
-| 13 | Adan | 10.0 | — |
-| 14 | Grams | 10.6 | — |
+| 1 | Lion | 4.9 | — |
+| 2 | Adakaon-nomom | 5.1 | 🥇 memory |
+| 3 | Adakaon-bf16 | 6.6 | 🥇 loss |
+| 4 | torch.AdamW (fused) | 7.0 | 🥇 iter/LoRA-speed |
+| 5 | **ScheduleFree** | 7.0 | **🥇 convergence** |
+| 6 | **ADOPT** | 7.1 | **🥇 generalization** |
+| 7 | AdaBelief-b999 | 7.7 | — |
+| 8 | AdaBelief | 8.0 | — |
+| 9 | AdaPNM | 8.6 | 🥇 constant-LR |
+| 10 | MARS | 8.7 | — |
+| 11 | AdaMuon | 8.9 | — |
+| 12 | AdamP | 8.9 | — |
+| 13 | AdEMAMix | 9.7 | — |
+| 14 | Adan | 10.9 | — |
+| 15 | Grams | 11.0 | — |
 
 ### Per-candidate verdict
 | candidate | tuned config (proxy) | te / gap @ C128 | B/p | LoRA ms | verdict |
@@ -57,6 +58,7 @@ on the REX + progressive-resolution recipe. **Lower is better everywhere.** Full
 | AdEMAMix | lr5e-4, α=5, no warmup | 0.0792 / +0.0162 | 4.03 | 6.57 | under-served by a short proxy (slow-EMA wants long runs) — re-judge long before discarding. |
 | Adan | lr1.5e-3, int8 | 0.0783 / +0.0133 | 3.04 | 12.29 | weakest case: heaviest (3 buffers) + slowest; gap ok but not enough to justify the cost. |
 | Grams | lr4e-3 | 0.0806 / +0.0210 | 2.03 | 5.01 | light + decent loss, but **gap-poor at scale** (sign(g) drives loss down → memorizes; looked low-gap on the short proxy then reversed). Not for the gap thesis. |
+| AdamP | lr1e-3, wd0.05 | 0.0747 / +0.0132 | 2.03 | 7.51 | good loss + decent gap + good continuity + light, **but slowest per-step** (18.2 ms — the per-channel projection cost). Its signature projection barely fires on the proxy (delta=0 ≡ delta=0.1) → ≈AdamW here; its edge needs scale-invariant weights + long training. Re-judge on a real run. |
 
 ### The headline tables (excerpts)
 **Generalization (by gap — the small-data headline):** ADOPT +0.0070 · AdaPNM +0.0079 · AdamW +0.0103 ·

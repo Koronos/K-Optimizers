@@ -22,6 +22,7 @@ from kaon import (
     AdaBelief,
     Adakaon,
     AdaMuon,
+    AdamP,
     Adan,
     AdaPNM,
     AdEMAMix,
@@ -94,6 +95,11 @@ OPTIMIZERS = {
         make=lambda p, lr: Grams(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16"),
         lr=4e-3, lr_const=4e-3, family="published",
         blurb="Adam magnitude, direction = sign(current grad) (light, regularizing)",
+    ),
+    "AdamP": dict(
+        make=lambda p, lr: AdamP(p, lr=lr, weight_decay=0.05, cautious=True, momentum_dtype="bfloat16"),
+        lr=1e-3, lr_const=1e-3, family="published",
+        blurb="AdamW minus the radial update on scale-invariant weights (gap-oriented)",
     ),
     "MARS": dict(
         make=lambda p, lr: MARS(p, lr=lr, gamma=0.025, cautious=True, momentum_dtype="bfloat16"),
