@@ -9,7 +9,12 @@ benchmarks/
 │   ├── registry.py         #   every optimizer + its best config (+ optional `variants` to probe)
 │   ├── battery.py          #   RANKS the field: measure → cache → regenerate RANKINGS.md
 │   ├── results.json        #   the per-optimizer ranking cache (git-tracked, reproducible)
+│   ├── results_archive.json#   discarded optimizers' cached numbers (kept after they leave the registry)
 │   ├── RANKINGS.md         #   the generated ranked tables  ← read here
+│   ├── plot_rankings.py    #   renders the cache as charts -> plots/{dashboard,loss_vs_gap}.png
+│   ├── plots/*.png         #   the generated charts (see "At a glance" below)
+│   ├── perceptual_eval.py  #   samples each model + scores sample quality (FID/KID-style proxy)
+│   ├── PERCEPTUAL.md        #   the perceptual-proxy write-up + verdict
 │   ├── profiler.py         #   PROFILES one optimizer: "what does it like?" (LR/sched/warmup/…)
 │   └── profiles/<Name>.md  #   the generated per-optimizer profile
 └── adamuon/                # optimizer-specific deep-dives (historical campaign)
@@ -35,6 +40,32 @@ we actually care about, and emits easy-to-read **rankings** ([`control/RANKINGS.
 Everything runs on the reproducible multi-resolution proxy (`512/768/1024` ≙ `32²/48²/64²`) with
 the REX d=0.9 + progressive-resolution recipe — the same setup that stands in for a full
 fine-tune (wide U-Net) and a LoRA (the adapter bag).
+
+## At a glance — the charts
+
+[`plot_rankings.py`](control/plot_rankings.py) renders the cache (`results.json` + any archived
+discards) as two figures. **Color = already-shipped (on main) / new-candidate / reference /
+discarded; `*` (and the ★ in the scatter) = a wrapper that runs over Adakaon as its base
+(ScheduleFree / Lookahead / SAM). Lower is better everywhere.**
+
+```bash
+python benchmarks/control/plot_rankings.py     # re-renders instantly from the cache (no retraining)
+```
+
+### The 6 dimensions at once
+![control battery dashboard](control/plots/dashboard.png)
+
+### Loss × Generalization — the Pareto view (what wins regardless of cost)
+The headline for small-data fine-tuning: **bottom-left is best** (low loss *and* low gap). It shows
+*who's good at any price* — read it together with the dashboard's memory/speed panels, because a
+point that looks great here can still be heavy or slow (e.g. Adan sits in the good region but is the
+2nd-heaviest and 2nd-slowest; the scatter alone hides that).
+
+![loss vs gap Pareto](control/plots/loss_vs_gap.png)
+
+> Discarded optimizers keep their measured numbers in
+> [`results_archive.json`](control/results_archive.json) (a separate cache) so these charts and this
+> README preserve the full historical comparison even after a contender leaves the live `registry.py`.
 
 ### Run it
 
