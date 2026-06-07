@@ -19,6 +19,7 @@ import torch
 from kaon import (
     ADOPT,
     MARS,
+    Adai,
     AdaBelief,
     Adakaon,
     AdaMuon,
@@ -100,6 +101,11 @@ OPTIMIZERS = {
         make=lambda p, lr: AdamP(p, lr=lr, weight_decay=0.05, cautious=True, momentum_dtype="bfloat16"),
         lr=1e-3, lr_const=1e-3, family="published",
         blurb="AdamW minus the radial update on scale-invariant weights (gap-oriented)",
+    ),
+    "Adai": dict(
+        make=lambda p, lr: Adai(p, lr=lr, cautious=True, momentum_dtype="bfloat16"),
+        lr=1.6e-2, lr_const=1.2e-2, family="published",
+        blurb="adaptive per-coord inertia (flat-minima); heavy (fp32 beta1_prod), SGD-scale LR",
     ),
     "MARS": dict(
         make=lambda p, lr: MARS(p, lr=lr, gamma=0.025, cautious=True, momentum_dtype="bfloat16"),

@@ -5,8 +5,17 @@
 > our proxy/profiler/battery infra, and judged against the field. **This is the review doc; the
 > live anchor with the blow-by-blow is `tmp/CANDIDATES_V2_PLAN.md` (gitignored).**
 
+> ⚠️ **Battery-integrity caveat (read before the convergence table).** The battery's common
+> convergence target = "the worst optimizer's best held-out loss". Several candidates here
+> (ADOPT, Grams, Adai) deliberately or structurally **underfit** (high loss) → they raise that
+> common target → the **convergence / time×quality** dimension gets compressed and unreliable for
+> the whole field once they're in it. The **gap, loss, memory, and constant-LR continuity tables
+> are absolute and unaffected — trust those.** For convergence, use the clean **11-optimizer run
+> (target ≤ 0.0813)** where **ScheduleFree was decisively #1** (1125 steps / 15.89 s, beating fused
+> AdamW). A battery fix (fixed/percentile target) is a separate TODO.
+
 ## TL;DR
-- **8 candidates** (AdaBelief, MARS, AdEMAMix, Adan, ScheduleFree, ADOPT, Grams, AdamP) built on the shared backend (codec momentum + factored quantized 2nd moment +
+- **9 candidates** (AdaBelief, MARS, AdEMAMix, Adan, ScheduleFree, ADOPT, Grams, AdamP, Adai) built on the shared backend (codec momentum + factored quantized 2nd moment +
   bit-exact foreach + cautious + GC + dtype-safe checkpoint), each with **bit-exact foreach↔per-param
   parity** across {fp32, bf16, int8, 4bit} and a reference-correctness test. ~210 new tests, all green.
 - **Two candidates win a rank-1 axis** in the 13-optimizer control battery (C=128, N=2000, 2-seed):
@@ -28,24 +37,29 @@ Tuned on the C96/N800 proxy (ranked by held-out loss); the battery runs them at 
 on the REX + progressive-resolution recipe. **Lower is better everywhere.** Full tables:
 [`RANKINGS.md`](RANKINGS.md); cache: [`results.json`](results.json).
 
-### Overall (mean rank — a weak picker; read the 🥇 wins). Field of 15.
+### Overall (mean rank — a weak picker, and the convergence component is distorted; read the 🥇 wins + caveat). Field of 16.
 | # | optimizer | mean rank | 🥇 rank-1 |
 |---|---|---|---|
-| 1 | Lion | 4.9 | — |
-| 2 | Adakaon-nomom | 5.1 | 🥇 memory |
-| 3 | Adakaon-bf16 | 6.6 | 🥇 loss |
-| 4 | torch.AdamW (fused) | 7.0 | 🥇 iter/LoRA-speed |
-| 5 | **ScheduleFree** | 7.0 | **🥇 convergence** |
-| 6 | **ADOPT** | 7.1 | **🥇 generalization** |
-| 7 | AdaBelief-b999 | 7.7 | — |
-| 8 | AdaBelief | 8.0 | — |
-| 9 | AdaPNM | 8.6 | 🥇 constant-LR |
-| 10 | MARS | 8.7 | — |
-| 11 | AdaMuon | 8.9 | — |
-| 12 | AdamP | 8.9 | — |
-| 13 | AdEMAMix | 9.7 | — |
-| 14 | Adan | 10.9 | — |
-| 15 | Grams | 11.0 | — |
+| 1 | Lion | 4.4 | — |
+| 2 | Adakaon-nomom | 4.6 | 🥇 memory (+convergence*) |
+| 3 | Adakaon-bf16 | 6.9 | 🥇 loss |
+| 4 | **ADOPT** | 7.0 | **🥇 generalization** |
+| 5 | torch.AdamW (fused) | 7.6 | 🥇 iter/LoRA-speed |
+| 6 | AdaBelief-b999 | 7.7 | — |
+| 7 | **ScheduleFree** | 8.1 | **🥇 convergence*** (clean 11-field run; masked here by the target caveat) |
+| 8 | AdaBelief | 8.6 | — |
+| 9 | AdaPNM | 8.9 | 🥇 constant-LR |
+| 10 | AdaMuon | 9.0 | — |
+| 11 | MARS | 9.3 | — |
+| 12 | AdamP | 9.4 | — |
+| 13 | AdEMAMix | 10.4 | — |
+| 14 | Adan | 11.1 | — |
+| 15 | Grams | 11.4 | — |
+| 16 | Adai | 11.6 | — |
+
+`*` convergence rank moves with the common target (see the caveat above) — Adakaon-nomom's
+"🥇 convergence" here is an artifact of the underfitting optimizers raising the bar; ScheduleFree
+owns convergence on the clean field.
 
 ### Per-candidate verdict
 | candidate | tuned config (proxy) | te / gap @ C128 | B/p | LoRA ms | verdict |
@@ -59,6 +73,7 @@ on the REX + progressive-resolution recipe. **Lower is better everywhere.** Full
 | Adan | lr1.5e-3, int8 | 0.0783 / +0.0133 | 3.04 | 12.29 | weakest case: heaviest (3 buffers) + slowest; gap ok but not enough to justify the cost. |
 | Grams | lr4e-3 | 0.0806 / +0.0210 | 2.03 | 5.01 | light + decent loss, but **gap-poor at scale** (sign(g) drives loss down → memorizes; looked low-gap on the short proxy then reversed). Not for the gap thesis. |
 | AdamP | lr1e-3, wd0.05 | 0.0747 / +0.0132 | 2.03 | 7.51 | good loss + decent gap + good continuity + light, **but slowest per-step** (18.2 ms — the per-channel projection cost). Its signature projection barely fires on the proxy (delta=0 ≡ delta=0.1) → ≈AdamW here; its edge needs scale-invariant weights + long training. Re-judge on a real run. |
+| Adai | lr1.6e-2 | 0.1170 / +0.0073 | **6.03** | **47.1** | **clear negative result / NOT a keeper.** Heaviest (fp32 `beta1_prod` running product can't be quantized), worst loss (underfits badly — its low gap is pure underfit), and **catastrophically slow on LoRA (47 ms — 10×)** because its *global* v_mean reduction serializes across the 512 tiny adapter tensors. Structurally misaligned with the memory-efficient + launch-bound-LoRA thesis. Useful finding: the global-reduction optimizer class is a poor fit here. |
 
 ### The headline tables (excerpts)
 **Generalization (by gap — the small-data headline):** ADOPT +0.0070 · AdaPNM +0.0079 · AdamW +0.0103 ·
@@ -121,8 +136,11 @@ Lesson reinforced: short-proxy gap/loss does not extrapolate for these mechanism
 battery (and ultimately FID) decides. Don't trust a candidate's proxy gap.
 
 ## Status / next
-- All 7 candidates on `integration/candidates-v2`, OFF main, individually committed, every test green
-  (~210 new tests; full suite passes). Battery field = 14 optimizers, cached.
+- All 9 candidates on `integration/candidates-v2`, OFF main, individually committed, every test green
+  (~250 new tests; full suite 503). Battery field = 16 optimizers, cached.
+- **Battery TODO:** make the convergence target fixed/percentile-based (not "worst optimizer's best")
+  so adding an underfitting optimizer can't distort the convergence/time×quality dimension (see the
+  caveat at the top).
 - **Recommended next:** a real SDXL/Flux LoRA + FID/KID A/B for **ScheduleFree** (convergence/time
   champion, light) and **ADOPT** (gap champion / natural regularizer, light) vs the AdaPNM/Adakaon
   baseline — these two earned it. AdaBelief-b999 is a reasonable third (light, low loss, gap fixed).
