@@ -81,6 +81,10 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
     # torch.optim.Optimizer has no such methods, so this guard leaves every other
     # optimizer's run bit-identical; for SF it computes grads at y and evals at x.
     sf = callable(getattr(opt, "train", None)) and callable(getattr(opt, "eval", None))
+    # SAM-style two-pass optimizers (first_step climbs to w+e, second_step restores + steps
+    # the base opt on the perturbed gradient). The two passes MUST use the same minibatch and
+    # the same noise/timestep draws, so we snapshot+restore the generator state between them.
+    sam = callable(getattr(opt, "first_step", None)) and callable(getattr(opt, "second_step", None))
 
     def evloss(*a):
         if sf:
@@ -103,9 +107,19 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
         for pg in opt.param_groups:
             pg["lr"] = lr * mult
         idx = [tr[(pos + j) % len(tr)] for j in range(bs)]; pos += bs
-        opt.zero_grad()
-        H.batch_loss(net, data[Rr], torch.tensor(idx, device=DEV), ac, g).backward()
-        opt.step()
+        idxt = torch.tensor(idx, device=DEV)
+        if sam:
+            gstate = g.get_state()  # replay the SAME noise/timestep draws on both passes
+            opt.zero_grad()
+            H.batch_loss(net, data[Rr], idxt, ac, g).backward()
+            opt.first_step(zero_grad=True)
+            g.set_state(gstate)
+            H.batch_loss(net, data[Rr], idxt, ac, g).backward()
+            opt.second_step(zero_grad=True)
+        else:
+            opt.zero_grad()
+            H.batch_loss(net, data[Rr], idxt, ac, g).backward()
+            opt.step()
         if ckpt_every and (it + 1) % ckpt_every == 0:
             traj.append((it + 1, evloss(net, data[64], te, ac)))
     if DEV == "cuda":
@@ -118,18 +132,33 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
 
 
 def lora_step_ms(make, lr, reps=50, warmup=10):
-    """Median ms to step a 512-tiny-tensor adapter bag (the launch-bound regime)."""
+    """Median ms to step a 512-tiny-tensor adapter bag (the launch-bound regime).
+
+    SAM-style optimizers do two passes per step; with random grads already attached we
+    time first_step()+second_step() (the perturb-climb + restore + base step), which is the
+    honest ~2x launch cost. The grads are fixed (the bag attaches them once), so no recompute
+    is needed between the passes for a pure launch-cost measurement.
+    """
     params = H.lora_bag()
     opt = make(params, lr)
+    sam = callable(getattr(opt, "first_step", None)) and callable(getattr(opt, "second_step", None))
+
+    def one_step():
+        if sam:
+            opt.first_step(zero_grad=False)
+            opt.second_step(zero_grad=False)
+        else:
+            opt.step()
+
     for _ in range(warmup):
-        opt.step()
+        one_step()
     if DEV == "cuda":
         torch.cuda.synchronize()
     ts = []
     for _ in range(reps):
         if DEV == "cuda":
             torch.cuda.synchronize()
-        t0 = time.time(); opt.step()
+        t0 = time.time(); one_step()
         if DEV == "cuda":
             torch.cuda.synchronize()
         ts.append((time.time() - t0) * 1000.0)

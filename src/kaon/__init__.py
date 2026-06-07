@@ -16,6 +16,8 @@ Optimizers:
     Grams: Adam's magnitude with the update direction set by sign(current gradient) (candidate).
     AdamP: AdamW minus the radial update component on scale-invariant weights (candidate).
     Adai: adaptive per-coordinate inertia (momentum) from the global-normalized variance (candidate).
+    Lookahead: k-step slow-weight averaging wrapper over Adakaon (candidate wrapper).
+    SAM: Sharpness-Aware Minimization (two-pass flat-minima) wrapper over Adakaon (candidate wrapper).
 
 Quickstart::
 
@@ -43,7 +45,9 @@ from kaon.autokaon import Autokaon
 from kaon.grams import Grams
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
+from kaon.lookahead import Lookahead
 from kaon.mars import MARS
+from kaon.sam import SAM
 from kaon.schedulefree import ScheduleFree
 
 __all__ = [
@@ -60,7 +64,9 @@ __all__ = [
     "Grams",
     "KProdigy",
     "Lion",
+    "Lookahead",
     "MARS",
+    "SAM",
     "ScheduleFree",
     "__version__",
 ]
