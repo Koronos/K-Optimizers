@@ -120,21 +120,64 @@ opt = Autokaon(
 
 ## Recipes
 
-| Goal | Configuration |
-|---|---|
-| **Minimum VRAM** (large model) | `Adakaon(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` |
-| **LoRA / LoKr adapters** (many small weights) | `Adakaon(..., betas=(0.0,0.999), bf16_method="stochastic_rounding")` — `foreach=True` (default) batches the hundreds of adapter tensors |
-| **AdamW-quality, low memory** | `Adakaon(..., betas=(0.9,0.999), momentum_dtype="bfloat16")` |
-| **Lion8bit-class memory + momentum** | `Adakaon(..., betas=(0.9,0.999), momentum_dtype="int8")` |
-| **Best convergence (memory available)** | `Muon(..., lr=2e-2, momentum_dtype="bfloat16")` |
-| **Beat-AdamW precision at Adafactor memory** | `AdaMuon(..., lr=1e-3, momentum_dtype="int8")` — orthogonalized momentum + factored 2nd moment; `ns_steps=2`/`cautious=True` defaults, optional `compile=True` |
-| **Absolute minimum state (no 2nd moment)** | `Lion(..., lr=2e-4, betas=(0.95,0.98), momentum_dtype="4bit")` — Lion sign-momentum at 0.5 B/param; implicit regularization for small-data fine-tuning |
-| **No LR to tune (SDXL UNet+TE)** | `KProdigy([{"params": unet, "lr": 1.0}, {"params": te, "lr": 1.0}])` |
-| **Parameter-free + minimum VRAM** | `KProdigy(..., second_moment="factored", momentum_dtype="bfloat16", slice_p=11)` |
-| **No LR to tune + ~free after warmup** | `Autokaon(..., bf16_method="stochastic_rounding")` — auto-discovers the LR, then freezes to plain Adakaon |
+Each line below is a **complete call** — paste it, swap in your `model.parameters()`, and
+re-tune `lr` on your data. The **benchmark behind each recipe** (real numbers + links) lives in
+**[docs/recipes.md](docs/recipes.md)**.
+
+**Small-data fine-tuning (LoRA / DreamBooth)** — rank by the train–val *gap*, not the loss:
+
+```python
+from kaon import AdaPNM, Lion, Adakaon
+
+# Best generalization; the only one happy on a constant (resumable) LR:
+AdaPNM(model.parameters(), lr=2e-3, betas=(0.8, 0.999), beta0=0.5)
+
+# Lightest state (no 2nd moment), regularizing sign-momentum — ~0.5 B/param:
+Lion(model.parameters(), lr=2e-4, betas=(0.95, 0.98), momentum_dtype="4bit")
+
+# Minimum VRAM, regularizing (no momentum) — near-zero optimizer state:
+Adakaon(model.parameters(), lr=1e-4, betas=(0.0, 0.999), bf16_method="stochastic_rounding")
+```
+
+**Maximum quality / fastest convergence-to-quality:**
+
+```python
+from kaon import AdaMuon, Muon, Adakaon
+
+# Beat AdamW on convergence at Adafactor memory (~1 B/param int8; ns_steps=2/cautious defaults):
+AdaMuon(model.parameters(), lr=1e-3, momentum_dtype="int8")
+
+# Best convergence quality when memory is available:
+Muon(model.parameters(), lr=2e-2, momentum_dtype="bfloat16")
+
+# AdamW-quality at 1/4–1/8 the memory (bf16 = 2 B/param; int8 = ~1 B/param, near-lossless):
+Adakaon(model.parameters(), lr=1e-4, betas=(0.9, 0.999), momentum_dtype="bfloat16")
+Adakaon(model.parameters(), lr=1e-4, betas=(0.9, 0.999), momentum_dtype="int8")
+```
+
+**Parameter-free (no LR to tune):**
+
+```python
+from kaon import KProdigy, Autokaon
+
+# Prodigy D-adaptation; one LR for SDXL UNet + text-encoder (each gets its own D):
+KProdigy([{"params": unet.parameters(), "lr": 1.0},
+          {"params": text_encoder.parameters(), "lr": 1.0}])
+
+# Parameter-free AND minimum VRAM (~1.3 B/param on the SDXL UNet):
+KProdigy(model.parameters(), lr=1.0, second_moment="factored", momentum_dtype="int8", slice_p=11)
+
+# Mechanic tuner that freezes to byte-for-byte plain Adakaon after warmup:
+Autokaon(model.parameters(), bf16_method="stochastic_rounding")
+```
+
+`foreach=True` (the default) batches many-small-tensor (LoRA/LoKr) steps — **318 ms → 15 ms** on
+a 1434-adapter SDXL UNet. See [docs/foreach-batching.md](docs/foreach-batching.md).
 
 ## Docs
 
+- [docs/recipes.md](docs/recipes.md) — every recipe as a paste-ready call **plus the
+  benchmark that justifies it** (numbers + links + how to reproduce).
 - [docs/adakaon.md](docs/adakaon.md) — Adakaon design, validated results,
   full API.
 - [docs/autokaon.md](docs/autokaon.md) — the Mechanic LR tuner, freeze-to-free,
