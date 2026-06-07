@@ -25,6 +25,11 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   Adafusion's backend (codec, stochastic-rounding bf16, cautious, foreach). Lightest
   state in the family — **~1 B (int8) / 0.5 B (4bit) per param** — with Lion's implicit
   regularization. `betas` are a loss↔generalization dial. → [docs/lion.md](docs/lion.md)
+- **`AdaPNM`** — **Adam + Positive-Negative Momentum** (Xie et al. 2021) on the kaon
+  backend. PNM's negative-momentum term injects anti-correlated noise — a built-in
+  *implicit regularizer* (flat-minima seeking) **without** SAM's extra forward/backward.
+  Tuned defaults `betas=(0.8, 0.999)`, `beta0=0.5` (`beta1` is the loss↔gap dial). The
+  most **gap-robust at constant LR** (no schedule needed — resumable); experimental.
 - **`KProdigy`** — a memory-efficient **Prodigy** (parameter-free D-adaptation):
   train at `lr=1.0` and the optimizer finds the effective LR itself. Matches
   reference Prodigy bit-for-bit at its defaults, then adds the kaon memory

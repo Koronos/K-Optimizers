@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`AdaPNM`** — **Adam + Positive-Negative Momentum** (Xie et al. 2021,
+  *Manipulating Stochastic Gradient Noise to Improve Generalization*, arXiv:2103.17182)
+  on the kaon backend (factored quantized second moment, int8/4bit momentum codec,
+  stochastic-rounding bf16, cautious, foreach). PNM's negative-momentum term injects
+  anti-correlated noise — a built-in *implicit regularizer* (flat-minima seeking)
+  **without** SAM's extra forward/backward. Tuned defaults **`betas=(0.8, 0.999)`,
+  `beta0=0.5`** (`beta1` is the loss↔gap dial; the proxy sweep bottoms at `0.8`). On the
+  synthetic gap proxy it reaches ~Lion/AdamW loss at **36–44% lower train–val gap**, and
+  it is the **most gap-robust optimizer at constant LR** (no schedule needed — resumable;
+  35–43% lower gap than the field). Developed under the code name *Janus*.
 - **`Lion`** — **Lion's sign-momentum** update (`sign(β1·m+(1-β1)·g)`, single momentum
   buffer, **no second moment**) on Adafusion's backend: the shared int8/4bit momentum codec,
   stochastic-rounding bf16 weight update, cautious masking, and **foreach batching** (bit-exact

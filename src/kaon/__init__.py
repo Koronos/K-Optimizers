@@ -7,6 +7,7 @@ Optimizers:
     KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
     Autofusion: parameter-free LR on Adafusion via a Mechanic tuner (freeze-to-free).
     Lion: sign-momentum (EvoLved Sign Momentum) on Adafusion's quantized-momentum backend (experimental).
+    AdaPNM: Adam + positive-negative momentum on the factored/quantized backend (experimental).
 
 Quickstart::
 
@@ -23,6 +24,7 @@ Quickstart::
 from kaon._version import __version__
 from kaon.adafusion import Adafusion
 from kaon.adamuon import AdaMuon
+from kaon.adapnm import AdaPNM
 from kaon.autofusion import Autofusion
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
@@ -30,6 +32,7 @@ from kaon.muon import Muon
 
 __all__ = [
     "AdaMuon",
+    "AdaPNM",
     "Adafusion",
     "Autofusion",
     "KProdigy",
