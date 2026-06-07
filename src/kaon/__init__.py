@@ -11,6 +11,7 @@ Optimizers:
     MARS: variance-reduction corrected gradient (STORM-style) feeding AdamW on the factored backend (candidate).
     AdEMAMix: two-EMA momentum mixture (fast + slow long-horizon) on the factored backend (candidate).
     Adan: adaptive Nesterov momentum (grad + grad-difference EMAs) on the factored backend (candidate).
+    ScheduleFree: Schedule-Free AdamW (iterate averaging, no LR schedule) on the factored backend (candidate).
 
 Quickstart::
 
@@ -35,6 +36,7 @@ from kaon.autokaon import Autokaon
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
 from kaon.mars import MARS
+from kaon.schedulefree import ScheduleFree
 
 __all__ = [
     "AdEMAMix",
@@ -47,5 +49,6 @@ __all__ = [
     "KProdigy",
     "Lion",
     "MARS",
+    "ScheduleFree",
     "__version__",
 ]
