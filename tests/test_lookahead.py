@@ -11,6 +11,7 @@ import copy
 
 import torch
 
+from kaon._wrappers import CodecBuffer
 from kaon.adakaon import Adakaon
 from kaon.lookahead import Lookahead
 
@@ -56,7 +57,7 @@ def test_sync_rule_k1():
             torch.testing.assert_close(p.detach(), rp.detach(), rtol=1e-5, atol=1e-6)
         # stored phi matches and live == phi at a sync
         for p, ph in zip(params, phi, strict=True):
-            stored = opt._dequant_phi(opt.state[p], "float32", p)
+            stored = CodecBuffer.read(opt.state[p], "phi", "float32", p)
             torch.testing.assert_close(stored, ph, rtol=1e-5, atol=1e-6)
             torch.testing.assert_close(p.detach(), ph, rtol=1e-5, atol=1e-6)
 
@@ -140,8 +141,8 @@ def _parity(momentum_dtype, slow_dtype):
         torch.testing.assert_close(a.detach(), b.detach(), rtol=1e-5, atol=1e-6)
     # stored phi matches too
     for a, b in zip(p_loop, p_fe, strict=True):
-        pa = o_loop._dequant_phi(o_loop.state[a], slow_dtype, a)
-        pb = o_fe._dequant_phi(o_fe.state[b], slow_dtype, b)
+        pa = CodecBuffer.read(o_loop.state[a], "phi", slow_dtype, a)
+        pb = CodecBuffer.read(o_fe.state[b], "phi", slow_dtype, b)
         torch.testing.assert_close(pa, pb, rtol=1e-5, atol=1e-6)
 
 
@@ -172,7 +173,7 @@ def test_train_eval_roundtrip():
     opt.eval()
     # live now == phi (the slow weights), which differ from theta after some steps
     for p in params:
-        phi = opt._dequant_phi(opt.state[p], "float32", p)
+        phi = CodecBuffer.read(opt.state[p], "phi", "float32", p)
         torch.testing.assert_close(p.detach(), phi, rtol=1e-5, atol=1e-6)
     opt.train()
     # back to the exact fast weights
@@ -214,6 +215,6 @@ def test_state_dict_roundtrip_int8():
     # phi codes preserved as int8 (no fp32 upcast) and equal
     for p, p2 in zip(params, params2, strict=True):
         assert opt2.state[p2]["phi"].dtype == torch.int8
-        a = opt._dequant_phi(opt.state[p], "int8", p)
-        b = opt2._dequant_phi(opt2.state[p2], "int8", p2)
+        a = CodecBuffer.read(opt.state[p], "phi", "int8", p)
+        b = CodecBuffer.read(opt2.state[p2], "phi", "int8", p2)
         torch.testing.assert_close(a, b, rtol=0, atol=0)
