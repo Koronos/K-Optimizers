@@ -44,6 +44,7 @@ from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
     cautious_one_,
+    centralize_grads_,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
@@ -193,6 +194,7 @@ class Adakaon(Optimizer):
         momentum_dtype: MomentumDtype = "bfloat16",
         momentum_4bit_block: int = _FOURBIT_BLOCK,
         cautious: bool = True,
+        gradient_centralization: bool = True,
         bf16_method: str = "stochastic_rounding",
         foreach: bool = True,
         foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
@@ -224,6 +226,7 @@ class Adakaon(Optimizer):
             "momentum_dtype": momentum_dtype,
             "momentum_4bit_block": momentum_4bit_block,
             "cautious": cautious,
+            "gradient_centralization": gradient_centralization,
             "bf16_method": bf16_method,
         }
         super().__init__(params, defaults)
@@ -283,6 +286,8 @@ class Adakaon(Optimizer):
             for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("Adakaon does not support sparse gradients")
+            if group["gradient_centralization"]:
+                centralize_grads_(params)
             if self._foreach and self._group_foreach_eligible(group):
                 chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
                 # Effective cutoff = the performance threshold, lowered only if the

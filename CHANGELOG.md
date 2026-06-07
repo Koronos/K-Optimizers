@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`gradient_centralization`** — a composable, **zero-state** gradient preprocessor
+  (Gradient Centralization, Yong et al. 2020, arXiv:2004.01461): subtract the per-output-row
+  gradient mean over the fan-in dims for every ≥2-D weight, at the top of the step, before the
+  optimizer reads `p.grad`. One implementation in `kaon._backend.centralize_grads_`, wired into
+  every optimizer. **On by default** for `Adakaon`, `Lion`, `AdaPNM`, `KProdigy`; **off** for
+  `AdaMuon` (its Newton-Schulz orthogonalization already handles the directional structure — GC
+  hurt it). Measured on the proxy (gap lens, 3 seed-pairs each): a free held-out-loss win of
+  **~-0.003..-0.006** for the factored-Adam / sign optimizers, at no memory cost and negligible
+  speed cost. Disable with `gradient_centralization=False`. Note: it is a *modifier* — the
+  reference-equivalence properties (e.g. KProdigy ≡ reference Prodigy) hold with it off, and it
+  can hurt very small / non-conv problems, so it is a per-optimizer opt-out.
 - **`AdaPNM`** — **Adam + Positive-Negative Momentum** (Xie et al. 2021,
   *Manipulating Stochastic Gradient Noise to Improve Generalization*, arXiv:2103.17182)
   on the kaon backend (factored quantized second moment, int8/4bit momentum codec,

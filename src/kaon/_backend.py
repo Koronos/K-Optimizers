@@ -25,6 +25,7 @@ __all__ = [
     "STACK_SAFETY_FRACTION",
     "cautious_batched_",
     "cautious_one_",
+    "centralize_grads_",
     "foreach_budget",
     "is_low_precision",
     "subtract_batched_",
@@ -131,3 +132,38 @@ def cautious_one_(delta: Tensor, grad: Tensor) -> Tensor:
     """Per-parameter cautious masking (scalar rescale). Modifies and returns ``delta``."""
     mask = (delta * grad > 0).to(delta.dtype)
     return delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
+
+
+# ----------------------------- gradient preprocessing -----------------------------
+@torch.no_grad()
+def centralize_grads_(params: list[Tensor]) -> None:
+    """Gradient Centralization (Yong et al. 2020, arXiv:2004.01461), in place.
+
+    For every ``ndim >= 2`` weight, subtract the gradient's mean over the fan-in dims (all
+    dims except the output channel, dim 0) per output row. A **zero-state** gradient
+    preprocessor applied at the top of the step, before the optimizer reads ``p.grad``;
+    1-D params (biases / norm scales) are left untouched.
+
+    Measured (proxy, gap lens, 3 seeds-pairs): a free held-out-loss win (~-0.003..-0.006) for
+    the factored-Adam and sign optimizers (Adakaon, Lion, AdaPNM, KProdigy); neutral-to-negative
+    for the orthogonalized AdaMuon, so it is per-optimizer opt-out (``gradient_centralization``).
+
+    **Batched by shape** so the LoRA many-tiny-tensor regime stays fast: a naive per-param Python
+    loop here added ~1024 kernel launches/step on a 512-adapter bag (3x slower). Same-shape grads
+    are stacked and centralized in a handful of ops; lone shapes go in place.
+    """
+    by_shape: dict[tuple[int, ...], list[Tensor]] = {}
+    for p in params:
+        g = p.grad
+        if g is not None and g.ndim >= 2:
+            by_shape.setdefault(tuple(g.shape), []).append(g)
+    for grads in by_shape.values():
+        if len(grads) == 1:
+            g = grads[0]
+            g.sub_(g.mean(dim=tuple(range(1, g.ndim)), keepdim=True))
+        else:
+            # Stack so the per-param means are one reduction, centralize the stack, scatter
+            # back. (A broadcasting ``_foreach_sub_`` falls to a slow path and is ~2x worse.)
+            gs = torch.stack(grads)  # [N, *shape]; fan-in dims are 2..end (dim 1 = output row)
+            gs.sub_(gs.mean(dim=tuple(range(2, gs.ndim)), keepdim=True))
+            torch._foreach_copy_(grads, list(gs.unbind(0)))

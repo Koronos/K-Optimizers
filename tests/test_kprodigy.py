@@ -71,7 +71,7 @@ def test_invalid_args(bad):
 
 
 def test_d_rises_and_converges():
-    losses, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0))
+    losses, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False))
     assert opt.get_d() > 10 * opt.param_groups[0]["d0"]   # D bootstrapped
     assert losses[-1] < 0.05 * losses[0]                  # converged
 
@@ -83,7 +83,7 @@ def test_parity_with_reference_prodigy():
     prodigyopt = pytest.importorskip("prodigyopt")
 
     lp, ref = _run(lambda m: prodigyopt.Prodigy(m.parameters(), lr=1.0, use_bias_correction=False))
-    lk, kp = _run(lambda m: KProdigy(m.parameters(), lr=1.0, momentum_dtype="float32", second_moment="full"))
+    lk, kp = _run(lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, momentum_dtype="float32", second_moment="full"))
 
     d_ref, d_kp = ref.param_groups[0]["d"], kp.get_d()
     assert abs(d_ref - d_kp) / d_ref < 5e-3            # D estimate matches
@@ -94,19 +94,19 @@ def test_parity_with_reference_prodigy():
 
 @pytest.mark.parametrize("momentum_dtype", ["float32", "bfloat16", "int8"])
 def test_momentum_dtypes_converge(momentum_dtype):
-    losses, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, momentum_dtype=momentum_dtype))
+    losses, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, momentum_dtype=momentum_dtype))
     assert losses[-1] < 0.05 * losses[0]
 
 
 def test_momentum_buffer_dtype():
     for md, dt in [("float32", torch.float32), ("bfloat16", torch.bfloat16), ("int8", torch.int8)]:
-        _, opt = _run(lambda m, x=md: KProdigy(m.parameters(), lr=1.0, momentum_dtype=x), steps=2)
+        _, opt = _run(lambda m, x=md: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, momentum_dtype=x), steps=2)
         p = opt.param_groups[0]["params"][0]
         assert opt.state[p]["m"].dtype == dt
 
 
 def test_factored_second_moment_converges_and_saves_state():
-    losses, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, second_moment="factored"))
+    losses, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, second_moment="factored"))
     assert losses[-1] < 0.1 * losses[0]
     p = opt.param_groups[0]["params"][0]
     state = opt.state[p]
@@ -116,13 +116,13 @@ def test_factored_second_moment_converges_and_saves_state():
 
 
 def test_no_momentum_minimum_state():
-    _, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, betas=(0.0, 0.999)), steps=2)
+    _, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, betas=(0.0, 0.999)), steps=2)
     p = opt.param_groups[0]["params"][0]
     assert "m" not in opt.state[p]
 
 
 def test_slice_p_reduces_d_state():
-    _, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, slice_p=11), steps=2)
+    _, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, slice_p=11), steps=2)
     p = opt.param_groups[0]["params"][0]
     assert opt.state[p]["s"].numel() <= p.numel() // 10 + 1
 
@@ -132,11 +132,11 @@ def test_slice_p_reduces_d_state():
 def test_bf16_weights_stochastic_rounding_makes_progress():
     """With bf16 weights and d0=1e-6, naive rounding stalls; SR must not."""
     losses_sr, opt_sr = _run(
-        lambda m: KProdigy(m.parameters(), lr=1.0, bf16_method="stochastic_rounding"),
+        lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, bf16_method="stochastic_rounding"),
         pdtype=torch.bfloat16,
     )
     losses_none, _ = _run(
-        lambda m: KProdigy(m.parameters(), lr=1.0, bf16_method="none"),
+        lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, bf16_method="none"),
         pdtype=torch.bfloat16,
     )
     assert losses_sr[-1] < 0.1 * losses_sr[0]            # SR converges
@@ -145,7 +145,7 @@ def test_bf16_weights_stochastic_rounding_makes_progress():
 
 
 def test_bf16_weights_kahan_converges():
-    losses, _ = _run(lambda m: KProdigy(m.parameters(), lr=1.0, bf16_method="kahan"), pdtype=torch.bfloat16)
+    losses, _ = _run(lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, bf16_method="kahan"), pdtype=torch.bfloat16)
     assert losses[-1] < 0.1 * losses[0]
 
 
@@ -179,7 +179,7 @@ def test_independent_d_override_off_requires_equal_lr():
 
 
 def test_state_dict_roundtrip():
-    _, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0), steps=5)
+    _, opt = _run(lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False), steps=5)
     sd = opt.state_dict()
     p = opt.param_groups[0]["params"][0]
     opt2 = KProdigy([p], lr=1.0)
@@ -287,7 +287,7 @@ def test_pass1_foreach_matches_per_param_multigroup(independent_d):
 def test_foreach_4bit_cautious_converges():
     """The new 4bit momentum + cautious path trains and bootstraps D."""
     losses, opt = _run(
-        lambda m: KProdigy(m.parameters(), lr=1.0, momentum_dtype="4bit", cautious=True)
+        lambda m: KProdigy(m.parameters(), lr=1.0, gradient_centralization=False, momentum_dtype="4bit", cautious=True)
     )
     assert losses[-1] < 0.1 * losses[0]
     assert opt.get_d() > 10 * opt.param_groups[0]["d0"]

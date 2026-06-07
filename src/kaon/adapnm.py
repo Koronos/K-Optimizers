@@ -124,6 +124,7 @@ from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
     cautious_one_,
+    centralize_grads_,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
@@ -222,6 +223,7 @@ class AdaPNM(Optimizer):
         weight_decay: float = 0.0,
         *,
         cautious: bool = True,
+        gradient_centralization: bool = True,
         ams_bound: bool = False,
         momentum_dtype: MomentumDtype = "bfloat16",
         momentum_4bit_block: int = _FOURBIT_BLOCK,
@@ -260,6 +262,7 @@ class AdaPNM(Optimizer):
             "eps": float(eps),
             "weight_decay": weight_decay,
             "cautious": cautious,
+            "gradient_centralization": gradient_centralization,
             "ams_bound": ams_bound,
             "momentum_dtype": momentum_dtype,
             "momentum_4bit_block": momentum_4bit_block,
@@ -444,6 +447,8 @@ class AdaPNM(Optimizer):
             group["step"] += 1
             if not params:
                 continue
+            if group["gradient_centralization"]:
+                centralize_grads_(params)
             if self._foreach and self._group_foreach_eligible(group):
                 chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
                 cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)

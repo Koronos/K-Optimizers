@@ -67,6 +67,7 @@ def test_matches_numpy_reference(cautious, weight_decay):
     opt = Lion(
         [p], lr=lr, betas=(b1, b2), weight_decay=weight_decay,
         momentum_dtype="float32", cautious=cautious, foreach=False,
+        gradient_centralization=False,  # the numpy reference has no GC
     )
     pr = p.detach().numpy().copy().astype(np.float64)
     mr = np.zeros_like(pr)

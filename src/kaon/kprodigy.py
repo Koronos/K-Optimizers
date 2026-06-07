@@ -9,7 +9,9 @@ bf16 diffusion fine-tuning* — fixing the issues that plagued the original
 ``KProdigy`` research repo (whose shipped defaults, ``d_update_freq=5`` and
 ``use_bias_correction=True``, starved the D-bootstrap and made the effective LR
 fail to rise). The D-estimation math here matches the reference Prodigy bit for
-bit at the defaults; the *enhancements* are orthogonal memory savings:
+bit (with ``gradient_centralization=False`` — the default GC is a gradient
+preprocessor on top, a measured held-out-loss win); the *enhancements* are
+orthogonal memory savings:
 
 * **bf16 / int8 / 4bit first moment** (``momentum_dtype``) — like ``Adakaon``.
 * **factored second moment** (``second_moment="factored"``) — Adafactor-style
@@ -59,6 +61,7 @@ from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
     cautious_one_,
+    centralize_grads_,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
@@ -171,6 +174,7 @@ class KProdigy(Optimizer):
         second_moment: SecondMoment = "full",
         eps_factored: float = 1e-30,
         cautious: bool = False,
+        gradient_centralization: bool = True,
         bf16_method: str = "stochastic_rounding",
         factor_conv_as_matrix: bool = True,
         foreach: bool = True,
@@ -226,6 +230,7 @@ class KProdigy(Optimizer):
             "second_moment": second_moment,
             "eps_factored": eps_factored,
             "cautious": cautious,
+            "gradient_centralization": gradient_centralization,
             "bf16_method": bf16_method,
             "factor_conv_as_matrix": factor_conv_as_matrix,
         }
@@ -326,6 +331,8 @@ class KProdigy(Optimizer):
     @torch.no_grad()
     def _step_scope(self, groups: list[dict[str, Any]]) -> None:
         lead = groups[0]
+        if lead["gradient_centralization"]:  # before pass-1 so the D-stats see the centralized grad
+            centralize_grads_([p for g in groups for p in g["params"] if p.grad is not None])
         beta1, beta2 = lead["betas"]
         beta3 = lead["beta3"] if lead["beta3"] is not None else math.sqrt(beta2)
         k = lead["k"]
