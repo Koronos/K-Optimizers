@@ -38,6 +38,13 @@ One momentum buffer, no second moment: **~2 B/param (bf16) / ~1 B (int8) / ~0.5 
 The 4bit path (0.5 B/param) is Lion's signature — lighter than Adakaon (which still
 keeps a small factored second moment) and far under AdamW (8 B). Memory is its strongest axis.
 
+> **Caveat (measured): prefer `int8` over `4bit` for Lion.** Unlike the factored-Adam optimizers
+> (Adakaon/AdaPNM, where 4bit momentum is ~lossless), Lion's update is `sign(momentum)` — the
+> momentum's *sign* IS the direction, so 4bit quantization noise flips signs and costs held-out
+> quality (proxy: 4bit ≈ +0.005 loss vs bf16, while **int8 is loss-equivalent to bf16** at 1
+> B/param). Use `momentum_dtype="int8"` for cheap-but-lossless Lion momentum; reach for `4bit`
+> only when 0.5 B/param is truly required and a small quality hit is acceptable.
+
 ## Reused from Adakaon (shared backend — no duplication)
 
 - **Momentum codec** (`bfloat16`/`int8`/`4bit`, `momentum_4bit_block`) — int8 per-row absmax,
