@@ -16,7 +16,19 @@ from __future__ import annotations
 
 import torch
 
-from kaon import MARS, AdaBelief, Adakaon, AdaMuon, Adan, AdaPNM, AdEMAMix, Lion, ScheduleFree
+from kaon import (
+    ADOPT,
+    MARS,
+    AdaBelief,
+    Adakaon,
+    AdaMuon,
+    Adan,
+    AdaPNM,
+    AdEMAMix,
+    Grams,
+    Lion,
+    ScheduleFree,
+)
 
 OPTIMIZERS = {
     # --- reference baseline ---
@@ -67,6 +79,21 @@ OPTIMIZERS = {
         make=lambda p, lr: AdaBelief(p, lr=lr, betas=(0.9, 0.95), cautious=True, momentum_dtype="bfloat16"),
         lr=5e-4, lr_const=5e-4, family="published",
         blurb="Adam on the variance of (g-m) — belief in the gradient (light, generalizing)",
+    ),
+    "AdaBelief-b999": dict(  # gap-aimed variant: high beta2 (the proxy-loss tune chose 0.95 -> gap-worst at scale)
+        make=lambda p, lr: AdaBelief(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16"),
+        lr=1e-3, lr_const=1e-3, family="published",
+        blurb="AdaBelief at beta2=0.999 (smoother 2nd moment — gap-aimed)",
+    ),
+    "ADOPT": dict(
+        make=lambda p, lr: ADOPT(p, lr=lr, betas=(0.9, 0.9999), cautious=True, momentum_dtype="bfloat16"),
+        lr=4e-3, lr_const=4e-3, family="published",
+        blurb="modified Adam, converges with any beta2 (v-lag + normalize-then-momentum)",
+    ),
+    "Grams": dict(
+        make=lambda p, lr: Grams(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16"),
+        lr=4e-3, lr_const=4e-3, family="published",
+        blurb="Adam magnitude, direction = sign(current grad) (light, regularizing)",
     ),
     "MARS": dict(
         make=lambda p, lr: MARS(p, lr=lr, gamma=0.025, cautious=True, momentum_dtype="bfloat16"),

@@ -10,52 +10,61 @@
 
 | # | optimizer | mean rank | 🥇 wins (rank 1) | identity |
 |---|---|---|---|---|
-| 1 | **Lion** | 4.0 | — | sign-momentum, no 2nd moment (lightest state) |
-| 2 | **Adakaon-nomom** | 4.4 | 🥇 memory | factored Adam, no momentum (minimum VRAM, regularizing) |
-| 3 | **Adakaon-bf16** | 5.3 | 🥇 loss | factored Adam, bf16 momentum (AdamW-quality, low memory) |
-| 4 | **ScheduleFree** | 5.6 | 🥇 convergence | iterate-averaging AdamW, no LR schedule (constant-LR / resumable) |
-| 5 | **torch.AdamW (fused)** | 5.7 | 🥇 iter-speed, LoRA-speed | torch.optim.AdamW, fused kernel — the EXTERNAL reference (not a kaon optimizer) |
-| 6 | **AdaPNM** | 6.1 | 🥇 generalization, constant-LR | positive-negative momentum (best generalization / constant-LR) |
-| 7 | **AdaBelief** | 6.3 | — | Adam on the variance of (g-m) — belief in the gradient (light, generalizing) |
-| 8 | **MARS** | 6.6 | — | variance-reduction corrected gradient feeding AdamW (convergence) |
-| 9 | **AdaMuon** | 6.7 | — | orthogonalized momentum + factored 2nd moment (convergence) |
-| 10 | **AdEMAMix** | 7.6 | — | two-EMA momentum (fast + slow long-horizon) — generalization on long runs |
-| 11 | **Adan** | 7.7 | — | adaptive Nesterov momentum (grad + grad-difference EMAs); int8 (3 buffers) |
+| 1 | **Lion** | 4.6 | — | sign-momentum, no 2nd moment (lightest state) |
+| 2 | **Adakaon-nomom** | 4.9 | 🥇 memory | factored Adam, no momentum (minimum VRAM, regularizing) |
+| 3 | **Adakaon-bf16** | 6.3 | 🥇 loss | factored Adam, bf16 momentum (AdamW-quality, low memory) |
+| 4 | **torch.AdamW (fused)** | 6.6 | 🥇 iter-speed, LoRA-speed | torch.optim.AdamW, fused kernel — the EXTERNAL reference (not a kaon optimizer) |
+| 5 | **ScheduleFree** | 6.6 | 🥇 convergence | iterate-averaging AdamW, no LR schedule (constant-LR / resumable) |
+| 6 | **ADOPT** | 6.9 | 🥇 generalization | modified Adam, converges with any beta2 (v-lag + normalize-then-momentum) |
+| 7 | **AdaBelief-b999** | 7.1 | — | AdaBelief at beta2=0.999 (smoother 2nd moment — gap-aimed) |
+| 8 | **AdaBelief** | 7.7 | — | Adam on the variance of (g-m) — belief in the gradient (light, generalizing) |
+| 9 | **AdaPNM** | 8.1 | 🥇 constant-LR | positive-negative momentum (best generalization / constant-LR) |
+| 10 | **MARS** | 8.1 | — | variance-reduction corrected gradient feeding AdamW (convergence) |
+| 11 | **AdaMuon** | 8.4 | — | orthogonalized momentum + factored 2nd moment (convergence) |
+| 12 | **AdEMAMix** | 9.1 | — | two-EMA momentum (fast + slow long-horizon) — generalization on long runs |
+| 13 | **Adan** | 10.0 | — | adaptive Nesterov momentum (grad + grad-difference EMAs); int8 (3 buffers) |
+| 14 | **Grams** | 10.6 | — | Adam magnitude, direction = sign(current grad) (light, regularizing) |
 ## 🎯 Loss × generalization (scheduled, progressive curriculum)
 
 The headline for small-data fine-tuning: rank by the **train–val gap**, not the loss.
 
 | # (by gap) | optimizer | held-out loss | train–val gap |
 |---|---|---|---|
-| 1 | AdaPNM | 0.0813 | +0.0079 |
-| 2 | torch.AdamW (fused) | 0.0799 | +0.0103 |
-| 3 | Adan | 0.0783 | +0.0133 |
-| 4 | Lion | 0.0766 | +0.0142 |
-| 5 | MARS | 0.0752 | +0.0156 |
-| 6 | AdEMAMix | 0.0792 | +0.0162 |
-| 7 | Adakaon-nomom | 0.0796 | +0.0170 |
-| 8 | ScheduleFree | 0.0763 | +0.0185 |
-| 9 | AdaMuon | 0.0759 | +0.0186 |
-| 10 | Adakaon-bf16 | 0.0733 | +0.0204 |
-| 11 | AdaBelief | 0.0742 | +0.0240 |
+| 1 | ADOPT | 0.0920 | +0.0070 |
+| 2 | AdaPNM | 0.0813 | +0.0079 |
+| 3 | torch.AdamW (fused) | 0.0799 | +0.0103 |
+| 4 | Adan | 0.0783 | +0.0133 |
+| 5 | Lion | 0.0766 | +0.0142 |
+| 6 | AdaBelief-b999 | 0.0780 | +0.0155 |
+| 7 | MARS | 0.0752 | +0.0156 |
+| 8 | AdEMAMix | 0.0792 | +0.0162 |
+| 9 | Adakaon-nomom | 0.0796 | +0.0170 |
+| 10 | ScheduleFree | 0.0763 | +0.0185 |
+| 11 | AdaMuon | 0.0759 | +0.0186 |
+| 12 | Adakaon-bf16 | 0.0733 | +0.0204 |
+| 13 | Grams | 0.0806 | +0.0210 |
+| 14 | AdaBelief | 0.0742 | +0.0240 |
 
-## ⏱️ Convergence speed & time×quality (target held-out loss ≤ 0.0813)
+## ⏱️ Convergence speed & time×quality (target held-out loss ≤ 0.0920)
 
 `steps→target` = how fast it reaches the common quality bar; `time→target` folds in the per-step cost (the metric that actually matters in wall-clock).
 
 | # (by time×quality) | optimizer | steps→target | ms/step | time→target (s) |
 |---|---|---|---|---|
-| 1 | ScheduleFree | 1125 | 14.1 | 15.89 |
-| 2 | AdaBelief | 1500 | 14.7 | 22.04 |
-| 3 | Adakaon-bf16 | 1500 | 14.8 | 22.14 |
-| 4 | Lion | 1750 | 13.4 | 23.42 |
-| 5 | MARS | 1625 | 14.8 | 24.02 |
-| 6 | Adakaon-nomom | 1875 | 13.4 | 25.04 |
-| 7 | torch.AdamW (fused) | 2000 | 12.7 | 25.48 |
-| 8 | AdEMAMix | 1750 | 14.6 | 25.61 |
-| 9 | AdaMuon | 1625 | 16.9 | 27.52 |
-| 10 | AdaPNM | 2000 | 14.5 | 29.03 |
-| 11 | Adan | 1875 | 17.3 | 32.37 |
+| 1 | ScheduleFree | 500 | 14.1 | 7.06 |
+| 2 | AdaBelief | 625 | 14.7 | 9.18 |
+| 3 | Adakaon-bf16 | 625 | 14.8 | 9.22 |
+| 4 | AdEMAMix | 1000 | 14.6 | 14.64 |
+| 5 | MARS | 1000 | 14.8 | 14.78 |
+| 6 | Adakaon-nomom | 1250 | 13.4 | 16.69 |
+| 7 | Lion | 1250 | 13.4 | 16.73 |
+| 8 | Grams | 1250 | 14.7 | 18.35 |
+| 9 | AdaMuon | 1125 | 16.9 | 19.05 |
+| 10 | AdaBelief-b999 | 1375 | 14.3 | 19.68 |
+| 11 | torch.AdamW (fused) | 1625 | 12.7 | 20.70 |
+| 12 | AdaPNM | 1750 | 14.5 | 25.40 |
+| 13 | Adan | 1625 | 17.3 | 28.06 |
+| 14 | ADOPT | 2000 | 14.3 | 28.63 |
 
 ## ⚡ Per-iteration speed
 
@@ -67,13 +76,16 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 2 | Adakaon-nomom | 13.4 | 2.96 |
 | 3 | Lion | 13.4 | 3.32 |
 | 4 | ScheduleFree | 14.1 | 5.05 |
-| 5 | AdaPNM | 14.5 | 5.38 |
-| 6 | AdEMAMix | 14.6 | 6.57 |
-| 7 | AdaBelief | 14.7 | 4.84 |
-| 8 | Adakaon-bf16 | 14.8 | 3.54 |
-| 9 | MARS | 14.8 | 6.64 |
-| 10 | AdaMuon | 16.9 | 6.55 |
-| 11 | Adan | 17.3 | 12.29 |
+| 5 | ADOPT | 14.3 | 3.56 |
+| 6 | AdaBelief-b999 | 14.3 | 4.82 |
+| 7 | AdaPNM | 14.5 | 5.38 |
+| 8 | AdEMAMix | 14.6 | 6.57 |
+| 9 | Grams | 14.7 | 5.01 |
+| 10 | AdaBelief | 14.7 | 4.84 |
+| 11 | Adakaon-bf16 | 14.8 | 3.54 |
+| 12 | MARS | 14.8 | 6.64 |
+| 13 | AdaMuon | 16.9 | 6.55 |
+| 14 | Adan | 17.3 | 12.29 |
 
 ## 💾 Memory (measured optimizer state)
 
@@ -85,11 +97,14 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 4 | Adakaon-bf16 | 2.03 |
 | 5 | AdaBelief | 2.03 |
 | 6 | ScheduleFree | 2.03 |
-| 7 | Adan | 3.04 |
-| 8 | AdaPNM | 4.03 |
-| 9 | MARS | 4.03 |
-| 10 | AdEMAMix | 4.03 |
-| 11 | torch.AdamW (fused) | 8.00 |
+| 7 | ADOPT | 2.03 |
+| 8 | AdaBelief-b999 | 2.03 |
+| 9 | Grams | 2.03 |
+| 10 | Adan | 3.04 |
+| 11 | AdaPNM | 4.03 |
+| 12 | MARS | 4.03 |
+| 13 | AdEMAMix | 4.03 |
+| 14 | torch.AdamW (fused) | 8.00 |
 
 ## 🔁 Continuity — robustness at constant LR (resumable, no schedule)
 
@@ -98,13 +113,16 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | # (by const gap) | optimizer | const-LR gap | Δ vs scheduled |
 |---|---|---|---|
 | 1 | AdaPNM | +0.0063 | -0.0015 |
-| 2 | Adakaon-nomom | +0.0075 | -0.0095 |
-| 3 | Lion | +0.0090 | -0.0052 |
-| 4 | torch.AdamW (fused) | +0.0108 | +0.0005 |
-| 5 | MARS | +0.0141 | -0.0016 |
-| 6 | Adan | +0.0146 | +0.0013 |
-| 7 | AdEMAMix | +0.0167 | +0.0005 |
-| 8 | Adakaon-bf16 | +0.0168 | -0.0036 |
-| 9 | ScheduleFree | +0.0175 | -0.0011 |
-| 10 | AdaMuon | +0.0175 | -0.0011 |
-| 11 | AdaBelief | +0.0179 | -0.0062 |
+| 2 | ADOPT | +0.0069 | -0.0001 |
+| 3 | Adakaon-nomom | +0.0075 | -0.0095 |
+| 4 | Lion | +0.0090 | -0.0052 |
+| 5 | torch.AdamW (fused) | +0.0108 | +0.0005 |
+| 6 | MARS | +0.0141 | -0.0016 |
+| 7 | AdaBelief-b999 | +0.0143 | -0.0012 |
+| 8 | Adan | +0.0146 | +0.0013 |
+| 9 | AdEMAMix | +0.0167 | +0.0005 |
+| 10 | Adakaon-bf16 | +0.0168 | -0.0036 |
+| 11 | ScheduleFree | +0.0175 | -0.0011 |
+| 12 | AdaMuon | +0.0175 | -0.0011 |
+| 13 | AdaBelief | +0.0179 | -0.0062 |
+| 14 | Grams | +0.0182 | -0.0028 |
