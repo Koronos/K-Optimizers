@@ -10,6 +10,7 @@ Optimizers:
     AdaBelief: Adam on the variance of the gradient residual (g - m) on the factored backend (candidate).
     MARS: variance-reduction corrected gradient (STORM-style) feeding AdamW on the factored backend (candidate).
     AdEMAMix: two-EMA momentum mixture (fast + slow long-horizon) on the factored backend (candidate).
+    Adan: adaptive Nesterov momentum (grad + grad-difference EMAs) on the factored backend (candidate).
 
 Quickstart::
 
@@ -27,6 +28,7 @@ from kaon._version import __version__
 from kaon.adabelief import AdaBelief
 from kaon.adakaon import Adakaon
 from kaon.adamuon import AdaMuon
+from kaon.adan import Adan
 from kaon.adapnm import AdaPNM
 from kaon.ademamix import AdEMAMix
 from kaon.autokaon import Autokaon
@@ -40,6 +42,7 @@ __all__ = [
     "AdaMuon",
     "AdaPNM",
     "Adakaon",
+    "Adan",
     "Autokaon",
     "KProdigy",
     "Lion",
