@@ -5,7 +5,7 @@ Optimizers:
     Muon: orthogonalized-momentum optimizer with an AdamW fallback (hybrid).
     AdaMuon: orthogonalized momentum + factored quantized variance (Adafactor memory).
     KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
-    Autofusion: parameter-free LR on Adakaon via a Mechanic tuner (freeze-to-free).
+    Autokaon: parameter-free LR on Adakaon via a Mechanic tuner (freeze-to-free).
     Lion: sign-momentum (EvoLved Sign Momentum) on Adakaon's quantized-momentum backend (experimental).
     AdaPNM: Adam + positive-negative momentum on the factored/quantized backend (experimental).
 
@@ -25,7 +25,7 @@ from kaon._version import __version__
 from kaon.adakaon import Adakaon
 from kaon.adamuon import AdaMuon
 from kaon.adapnm import AdaPNM
-from kaon.autofusion import Autofusion
+from kaon.autokaon import Autokaon
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
 from kaon.muon import Muon
@@ -34,7 +34,7 @@ __all__ = [
     "AdaMuon",
     "AdaPNM",
     "Adakaon",
-    "Autofusion",
+    "Autokaon",
     "KProdigy",
     "Lion",
     "Muon",

@@ -1,4 +1,6 @@
-# Autofusion — parameter-free LR on Adakaon (Mechanic, *not* Prodigy)
+# Autokaon — parameter-free LR on Adakaon (Mechanic, *not* Prodigy)
+
+<!-- Formerly named "Autofusion". -->
 
 > A scalar learning-rate tuner wrapped around Adakaon's update, with a
 > **freeze-to-free** handoff: after warmup it becomes byte-for-byte plain
@@ -7,7 +9,7 @@
 
 ## How it works
 
-`Autofusion` does **not** estimate a distance-to-solution like Prodigy. It uses
+`Autokaon` does **not** estimate a distance-to-solution like Prodigy. It uses
 **Mechanic** (Cutkosky, Defazio & Mehta, NeurIPS 2023,
 [arXiv:2306.00144](https://arxiv.org/abs/2306.00144)) — an online learning-rate
 *tuner* that wraps an arbitrary base optimizer and learns a single **scalar**
@@ -55,7 +57,7 @@ pure waste. `lr_freeze` ends adaptation:
 - `int N` — freeze after `N` steps.
 - `None` — never freeze (plain Mechanic-tuned Adakaon).
 
-On freeze, `Autofusion` records `S = sum(s)`, **sets the inner Adakaon's `lr` to
+On freeze, `Autokaon` records `S = sum(s)`, **sets the inner Adakaon's `lr` to
 `S`**, frees `ref` and the tuner scalars, and routes every later `step()` straight
 to `base.step()`. After freeze it **is** plain Adakaon at `lr=S` — same memory
 (`ref` gone), same speed (no wrapper passes), same update — *by construction*.
@@ -76,14 +78,14 @@ for `bfloat16`. So freeze is seamless at any `beta1`.
 
 ### LR schedules after freeze (the Prodigy + Cosine pattern)
 
-`Autofusion` is a proper `torch.optim.Optimizer`, so a standard LR scheduler
+`Autokaon` is a proper `torch.optim.Optimizer`, so a standard LR scheduler
 attaches to it directly. The intended pattern mirrors how parameter-free
 optimizers are usually run — *discover* the LR, then *decay* it:
 
 ```python
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-opt = Autofusion(model.parameters(), lr_freeze="auto")
+opt = Autokaon(model.parameters(), lr_freeze="auto")
 sched = CosineAnnealingLR(opt, T_max=total_steps)
 
 for step in range(total_steps):
@@ -97,7 +99,7 @@ The scheduler writes `param_groups[...]["lr"]`. **During warmup that lr is
 ignored** — the Mechanic scale (`sum(s)`) drives the update — so the scheduler is
 effectively a no-op until freeze. **After freeze** the base runs alone off
 `param_groups["lr"]`, so the scheduler now shapes the discovered LR `S` (Cosine
-decays from `S` toward 0). Net effect: Autofusion finds the peak LR for you, then
+decays from `S` toward 0). Net effect: Autokaon finds the peak LR for you, then
 Cosine anneals it — no manual peak-LR tuning. (A scheduler that reads
 `get_last_lr()` before freeze sees the base lr, not the live Mechanic scale; use
 `get_d()` for the effective LR during warmup.)
@@ -115,7 +117,7 @@ one without the checkpoint aliasing the live state.
 ## API
 
 ```python
-Autofusion(
+Autokaon(
     params, lr=1.0, *,
     s_init="auto",                  # data-relative LARS seed (or a fixed float, e.g. 1e-8)
     lr_freeze="auto",               # "auto" (plateau) | int N | None (never)  — headline feature
@@ -129,7 +131,7 @@ Autofusion(
 )
 ```
 
-**The common case is just `Autofusion(params, **adakaon_kwargs)`** — minimal and
+**The common case is just `Autokaon(params, **adakaon_kwargs)`** — minimal and
 parameter-free. The empirical scaffolding that accumulated across the tuning
 campaign (`store_delta`, `s_init_rel`, `scale_floor_frac`, the auto-freeze
 `tol`/`patience`/`max_frac`) is now **internal constants** at their validated

@@ -222,7 +222,7 @@ class _MomentumCodec:
         """Multiply the stored first moment in place by a scalar.
 
         The quantized codecs scale the per-row/block ``m_scale`` (no requant
-        error); the float codec scales ``m`` directly. Used by Autofusion's freeze
+        error); the float codec scales ``m`` directly. Used by Autokaon's freeze
         to fold the discovered LR into the momentum (the EMA is linear in lr).
         """
         raise NotImplementedError

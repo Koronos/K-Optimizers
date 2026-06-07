@@ -34,13 +34,13 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   train at `lr=1.0` and the optimizer finds the effective LR itself. Matches
   reference Prodigy bit-for-bit at its defaults, then adds the kaon memory
   toolkit. → [docs/kprodigy.md](docs/kprodigy.md)
-- **`Autofusion`** — a parameter-free LR on **Adakaon's** update via a
+- **`Autokaon`** — a parameter-free LR on **Adakaon's** update via a
   [Mechanic](https://arxiv.org/abs/2306.00144) scalar tuner (Mechanic, *not*
   Prodigy): train at `lr=1.0` and it auto-discovers the LR, keeping Adakaon's
   exact update. Its headline is **freeze-to-free** (`lr_freeze`): after warmup it
   folds the discovered LR into the base, frees the tuner's `ref` buffer, and
   becomes **byte-for-byte and speed-for-speed plain Adakaon**.
-  → [docs/autofusion.md](docs/autofusion.md)
+  → [docs/autokaon.md](docs/autokaon.md)
 
 `Adakaon`, `Muon`, `AdaMuon`, and `Lion` are standard `torch.optim.Optimizer`s that work
 one-parameter-at-a-time, so they drop into per-parameter / gradient-release
@@ -106,13 +106,13 @@ opt = KProdigy(model.parameters(), lr=1.0, momentum_dtype="bfloat16")
 ```
 
 ```python
-from kaon import Autofusion
+from kaon import Autokaon
 
 # Parameter-free Adakaon: lr stays 1.0; a Mechanic tuner finds the LR. By
 # default (lr_freeze="auto") it freezes on an LR plateau, frees the tuner state,
 # and runs as pure Adakaon at the discovered LR (free thereafter). The common
-# case is just Autofusion(params, **adakaon_kwargs).
-opt = Autofusion(
+# case is just Autokaon(params, **adakaon_kwargs).
+opt = Autokaon(
     model.parameters(),
     bf16_method="stochastic_rounding",   # adakaon_betas=(0.0, 0.999) by default
 )                                        # => bit-exact freeze
@@ -131,13 +131,13 @@ opt = Autofusion(
 | **Absolute minimum state (no 2nd moment)** | `Lion(..., lr=2e-4, betas=(0.95,0.98), momentum_dtype="4bit")` — Lion sign-momentum at 0.5 B/param; implicit regularization for small-data fine-tuning |
 | **No LR to tune (SDXL UNet+TE)** | `KProdigy([{"params": unet, "lr": 1.0}, {"params": te, "lr": 1.0}])` |
 | **Parameter-free + minimum VRAM** | `KProdigy(..., second_moment="factored", momentum_dtype="bfloat16", slice_p=11)` |
-| **No LR to tune + ~free after warmup** | `Autofusion(..., bf16_method="stochastic_rounding")` — auto-discovers the LR, then freezes to plain Adakaon |
+| **No LR to tune + ~free after warmup** | `Autokaon(..., bf16_method="stochastic_rounding")` — auto-discovers the LR, then freezes to plain Adakaon |
 
 ## Docs
 
 - [docs/adakaon.md](docs/adakaon.md) — Adakaon design, validated results,
   full API.
-- [docs/autofusion.md](docs/autofusion.md) — the Mechanic LR tuner, freeze-to-free,
+- [docs/autokaon.md](docs/autokaon.md) — the Mechanic LR tuner, freeze-to-free,
   the minimal API + the one advanced knob, and the campaign results.
 - [docs/kprodigy.md](docs/kprodigy.md) — memory-efficient Prodigy design + API.
 - [docs/muon.md](docs/muon.md) — Muon design + API.

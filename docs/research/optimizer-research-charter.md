@@ -77,9 +77,9 @@ diffusion specifically vs only LLMs? interaction with bf16 + LoRA?
 - **Weight averaging / EMA** — model-weight EMA is a known strong regularizer for diffusion;
   SWA / LAWA / latest-weight-averaging. Is the optimizer the right place, or a wrapper? Combine
   with the above.
-- **Schedule-free & parameter-free LR (Defazio schedule-free, Prodigy, Mechanic/Autofusion).**
+- **Schedule-free & parameter-free LR (Defazio schedule-free, Prodigy, Mechanic/Autokaon).**
   Kill the LR/scheduler babysitting — but re-tune their target toward generalization, not just
-  fast convergence (our `Autofusion` already does freeze-to-free on Adakaon).
+  fast convergence (our `Autokaon` already does freeze-to-free on Adakaon).
 - **Diffusion-specific loss/timestep handling baked into the optimizer or training:** min-SNR /
   sigmoid / soft-min-SNR weighting, mid-SNR emphasis (where the gap lives), immiscible/optimal-
   transport noise pairing, REPA-style representation alignment — do these reduce the gap?

@@ -38,10 +38,10 @@ All notable changes to this project will be documented in this file.
   - Optional `compile=True` — whole-step `torch.compile` (AdaMuon-only by design);
     workload-dependent, benchmark it.
   - Reproducible harnesses + evaluation under `benchmarks/adamuon/`.
-- **`Autofusion`** — a parameter-free learning rate on Adakaon's update via a
+- **`Autokaon`** — a parameter-free learning rate on Adakaon's update via a
   [Mechanic](https://arxiv.org/abs/2306.00144) scalar tuner (an update-agnostic
   online LR tuner — **Mechanic, *not* Prodigy**), with a **freeze-to-free**
-  handoff. See [docs/autofusion.md](docs/autofusion.md) for the full design,
+  handoff. See [docs/autokaon.md](docs/autokaon.md) for the full design,
   the minimal API, and the validated campaign results.
   - Train at `lr=1.0`; the tuner discovers the effective LR (read via `get_d()`),
     keeping Adakaon's exact normalize-then-momentum update verbatim.
@@ -53,7 +53,7 @@ All notable changes to this project will be documented in this file.
     bit-exact (Adakaon's update is then linear in `lr`); `"auto"` freezes on an
     LR plateau.
   - **Minimal, parameter-free API:** the common case is
-    `Autofusion(params, **adakaon_kwargs)`. The empirical scaffolding that
+    `Autokaon(params, **adakaon_kwargs)`. The empirical scaffolding that
     accumulated across iterations (`store_delta`, `s_init_rel`, `scale_floor_frac`,
     the auto-freeze `tol`/`patience`/`max_frac`) was collapsed to internal
     constants once iteration-3 validated on a real SDXL LoRA that the data-relative
@@ -64,7 +64,7 @@ All notable changes to this project will be documented in this file.
     the weights); `Delta` is reconstructed on the fly as `(p-ref)/sum(s)`.
   - `adakaon_betas` passthrough sets the inner momentum betas (the tuner `betas`
     kwarg shadows them); all other Adakaon knobs forward through `**kwargs`.
-  - **Naming:** the optimizer is `Autofusion`. (It went through the working names
+  - **Naming:** the optimizer is `Autokaon`. (It went through the working names
     `AdakaonProdigy` — a misnomer, it is Mechanic, not Prodigy — and
     `AdaptiveAdakaon` during development; neither shipped, both are removed.)
 - **KProdigy now reuses Adakaon's full update engine.** KProdigy's pass-2 weight
@@ -147,12 +147,16 @@ All notable changes to this project will be documented in this file.
   and bit-exact vs the per-parameter path on CPU.
 
 ### Changed
+- **Renamed `Autofusion` → `Autokaon`** (follows the `Adafusion → Adakaon` rename —
+  the in-house optimizers built on the kaon backend now share the `*kaon` family
+  name). Class, module (`kaon.autofusion` → `kaon.autokaon`), tests, and docs
+  (`docs/autofusion.md` → `docs/autokaon.md`) renamed. No behaviour change.
 - **Renamed `Adafusion` → `Adakaon`.** The flagship optimizer is the one that most
   fully exercises the shared **kaon** backend (factored second moment + quantized
   momentum codec + stochastic rounding + foreach + cautious) — every other optimizer
   reuses its machinery — so it now carries the framework's name. Class, module
   (`kaon.adafusion` → `kaon.adakaon`), tests, and docs (`docs/adafusion.md` →
-  `docs/adakaon.md`) renamed; `Autofusion`'s `adafusion_*` kwargs are now
+  `docs/adakaon.md`) renamed; `Autokaon`'s `adafusion_*` kwargs are now
   `adakaon_*`. No behaviour change.
 - `cautious` now defaults to **`True`**. Measured on a mini pixel-DDPM (8 paired
   seeds, per-arm best LR): with momentum it lowers held-out val loss ~1.4% (paired

@@ -29,4 +29,4 @@ Muon(
 ## See also
 
 - [adakaon.md](adakaon.md), [kprodigy.md](kprodigy.md),
-  [autofusion.md](autofusion.md) — the other optimizers in `kaon`.
+  [autokaon.md](autokaon.md) — the other optimizers in `kaon`.

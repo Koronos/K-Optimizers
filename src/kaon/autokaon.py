@@ -1,6 +1,8 @@
-"""Autofusion — a parameter-free learning rate on top of *Adakaon's*
+"""Autokaon — a parameter-free learning rate on top of *Adakaon's*
 update rule, via a Mechanic-style online scale tuner, with a **freeze-to-free**
 handoff that turns it into plain Adakaon after warmup.
+
+(Formerly named *Autofusion*.)
 
 Motivation
 ----------
@@ -99,7 +101,7 @@ from torch import Tensor
 
 from kaon.adakaon import Adakaon
 
-__all__ = ["Autofusion"]
+__all__ = ["Autokaon"]
 
 # Mechanic's default tuner betas (arXiv:2306.00144, Alg. 1): n=6 parallel
 # coin-betting tuners with geometrically spaced recency horizons, summed.
@@ -122,7 +124,7 @@ _LR_FREEZE_PATIENCE: int = 50
 _LR_FREEZE_MAX_FRAC: float = 0.9
 
 
-class Autofusion(torch.optim.Optimizer):
+class Autokaon(torch.optim.Optimizer):
     """Parameter-free LR on Adakaon's update via a Mechanic scale tuner, with a
     freeze-to-pure-Adakaon handoff.
 
