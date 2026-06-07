@@ -55,6 +55,13 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._backend import (
+    cautious_batched_,
+    cautious_one_,
+    is_low_precision,
+    subtract_batched_,
+    subtract_one_,
+)
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -63,11 +70,9 @@ from kaon._momentum_codec import (
     _quant_int8,
     load_state_dict_preserving_dtypes,
 )
-from kaon._stochastic_rounding import add_stochastic_, subtract_batched_
 
 __all__ = ["KProdigy"]
 
-_LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 SecondMoment = Literal["full", "factored"]
 
@@ -78,10 +83,6 @@ _STACK_BYTES_PER_ELEM = 48
 _MIN_STACK_ELEMS = 262_144
 _DEFAULT_STACK_ELEMS = 64_000_000
 _FOREACH_BATCH_CUTOFF = 2_000_000
-
-
-def _is_low_precision(t: Tensor) -> bool:
-    return t.dtype in _LOW_PRECISION
 
 
 def _rms(t: Tensor) -> Tensor:
@@ -289,7 +290,7 @@ class KProdigy(Optimizer):
             # Full second moment (also the fallback for 1-D params under factored).
             state["v"] = torch.zeros_like(p, dtype=torch.float32)
 
-        if _is_low_precision(p) and group["bf16_method"] == "kahan":
+        if is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
 
     # -- step --------------------------------------------------------------
@@ -752,7 +753,7 @@ class KProdigy(Optimizer):
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"
-            and _is_low_precision(p)
+            and is_low_precision(p)
             and p.dtype != torch.bfloat16
         ):
             return False
@@ -838,10 +839,9 @@ class KProdigy(Optimizer):
             delta = delta.add_(p_fp32, alpha=decay * dlr)
 
         if cautious:
-            mask = (delta * grad_fp32 > 0).to(delta.dtype)
-            delta = delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
+            delta = cautious_one_(delta, grad_fp32)
 
-        self._apply_subtract(p, delta, state, bf16_method)
+        subtract_one_(p, delta, state, bf16_method)
 
     # -- foreach update (Adakaon bucketing) ------------------------------
 
@@ -900,7 +900,6 @@ class KProdigy(Optimizer):
         group: dict[str, Any], d: float, dlr: float,
     ) -> None:
         R, C = eff  # noqa: N806
-        N = len(plist)  # noqa: N806
         eps = group["eps"]
         decay = group["weight_decay"]
         decouple = group["decouple"]
@@ -926,9 +925,7 @@ class KProdigy(Optimizer):
             delta = delta.add_(p_fp32, alpha=decay * dlr)
 
         if cautious:
-            mask = (delta * grad > 0).to(delta.dtype)
-            denom = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view(N, 1, 1)
-            delta = delta.mul_(mask).div_(denom)
+            delta = cautious_batched_(delta, grad)
 
         subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
 
@@ -937,7 +934,6 @@ class KProdigy(Optimizer):
         self, plist: list[Tensor], shape: tuple[int, ...], group: dict[str, Any], d: float, dlr: float
     ) -> None:
         """Batched update for params using the FULL second moment (any shape)."""
-        N = len(plist)  # noqa: N806
         eps = group["eps"]
         decay = group["weight_decay"]
         decouple = group["decouple"]
@@ -956,9 +952,7 @@ class KProdigy(Optimizer):
             delta = delta.add_(p_fp32, alpha=decay * dlr)
 
         if cautious:
-            mask = (delta * grad > 0).to(delta.dtype)
-            md = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view([N] + [1] * len(shape))
-            delta = delta.mul_(mask).div_(md)
+            delta = cautious_batched_(delta, grad)
 
         subtract_batched_([p.data for p in plist], delta, bf16_method)
 
@@ -972,17 +966,4 @@ class KProdigy(Optimizer):
 
     # -- weight update -----------------------------------------------------
 
-    @staticmethod
-    def _apply_subtract(p: Tensor, delta_fp32: Tensor, state: dict[str, Any], bf16_method: str) -> None:
-        low = _is_low_precision(p)
-        if low and bf16_method == "kahan":
-            shift = state["shift"]
-            shift.sub_(delta_fp32.to(p.dtype))
-            p_before = p.detach().clone()
-            p.add_(shift)
-            shift.add_(p_before.sub_(p))
-        elif low and bf16_method == "stochastic_rounding" and p.dtype == torch.bfloat16:
-            add_stochastic_(p.data, delta_fp32, alpha=-1.0)
-        else:
-            p.data.sub_(delta_fp32.to(p.dtype))
 

@@ -72,6 +72,13 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._backend import (
+    cautious_batched_,
+    cautious_one_,
+    is_low_precision,
+    subtract_batched_,
+    subtract_one_,
+)
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -82,11 +89,9 @@ from kaon._momentum_codec import (
     _quant_int8_stacked,
     load_state_dict_preserving_dtypes,
 )
-from kaon._stochastic_rounding import add_stochastic_, subtract_batched_
 
 __all__ = ["Lion"]
 
-_LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
 # Performance cutoff (mirrors Adakaon): weights larger than this loop instead
@@ -98,10 +103,6 @@ _DEFAULT_STACK_ELEMS = 64_000_000  # CPU / unknown device: no VRAM limit to resp
 _STACK_SAFETY_FRACTION = 0.10
 _STACK_BYTES_PER_ELEM = 48
 _MIN_STACK_ELEMS = 262_144
-
-
-def _is_low_precision(t: Tensor) -> bool:
-    return t.dtype in _LOW_PRECISION
 
 
 class Lion(Optimizer):
@@ -231,7 +232,7 @@ class Lion(Optimizer):
             state["m_scale"] = torch.ones(nblocks, dtype=torch.float32, device=grad.device)
             state["m_numel"] = numel
             state["m_block"] = bs
-        if _is_low_precision(p) and group["bf16_method"] == "kahan":
+        if is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
 
     # -------------------------------------------------------- momentum (codec)
@@ -377,7 +378,7 @@ class Lion(Optimizer):
         # fp16+SR is unsupported (raises) -> route to the per-param path.
         return not (
             group["bf16_method"] == "stochastic_rounding"
-            and _is_low_precision(p)
+            and is_low_precision(p)
             and p.dtype != torch.bfloat16
         )
 
@@ -448,9 +449,7 @@ class Lion(Optimizer):
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
-            mask = (delta * grad > 0).to(delta.dtype)
-            denom = mask.mean(dim=1).clamp_(min=1e-8).view(n, 1)
-            delta = delta.mul_(mask).div_(denom)
+            delta = cautious_batched_(delta, grad)
 
         delta.mul_(lr)
         subtract_batched_([p.data.reshape(length) for p in plist], delta, bf16_method)
@@ -484,22 +483,8 @@ class Lion(Optimizer):
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
-            mask = (delta * grad > 0).to(delta.dtype)
-            delta = delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
+            delta = cautious_one_(delta, grad)
 
         delta.mul_(lr)
-        self._apply_subtract(p, delta, state, bf16_method)
+        subtract_one_(p, delta, state, bf16_method)
 
-    @staticmethod
-    def _apply_subtract(p: Tensor, delta_fp32: Tensor, state: dict[str, Any], bf16_method: str) -> None:
-        low = _is_low_precision(p)
-        if low and bf16_method == "kahan":
-            shift = state["shift"]
-            shift.sub_(delta_fp32.to(p.dtype))
-            p_before = p.detach().clone()
-            p.add_(shift)
-            shift.add_(p_before.sub_(p))
-        elif low and bf16_method == "stochastic_rounding" and p.dtype == torch.bfloat16:
-            add_stochastic_(p.data, delta_fp32, alpha=-1.0)
-        else:
-            p.data.sub_(delta_fp32.to(p.dtype))

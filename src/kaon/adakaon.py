@@ -40,6 +40,13 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._backend import (
+    cautious_batched_,
+    cautious_one_,
+    is_low_precision,
+    subtract_batched_,
+    subtract_one_,
+)
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -58,7 +65,6 @@ from kaon._momentum_codec import (
     _unpack_nibbles,
     load_state_dict_preserving_dtypes,
 )
-from kaon._stochastic_rounding import add_stochastic_, subtract_batched_
 
 __all__ = ["Adakaon"]
 
@@ -71,7 +77,6 @@ _ = (
     _quant_int8_stacked, _unpack_nibbles,
 )
 
-_LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
 # Stacking a foreach bucket allocates several transient copies of the stacked
@@ -266,7 +271,7 @@ class Adakaon(Optimizer):
             state["v"] = torch.zeros_like(grad, dtype=torch.float32)
         if group["betas"][0] > 0:
             self._codec(group).init_state(state, grad, group)
-        if _is_low_precision(p) and group["bf16_method"] == "kahan":
+        if is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
 
     @torch.no_grad()
@@ -364,7 +369,7 @@ class Adakaon(Optimizer):
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"
-            and _is_low_precision(p)
+            and is_low_precision(p)
             and p.dtype != torch.bfloat16        # fp16+SR is unsupported -> per-param (raises)
         ):
             return False
@@ -483,9 +488,7 @@ class Adakaon(Optimizer):
             delta = delta.add_(p_fp32, alpha=lr * wd)
 
         if cautious:
-            mask = (delta * grad > 0).to(delta.dtype)
-            denom = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view(N, 1, 1)
-            delta = delta.mul_(mask).div_(denom)
+            delta = cautious_batched_(delta, grad)
 
         # Subtract delta from the (matrixized) weights, batched.
         subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
@@ -546,9 +549,7 @@ class Adakaon(Optimizer):
             delta = delta.add_(p_fp32, alpha=lr * wd)
 
         if cautious:
-            mask = (delta * grad > 0).to(delta.dtype)
-            denom = mask.mean(dim=1).clamp_(min=1e-8).view(N, 1)
-            delta = delta.mul_(mask).div_(denom)
+            delta = cautious_batched_(delta, grad)
 
         subtract_batched_([p.data for p in plist], delta, bf16_method)
 
@@ -596,25 +597,8 @@ class Adakaon(Optimizer):
             delta = delta.add_(p_fp32, alpha=lr * wd)
 
         if cautious:
-            mask = (delta * grad_fp32 > 0).to(delta.dtype)
-            delta = delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
+            delta = cautious_one_(delta, grad_fp32)
 
-        self._apply_subtract(p, delta, state, bf16_method)
-
-    @staticmethod
-    def _apply_subtract(p: Tensor, delta_fp32: Tensor, state: dict[str, Any], bf16_method: str) -> None:
-        low = _is_low_precision(p)
-        if low and bf16_method == "kahan":
-            shift = state["shift"]
-            shift.sub_(delta_fp32.to(p.dtype))
-            p_before = p.detach().clone()
-            p.add_(shift)
-            shift.add_(p_before.sub_(p))
-        elif low and bf16_method == "stochastic_rounding" and p.dtype == torch.bfloat16:
-            add_stochastic_(p.data, delta_fp32, alpha=-1.0)
-        else:
-            p.data.sub_(delta_fp32.to(p.dtype))
+        subtract_one_(p, delta, state, bf16_method)
 
 
-def _is_low_precision(t: Tensor) -> bool:
-    return t.dtype in _LOW_PRECISION

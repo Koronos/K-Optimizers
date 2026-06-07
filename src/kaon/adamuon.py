@@ -58,6 +58,12 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._backend import (
+    cautious_batched_,
+    is_low_precision,
+    subtract_batched_,
+    subtract_one_,
+)
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -65,12 +71,10 @@ from kaon._momentum_codec import (
     _MomentumCodec,
     load_state_dict_preserving_dtypes,
 )
-from kaon._stochastic_rounding import add_stochastic_, subtract_batched_
 from kaon.muon import zeropower_via_newtonschulz5
 
 __all__ = ["AdaMuon"]
 
-_LOW_PRECISION = (torch.bfloat16, torch.float16)
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
 # Shape-independent applied-update RMS target (before lr). The factored
@@ -278,7 +282,7 @@ class AdaMuon(Optimizer):
         # shape (the codec matrixizes it per-step for Newton-Schulz).
         if group["betas"][0] > 0:
             self._codec(group).init_state(state, grad, group)
-        if _is_low_precision(p) and group["bf16_method"] == "kahan":
+        if is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
 
     @torch.no_grad()
@@ -352,7 +356,7 @@ class AdaMuon(Optimizer):
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"
-            and _is_low_precision(p)
+            and is_low_precision(p)
             and p.dtype != torch.bfloat16
         ):
             return False
@@ -466,9 +470,7 @@ class AdaMuon(Optimizer):
             delta = delta.add_(p_fp32, alpha=lr * wd)
 
         if cautious:
-            mask = (delta * grad > 0).to(delta.dtype)
-            denom = mask.reshape(N, -1).mean(dim=1).clamp_(min=1e-8).view(N, 1, 1)
-            delta = delta.mul_(mask).div_(denom)
+            delta = cautious_batched_(delta, grad)
 
         subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
 
@@ -522,9 +524,7 @@ class AdaMuon(Optimizer):
             delta = delta.add_(p_fp32, alpha=lr * wd)
 
         if cautious:
-            mask = (delta * grad > 0).to(delta.dtype)
-            denom = mask.mean(dim=1).clamp_(min=1e-8).view(N, 1)
-            delta = delta.mul_(mask).div_(denom)
+            delta = cautious_batched_(delta, grad)
 
         subtract_batched_([p.data for p in plist], delta, bf16_method)
 
@@ -586,22 +586,6 @@ class AdaMuon(Optimizer):
             mask = (delta * cautious_ref > 0).to(delta.dtype)
             delta = delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
 
-        self._apply_subtract(p, delta, state, bf16_method)
-
-    @staticmethod
-    def _apply_subtract(p: Tensor, delta_fp32: Tensor, state: dict[str, Any], bf16_method: str) -> None:
-        low = _is_low_precision(p)
-        if low and bf16_method == "kahan":
-            shift = state["shift"]
-            shift.sub_(delta_fp32.to(p.dtype))
-            p_before = p.detach().clone()
-            p.add_(shift)
-            shift.add_(p_before.sub_(p))
-        elif low and bf16_method == "stochastic_rounding" and p.dtype == torch.bfloat16:
-            add_stochastic_(p.data, delta_fp32, alpha=-1.0)
-        else:
-            p.data.sub_(delta_fp32.to(p.dtype))
+        subtract_one_(p, delta, state, bf16_method)
 
 
-def _is_low_precision(t: Tensor) -> bool:
-    return t.dtype in _LOW_PRECISION
