@@ -56,6 +56,16 @@ MomentumDtype = ("bfloat16", "float32", "int8", "4bit")
 # fidelity replay on real SDXL gradients here confirmed block 128 ≈ int8 fidelity.
 _FOURBIT_BLOCK = 128
 
+# Quantization levels and floors, named so the (de)quant math reads identically in every
+# helper. Both codecs are SYMMETRIC signed linear quantizers, so they deliberately leave one
+# code unused at the bottom of the range (int8: -128; 4-bit: -8) to keep the scale symmetric.
+_INT8_ABSMAX = 127.0     # scale = absmax / 127  -> codes span [-127, 127]
+_INT8_CLAMP = 127
+_FOURBIT_ABSMAX = 7.0    # scale = absmax / 7    -> codes span [-7, 7]
+_FOURBIT_CLAMP = 7
+_FOURBIT_ZERO = 8        # +8 shift maps signed [-7, 7] -> unsigned nibble [1, 15] (nibble 0 unused)
+_ABSMAX_FLOOR = 1e-12    # floor on absmax so an all-zero row/block can't divide by zero
+
 
 def _quant_int8(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     """Quantize a momentum tensor to int8 with a per-row (dim-0) absmax scale.
@@ -65,9 +75,9 @@ def _quant_int8(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     tensors use a single scalar scale.
     """
     dims = tuple(range(1, m_fp32.ndim)) if m_fp32.ndim >= 2 else ()
-    absmax = m_fp32.abs().amax(dim=dims, keepdim=True).clamp_(min=1e-12)
-    scale = absmax / 127.0
-    q = (m_fp32 / scale).round_().clamp_(-127, 127).to(torch.int8)
+    absmax = m_fp32.abs().amax(dim=dims, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
+    scale = absmax / _INT8_ABSMAX
+    q = (m_fp32 / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP).to(torch.int8)
     return q, scale
 
 
@@ -79,9 +89,9 @@ def _quant_int8_stacked(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     Reducing only the trailing axis here is element-for-element the same set of
     values the per-param path reduces per tensor, so the scales match exactly.
     """
-    absmax = m_fp32.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-12)
-    scale = absmax / 127.0
-    q = (m_fp32 / scale).round_().clamp_(-127, 127).to(torch.int8)
+    absmax = m_fp32.abs().amax(dim=-1, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
+    scale = absmax / _INT8_ABSMAX
+    q = (m_fp32 / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP).to(torch.int8)
     return q, scale
 
 
@@ -121,10 +131,10 @@ def _quant_4bit(m_fp32: Tensor, block_size: int) -> tuple[Tensor, Tensor, int]:
     if pad:
         flat = torch.cat([flat, flat.new_zeros(pad)])
     blocks = flat.view(nblocks, block_size)
-    absmax = blocks.abs().amax(dim=1, keepdim=True).clamp_(min=1e-12)
-    scale = absmax / 7.0
-    q = (blocks / scale).round_().clamp_(-7, 7).to(torch.int8)
-    nib = (q + 8).to(torch.uint8).reshape(-1)[:numel]
+    absmax = blocks.abs().amax(dim=1, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
+    scale = absmax / _FOURBIT_ABSMAX
+    q = (blocks / scale).round_().clamp_(-_FOURBIT_CLAMP, _FOURBIT_CLAMP).to(torch.int8)
+    nib = (q + _FOURBIT_ZERO).to(torch.uint8).reshape(-1)[:numel]
     packed = _pack_nibbles(nib)
     return packed, scale.reshape(nblocks), numel
 
@@ -132,7 +142,7 @@ def _quant_4bit(m_fp32: Tensor, block_size: int) -> tuple[Tensor, Tensor, int]:
 def _dequant_4bit(packed: Tensor, scale: Tensor, numel: int, block_size: int) -> Tensor:
     """Inverse of :func:`_quant_4bit`: -> flat fp32 of length ``numel``."""
     nib = _unpack_nibbles(packed, numel)
-    q = nib.to(torch.float32) - 8.0
+    q = nib.to(torch.float32) - _FOURBIT_ZERO
     nblocks = scale.shape[0]
     pad = nblocks * block_size - numel
     if pad:
@@ -156,10 +166,10 @@ def _quant_4bit_stacked(m_fp32: Tensor, block_size: int) -> tuple[Tensor, Tensor
     if pad:
         flat = torch.cat([flat, flat.new_zeros(n, pad)], dim=1)
     blocks = flat.view(n, nblocks, block_size)
-    absmax = blocks.abs().amax(dim=2, keepdim=True).clamp_(min=1e-12)
-    scale = absmax / 7.0
-    q = (blocks / scale).round_().clamp_(-7, 7).to(torch.int8)
-    nib = (q + 8).to(torch.uint8).reshape(n, -1)[:, :per]
+    absmax = blocks.abs().amax(dim=2, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
+    scale = absmax / _FOURBIT_ABSMAX
+    q = (blocks / scale).round_().clamp_(-_FOURBIT_CLAMP, _FOURBIT_CLAMP).to(torch.int8)
+    nib = (q + _FOURBIT_ZERO).to(torch.uint8).reshape(n, -1)[:, :per]
     packed = _pack_nibbles(nib)                          # [N, ceil(per/2)]
     return packed, scale.reshape(n, nblocks)
 
@@ -168,7 +178,7 @@ def _dequant_4bit_stacked(packed: Tensor, scale: Tensor, per: int, block_size: i
     """Inverse of :func:`_quant_4bit_stacked`: -> ``[N, per]`` fp32."""
     n = packed.shape[0]
     nib = _unpack_nibbles(packed, per)                   # [N, per]
-    q = nib.to(torch.float32) - 8.0
+    q = nib.to(torch.float32) - _FOURBIT_ZERO
     nblocks = scale.shape[1]
     pad = nblocks * block_size - per
     if pad:
@@ -334,10 +344,10 @@ class _FourBitCodec(_MomentumCodec):
         numel = grad.numel()
         bs = self._block_size(grad, group)
         nblocks = (numel + bs - 1) // bs
-        # zero momentum -> nibble 8 (the zero level after the +8 shift); a packed
-        # byte of two 8-nibbles is 0x88 = 136. Scales are 1.0 so a fresh dequant
-        # returns exactly 0.
-        state["m"] = torch.full(((numel + 1) // 2,), 0x88, dtype=torch.uint8, device=grad.device)
+        # zero momentum -> nibble _FOURBIT_ZERO (the zero level after the +8 shift); a packed
+        # byte of two such nibbles is 0x88 = 136. Scales are 1.0 so a fresh dequant returns 0.
+        zero_byte = _FOURBIT_ZERO | (_FOURBIT_ZERO << 4)   # 0x88
+        state["m"] = torch.full(((numel + 1) // 2,), zero_byte, dtype=torch.uint8, device=grad.device)
         state["m_scale"] = torch.ones(nblocks, dtype=torch.float32, device=grad.device)
         state["m_numel"] = numel
         state["m_block"] = bs
