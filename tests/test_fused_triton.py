@@ -153,17 +153,34 @@ def test_chunked_mixed_with_small_and_1d():
     assert len(ov._fused) == 2 and len(ov._big) == 1
 
 
-def test_chunked_int8_big_routes_to_native():
-    # chunked quant is future work -> a big int8 tensor goes to the native inner optimizer
-    ps = _bag([(1024, 512)], torch.float32)
-    for p in ps:
-        p.grad = torch.randn_like(p)
-    ov = FusedAdakaon(ps, momentum_dtype="int8")
-    ov.step()
-    torch.cuda.synchronize()
-    assert len(ov._big) == 0 and len(ov._fused) == 0 and ov.inner is not None
-    assert ov.inner.state[ps[0]]["m"].dtype == torch.int8
-    assert torch.isfinite(ps[0]).all()
+def test_chunked_int8_parity():
+    # big int8 momentum via the codec (dequant -> fp32 temp -> kernels -> requant); 1 B/param
+    d, scale, ov = _run_parity([(1024, 512)], torch.float32, "int8")
+    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+    assert len(ov._big) == 1
+    st = ov.state[ov._big[0]]
+    assert st["m"].dtype == torch.int8 and st["m"].numel() == ov._big[0].numel()  # 1 B/param
+
+
+def test_chunked_4bit_parity():
+    d, scale, ov = _run_parity([(1024, 512)], torch.float32, "4bit")
+    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+    assert len(ov._big) == 1
+    st = ov.state[ov._big[0]]
+    assert st["m"].dtype == torch.uint8 and st["m"].numel() == ov._big[0].numel() // 2  # 0.5 B/param
+
+
+def test_chunked_4bit_odd_C():
+    # the chunked codec packs the flat tensor, so 4bit handles odd C (unlike the one-block path)
+    d, scale, ov = _run_parity([(1024, 513)], torch.float32, "4bit")
+    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+    assert len(ov._big) == 1
+
+
+@pytest.mark.parametrize("mdtype", ["int8", "4bit"])
+def test_chunked_quant_features(mdtype):
+    d, scale, _ = _run_parity([(1024, 512)], torch.float32, mdtype, wd=0.05, cautious=True, gc=False)
+    assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
 
 
 # ----------------------------------------------------------------- decoupled weight decay

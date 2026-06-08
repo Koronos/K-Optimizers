@@ -40,14 +40,16 @@ What is already optimizer-AGNOSTIC vs Adakaon-SPECIFIC here:
                                                    cautious). AdaPNM would add a 2nd (negative)
                                                    momentum; AdaMuon would swap in orthogonalization.
 
-  NOT yet covered (native fallback handles them): int8/4bit momentum, weight_decay != 0, fp16
-  params, conv ndim>2, tiles above ``TILE_CAP`` (high-rank LoRA), per-param-group configs.
+  NOT covered (native fallback handles them): fp16 params, conv ndim>2, 1-D, small odd-C 4bit, and
+  per-param-group configs. (Large tensors above ``TILE_CAP`` are handled by the chunked path.)
 ────────────────────────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
 import torch
 from torch.optim import Optimizer
+
+from kaon._momentum_codec import _make_codec, _quant_4bit, _quant_int8  # torch codec (no triton dep)
 
 try:  # Triton is an optional, GPU-only dependency — keep ``import kaon`` working without it.
     import triton
@@ -424,13 +426,14 @@ class PointerArrayCache:
 class FusedAdakaon(Optimizer):
     """Adakaon-bf16 with a pointer-array fused Triton kernel for small 2-D weights; native otherwise.
 
-    Two fused paths: a one-block kernel for tiles ≤ ``tile_cap`` (momentum bf16/fp32/int8/4bit;
-    1 / 0.5 B/param via the reusable dequant/requant helpers) and a chunked multi-block path for
-    larger 2-D fp32/bf16-momentum tensors (cheap reductions in torch + two elementwise kernels —
-    ~2.5x over native on big weight matrices). Both support GC, cautious, and decoupled
-    (AdamW-style) ``weight_decay``. Routed to an inner :class:`kaon.Adakaon` (always correct):
-    1-D / conv tensors, odd-column 4bit, int8/4bit momentum on big tensors (chunked quant is future
-    work), and fp16 params. Experimental: imported from ``kaon._fused_triton``, not in the public API.
+    Two fused paths, both covering momentum bf16/fp32/int8/4bit (1 / 0.5 B/param) with GC, cautious,
+    and decoupled (AdamW-style) ``weight_decay``: a one-block kernel for tiles ≤ ``tile_cap`` (quant
+    via the reusable in-kernel dequant/requant helpers) and a chunked multi-block path for larger 2-D
+    tensors (cheap reductions in torch + two elementwise kernels; int8/4bit via the shared codec on an
+    fp32 temp — ~2.5x over native fp32, ~1.7x over native quant on big weight matrices). Routed to an
+    inner :class:`kaon.Adakaon` (always correct): 1-D / conv tensors, fp16 params, and small not-one-
+    block tensors (e.g. odd-column 4bit at LoRA scale). Experimental: imported from
+    ``kaon._fused_triton``, not in the public API.
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps1=1e-30, clip=1.0,
@@ -443,7 +446,7 @@ class FusedAdakaon(Optimizer):
         beta1, beta2 = betas
         defaults = dict(lr=lr, beta1=float(beta1), beta2=float(beta2), eps1=eps1, clip=clip,
                         wd=float(weight_decay), cautious=cautious, gc=gradient_centralization,
-                        mdtype=momentum_dtype)
+                        mdtype=momentum_dtype, momentum_4bit_block=_FOURBIT_BLOCK)
         super().__init__(params, defaults)
         self._tile_cap = tile_cap
         self._t = 0
@@ -453,25 +456,35 @@ class FusedAdakaon(Optimizer):
         self._fused_group: dict[int, dict] = {}
         self.inner = None        # native Adakaon over the fallback params
         self._cache: PointerArrayCache | None = None
+        self._codecs: dict[str, object] = {}         # momentum codec per dtype (chunked quant path)
+
+    def _codec(self, group):
+        md = group["mdtype"]
+        c = self._codecs.get(md)
+        if c is None:
+            c = self._codecs[md] = _make_codec(md)
+        return c
 
     def _partition(self):
         from kaon import Adakaon
         fb = []
         for group in self.param_groups:
             is_4bit = group["mdtype"] == "4bit"
-            big_mom = group["mdtype"] in ("float32", "bfloat16")  # chunked path: fp32/bf16 mom only
             for p in group["params"]:
                 ok = fused_eligible(p, self._tile_cap)
                 # 4bit packs 2 nibbles/byte over row-major-flat elements; an EVEN column count keeps
-                # each byte's pair within one row (clean reshape-pack). Odd C -> native.
+                # each byte's pair within one row (clean reshape-pack). Odd C -> chunked/native.
                 if ok and is_4bit and p.shape[1] % 2 != 0:
                     ok = False
+                big = (p.ndim == 2 and p.is_cuda and p.is_contiguous()
+                       and p.dtype in (torch.float32, torch.bfloat16)
+                       and next_pow2_tile(*p.shape)[0] * next_pow2_tile(*p.shape)[1] > self._tile_cap)
                 if ok:
                     self._fused.append(p)
                     self._fused_group[id(p)] = group
-                elif (big_mom and p.ndim == 2 and p.is_cuda and p.is_contiguous()
-                      and p.dtype in (torch.float32, torch.bfloat16)):
-                    # too big for one block -> chunked path (int8/4bit chunked is future work)
+                elif big:
+                    # genuinely too big for one block -> chunked path (fp32/bf16 direct; int8/4bit via
+                    # the codec). Small not-one-block tensors (e.g. odd-C 4bit) -> native (foreach).
                     self._big.append(p)
                     self._fused_group[id(p)] = group
                 else:
@@ -508,36 +521,75 @@ class FusedAdakaon(Optimizer):
             st["row"] = torch.zeros(R, dtype=torch.float32, device=p.device)
             st["col"] = torch.zeros(C, dtype=torch.float32, device=p.device)
 
-    @torch.no_grad()
-    def _chunked_step(self, p, group):
-        """One big 2-D tensor: cheap per-tensor reductions in torch (row/col EMA, rms via a matvec
-        that avoids any [R,C] temp), then two chunked elementwise kernels for the heavy passes."""
-        self._ensure_state(p)
-        st = self.state[p]
+    def _chunked_reductions(self, p, group, st):
+        """Shared torch part of a big-tensor step: GC + row/col EMA + rms (matvec, no [R,C] temp).
+        Returns (g_centralized_fp32, r_factor, c_factor, inv_rms_lr)."""
         R, C = p.shape
         n = R * C
-        lr, b1, b2 = group["lr"], group["beta1"], group["beta2"]
-        eps1, clip, wd = group["eps1"], group["clip"], group["wd"]
+        b2, eps1, clip, lr = group["beta2"], group["eps1"], group["clip"], group["lr"]
         g = p.grad.float()
         if group["gc"]:
             g = g - g.mean(dim=1, keepdim=True)            # GC over fan-in (C)
         g = g.contiguous()
         gsq = g * g
-        row, col = st["row"], st["col"]
-        row.lerp_(gsq.mean(1).add_(eps1), 1.0 - b2)
-        col.lerp_(gsq.mean(0).add_(eps1), 1.0 - b2)
-        r = row.div(row.mean()).rsqrt_()                   # [R]
-        c = col.rsqrt()                                    # [C]
+        st["row"].lerp_(gsq.mean(1).add_(eps1), 1.0 - b2)
+        st["col"].lerp_(gsq.mean(0).add_(eps1), 1.0 - b2)
+        r = st["row"].div(st["row"].mean()).rsqrt_()       # [R]
+        c = st["col"].rsqrt()                              # [C]
         rms = (((r * r) * gsq.matmul(c * c)).sum() / n).sqrt_()           # matvec, no [R,C] temp
-        inv_rms_lr = lr / float(rms.div_(clip).clamp_(min=1.0))
+        return g, r, c, lr / float(rms.div_(clip).clamp_(min=1.0))
+
+    @torch.no_grad()
+    def _chunked_step(self, p, group):
+        """One big 2-D tensor: cheap per-tensor reductions in torch, then two chunked elementwise
+        kernels for the heavy [R,C] passes. fp32/bf16 momentum stores directly; int8/4bit goes
+        through the codec (dequant -> fp32 temp -> kernels -> requant)."""
+        if group["mdtype"] in ("int8", "4bit"):
+            return self._chunked_step_quant(p, group)
+        self._ensure_state(p)
+        st = self.state[p]
+        n = p.numel()
+        b1, wd = group["beta1"], group["wd"]
+        g, r, c, inv_rms_lr = self._chunked_reductions(p, group, st)
         cautious, sr = group["cautious"], p.dtype == torch.bfloat16
         keep = torch.zeros(1, dtype=torch.int32, device=p.device)
         gf, mf, pf = g.reshape(-1), st["m"].reshape(-1), p.reshape(-1)
         grid = (triton.cdiv(n, 1024),)
-        _chunked_mom[grid](gf, mf, pf, r, c, keep, C, n, inv_rms_lr, lr * wd, b1,
+        _chunked_mom[grid](gf, mf, pf, r, c, keep, p.shape[1], n, inv_rms_lr, group["lr"] * wd, b1,
                            CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
         inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
-        _chunked_apply[grid](gf, mf, pf, n, inv_mean, lr * wd, self._t,
+        _chunked_apply[grid](gf, mf, pf, n, inv_mean, group["lr"] * wd, self._t,
+                             CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024)
+
+    @torch.no_grad()
+    def _chunked_step_quant(self, p, group):
+        """Big-tensor chunked step with int8/4bit momentum, via the shared codec: dequant the stored
+        codes to an fp32 temp, run the EMA + apply kernels on it (so the WEIGHT update uses the exact
+        pre-requant fp32 momentum, like native), then requant the temp back to int8/4bit storage."""
+        R, C = p.shape
+        n = R * C
+        codec, md = self._codec(group), group["mdtype"]
+        st = self.state[p]
+        if "m" not in st:
+            codec.init_state(st, p.grad, group)
+            st["row"] = torch.zeros(R, dtype=torch.float32, device=p.device)
+            st["col"] = torch.zeros(C, dtype=torch.float32, device=p.device)
+        b1, wd = group["beta1"], group["wd"]
+        g, r, c, inv_rms_lr = self._chunked_reductions(p, group, st)
+        m_fp32 = codec.dequant_one(st, torch.empty(R, C, device=p.device)).reshape(R, C)
+        cautious, sr = group["cautious"], p.dtype == torch.bfloat16
+        keep = torch.zeros(1, dtype=torch.int32, device=p.device)
+        gf, mf, pf = g.reshape(-1), m_fp32.reshape(-1), p.reshape(-1)
+        grid = (triton.cdiv(n, 1024),)
+        _chunked_mom[grid](gf, mf, pf, r, c, keep, C, n, inv_rms_lr, group["lr"] * wd, b1,
+                           CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
+        # requant the updated fp32 momentum back into the codec's storage (per-row int8 / per-block 4bit)
+        if md == "int8":
+            st["m"], st["m_scale"] = _quant_int8(m_fp32)
+        else:
+            st["m"], st["m_scale"], _ = _quant_4bit(m_fp32.reshape(-1), st["m_block"])
+        inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
+        _chunked_apply[grid](gf, mf, pf, n, inv_mean, group["lr"] * wd, self._t,
                              CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024)
 
     @torch.no_grad()
