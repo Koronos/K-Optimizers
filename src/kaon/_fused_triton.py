@@ -62,7 +62,12 @@ except ImportError:  # pragma: no cover - exercised only on triton-less installs
 __all__ = ["FusedAdakaon", "fused_eligible", "warps_for", "next_pow2_tile", "TILE_CAP", "HAS_TRITON"]
 
 HAS_TRITON = _HAS_TRITON
-TILE_CAP = 1 << 16  # 65536 padded lanes — the largest tile we let a single program own
+# Largest padded tile a single program owns. Measured crossover (RTX 4080, fp32): the one-block
+# kernel beats native up to ~131072 lanes (2.7x @ 65K, 1.2-1.4x @ 131K) and loses past ~262144
+# (register spill; >=1M lanes won't even compile). 131072 is the measured sweet spot; this cap is
+# also the safety guard that keeps truly-large tensors (full-FT matrices) on the native path. A
+# chunked multi-block kernel for those is future work (native goes bandwidth-bound there -> headroom).
+TILE_CAP = 1 << 17  # 131072 padded lanes
 DEV = "cuda"
 
 # Momentum storage kinds (passed to the kernel as a constexpr so the unused branches compile away).

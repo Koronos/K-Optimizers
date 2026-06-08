@@ -17,7 +17,14 @@ import pytest
 import torch
 
 from kaon import Adakaon
-from kaon._fused_triton import HAS_TRITON, FusedAdakaon, fused_eligible, next_pow2_tile, warps_for
+from kaon._fused_triton import (
+    HAS_TRITON,
+    TILE_CAP,
+    FusedAdakaon,
+    fused_eligible,
+    next_pow2_tile,
+    warps_for,
+)
 
 pytestmark = pytest.mark.skipif(
     not (HAS_TRITON and torch.cuda.is_available()),
@@ -62,19 +69,19 @@ def _run_parity(shapes, dtype, mdtype, *, cautious=True, gc=True, wd=0.0, steps=
 
 # ----------------------------------------------------------------- host helpers
 def test_eligibility_predicate():
-    big = (1 << 16)  # tile cap
+    assert TILE_CAP == 1 << 17                                       # measured crossover (131072)
     assert fused_eligible(torch.zeros(8, 16, device=DEV))            # tiny 2-D
     assert fused_eligible(torch.zeros(16, 320, device=DEV))          # low-rank LoRA
     assert fused_eligible(torch.zeros(16, 320, device=DEV, dtype=torch.bfloat16))
+    assert fused_eligible(torch.zeros(128, 1024, device=DEV))        # 131072 lanes == cap (medium)
     assert not fused_eligible(torch.zeros(128, device=DEV))          # 1-D
     assert not fused_eligible(torch.zeros(8, 8, 3, 3, device=DEV))   # conv ndim>2
     assert not fused_eligible(torch.zeros(8, 16))                    # cpu
     assert not fused_eligible(torch.zeros(8, 16, device=DEV, dtype=torch.float16))  # fp16
-    assert not fused_eligible(torch.zeros(256, 1024, device=DEV))    # tile > cap
+    assert not fused_eligible(torch.zeros(512, 1024, device=DEV))    # 524288 lanes > cap -> native
     # non-contiguous
     t = torch.zeros(16, 32, device=DEV).t()
     assert not fused_eligible(t)
-    assert big == (1 << 16)
 
 
 def test_warps_and_tile_helpers():
@@ -104,6 +111,13 @@ def test_fp32_parity_mixed_shapes_multiple_buckets():
 def test_fp32_parity_lora_shapes():
     d, _, _ = _run_parity([(16, 320), (320, 16), (8, 1280)], torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_fp32_parity_medium_tiles_near_cap():
+    # tiles up to the raised cap (131072 lanes) fuse and stay exact vs native (measured 1.2-1.4x faster)
+    d, _, ov = _run_parity([(128, 1024), (256, 512)], torch.float32, "float32")
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+    assert len(ov._fused) == 2                                 # both fused at the new cap
 
 
 # ----------------------------------------------------------------- decoupled weight decay
