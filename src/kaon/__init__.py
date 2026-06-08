@@ -7,6 +7,12 @@ Optimizers:
     Autokaon: parameter-free LR on Adakaon via a Mechanic tuner (freeze-to-free).
     Lion: sign-momentum (EvoLved Sign Momentum) on Adakaon's quantized-momentum backend (experimental).
     AdaPNM: Adam + positive-negative momentum on the factored/quantized backend (experimental).
+    AdaBelief: Adam on the variance of the gradient residual (g - m) on the factored backend (candidate).
+    ScheduleFree: Schedule-Free AdamW (iterate averaging, no LR schedule) on the factored backend (candidate).
+    ADOPT: modified Adam that converges with any beta2 (v-lag + normalize-then-momentum) (candidate).
+    AdamP: AdamW minus the radial update component on scale-invariant weights (candidate).
+    Lookahead: k-step slow-weight averaging wrapper over Adakaon (candidate wrapper).
+    SAM: Sharpness-Aware Minimization (two-pass flat-minima) wrapper over Adakaon (candidate wrapper).
 
 Quickstart::
 
@@ -21,19 +27,31 @@ Quickstart::
 """
 
 from kaon._version import __version__
+from kaon.adabelief import AdaBelief
 from kaon.adakaon import Adakaon
+from kaon.adamp import AdamP
 from kaon.adamuon import AdaMuon
 from kaon.adapnm import AdaPNM
+from kaon.adopt import ADOPT
 from kaon.autokaon import Autokaon
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
+from kaon.lookahead import Lookahead
+from kaon.sam import SAM
+from kaon.schedulefree import ScheduleFree
 
 __all__ = [
+    "ADOPT",
+    "AdaBelief",
     "AdaMuon",
     "AdaPNM",
     "Adakaon",
+    "AdamP",
     "Autokaon",
     "KProdigy",
     "Lion",
+    "Lookahead",
+    "SAM",
+    "ScheduleFree",
     "__version__",
 ]
