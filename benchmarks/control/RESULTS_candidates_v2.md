@@ -31,6 +31,16 @@
 > move it — "steps/time to the field's median final quality". The 17-optimizer table below is the
 > clean, consistent global run (all non-frozen optimizers re-measured fresh at best config).
 
+## ✅ Decision (locked 2026-06-07)
+**Kept** (stay in the live registry, on `integration/candidates-v2`): **ADOPT, ScheduleFree, Lookahead,
+SAM, AdamP, AdaBelief** (the wrappers run over Adakaon). **Discarded** (code preserved on branch
+`candidates-v2-discarded`; numbers archived in `results_archive.json` so the charts/README keep them):
+**Adan, MARS, Grams, Adai, AdEMAMix**. Rationale per the strengths/weaknesses below — in short: Adan is
+Pareto-dominated once memory+speed count; MARS is heavy with a mid gap; Grams memorizes; Adai is the
+heaviest + slowest-on-LoRA + the only perceptual failure; AdEMAMix is mid here but earns one last
+*long-run* retest before final burial. AdamP was upgraded from "conditional" to keep (it's #3 loss /
+#5 gap / light; only slow, and its norm-layer edge is untested on the proxy).
+
 ## TL;DR
 - **11 candidates** — 9 standalone (AdaBelief, MARS, AdEMAMix, Adan, ScheduleFree, ADOPT, Grams, AdamP, Adai) + 2 wrappers (Lookahead, SAM) — built on the shared backend (codec momentum + factored quantized 2nd moment +
   bit-exact foreach + cautious + GC + dtype-safe checkpoint), each with **bit-exact foreach↔per-param

@@ -18,17 +18,12 @@ import torch
 
 from kaon import (
     ADOPT,
-    MARS,
     SAM,
     AdaBelief,
-    Adai,
     Adakaon,
     AdamP,
     AdaMuon,
-    Adan,
     AdaPNM,
-    AdEMAMix,
-    Grams,
     Lion,
     Lookahead,
     ScheduleFree,
@@ -91,20 +86,10 @@ OPTIMIZERS = {
         lr=4e-3, lr_const=4e-3, family="published",
         blurb="modified Adam, converges with any beta2 (v-lag + normalize-then-momentum)",
     ),
-    "Grams": dict(
-        make=lambda p, lr: Grams(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16"),
-        lr=4e-3, lr_const=4e-3, family="published",
-        blurb="Adam magnitude, direction = sign(current grad) (light, regularizing)",
-    ),
     "AdamP": dict(
         make=lambda p, lr: AdamP(p, lr=lr, weight_decay=0.05, cautious=True, momentum_dtype="bfloat16"),
         lr=1e-3, lr_const=1e-3, family="published",
         blurb="AdamW minus the radial update on scale-invariant weights (gap-oriented)",
-    ),
-    "Adai": dict(
-        make=lambda p, lr: Adai(p, lr=lr, cautious=True, momentum_dtype="bfloat16"),
-        lr=1.6e-2, lr_const=1.2e-2, family="published",
-        blurb="adaptive per-coord inertia (flat-minima); heavy (fp32 beta1_prod), SGD-scale LR",
     ),
     # --- wrappers over Adakaon (gap-frontier techniques; ~2x cost for SAM) ---
     "Lookahead": dict(
@@ -118,21 +103,6 @@ OPTIMIZERS = {
                                cautious=True, momentum_dtype="bfloat16"),
         lr=1.2e-3, lr_const=1.2e-3, family="published",
         blurb="sharpness-aware (flat minima) over Adakaon; 2x cost, lowers the gap",
-    ),
-    "MARS": dict(
-        make=lambda p, lr: MARS(p, lr=lr, gamma=0.025, cautious=True, momentum_dtype="bfloat16"),
-        lr=1e-3, lr_const=1e-3, family="published",
-        blurb="variance-reduction corrected gradient feeding AdamW (convergence)",
-    ),
-    "AdEMAMix": dict(
-        make=lambda p, lr: AdEMAMix(p, lr=lr, alpha=5.0, cautious=True, momentum_dtype="bfloat16"),
-        lr=5e-4, lr_const=5e-4, family="published",
-        blurb="two-EMA momentum (fast + slow long-horizon) — generalization on long runs",
-    ),
-    "Adan": dict(
-        make=lambda p, lr: Adan(p, lr=lr, cautious=True, momentum_dtype="int8"),
-        lr=1.5e-3, lr_const=1.5e-3, family="published",
-        blurb="adaptive Nesterov momentum (grad + grad-difference EMAs); int8 (3 buffers)",
     ),
     "ScheduleFree": dict(
         make=lambda p, lr: ScheduleFree(p, lr=lr, warmup_steps=100, cautious=True, momentum_dtype="bfloat16"),
