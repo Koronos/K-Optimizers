@@ -128,15 +128,12 @@ from kaon._backend import (
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
-    _dequant_4bit,
-    _dequant_4bit_stacked,
     _quant_4bit,
-    _quant_4bit_stacked,
     _quant_int8,
-    _quant_int8_stacked,
     load_state_dict_preserving_dtypes,
 )
 from kaon._stochastic_rounding import add_stochastic_
+from kaon._wrappers import CodecBuffer, TrainEvalWeights
 
 __all__ = ["ScheduleFree"]
 
@@ -147,7 +144,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class ScheduleFree(Optimizer):
+class ScheduleFree(TrainEvalWeights, Optimizer):
     """Schedule-Free AdamW (Defazio et al. 2024) on kaon's memory backend.
 
     The model's parameter buffer holds ``y`` (the interpolation point) in **train**
@@ -271,43 +268,22 @@ class ScheduleFree(Optimizer):
         self._foreach_stack_budget = foreach_stack_budget
 
     # =================================================================== train/eval
-    @torch.no_grad()
-    def eval(self) -> None:
-        """Switch ``p.data`` from the ``y`` (train) view to the ``x`` (averaged) view.
-
-        Call before sampling / validation / checkpointing. In-place closed-form
-        ``p <- p + (1 - 1/beta1)*(z - p)`` (== ``y -> x``). Idempotent: a no-op if
-        already in eval mode.
-        """
-        for group in self.param_groups:
-            if not group["train_mode"]:
-                continue
+    # train() / eval() come from TrainEvalWeights (the flag plumbing + step() guard, run under
+    # no_grad); the swap math is the two hooks below. The model's buffer holds y (train) and x
+    # (eval); both are a closed-form lerp toward z (x is never materialized), exact inverses.
+    def _to_eval_view(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
+        """y -> x : ``p <- p + (1 - 1/beta1)*(z - p)``."""
+        if "z" in state:
             beta1, _ = group["betas"]
-            for p in group["params"]:
-                state = self.state.get(p)
-                if state and "z" in state:
-                    z = self._dequant_z(state, group["momentum_dtype"], p)
-                    p.lerp_(z.to(p.dtype), weight=1.0 - 1.0 / beta1)
-            group["train_mode"] = False
+            z = CodecBuffer.read(state, "z", group["momentum_dtype"], p)
+            p.lerp_(z.to(p.dtype), weight=1.0 - 1.0 / beta1)
 
-    @torch.no_grad()
-    def train(self) -> None:
-        """Switch ``p.data`` from the ``x`` (eval) view back to the ``y`` (train) view.
-
-        Call before training steps. In-place closed-form ``p <- p + (1 - beta1)*(z - p)``
-        (== ``x -> y``), the exact inverse of :meth:`eval`. Idempotent: a no-op if
-        already in train mode.
-        """
-        for group in self.param_groups:
-            if group["train_mode"]:
-                continue
+    def _to_train_view(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
+        """x -> y : ``p <- p + (1 - beta1)*(z - p)`` (inverse of eval)."""
+        if "z" in state:
             beta1, _ = group["betas"]
-            for p in group["params"]:
-                state = self.state.get(p)
-                if state and "z" in state:
-                    z = self._dequant_z(state, group["momentum_dtype"], p)
-                    p.lerp_(z.to(p.dtype), weight=1.0 - beta1)
-            group["train_mode"] = True
+            z = CodecBuffer.read(state, "z", group["momentum_dtype"], p)
+            p.lerp_(z.to(p.dtype), weight=1.0 - beta1)
 
     # ===================================================================== z storage
     # z (and the optional inner-momentum exp_avg) are full-size; they are stored
@@ -385,105 +361,39 @@ class ScheduleFree(Optimizer):
             state["shift"] = torch.zeros_like(p)
             state["shift_z"] = torch.zeros_like(p)
 
+    # The read/write of the full-size buffers go through the shared CodecBuffer
+    # (kaon._wrappers) — the same codec storage Lookahead's phi uses, byte-identical to the
+    # hand-rolled versions these replace (CodecBuffer additionally guarantees a fresh fp32 on
+    # read, which is harmless here since z is written straight back). Only `_alloc_full` above
+    # stays local: it also zero-initializes the quantized exp_avg, which must NOT route through
+    # a quantize-of-zeros.
     @staticmethod
     def _dequant_full(state: dict[str, Any], prefix: str, md: str, like: Tensor) -> Tensor:
-        """Read a stored full-size buffer back as a fresh fp32 tensor shaped like ``like``.
-
-        The int8 per-row scale may have been stored with a matrixized ``[row, 1]``
-        shape (foreach path) or the original ``[row, 1, ...]`` shape (per-param
-        path); both encode the same per-row (dim-0) values, so dequant by reshaping
-        the codes to ``[row, -1]`` and broadcasting a flattened ``[row, 1]`` scale —
-        agnostic to which shape was stored.
-        """
-        if md in ("bfloat16", "float32"):
-            return state[prefix].float().reshape_as(like)
-        if md == "int8":
-            codes = state[prefix]
-            row = codes.shape[0] if codes.ndim >= 2 else 1
-            scale = state[f"{prefix}_scale"].reshape(row, 1) if codes.ndim >= 2 else state[f"{prefix}_scale"]
-            return codes.float().reshape(row, -1).mul_(scale).reshape_as(like)
-        m = _dequant_4bit(
-            state[prefix], state[f"{prefix}_scale"],
-            state[f"{prefix}_numel"], state[f"{prefix}_block"],
-        )
-        return m.view_as(like)
+        return CodecBuffer.read(state, prefix, md, like)
 
     def _dequant_z(self, state: dict[str, Any], md: str, like: Tensor) -> Tensor:
-        return self._dequant_full(state, "z", md, like)
+        return CodecBuffer.read(state, "z", md, like)
 
     @staticmethod
     def _store_full(state: dict[str, Any], prefix: str, md: str, m_fp32: Tensor) -> None:
-        """Write an updated fp32 full-size buffer back into the configured storage."""
-        if md in ("bfloat16", "float32"):
-            tgt = state[prefix]
-            tgt.copy_(m_fp32.reshape(tgt.shape))
-        elif md == "int8":
-            m_orig = m_fp32.reshape(state[prefix].shape)
-            state[prefix], state[f"{prefix}_scale"] = _quant_int8(m_orig)
-        else:  # 4bit
-            packed, scale, _ = _quant_4bit(m_fp32, state[f"{prefix}_block"])
-            state[prefix], state[f"{prefix}_scale"] = packed, scale
+        CodecBuffer.write(state, prefix, md, m_fp32)
 
     @staticmethod
     def _dequant_full_stacked(
         states: list[dict[str, Any]], prefix: str, md: str, shape: tuple[int, ...]
     ) -> Tensor:
-        """Stacked fp32 full-size buffer ``[N, *shape]`` from per-param storage."""
-        n = len(states)
-        per = 1
-        for d in shape:
-            per *= d
-        if md in ("bfloat16", "float32"):
-            return torch.stack([s[prefix].reshape(shape) for s in states]).float()
-        if md == "int8":
-            row = shape[0] if len(shape) >= 2 else 1
-            rest = max(per // row, 1)
-            m = torch.stack([s[prefix].reshape(row, rest) for s in states]).float()
-            scale = torch.stack([s[f"{prefix}_scale"].reshape(row, 1) for s in states])
-            return m.mul_(scale).reshape((n, *shape))
-        packed = torch.stack([s[prefix] for s in states])
-        sc = torch.stack([s[f"{prefix}_scale"] for s in states])
-        bs = states[0][f"{prefix}_block"]
-        return _dequant_4bit_stacked(packed, sc, per, bs).reshape((n, *shape))
+        return CodecBuffer.read_stacked(states, prefix, md, shape)
 
     @staticmethod
     def _store_full_stacked(
         states: list[dict[str, Any]], prefix: str, md: str, m_fp32: Tensor
     ) -> None:
-        """Write a stacked fp32 full-size buffer ``[N, *shape]`` back into per-param storage."""
-        n = m_fp32.shape[0]
-        shape = tuple(m_fp32.shape[1:])
-        per = 1
-        for d in shape:
-            per *= d
-        if md in ("bfloat16", "float32"):
-            ms = [s[prefix].reshape(shape) for s in states]
-            torch._foreach_copy_(ms, list(m_fp32.unbind(0)))
-        elif md == "int8":
-            row = shape[0] if len(shape) >= 2 else 1
-            rest = max(per // row, 1)
-            q, new_scale = _quant_int8_stacked(m_fp32.reshape(n, row, rest))
-            torch._foreach_copy_(
-                [s[prefix].reshape(row, rest) for s in states], list(q.unbind(0))
-            )
-            for s, sc in zip(states, new_scale.unbind(0), strict=True):
-                s[f"{prefix}_scale"] = sc.reshape(row, 1) if len(shape) >= 2 else sc.reshape(1)
-        else:  # 4bit
-            bs = states[0][f"{prefix}_block"]
-            new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs)
-            torch._foreach_copy_([s[prefix] for s in states], list(new_packed.unbind(0)))
-            for s, sc in zip(states, new_scale.unbind(0), strict=True):
-                s[f"{prefix}_scale"].copy_(sc)
+        CodecBuffer.write_stacked(states, prefix, md, m_fp32)
 
     # ============================================================================ step
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
-        if not self.param_groups[0]["train_mode"]:
-            raise RuntimeError(
-                "ScheduleFree.step() called outside train mode. Call optimizer.train() "
-                "before the training step (and optimizer.eval() before sampling / "
-                "checkpointing). See the ScheduleFree docstring."
-            )
+        self._require_train_mode("ScheduleFree")  # from TrainEvalWeights
         loss = None
         if closure is not None:
             with torch.enable_grad():

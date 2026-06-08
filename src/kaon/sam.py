@@ -69,11 +69,12 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kaon._stochastic_rounding import add_stochastic_
+from kaon._wrappers import WrapsInnerOptimizer
 
 __all__ = ["SAM"]
 
 
-class SAM(Optimizer):
+class SAM(WrapsInnerOptimizer, Optimizer):
     """Sharpness-Aware Minimization wrapping a base kaon optimizer.
 
     Args:
@@ -122,18 +123,19 @@ class SAM(Optimizer):
         # the base optimizer (Adakaon) also has an ``eps`` key (a tuple), and torch's
         # ``Optimizer.__init__`` fills only *missing* defaults into pre-existing param
         # groups — so a scalar ``eps`` planted by SAM would shadow Adakaon's tuple and
-        # break its step. ``rho``/``adaptive`` are SAM-only and safe to keep per-group
-        # (so a param-group override of rho works).
+        # break its step. (WrapsInnerOptimizer's separate state also keeps SAM's transient
+        # snapshot out of the inner Adam state.) ``rho``/``adaptive`` are SAM-only and safe
+        # to keep per-group, so a param-group override of rho works.
         self.eps = float(eps)
 
-        defaults = {"rho": float(rho), "adaptive": bool(adaptive), **kwargs}
-        super().__init__(params, defaults)
-
-        # Build the inner base optimizer over the SAME param groups, then alias our
-        # param_groups to its so the two stay in lock-step (lr schedules etc. drive both).
-        self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
-        self.param_groups = self.base_optimizer.param_groups
-        self.defaults.update(self.base_optimizer.defaults)
+        # WrapsInnerOptimizer builds nothing — we build the inner base optimizer and bind it
+        # (shared param_groups, separate per-param wrapper state, delegated zero_grad /
+        # state_dict). ``base_optimizer`` stays as a public alias of the bound ``inner``.
+        self._bind_inner(base_optimizer(params, **kwargs), state_key="sam")
+        self.base_optimizer = self.inner
+        for group in self.param_groups:
+            group.setdefault("rho", float(rho))
+            group.setdefault("adaptive", bool(adaptive))
 
     # ------------------------------------------------------------------ norm
     @torch.no_grad()
@@ -233,6 +235,10 @@ class SAM(Optimizer):
 
     # ------------------------------------------------------------------ state
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        super().load_state_dict(state_dict)
-        # Keep the inner optimizer pointed at the (restored) shared param groups.
-        self.base_optimizer.param_groups = self.param_groups
+        """Restore the inner base optimizer (dtype-preserving) via the wrapper mixin.
+
+        WrapsInnerOptimizer's ``state_dict`` already saves the inner optimizer's full
+        state (SAM keeps no persistent state of its own), so this round-trips the base
+        optimizer's momentum/factored state — unlike the previous bare ``super()`` call."""
+        self._load_wrapped(state_dict, lambda inner, sd: inner.load_state_dict(sd))
+        self.base_optimizer = self.inner
