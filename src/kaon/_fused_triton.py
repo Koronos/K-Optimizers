@@ -364,16 +364,17 @@ if _HAS_TRITON:
     # ============================================================ AdaPNM (positive-negative momentum)
     # Reuses the núcleo (gradient_centralize, factored_rc, dequant/requant_*, sr_round). New vs Adakaon:
     # TWO momenta (pos/neg, roles alternate by step parity — the host passes them swapped), the
-    # raw-grad EMA on only the positive buffer (decay beta1^2), the pos-neg mix / noise_norm, decoupled
-    # WD applied BEFORE the step (p *= 1-lr*wd), and no RMS-clip (the factored 1/sqrt(v_hat) is the
-    # whole denominator). ``sc`` folds bc2_sq * step_size; ``inv_noise`` = 1/noise_norm.
+    # raw-grad EMA on only the positive buffer (decay beta1^2), the pos-neg mix / noise_norm, and
+    # decoupled WD applied BEFORE the step (p *= 1-lr*wd). Like Adakaon it RMS-clips the update
+    # (``CLIP``, threshold ``clip_eff == clip * step_size``) — load-bearing: without it the factored
+    # 1/sqrt(v_hat) blows up on a cold col and diverges. ``sc`` folds bc2_sq * step_size; ``inv_noise`` = 1/noise_norm.
 
     @triton.jit
     def _adapnm_tile_kernel(
         g_addr, p_addr, pos_addr, neg_addr, posc_addr, negc_addr, row_addr, col_addr, Rs_ptr, Cs_ptr,
-        beta1_sq, beta0, inv_noise, beta2, sc, lrwd, eps1, seed,
+        beta1_sq, beta0, inv_noise, beta2, sc, lrwd, eps1, clip_eff, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
-        GC: tl.constexpr, SR: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GC: tl.constexpr, SR: tl.constexpr, CLIP: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
     ):
         t = tl.program_id(0)
         R = tl.load(Rs_ptr + t)
@@ -439,6 +440,13 @@ if _HAS_TRITON:
 
         pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
         upd = tl.where(m2, pn * r_factor[:, None] * c_factor[None, :] * sc, 0.0)
+        # Adafactor RMS-clip on the (lr-scaled) update: rms(upd) <= clip_eff == clip * step_size,
+        # i.e. rms(pn / sqrt(v_hat)) <= clip. Bounds the cold-col rsqrt blowup -> no NaN runaway.
+        if CLIP:
+            rms = tl.sqrt(tl.sum(upd * upd) / (Rf * Cf))
+            d = rms / clip_eff
+            d = tl.where(d < 1.0, 1.0, d)
+            upd = upd / d
         delta = upd
         if CAUTIOUS:
             keep = (upd * g) > 0.0

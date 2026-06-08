@@ -154,6 +154,122 @@ def _rms(t: Tensor) -> Tensor:
     return t.norm(2) / math.sqrt(max(t.numel(), 1))
 
 
+def _rms_clip_one_(u: Tensor, clip: float) -> Tensor:
+    """Adafactor RMS clip on a single normalized update: ``rms(u) <= clip``. In place."""
+    if clip > 0.0:
+        u.div_((_rms(u) / clip).clamp_(min=1.0))
+    return u
+
+
+def _rms_clip_batched_(u: Tensor, clip: float) -> Tensor:
+    """Per-slice RMS clip on a stacked ``[N, *shape]`` normalized update. In place."""
+    if clip > 0.0:
+        n = u.shape[0]
+        per = max(u[0].numel(), 1) if n else 1
+        rms = u.reshape(n, -1).norm(2, dim=1) / math.sqrt(per)
+        u.div_(rms.div_(clip).clamp_(min=1.0).view(n, *([1] * (u.ndim - 1))))
+    return u
+
+
+# --------------------------------------------------------------------- diagnostics
+# Env-gated, zero-overhead-when-off stability probe used to diagnose the real-training
+# NaN divergence. Set KAON_PROBE_LOG=/path/to/log to enable. It records, per group step:
+#   * the worst factored denominator multiplier  max(r_factor * c_factor * bc2_sq)  and which
+#     param produced it (the suspected blowup channel: a near-zero col-EMA -> huge rsqrt), and
+#   * the FIRST non-finite parameter, with its shape, fused routing (one-block/big/native),
+#     and the offending channel's row/col/momentum stats — i.e. the exact culprit, not a guess.
+import os  # noqa: E402
+
+_PROBE_LOG = os.environ.get("KAON_PROBE_LOG")
+_PROBE_EVERY = int(os.environ.get("KAON_PROBE_EVERY", "25"))
+
+
+def _probe_write(line: str) -> None:
+    with open(_PROBE_LOG, "a") as fh:  # noqa: SIM115 — short append, diagnostics only
+        fh.write(line + "\n")
+
+
+@torch.no_grad()
+def _probe_group(opt: AdaPNM, group: dict[str, Any]) -> None:
+    """Inspect every factored param after a step: worst denom multiplier + first non-finite."""
+    step = group["step"]
+    c = opt._coeffs(group)
+    bc2_sq = c["bc2_sq"]
+    routing = _probe_routing(opt, group)
+    worst_mult, worst_shape = 0.0, None
+    for p in group["params"]:
+        st = opt.state.get(p)
+        if not st or "col" not in st:
+            continue
+        col = st["col"]
+        row = st["row"]
+        cfac_max = col.clamp_min(1e-30).rsqrt().max().item()
+        rfac_max = row.div(row.mean().clamp_min(1e-30)).clamp_min(1e-30).rsqrt().max().item()
+        mult = rfac_max * cfac_max * bc2_sq
+        if mult > worst_mult:
+            worst_mult, worst_shape = mult, tuple(p.shape)
+        if not torch.isfinite(p).all():
+            _probe_write(
+                f"[NONFINITE] step={step} shape={tuple(p.shape)} route={routing.get(id(p),'?')} "
+                f"col_min={col.min().item():.3e} col_max={col.max().item():.3e} "
+                f"cfac_max={cfac_max:.3e} rfac_max={rfac_max:.3e} denom_mult={mult:.3e} "
+                f"p_absmax={p.detach().abs().float().amax().item():.3e} "
+                f"grad_absmax={(p.grad.detach().abs().float().amax().item() if p.grad is not None else float('nan')):.3e}"
+            )
+    if step == 1 or step % _PROBE_EVERY == 0:
+        _probe_write(f"[denom] step={step} worst_mult={worst_mult:.3e} shape={worst_shape}")
+
+
+def _native_reason(p: Tensor, md: str, bf16m: str, cap: int, ft: Any) -> str:
+    """Why does this param miss the fused path? (the 'falling to native' census)."""
+    if p.ndim != 2:
+        return f"ndim={p.ndim}(1d/conv)"
+    if not p.is_cuda:
+        return "not_cuda"
+    if not p.is_contiguous():
+        return "non_contiguous"
+    if p.dtype not in (torch.float32, torch.bfloat16):
+        return f"dtype={p.dtype}"
+    if p.dtype == torch.bfloat16 and bf16m != "stochastic_rounding":
+        return f"bf16_method={bf16m}"
+    if md == "4bit" and p.shape[1] % 2 != 0:
+        return "4bit_odd_C"
+    br, bc = ft.next_pow2_tile(*p.shape)
+    if br * bc > cap:
+        return f"tile>{cap}({br}x{bc})"
+    return "unknown"
+
+
+def _probe_census(one_block: list, big: list, native: list, md: str, bf16m: str, cap: int, ft: Any) -> None:
+    from collections import Counter
+    reasons = Counter(_native_reason(p, md, bf16m, cap, ft) for p in native)
+    shapes_nat = Counter(tuple(p.shape) for p in native)
+    _probe_write(
+        f"[census] one_block={len(one_block)} big={len(big)} native={len(native)} "
+        f"native_reasons={dict(reasons)} native_shapes={dict(shapes_nat)}"
+    )
+    _probe_write(f"[census] one_block_shapes={dict(Counter(tuple(p.shape) for p in one_block))}")
+    _probe_write(f"[census] big_shapes={dict(Counter(tuple(p.shape) for p in big))}")
+
+
+def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
+    """Map id(param) -> 'one_block' | 'big' | 'native' from the cached fused partition."""
+    out: dict[int, str] = {}
+    if not getattr(opt, "_fused", False):
+        return out
+    cached = opt._fused_part.get(id(group))
+    if cached is None:
+        return out
+    _ids, one_block, big, native = cached
+    for p in one_block:
+        out[id(p)] = "one_block"
+    for p in big:
+        out[id(p)] = "big"
+    for p in native:
+        out[id(p)] = "native"
+    return out
+
+
 class AdaPNM(Optimizer):
     """AdaPNM (Adam + Positive-Negative Momentum) on Adakaon's memory backend.
 
@@ -180,6 +296,16 @@ class AdaPNM(Optimizer):
             non-factored (1-D) path it is added to ``sqrt(v_hat)`` exactly as
             kozistr does. On the factored path it is folded into the Adafactor
             ``eps1`` (added to ``grad**2`` before the row/col reductions).
+        clip_threshold: Adafactor-style RMS clip on the (v_hat-normalized) update —
+            ``rms(pn / sqrt(v_hat)) <= clip_threshold`` before the lr scale, exactly as
+            Adakaon. **On by default (``1.0``).** This is the stability guard for the
+            factored denominator: a near-zero ``col`` EMA makes ``c_factor = rsqrt(col)``
+            explode (~1e4), so a fresh gradient on that channel produces an unbounded
+            step → NaN. The clip bounds that runaway (measured: real Cosmos LoKr
+            training diverged to NaN without it). ``0`` disables the clip (the original
+            unclamped PNM update — diverges on real diffusion training, kept only for
+            ablation). Set looser (e.g. ``> 1``) to recover more of the raw PNM step if
+            a generalization measurement shows the clip costs gap.
         weight_decay: decoupled (AdamW-style) weight decay. Applied multiplicatively
             ``p *= (1 - lr*weight_decay)`` *before* the moment updates, matching
             kozistr's ``weight_decouple=True`` default (not folded into the cautious
@@ -222,6 +348,7 @@ class AdaPNM(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.0,
         *,
+        clip_threshold: float = 1.0,
         cautious: bool = True,
         gradient_centralization: bool = True,
         ams_bound: bool = False,
@@ -245,6 +372,8 @@ class AdaPNM(Optimizer):
             raise ValueError(f"lr must be >= 0, got {lr}")
         if eps < 0.0:
             raise ValueError(f"eps must be >= 0, got {eps}")
+        if clip_threshold < 0.0:
+            raise ValueError(f"clip_threshold must be >= 0, got {clip_threshold}")
         if weight_decay < 0.0:
             raise ValueError(f"weight_decay must be >= 0, got {weight_decay}")
         if momentum_dtype not in ("bfloat16", "float32", "int8", "4bit"):
@@ -262,6 +391,7 @@ class AdaPNM(Optimizer):
             "betas": (beta1, beta2),
             "beta0": float(beta0),
             "eps": float(eps),
+            "clip_threshold": float(clip_threshold),
             "weight_decay": weight_decay,
             "cautious": cautious,
             "gradient_centralization": gradient_centralization,
@@ -465,6 +595,8 @@ class AdaPNM(Optimizer):
             if group["gradient_centralization"]:
                 centralize_grads_(params)
             self._native_dispatch(params, group)
+            if _PROBE_LOG:
+                _probe_group(self, group)
         return loss
 
     @torch.no_grad()
@@ -513,8 +645,10 @@ class AdaPNM(Optimizer):
                 self._native_dispatch(native, group)
             if one_block:
                 self._fused_one_block(one_block, group, ft, c)
-            for p in big:
-                self._chunked_step(p, group, ft, c, pos_pref, neg_pref)
+            if big:
+                self._fused_big(big, group, ft, c, pos_pref, neg_pref)
+            if _PROBE_LOG:
+                _probe_group(self, group)
         return loss
 
     def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
@@ -542,6 +676,8 @@ class AdaPNM(Optimizer):
             else:
                 native.append(p)
         self._fused_part[gid] = (ids, one_block, big, native)
+        if _PROBE_LOG:
+            _probe_census(one_block, big, native, md, bf16m, cap, ft)
         return one_block, big, native
 
     def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict) -> None:
@@ -559,7 +695,9 @@ class AdaPNM(Optimizer):
         odd = group["step"] % 2 == 1
         lr, wd, eps1 = group["lr"], group["weight_decay"], group["eps"]
         cautious, gc = group["cautious"], group["gradient_centralization"]
+        clip = group["clip_threshold"]
         sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
+        clip_eff = clip * c["step_size"]        # rms(upd) <= clip*step_size == rms(pn/sqrt(v_hat)) <= clip
         for bk in cache.buckets:
             # which physical buffer plays positive this step (alternation): the m_pos slot if odd.
             if odd:
@@ -570,9 +708,28 @@ class AdaPNM(Optimizer):
             ft._adapnm_tile_kernel[(len(bk["plist"]),)](
                 bk["g_addr"], bk["p_addr"], kpos, kneg, kposc, knegc, bk["row_addr"], bk["col_addr"],
                 bk["Rs"], bk["Cs"], c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], sc, lr * wd, eps1,
-                group["step"], LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0, GC=gc,
-                SR=bk["lowp"], BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
+                clip_eff, group["step"], LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0,
+                GC=gc, SR=bk["lowp"], CLIP=clip > 0.0, BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
             )
+
+    @torch.no_grad()
+    def _fused_big(self, big: list[Tensor], group: dict[str, Any], ft: Any, c: dict,
+                   pos_pref: str, neg_pref: str) -> None:
+        """Dispatch the >tile-cap ("big") 2-D factors.
+
+        The per-tensor fused-chunked kernel is launch-bound (~8 kernels/tensor): for the many
+        same-shape big factors a real LoKr run has (e.g. 236x 512x512), the **batched native
+        foreach** path is ~5x faster (measured 14ms vs 69ms) because it stacks same-shape tensors
+        and amortizes launches. A lone big tensor has no batch to amortize, so it keeps the
+        fused-chunked kernel. Same math + state either way (both RMS-clip), so they interoperate.
+        """
+        if len(big) >= 2:
+            if group["gradient_centralization"]:
+                centralize_grads_(big)
+            self._native_dispatch(big, group)
+        else:
+            for p in big:
+                self._chunked_step(p, group, ft, c, pos_pref, neg_pref)
 
     def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:
         b2, eps1 = group["betas"][1], group["eps"]
@@ -605,8 +762,17 @@ class AdaPNM(Optimizer):
         ft._adapnm_chunked_mom[grid](gf, posf, negf, pf, r, cfac, keep, C, n, c["beta1_sq"], c["beta0"],
                                      inv_noise, sc, lr * wd, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
         self._store_one(st, pos_pref, md, m_pos)                       # requant/store updated positive
+        # Adafactor RMS-clip on the v_hat-normalized update U = pn * r * c * bc2_sq (== delta/step_size):
+        # bound rms(U) <= clip by folding 1/max(rms(U)/clip, 1) into the lr-scale `sc` (one [R,C] temp).
+        sc_apply = sc
+        clip = group["clip_threshold"]
+        if clip > 0.0:
+            u = m_pos.mul(1.0 + c["beta0"]).sub_(m_neg, alpha=c["beta0"])   # pn numerator (fresh temp)
+            u.mul_(r.reshape(R, 1)).mul_(cfac.reshape(1, C))
+            rms_u = float(u.norm()) * inv_noise * c["bc2_sq"] / math.sqrt(n)
+            sc_apply = sc / max(rms_u / clip, 1.0)
         inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
-        ft._adapnm_chunked_apply[grid](gf, posf, negf, pf, r, cfac, C, n, c["beta0"], inv_noise, sc,
+        ft._adapnm_chunked_apply[grid](gf, posf, negf, pf, r, cfac, C, n, c["beta0"], inv_noise, sc_apply,
                                        lr * wd, inv_mean, group["step"], CAUTIOUS=cautious, WD=wd != 0,
                                        SR=sr, BLOCK=1024)
 
@@ -741,7 +907,8 @@ class AdaPNM(Optimizer):
         # Positive-negative momentum mixing (read both, EMA only the positive).
         pn = self._pn_stacked(states, pos, neg, md, (R, C), grad, c)               # [N, R, C]
 
-        delta = pn.mul_(inv_denom).mul_(c["step_size"])                            # full step
+        update = _rms_clip_batched_(pn.mul_(inv_denom), group["clip_threshold"])   # rms(u)<=clip
+        delta = update.mul_(c["step_size"])                                        # full step
 
         if cautious:
             delta = cautious_batched_(delta, grad)
@@ -789,7 +956,8 @@ class AdaPNM(Optimizer):
         de_nom.div_(c["bc2_sq"])                                          # v_hat denom
 
         pn = self._pn_stacked(states, pos, neg, md, (length,), grad, c)   # [N, L]
-        delta = pn.div_(de_nom).mul_(c["step_size"])
+        update = _rms_clip_batched_(pn.div_(de_nom), group["clip_threshold"])
+        delta = update.mul_(c["step_size"])
 
         if cautious:
             delta = cautious_batched_(delta, grad)
@@ -859,7 +1027,8 @@ class AdaPNM(Optimizer):
             r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
             inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])           # 1/sqrt(v_hat)
             pn = self._pn_one(state, pos, neg, md, gv, c)
-            delta = pn.mul_(inv_denom).mul_(c["step_size"])
+            update = _rms_clip_one_(pn.mul_(inv_denom), group["clip_threshold"])
+            delta = update.mul_(c["step_size"])
             if matrixize:
                 delta = delta.reshape_as(grad)
         else:
@@ -873,7 +1042,8 @@ class AdaPNM(Optimizer):
                 de_nom = v.add(1e-15).sqrt_().add_(eps1)
             de_nom.div_(c["bc2_sq"])
             pn = self._pn_one(state, pos, neg, md, grad, c)
-            delta = pn.div_(de_nom).mul_(c["step_size"])
+            update = _rms_clip_one_(pn.div_(de_nom), group["clip_threshold"])
+            delta = update.mul_(c["step_size"])
 
         if cautious:
             delta = cautious_one_(delta, grad)
