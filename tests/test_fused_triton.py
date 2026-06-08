@@ -1,12 +1,13 @@
 """Unit tests for the experimental Triton fused kernel (``kaon._fused_triton``).
 
-Covers the CURRENT functionality (bf16/fp32 momentum) before int8/4bit is added:
-  * fp32 parity with native Adakaon (the kernel is exact there),
-  * bf16 momentum / bf16-param (SR) fidelity bounds,
-  * tile bucketing for mixed shapes (the regression that made a naive global tile 9x slower),
-  * native-fallback routing (1-D / conv / high-rank) with end-to-end parity,
-  * the reusable host predicate ``fused_eligible`` and device primitive ``sr_round``,
-  * pointer-cache correctness across grad reallocation, memory footprint, grad=None.
+Covers:
+  * fp32 parity with native Adakaon (exact), bf16 / bf16-param (SR) fidelity bounds,
+  * int8 (1 B/param) and 4bit (0.5 B/param) momentum: parity vs native, memory, convergence,
+  * decoupled weight_decay (parity + shrink), tile bucketing for mixed shapes,
+  * native-fallback routing (1-D / conv / high-rank / odd-C-4bit) with end-to-end parity,
+  * the reusable device primitives in isolation — ``sr_round``, ``requant_int8``, ``requant_4bit``,
+    ``gradient_centralize``, ``factored_rc`` — each checked against its native/codec reference,
+  * host helpers (``fused_eligible`` / tile sizing), pointer-cache across grad realloc, grad=None.
 
 Skips cleanly when CUDA or Triton is unavailable (the kernel is GPU-only).
 """
@@ -455,3 +456,70 @@ def test_sr_round_unbiased():
     torch.cuda.synchronize()
     uniq = torch.unique(out.bfloat16()).numel()
     assert uniq <= 2
+
+
+# ----------------------------------------------------------------- reusable factored primitives
+def test_gradient_centralize_primitive():
+    """gradient_centralize device helper == torch GC (subtract per-row fan-in mean)."""
+    import triton
+    import triton.language as tl
+
+    from kaon._fused_triton import gradient_centralize
+
+    R, C, BR, BC = 6, 10, 8, 16
+
+    @triton.jit
+    def _probe(g_ptr, o_ptr, R, C, BR: tl.constexpr, BC: tl.constexpr):
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        m2 = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        g = tl.load(g_ptr + idx, mask=m2, other=0.0)
+        tl.store(o_ptr + idx, gradient_centralize(g, m2, C.to(tl.float32)), mask=m2)
+
+    g = torch.randn(R, C, device=DEV)
+    o = torch.zeros(R, C, device=DEV)
+    _probe[(1,)](g, o, R, C, BR=BR, BC=BC)
+    torch.cuda.synchronize()
+    assert torch.allclose(o, g - g.mean(dim=1, keepdim=True), atol=1e-5)
+
+
+def test_factored_rc_primitive():
+    """factored_rc device helper == native update_factored_state + factored_inv_sqrt_factors,
+    and it updates the row/col EMA state in place."""
+    import triton
+    import triton.language as tl
+
+    from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+    from kaon._fused_triton import factored_rc
+
+    R, C, BR, BC = 6, 10, 8, 16
+
+    @triton.jit
+    def _probe(g_ptr, rowp, colp, rfac, cfac, R, C, beta2, eps1, BR: tl.constexpr, BC: tl.constexpr):
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        rr = tl.arange(0, BR)
+        cc = tl.arange(0, BC)
+        m2 = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        g = tl.load(g_ptr + idx, mask=m2, other=0.0)
+        rf, cf = factored_rc(g, rowp, colp, rr, cc, R, C, R.to(tl.float32), C.to(tl.float32), beta2, eps1)
+        tl.store(rfac + rr, rf, mask=rr < R)
+        tl.store(cfac + cc, cf, mask=cc < C)
+
+    g = torch.randn(R, C, device=DEV)
+    row = torch.zeros(R, device=DEV)
+    col = torch.zeros(C, device=DEV)
+    rfac = torch.zeros(R, device=DEV)
+    cfac = torch.zeros(C, device=DEV)
+    _probe[(1,)](g, row, col, rfac, cfac, R, C, 0.999, 1e-30, BR=BR, BC=BC)
+    torch.cuda.synchronize()
+    row_r = torch.zeros(R, device=DEV)
+    col_r = torch.zeros(C, device=DEV)
+    update_factored_state(g, row_r, col_r, 0.999, 1e-30)
+    rf_r, cf_r = factored_inv_sqrt_factors(row_r, col_r)
+    assert torch.allclose(rfac, rf_r.view(-1), atol=1e-4)
+    assert torch.allclose(cfac, cf_r.view(-1), atol=1e-4)
+    assert torch.allclose(row, row_r, atol=1e-5)            # row EMA updated in place
+    assert torch.allclose(col, col_r, atol=1e-5)

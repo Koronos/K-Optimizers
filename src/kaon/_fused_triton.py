@@ -27,9 +27,10 @@ What is already optimizer-AGNOSTIC vs Adakaon-SPECIFIC here:
     * ``dequant_4bit`` / ``requant_4bit``        — per-128-block 4-bit packed codec (segmented absmax +
                                                    nibble pack via reshape/``tl.split``), in-kernel.
                                                    REUSABLE the same way. 0.5 B/param at fused speed.
-    * GC + factored row/col second moment        — currently INLINE in ``_adakaon_tile_kernel`` but
-                                                   marked; reusable by the whole factored-Adam family
-                                                   (Adakaon / AdaPNM / KProdigy) once extracted.
+    * ``gradient_centralize``                    — GC (subtract per-row fan-in mean). REUSABLE by the
+                                                   factored family and any conv optimizer.
+    * ``factored_rc``                            — row/col 2nd-moment EMA -> rsqrt r/c factors.
+                                                   REUSABLE by Adakaon / AdaPNM / KProdigy.
 
   4bit packs 2 codes/byte over row-major-flat elements, so the fused path needs an EVEN column count
   (keeps each byte's pair within one row); odd-C tensors route to the native Adakaon.
@@ -181,6 +182,35 @@ if _HAS_TRITON:
         tl.store(packed_ptr + rr * Chalf + jj, byte, mask=(rr < R) & (jj < Chalf))
 
     @triton.jit
+    def gradient_centralize(g, m2, Cf):
+        """Gradient Centralization: subtract each row's mean over the fan-in (C) axis.
+
+        REUSABLE by the whole factored-Adam family (and any conv optimizer). ``m2`` masks padded
+        lanes to 0 so they don't bias the mean and stay 0 after."""
+        gmean = tl.sum(g, axis=1) / Cf
+        return tl.where(m2, g - gmean[:, None], 0.0)
+
+    @triton.jit
+    def factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, beta2, eps1):
+        """Factored second-moment EMA (row/col) -> the rsqrt reconstruction factors (r, c).
+
+        REUSABLE by Adakaon / AdaPNM / KProdigy (every factored-Adam optimizer). Updates the row/col
+        EMA state in place (HF eps placement) and returns ``(r_factor [BR], c_factor [BC])`` such that
+        1/sqrt(v_hat)[i,j] == r_factor[i] * c_factor[j]. Mirrors ``kaon._factored``."""
+        gsq = g * g
+        row_mean = tl.sum(gsq, axis=1) / Cf + eps1
+        col_mean = tl.sum(gsq, axis=0) / Rf + eps1
+        omb = 1.0 - beta2
+        row_new = tl.load(rowp + rr, mask=rr < R, other=0.0)
+        row_new = row_new + omb * (row_mean - row_new)
+        col_new = tl.load(colp + cc, mask=cc < C, other=0.0)
+        col_new = col_new + omb * (col_mean - col_new)
+        tl.store(rowp + rr, row_new, mask=rr < R)
+        tl.store(colp + cc, col_new, mask=cc < C)
+        row_mean_all = tl.sum(tl.where(rr < R, row_new, 0.0)) / Rf
+        return tl.rsqrt(row_new / row_mean_all), tl.rsqrt(col_new)
+
+    @triton.jit
     def _adakaon_tile_kernel(
         g_addr, p_addr, m_addr, mscale_addr, row_addr, col_addr, Rs_ptr, Cs_ptr,
         lr, beta1, beta2, eps1, clip, wd, seed,
@@ -211,32 +241,16 @@ if _HAS_TRITON:
 
         ri = tl.arange(0, BR)[:, None]
         ci = tl.arange(0, BC)[None, :]
+        rr = tl.arange(0, BR)
+        cc = tl.arange(0, BC)
         m2 = (ri < R) & (ci < C)
         idx = ri * C + ci
         g = tl.load(gp + idx, mask=m2, other=0.0).to(tl.float32)
 
-        # --- REUSABLE (factored family): Gradient Centralization, mean over fan-in (C) ---
+        # --- REUSABLE (factored family): GC + row/col second moment -> r/c factors ---
         if GC:
-            gmean = tl.sum(g, axis=1) / Cf
-            g = tl.where(m2, g - gmean[:, None], 0.0)
-
-        # --- REUSABLE (factored family): row/col second-moment EMA + r/c factor ---
-        gsq = g * g
-        row_mean = tl.sum(gsq, axis=1) / Cf + eps1
-        col_mean = tl.sum(gsq, axis=0) / Rf + eps1
-        rr = tl.arange(0, BR)
-        cc = tl.arange(0, BC)
-        row_old = tl.load(rowp + rr, mask=rr < R, other=0.0)
-        col_old = tl.load(colp + cc, mask=cc < C, other=0.0)
-        omb = 1.0 - beta2
-        row_new = row_old + omb * (row_mean - row_old)
-        col_new = col_old + omb * (col_mean - col_old)
-        tl.store(rowp + rr, row_new, mask=rr < R)
-        tl.store(colp + cc, col_new, mask=cc < C)
-        row_valid = tl.where(rr < R, row_new, 0.0)
-        row_mean_all = tl.sum(row_valid) / Rf
-        r_factor = tl.rsqrt(row_new / row_mean_all)
-        c_factor = tl.rsqrt(col_new)
+            g = gradient_centralize(g, m2, Cf)
+        r_factor, c_factor = factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, beta2, eps1)
 
         # --- Adakaon-specific: reconstructed update, RMS-clip, lr scale ---
         upd = tl.where(m2, g * r_factor[:, None] * c_factor[None, :], 0.0)  # 0*inf corners -> 0
