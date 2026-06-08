@@ -119,6 +119,70 @@ def test_bf16_params_sr_finite_and_close():
     assert d / scale < 5e-2, f"rel={d/scale:.2e}"
 
 
+# ----------------------------------------------------------------- int8 momentum (in-kernel)
+def test_int8_parity_with_native():
+    # in-kernel per-row dequant/requant; libdevice.rint matches torch.round (half-to-even), so the
+    # quantized trajectory tracks native Adakaon(int8) tightly (not just in expectation).
+    d, scale, _ = _run_parity([(8, 16)] * 6, torch.float32, "int8")
+    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+
+
+def test_int8_parity_mixed_shapes():
+    shapes = [(8, 16), (16, 8), (12, 20), (16, 320)]
+    d, scale, ov = _run_parity(shapes, torch.float32, "int8")
+    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+    assert len(ov._cache.buckets) >= 3                       # mixed tiles still bucket
+
+
+def test_int8_state_layout_and_memory():
+    ps = _bag([(32, 48)] * 6, torch.float32)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    ov = FusedAdakaon(ps, momentum_dtype="int8")
+    on = Adakaon([p.detach().clone().requires_grad_(True) for p in ps], momentum_dtype="int8")
+    for p in on.param_groups[0]["params"]:
+        p.grad = torch.randn_like(p)
+    ov.step()
+    on.step()
+    torch.cuda.synchronize()
+    st = ov.state[ps[0]]
+    assert st["m"].dtype == torch.int8 and st["m"].element_size() == 1      # 1 byte/param
+    assert st["m"].numel() == ps[0].numel()
+    assert st["m_scale"].shape == (32,)                                     # per-row scale
+
+    def bpp(opt, params):
+        b = sum(v.numel() * v.element_size() for p in params for v in opt.state[p].values()
+                if torch.is_tensor(v))
+        return b / sum(p.numel() for p in params)
+
+    fused_bpp = bpp(ov, ps)
+    native_bpp = bpp(on, on.param_groups[0]["params"])
+    assert abs(fused_bpp - native_bpp) < 1e-6, f"{fused_bpp} vs {native_bpp}"
+    assert fused_bpp < 1.5                                                  # ~1 B/param + factored
+
+
+def test_int8_converges():
+    torch.manual_seed(0)
+    w = torch.randn(16, 24, device=DEV).requires_grad_(True)
+    target = torch.randn(16, 24, device=DEV)
+    opt = FusedAdakaon([w], lr=5e-2, momentum_dtype="int8")
+    losses = []
+    for _ in range(60):
+        opt.zero_grad()
+        loss = (w - target).pow(2).mean()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    torch.cuda.synchronize()
+    assert torch.isfinite(w).all()
+    assert losses[-1] < losses[0] * 0.2, f"{losses[0]:.3f} -> {losses[-1]:.3f}"
+
+
+def test_int8_with_bf16_params():
+    d, scale, _ = _run_parity([(16, 32), (32, 16)], torch.bfloat16, "int8")
+    assert d / scale < 5e-2, f"rel={d/scale:.2e}"  # bf16-param SR -> expectation match
+
+
 # ----------------------------------------------------------------- native fallback routing
 def test_fallback_routing_and_parity():
     # tiny fused + big-2D (tile>cap) + conv + 1-D -> the last three go to the inner native Adakaon

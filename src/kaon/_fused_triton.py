@@ -55,6 +55,11 @@ HAS_TRITON = _HAS_TRITON
 TILE_CAP = 1 << 16  # 65536 padded lanes — the largest tile we let a single program own
 DEV = "cuda"
 
+# Momentum storage kinds (passed to the kernel as a constexpr so the unused branches compile away).
+MOM_FP32, MOM_BF16, MOM_INT8 = 0, 1, 2
+_MOM_KIND = {"float32": MOM_FP32, "bfloat16": MOM_BF16, "int8": MOM_INT8}
+_INT8_ABSMAX = 127.0  # per-row symmetric int8 scale divisor (matches kaon._momentum_codec)
+
 
 # ============================================================ host-side reusable helpers
 def next_pow2_tile(R: int, C: int) -> tuple[int, int]:
@@ -91,6 +96,7 @@ def fused_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP) -> bool:
 
 # ============================================================ device-side reusable helpers
 if _HAS_TRITON:
+    from triton.language.extra import libdevice  # libdevice.rint == torch.round (half-to-even)
 
     @triton.jit
     def sr_round(res, seed, offs):
@@ -106,9 +112,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _adakaon_tile_kernel(
-        g_addr, p_addr, m_addr, row_addr, col_addr, Rs_ptr, Cs_ptr,
+        g_addr, p_addr, m_addr, mscale_addr, row_addr, col_addr, Rs_ptr, Cs_ptr,
         lr, beta1, beta2, eps1, clip, seed,
-        LOWP: tl.constexpr, MBF16: tl.constexpr, CAUTIOUS: tl.constexpr,
+        LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr,
         GC: tl.constexpr, SR: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
     ):
         """One program == one tensor. Whole factored Adakaon step, in place via pointer-array.
@@ -169,17 +175,31 @@ if _HAS_TRITON:
         denom = tl.where(denom < 1.0, 1.0, denom)
         upd = upd * (lr / denom)
 
-        # --- momentum EMA (bf16 or fp32 storage; EMA in fp32) ---
-        if MBF16:
-            mp = mi.to(tl.pointer_type(tl.bfloat16))
-        else:
-            mp = mi.to(tl.pointer_type(tl.float32))
-        m_old = tl.load(mp + idx, mask=m2, other=0.0).to(tl.float32)
+        # --- momentum EMA (storage fp32 / bf16 / int8; EMA always runs in fp32) ---
+        # dequant the stored momentum to fp32
+        if MOM == 2:  # int8: per-row (dim-0) absmax scale, dequant = code * scale[row]
+            mscp = tl.load(mscale_addr + t).to(tl.pointer_type(tl.float32))
+            scr = tl.load(mscp + rr, mask=rr < R, other=0.0)                       # [BR]
+            mq = tl.load(mi.to(tl.pointer_type(tl.int8)) + idx, mask=m2, other=0).to(tl.float32)
+            m_old = mq * scr[:, None]
+        elif MOM == 1:  # bf16
+            m_old = tl.load(mi.to(tl.pointer_type(tl.bfloat16)) + idx, mask=m2, other=0.0).to(tl.float32)
+        else:  # fp32
+            m_old = tl.load(mi.to(tl.pointer_type(tl.float32)) + idx, mask=m2, other=0.0).to(tl.float32)
         m_new = beta1 * m_old + (1.0 - beta1) * upd
-        if MBF16:
-            tl.store(mp + idx, m_new.to(tl.bfloat16), mask=m2)
+        # requant the updated momentum back to storage (m_new stays fp32 for delta/cautious below)
+        if MOM == 2:
+            amax = tl.max(tl.where(m2, tl.abs(m_new), 0.0), axis=1)                # [BR] per-row absmax
+            amax = tl.where(amax < 1e-12, 1e-12, amax)
+            new_scale = amax / 127.0
+            q = libdevice.rint(m_new / new_scale[:, None])                         # round half-to-even
+            q = tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8)
+            tl.store(mi.to(tl.pointer_type(tl.int8)) + idx, q, mask=m2)
+            tl.store(mscp + rr, new_scale, mask=rr < R)
+        elif MOM == 1:
+            tl.store(mi.to(tl.pointer_type(tl.bfloat16)) + idx, m_new.to(tl.bfloat16), mask=m2)
         else:
-            tl.store(mp + idx, m_new, mask=m2)
+            tl.store(mi.to(tl.pointer_type(tl.float32)) + idx, m_new, mask=m2)
 
         # --- REUSABLE-ish: cautious masking + survivor rescale ---
         delta = m_new
@@ -219,15 +239,20 @@ class PointerArrayCache:
         self.buckets = []
         for (BR, BC), bl in groups.items():  # noqa: N806
             st = [state_of(p) for p in bl]
+            mdtype = st[0]["m"].dtype
+            mom = MOM_INT8 if mdtype == torch.int8 else (MOM_BF16 if mdtype == torch.bfloat16 else MOM_FP32)
+            m_addr = i64([s["m"].data_ptr() for s in st])
+            # int8 needs a per-tensor pointer array to the fp32 row scales; other kinds never
+            # dereference mscale (constexpr-elided), so reuse m_addr as a harmless valid pointer.
+            mscale_addr = i64([s["m_scale"].data_ptr() for s in st]) if mom == MOM_INT8 else m_addr
             self.buckets.append(dict(
-                plist=bl, BR=BR, BC=BC,
+                plist=bl, BR=BR, BC=BC, mom=mom,
                 p_addr=i64([p.data_ptr() for p in bl]),
-                m_addr=i64([s["m"].data_ptr() for s in st]),
+                m_addr=m_addr, mscale_addr=mscale_addr,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
                 col_addr=i64([s["col"].data_ptr() for s in st]),
                 Rs=i32([p.shape[0] for p in bl]), Cs=i32([p.shape[1] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
-                mbf16=st[0]["m"].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
                 grad_first=bl[0].grad.data_ptr(),
             ))
@@ -246,9 +271,10 @@ class PointerArrayCache:
 class FusedAdakaon(Optimizer):
     """Adakaon-bf16 with a pointer-array fused Triton kernel for small 2-D weights; native otherwise.
 
-    Currently covers ``momentum_dtype`` ∈ {bf16, fp32} and ``weight_decay == 0``. int8/4bit momentum,
-    weight decay, conv, and high-rank tensors are routed to an inner :class:`kaon.Adakaon` (always
-    correct). Experimental: imported from ``kaon._fused_triton``, not yet in the public API.
+    Currently covers ``momentum_dtype`` ∈ {bf16, fp32, int8} (per-row int8 dequant/requant in-kernel)
+    and ``weight_decay == 0``. 4bit momentum, weight decay, conv, and high-rank tensors are routed to
+    an inner :class:`kaon.Adakaon` (always correct). Experimental: imported from ``kaon._fused_triton``,
+    not yet in the public API.
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps1=1e-30, clip=1.0,
@@ -256,8 +282,8 @@ class FusedAdakaon(Optimizer):
                  tile_cap=TILE_CAP):
         if not _HAS_TRITON:
             raise RuntimeError("FusedAdakaon requires Triton (a GPU-only optional dependency)")
-        if momentum_dtype not in ("bfloat16", "float32"):
-            raise ValueError("FusedAdakaon stores momentum as bf16/fp32 only (int8/4bit: future work)")
+        if momentum_dtype not in ("bfloat16", "float32", "int8"):
+            raise ValueError("FusedAdakaon momentum supports bf16/fp32/int8 (4bit: future work)")
         beta1, beta2 = betas
         defaults = dict(lr=lr, beta1=float(beta1), beta2=float(beta2), eps1=eps1, clip=clip,
                         cautious=cautious, gc=gradient_centralization, mdtype=momentum_dtype)
@@ -293,8 +319,14 @@ class FusedAdakaon(Optimizer):
         st = self.state[p]
         if "m" not in st:
             R, C = p.shape
-            md = torch.bfloat16 if self._fused_group[id(p)]["mdtype"] == "bfloat16" else torch.float32
-            st["m"] = torch.zeros(R, C, dtype=md, device=p.device)
+            mdtype = self._fused_group[id(p)]["mdtype"]
+            if mdtype == "int8":
+                st["m"] = torch.zeros(R, C, dtype=torch.int8, device=p.device)
+                # per-row absmax scale; init to ones so a fresh (zero) momentum dequants to 0
+                st["m_scale"] = torch.ones(R, dtype=torch.float32, device=p.device)
+            else:
+                md = torch.bfloat16 if mdtype == "bfloat16" else torch.float32
+                st["m"] = torch.zeros(R, C, dtype=md, device=p.device)
             st["row"] = torch.zeros(R, dtype=torch.float32, device=p.device)
             st["col"] = torch.zeros(C, dtype=torch.float32, device=p.device)
 
@@ -317,10 +349,10 @@ class FusedAdakaon(Optimizer):
                 grp = self._fused_group[id(b["plist"][0])]  # bucket shares one config (PoC limit)
                 lanes = b["BR"] * b["BC"]
                 _adakaon_tile_kernel[(len(b["plist"]),)](
-                    b["g_addr"], b["p_addr"], b["m_addr"], b["row_addr"], b["col_addr"],
+                    b["g_addr"], b["p_addr"], b["m_addr"], b["mscale_addr"], b["row_addr"], b["col_addr"],
                     b["Rs"], b["Cs"],
                     grp["lr"], grp["beta1"], grp["beta2"], grp["eps1"], grp["clip"], self._t,
-                    LOWP=b["lowp"], MBF16=b["mbf16"], CAUTIOUS=grp["cautious"], GC=grp["gc"],
+                    LOWP=b["lowp"], MOM=b["mom"], CAUTIOUS=grp["cautious"], GC=grp["gc"],
                     SR=b["lowp"], BR=b["BR"], BC=b["BC"], num_warps=warps_for(lanes),
                 )
 
