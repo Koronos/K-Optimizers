@@ -199,6 +199,8 @@ class Adakaon(Optimizer):
         foreach: bool = True,
         foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
+        fused: bool = False,
+        fused_tile_cap: int | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -248,6 +250,19 @@ class Adakaon(Optimizer):
         # dtype). Encapsulates every dequant→EMA→requant detail so the three step
         # functions stay dtype-agnostic.
         self._codecs: dict[str, _MomentumCodec] = {}
+        # Optional Triton-fused step (same math + state, faster on GPU). Eligible 2-D weights run
+        # through the fused kernels (one-block tile / chunked big-tensor); everything else falls back
+        # to the native path below, in-place on the SAME state, so fused/non-fused interoperate and
+        # resume from each other's checkpoints.
+        self._fused = bool(fused)
+        self._t = 0
+        self._fused_part: dict[int, tuple] = {}          # group id -> cached (ids, one_block, big, native)
+        self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
+        if self._fused:
+            from kaon._fused_triton import HAS_TRITON, TILE_CAP
+            if not HAS_TRITON:
+                raise RuntimeError("Adakaon(fused=True) requires Triton (a GPU-only optional dependency)")
+            self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
     def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
         md = group["momentum_dtype"]
@@ -281,6 +296,8 @@ class Adakaon(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        if self._fused:
+            return self._fused_step(loss)
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None]
             for p in params:
@@ -288,28 +305,164 @@ class Adakaon(Optimizer):
                     raise RuntimeError("Adakaon does not support sparse gradients")
             if group["gradient_centralization"]:
                 centralize_grads_(params)
-            if self._foreach and self._group_foreach_eligible(group):
-                chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
-                # Effective cutoff = the performance threshold, lowered only if the
-                # memory budget can't fit two of a tensor in a chunk (so batching
-                # would be a wasteful stack-of-1). Roomy card -> cutoff wins;
-                # constrained card -> safety wins.
-                cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)
-                fast: list[Tensor] = []
-                slow: list[Tensor] = []
-                for p in params:
-                    (fast if self._param_foreach_eligible(p, group, cutoff) else slow).append(p)
-                if len(fast) >= 2:
-                    self._step_foreach(fast, group, chunk_budget)
-                    for p in slow:
-                        self._step_one_param(p, group)
-                else:
-                    for p in params:
-                        self._step_one_param(p, group)
+            self._native_dispatch(params, group)
+        return loss
+
+    @torch.no_grad()
+    def _native_dispatch(self, params: list[Tensor], group: dict[str, Any]) -> None:
+        """The native (non-fused) step over ``params`` — foreach batching where eligible, else
+        per-param. Gradient Centralization is the caller's responsibility (done per-subset)."""
+        if not params:
+            return
+        if self._foreach and self._group_foreach_eligible(group):
+            chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
+            # Effective cutoff = the performance threshold, lowered only if the
+            # memory budget can't fit two of a tensor in a chunk (so batching
+            # would be a wasteful stack-of-1). Roomy card -> cutoff wins;
+            # constrained card -> safety wins.
+            cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)
+            fast: list[Tensor] = []
+            slow: list[Tensor] = []
+            for p in params:
+                (fast if self._param_foreach_eligible(p, group, cutoff) else slow).append(p)
+            if len(fast) >= 2:
+                self._step_foreach(fast, group, chunk_budget)
+                for p in slow:
+                    self._step_one_param(p, group)
             else:
                 for p in params:
                     self._step_one_param(p, group)
+        else:
+            for p in params:
+                self._step_one_param(p, group)
+
+    # ----------------------------------------------------------------- fused (Triton) step
+    @torch.no_grad()
+    def _fused_step(self, loss: Any) -> Any:
+        """Triton-fused step: eligible 2-D weights run through the one-block / chunked kernels
+        (same math + state as native); everything else falls back to :meth:`_native_dispatch`."""
+        import kaon._fused_triton as ft
+
+        self._t += 1
+        for group in self.param_groups:
+            params = [p for p in group["params"] if p.grad is not None]
+            for p in params:
+                if p.grad.is_sparse:
+                    raise RuntimeError("Adakaon does not support sparse gradients")
+            one_block, big, native = self._fused_partition(group, params, ft)
+            if native:  # GC for the native subset (fused subsets centralize in-kernel / in-reductions)
+                if group["gradient_centralization"]:
+                    centralize_grads_(native)
+                self._native_dispatch(native, group)
+            if one_block:
+                self._fused_one_block(one_block, group, ft)
+            for p in big:
+                self._chunked_step(p, group, ft)
         return loss
+
+    def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
+        """Split a group's params into (one-block, chunked-big, native), cached per param-set."""
+        gid = id(group)
+        ids = tuple(id(p) for p in params)
+        cached = self._fused_part.get(gid)
+        if cached is not None and cached[0] == ids:
+            return cached[1], cached[2], cached[3]
+        md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
+        one_block: list[Tensor] = []
+        big: list[Tensor] = []
+        native: list[Tensor] = []
+        momentum = group["betas"][0] > 0  # the kernels assume a momentum buffer; beta1==0 -> native
+        for p in params:
+            # bf16 params need stochastic rounding (the kernel's only bf16 write); kahan/none -> native
+            bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding")
+            ok = momentum and bf_ok and ft.fused_eligible(p, cap)
+            if ok and md == "4bit" and p.shape[1] % 2 != 0:
+                ok = False                                  # one-block 4bit needs even C
+            if ok:
+                one_block.append(p)
+            elif (momentum and bf_ok and p.ndim == 2 and p.is_cuda and p.is_contiguous()
+                  and p.dtype in (torch.float32, torch.bfloat16)
+                  and ft.next_pow2_tile(*p.shape)[0] * ft.next_pow2_tile(*p.shape)[1] > cap):
+                big.append(p)
+            else:
+                native.append(p)
+        self._fused_part[gid] = (ids, one_block, big, native)
+        return one_block, big, native
+
+    def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
+        """Launch the one-block pointer-array kernel over the eligible small 2-D weights."""
+        for p in plist:
+            st = self.state[p]
+            if not st:
+                self._init_state(p, st, group)
+        ids = tuple(id(p) for p in plist)
+        gid = id(group)
+        cache = self._fused_ob_caches.get(gid)
+        if cache is None or cache.ids != ids:
+            cache = ft.PointerArrayCache(plist, lambda p: self.state[p], None)
+            self._fused_ob_caches[gid] = cache
+        cache.refresh_grads()
+        b1, b2 = group["betas"]
+        lr, eps1 = group["lr"], group["eps"][0]
+        clip, wd = group["clip_threshold"], group["weight_decay"]
+        cautious, gc = group["cautious"], group["gradient_centralization"]
+        for bk in cache.buckets:
+            lanes = bk["BR"] * bk["BC"]
+            ft._adakaon_tile_kernel[(len(bk["plist"]),)](
+                bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["row_addr"], bk["col_addr"],
+                bk["Rs"], bk["Cs"], lr, b1, b2, eps1, clip, wd, self._t,
+                LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0, GC=gc, SR=bk["lowp"],
+                BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
+            )
+
+    def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:
+        """Shared torch part of a big-tensor step: GC + row/col EMA + rms (matvec, no [R,C] temp)."""
+        n = p.numel()
+        b2, eps1 = group["betas"][1], group["eps"][0]
+        clip, lr = group["clip_threshold"], group["lr"]
+        g = p.grad.float()
+        if group["gradient_centralization"]:
+            g = g - g.mean(dim=1, keepdim=True)
+        g = g.contiguous()
+        gsq = g * g
+        st["row"].lerp_(gsq.mean(1).add_(eps1), 1.0 - b2)
+        st["col"].lerp_(gsq.mean(0).add_(eps1), 1.0 - b2)
+        r = st["row"].div(st["row"].mean()).rsqrt_()
+        c = st["col"].rsqrt()
+        rms = (((r * r) * gsq.matmul(c * c)).sum() / n).sqrt_()
+        return g, r, c, lr / float(rms.div_(clip).clamp_(min=1.0))
+
+    def _chunked_step(self, p: Tensor, group: dict[str, Any], ft: Any) -> None:
+        """One big 2-D tensor via the chunked kernels; int8/4bit momentum through the codec (dequant
+        -> fp32 temp -> kernels -> requant) so the weight update uses the exact pre-requant momentum."""
+        st = self.state[p]
+        if not st:
+            self._init_state(p, st, group)
+        R, C = p.shape  # noqa: N806 — matrix dims
+        n = R * C
+        md, b1 = group["momentum_dtype"], group["betas"][0]
+        lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
+        sr = (p.dtype == torch.bfloat16) and (group["bf16_method"] == "stochastic_rounding")
+        g, r, c, inv_rms_lr = self._chunked_reductions(p, group, st)
+        quant = md in ("int8", "4bit")
+        if quant:
+            m_fp32 = self._codec(group).dequant_one(st, torch.empty(R, C, device=p.device)).reshape(R, C)
+            mf = m_fp32.reshape(-1)
+        else:
+            mf = st["m"].reshape(-1)
+        keep = torch.zeros(1, dtype=torch.int32, device=p.device)
+        gf, pf = g.reshape(-1), p.reshape(-1)
+        grid = ((n + 1023) // 1024,)
+        ft._chunked_mom[grid](gf, mf, pf, r, c, keep, C, n, inv_rms_lr, lr * wd, b1,
+                              CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
+        if quant:
+            if md == "int8":
+                st["m"], st["m_scale"] = _quant_int8(m_fp32)
+            else:
+                st["m"], st["m_scale"], _ = _quant_4bit(m_fp32.reshape(-1), st["m_block"])
+        inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
+        ft._chunked_apply[grid](gf, mf, pf, n, inv_mean, lr * wd, self._t,
+                                CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024)
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized first moment's stored dtype.

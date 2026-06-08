@@ -20,7 +20,6 @@ from kaon import Adakaon
 from kaon._fused_triton import (
     HAS_TRITON,
     TILE_CAP,
-    FusedAdakaon,
     fused_eligible,
     next_pow2_tile,
     warps_for,
@@ -35,6 +34,26 @@ DEV = "cuda"
 
 
 # ----------------------------------------------------------------- helpers
+def _fused(params, **kw):
+    """The fused optimizer under test is just ``Adakaon(fused=True)`` (no separate class)."""
+    return Adakaon(params, fused=True, **kw)
+
+
+def _parts(opt):
+    """(one_block, big, native) param lists from the cached fused partition (after a step)."""
+    ob, big, nat = [], [], []
+    for (_ids, o, b, n) in opt._fused_part.values():
+        ob += o
+        big += b
+        nat += n
+    return ob, big, nat
+
+
+def _buckets(opt):
+    """All one-block tile buckets across the cached pointer-array caches (after a step)."""
+    return [bk for cache in opt._fused_ob_caches.values() for bk in cache.buckets]
+
+
 def _bag(shapes, dtype=torch.float32, seed=0):
     g = torch.Generator(device=DEV).manual_seed(seed)
     return [torch.randn(*s, generator=g, device=DEV, dtype=dtype).requires_grad_(True) for s in shapes]
@@ -45,12 +64,12 @@ def _clone(ps):
 
 
 def _run_parity(shapes, dtype, mdtype, *, cautious=True, gc=True, wd=0.0, steps=6, seed=1):
-    """Step FusedAdakaon and native Adakaon on identical params+grads; return max|Δp| and scale."""
+    """Step Adakaon(fused=True) and native Adakaon on identical params+grads; return max|Δp| and scale."""
     cfg = dict(lr=2e-3, betas=(0.9, 0.999), weight_decay=wd, cautious=cautious,
                gradient_centralization=gc, momentum_dtype=mdtype)
     pv = _bag(shapes, dtype, seed)
     pn = _clone(pv)
-    ov = FusedAdakaon(pv, **cfg)
+    ov = _fused(pv, **cfg)
     on = Adakaon(pn, **cfg)
     gen = torch.Generator(device=DEV).manual_seed(7)
     for _ in range(steps):
@@ -105,7 +124,7 @@ def test_fp32_parity_mixed_shapes_multiple_buckets():
     d, scale, ov = _run_parity(shapes, torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
     # mixed shapes must bucket into >1 tile (the fix for the over-padding regression)
-    assert len(ov._cache.buckets) >= 4
+    assert len(_buckets(ov)) >= 4
 
 
 def test_fp32_parity_lora_shapes():
@@ -117,7 +136,7 @@ def test_fp32_parity_medium_tiles_near_cap():
     # tiles up to the raised cap (131072 lanes) fuse and stay exact vs native (measured 1.2-1.4x faster)
     d, _, ov = _run_parity([(128, 1024), (256, 512)], torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
-    assert len(ov._fused) == 2                                 # both fused at the new cap
+    assert len(_parts(ov)[0]) == 2                                 # both fused at the new cap
 
 
 # ----------------------------------------------------------------- chunked (big-tensor) path
@@ -125,7 +144,7 @@ def test_chunked_parity_fp32():
     # 1024x512 = 524288 lanes > cap -> chunked path; exact vs native (~2.5x faster on bigger ones)
     d, _, ov = _run_parity([(1024, 512)], torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
-    assert len(ov._big) == 1 and len(ov._fused) == 0
+    assert len(_parts(ov)[1]) == 1 and len(_parts(ov)[0]) == 0
 
 
 @pytest.mark.parametrize("cautious", [True, False])
@@ -150,31 +169,31 @@ def test_chunked_mixed_with_small_and_1d():
     shapes = [(8, 16), (16, 320), (1024, 512)]
     d, _, ov = _run_parity(shapes, torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
-    assert len(ov._fused) == 2 and len(ov._big) == 1
+    assert len(_parts(ov)[0]) == 2 and len(_parts(ov)[1]) == 1
 
 
 def test_chunked_int8_parity():
     # big int8 momentum via the codec (dequant -> fp32 temp -> kernels -> requant); 1 B/param
     d, scale, ov = _run_parity([(1024, 512)], torch.float32, "int8")
     assert d / scale < 5e-4, f"rel={d/scale:.2e}"
-    assert len(ov._big) == 1
-    st = ov.state[ov._big[0]]
-    assert st["m"].dtype == torch.int8 and st["m"].numel() == ov._big[0].numel()  # 1 B/param
+    assert len(_parts(ov)[1]) == 1
+    st = ov.state[_parts(ov)[1][0]]
+    assert st["m"].dtype == torch.int8 and st["m"].numel() == _parts(ov)[1][0].numel()  # 1 B/param
 
 
 def test_chunked_4bit_parity():
     d, scale, ov = _run_parity([(1024, 512)], torch.float32, "4bit")
     assert d / scale < 5e-4, f"rel={d/scale:.2e}"
-    assert len(ov._big) == 1
-    st = ov.state[ov._big[0]]
-    assert st["m"].dtype == torch.uint8 and st["m"].numel() == ov._big[0].numel() // 2  # 0.5 B/param
+    assert len(_parts(ov)[1]) == 1
+    st = ov.state[_parts(ov)[1][0]]
+    assert st["m"].dtype == torch.uint8 and st["m"].numel() == _parts(ov)[1][0].numel() // 2  # 0.5 B/param
 
 
 def test_chunked_4bit_odd_C():
     # the chunked codec packs the flat tensor, so 4bit handles odd C (unlike the one-block path)
     d, scale, ov = _run_parity([(1024, 513)], torch.float32, "4bit")
     assert d / scale < 5e-4, f"rel={d/scale:.2e}"
-    assert len(ov._big) == 1
+    assert len(_parts(ov)[1]) == 1
 
 
 @pytest.mark.parametrize("mdtype", ["int8", "4bit"])
@@ -203,8 +222,8 @@ def test_weight_decay_shrinks_weights():
     p0 = _bag(shapes, torch.float32, 5)
     p_wd = [p.detach().clone().requires_grad_(True) for p in p0]
     p_no = [p.detach().clone().requires_grad_(True) for p in p0]
-    o_wd = FusedAdakaon(p_wd, lr=1e-2, weight_decay=0.2, momentum_dtype="float32")
-    o_no = FusedAdakaon(p_no, lr=1e-2, weight_decay=0.0, momentum_dtype="float32")
+    o_wd = _fused(p_wd, lr=1e-2, weight_decay=0.2, momentum_dtype="float32")
+    o_no = _fused(p_no, lr=1e-2, weight_decay=0.0, momentum_dtype="float32")
     gen = torch.Generator(device=DEV).manual_seed(9)
     for _ in range(10):
         gs = [torch.randn(*p.shape, generator=gen, device=DEV) * 0.01 for p in p0]
@@ -222,7 +241,7 @@ def test_weight_decay_shrinks_weights():
 
 # ----------------------------------------------------------------- bf16 momentum / params
 def test_bf16_momentum_parity_bounded():
-    # FusedAdakaon runs the EMA in fp32 then rounds to bf16; native bf16 lerps in bf16. Equivalent
+    # Adakaon(fused=True) runs the EMA in fp32 then rounds to bf16; native bf16 lerps in bf16. Equivalent
     # (measured null) but not bit-identical -> bound the divergence, don't demand exactness.
     d, scale, _ = _run_parity([(8, 16)] * 6, torch.float32, "bfloat16")
     assert d / scale < 5e-3, f"rel={d/scale:.2e}"
@@ -246,14 +265,14 @@ def test_int8_parity_mixed_shapes():
     shapes = [(8, 16), (16, 8), (12, 20), (16, 320)]
     d, scale, ov = _run_parity(shapes, torch.float32, "int8")
     assert d / scale < 5e-4, f"rel={d/scale:.2e}"
-    assert len(ov._cache.buckets) >= 3                       # mixed tiles still bucket
+    assert len(_buckets(ov)) >= 3                       # mixed tiles still bucket
 
 
 def test_int8_state_layout_and_memory():
     ps = _bag([(32, 48)] * 6, torch.float32)
     for p in ps:
         p.grad = torch.randn_like(p)
-    ov = FusedAdakaon(ps, momentum_dtype="int8")
+    ov = _fused(ps, momentum_dtype="int8")
     on = Adakaon([p.detach().clone().requires_grad_(True) for p in ps], momentum_dtype="int8")
     for p in on.param_groups[0]["params"]:
         p.grad = torch.randn_like(p)
@@ -263,7 +282,7 @@ def test_int8_state_layout_and_memory():
     st = ov.state[ps[0]]
     assert st["m"].dtype == torch.int8 and st["m"].element_size() == 1      # 1 byte/param
     assert st["m"].numel() == ps[0].numel()
-    assert st["m_scale"].shape == (32,)                                     # per-row scale
+    assert st["m_scale"].shape == (32, 1)                                   # per-row codec scale
 
     def bpp(opt, params):
         b = sum(v.numel() * v.element_size() for p in params for v in opt.state[p].values()
@@ -280,7 +299,7 @@ def test_int8_converges():
     torch.manual_seed(0)
     w = torch.randn(16, 24, device=DEV).requires_grad_(True)
     target = torch.randn(16, 24, device=DEV)
-    opt = FusedAdakaon([w], lr=5e-2, momentum_dtype="int8")
+    opt = _fused([w], lr=5e-2, momentum_dtype="int8")
     losses = []
     for _ in range(60):
         opt.zero_grad()
@@ -339,14 +358,14 @@ def test_4bit_parity_mixed_even_shapes():
     shapes = [(8, 16), (16, 8), (12, 20), (16, 320)]           # all even C
     d, scale, ov = _run_parity(shapes, torch.float32, "4bit")
     assert d / scale < 5e-4, f"rel={d/scale:.2e}"
-    assert len(ov._fused) == len(shapes)                       # all fused (even C)
+    assert len(_parts(ov)[0]) == len(shapes)                       # all fused (even C)
 
 
 def test_4bit_half_byte_per_param():
     ps = _bag([(16, 64)] * 4, torch.float32)
     for p in ps:
         p.grad = torch.randn_like(p)
-    ov = FusedAdakaon(ps, momentum_dtype="4bit")
+    ov = _fused(ps, momentum_dtype="4bit")
     ov.step()
     torch.cuda.synchronize()
     st = ov.state[ps[0]]
@@ -359,11 +378,12 @@ def test_4bit_odd_C_routes_to_native():
     ps = _bag([(8, 15)], torch.float32)
     for p in ps:
         p.grad = torch.randn_like(p)
-    ov = FusedAdakaon(ps, momentum_dtype="4bit")
+    ov = _fused(ps, momentum_dtype="4bit")
     ov.step()
     torch.cuda.synchronize()
-    assert len(ov._fused) == 0 and ov.inner is not None
-    assert ov.inner.state[ps[0]]["m"].dtype == torch.uint8     # 4bit on the native optimizer
+    ob, big, nat = _parts(ov)
+    assert len(ob) == 0 and len(big) == 0 and len(nat) == 1    # small odd-C 4bit -> native subset
+    assert ov.state[ps[0]]["m"].dtype == torch.uint8           # 4bit momentum on the native path
     assert torch.isfinite(ps[0]).all()
 
 
@@ -371,7 +391,7 @@ def test_4bit_converges():
     torch.manual_seed(0)
     w = torch.randn(16, 24, device=DEV).requires_grad_(True)
     target = torch.randn(16, 24, device=DEV)
-    opt = FusedAdakaon([w], lr=5e-2, momentum_dtype="4bit")
+    opt = _fused([w], lr=5e-2, momentum_dtype="4bit")
     losses = []
     for _ in range(80):
         opt.zero_grad()
@@ -427,7 +447,7 @@ def test_fallback_routing_and_parity():
     pn = _clone(pv)
     cfg = dict(lr=2e-3, betas=(0.9, 0.999), cautious=True, gradient_centralization=True,
                momentum_dtype="float32")
-    ov, on = FusedAdakaon(pv, **cfg), Adakaon(pn, **cfg)
+    ov, on = _fused(pv, **cfg), Adakaon(pn, **cfg)
     gen = torch.Generator(device=DEV).manual_seed(7)
     for _ in range(6):
         gs = [torch.randn(*p.shape, generator=gen, device=DEV) for p in pv]
@@ -439,9 +459,10 @@ def test_fallback_routing_and_parity():
         on.step()
     torch.cuda.synchronize()
     # all three paths exercised at once: tiny 2-D -> one-block, 256x1024 -> chunked, conv + 1-D -> native
-    assert len(ov._fused) == 4
-    assert len(ov._big) == 1
-    assert ov.inner is not None and len(ov.inner.param_groups[0]["params"]) == 2
+    ob, big, nat = _parts(ov)
+    assert len(ob) == 4
+    assert len(big) == 1
+    assert len(nat) == 2                                       # conv + 1-D handled natively
     d = max((a.detach() - b.detach()).abs().max().item() for a, b in zip(pv, pn))
     assert d < 1e-5, f"max|Δp|={d:.2e}"
 
@@ -451,7 +472,7 @@ def test_bf16_momentum_two_bytes_per_param():
     ps = _bag([(32, 48)] * 8, torch.float32)
     for p in ps:
         p.grad = torch.randn_like(p)
-    opt = FusedAdakaon(ps, momentum_dtype="bfloat16")
+    opt = _fused(ps, momentum_dtype="bfloat16")
     opt.step()
     torch.cuda.synchronize()
     # state per fused param: m (bf16, 2B) + row (fp32) + col (fp32). Momentum is the dominant term.
@@ -468,7 +489,7 @@ def test_grad_realloc_still_correct():
     pv = _bag(shapes, torch.float32, 1)
     pn = _clone(pv)
     cfg = dict(lr=2e-3, momentum_dtype="float32")
-    ov, on = FusedAdakaon(pv, **cfg), Adakaon(pn, **cfg)
+    ov, on = _fused(pv, **cfg), Adakaon(pn, **cfg)
     gen = torch.Generator(device=DEV).manual_seed(7)
     for _ in range(5):
         # fresh grad tensors each step (new data_ptr) -> exercises refresh_grads()
@@ -490,7 +511,7 @@ def test_grad_realloc_still_correct():
 
 def test_grad_none_param_is_skipped():
     pv = _bag([(8, 16), (8, 16)], torch.float32, 1)
-    opt = FusedAdakaon(pv, momentum_dtype="float32")
+    opt = _fused(pv, momentum_dtype="float32")
     pv[0].grad = torch.randn_like(pv[0])
     # pv[1].grad stays None
     before = pv[1].detach().clone()
@@ -602,3 +623,32 @@ def test_factored_rc_primitive():
     assert torch.allclose(cfac, cf_r.view(-1), atol=1e-4)
     assert torch.allclose(row, row_r, atol=1e-5)            # row EMA updated in place
     assert torch.allclose(col, col_r, atol=1e-5)
+
+
+# ----------------------------------------------------------------- fused/native unification
+def test_fused_and_native_share_state_format():
+    """The fused 2-D paths (one-block + chunked) keep BYTE-COMPATIBLE state with native (same keys /
+    dtypes / shapes), so a run can be checkpoint-resumed across ``fused``. (1-D params go native in
+    both; native foreach-batches them and the int8 codec's per-param vs stacked scale shape differs
+    cosmetically there — orthogonal to fusion, so this checks the fused tensors.)"""
+    shapes = [(8, 16), (1024, 512)]             # one-block + chunked
+    pv = _bag(shapes, torch.float32, 3)
+    pn = _clone(pv)
+    of = Adakaon(pv, fused=True, momentum_dtype="int8")
+    on = Adakaon(pn, momentum_dtype="int8")
+    gen = torch.Generator(device=DEV).manual_seed(11)
+    for _ in range(3):
+        gs = [torch.randn(*p.shape, generator=gen, device=DEV) for p in pv]
+        for p, g in zip(pv, gs):
+            p.grad = g.clone()
+        for p, g in zip(pn, gs):
+            p.grad = g.clone()
+        of.step()
+        on.step()
+    torch.cuda.synchronize()
+    for a, b in zip(pv, pn):
+        sa, sb = of.state[a], on.state[b]
+        assert set(sa) == set(sb), f"state keys differ: {set(sa)} vs {set(sb)}"
+        for k in sa:
+            if torch.is_tensor(sa[k]):
+                assert sa[k].dtype == sb[k].dtype and sa[k].shape == sb[k].shape, f"{k}: {sa[k].shape}"

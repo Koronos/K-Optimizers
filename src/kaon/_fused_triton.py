@@ -1,11 +1,11 @@
-"""Triton fused optimizer kernels for kaon (experimental — not in the public API yet).
+"""Triton fused-step building blocks for kaon (experimental — not in the public API).
 
-Graduated from the ``benchmarks/control/fused_adakaon_v2.py`` PoC. One Triton program owns one
-tensor and runs the whole factored step in-block, reading each tensor's base address from a
-MultiTensorApply-style POINTER ARRAY and writing ``p``/``m`` IN PLACE (no stacking, no scatter).
-Tensors the kernel can't own fall back to a real :class:`kaon.Adakaon`, so the result is always
-correct; fusion is a strict speed overlay on the launch-bound (many-small-tensor / low-rank LoRA)
-regime, where it is 18-39x faster than the native foreach step at identical memory and fidelity.
+These are the kernels + host plumbing behind ``Adakaon(fused=True)`` (see ``adakaon.py``, which owns
+the step orchestration, partition, and state). One Triton program owns one tensor and runs the whole
+factored step in-block, reading each tensor's base address from a MultiTensorApply-style POINTER ARRAY
+and writing ``p``/``m`` IN PLACE (no stacking, no scatter) — 18-39x over native foreach on the
+launch-bound (many-small / low-rank LoRA) regime; a chunked multi-block path (``_chunked_mom`` /
+``_chunked_apply``) handles large tensors (~2.5x). Same math, state, and fidelity as the native path.
 
 ────────────────────────────────────────────────────────────────────────────────────────────────
 REUSE MAP — for the planned shared "kaon Triton núcleo" that other optimizers will build on.
@@ -35,21 +35,19 @@ What is already optimizer-AGNOSTIC vs Adakaon-SPECIFIC here:
   4bit packs 2 codes/byte over row-major-flat elements, so the fused path needs an EVEN column count
   (keeps each byte's pair within one row); odd-C tensors route to the native Adakaon.
 
-  Adakaon-SPECIFIC (the part each optimizer reimplements):
-    * ``_adakaon_tile_kernel``                   — the factored step (r/c-factor + RMS-clip + EMA +
-                                                   cautious). AdaPNM would add a 2nd (negative)
-                                                   momentum; AdaMuon would swap in orthogonalization.
+  Adakaon-SPECIFIC (Adakaon reimplements; another factored optimizer would swap only this):
+    * ``_adakaon_tile_kernel`` (one-block) + ``_chunked_mom``/``_chunked_apply`` (big) — the factored
+      step (r/c-factor + RMS-clip + EMA + cautious). AdaPNM would add a 2nd (negative) momentum;
+      AdaMuon would swap in orthogonalization. ``Adakaon._fused_step`` orchestrates the partition +
+      launches over its own state/codec; this module holds no optimizer class.
 
-  NOT covered (native fallback handles them): fp16 params, conv ndim>2, 1-D, small odd-C 4bit, and
-  per-param-group configs. (Large tensors above ``TILE_CAP`` are handled by the chunked path.)
+  NOT covered (Adakaon's native path handles them): fp16 params, conv ndim>2, 1-D, small odd-C 4bit,
+  beta1==0, and per-param-group configs. (Large tensors above ``TILE_CAP`` use the chunked path.)
 ────────────────────────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
 import torch
-from torch.optim import Optimizer
-
-from kaon._momentum_codec import _make_codec, _quant_4bit, _quant_int8  # torch codec (no triton dep)
 
 try:  # Triton is an optional, GPU-only dependency — keep ``import kaon`` working without it.
     import triton
@@ -61,7 +59,7 @@ except ImportError:  # pragma: no cover - exercised only on triton-less installs
     tl = None
     _HAS_TRITON = False
 
-__all__ = ["FusedAdakaon", "fused_eligible", "warps_for", "next_pow2_tile", "TILE_CAP", "HAS_TRITON"]
+__all__ = ["fused_eligible", "warps_for", "next_pow2_tile", "TILE_CAP", "HAS_TRITON"]
 
 HAS_TRITON = _HAS_TRITON
 # Largest padded tile a single program owns. Measured crossover (RTX 4080, fp32): the one-block
@@ -75,8 +73,7 @@ DEV = "cuda"
 # Momentum storage kinds (passed to the kernel as a constexpr so the unused branches compile away).
 MOM_FP32, MOM_BF16, MOM_INT8, MOM_4BIT = 0, 1, 2, 3
 # int8 (/127) and 4bit (/7) scale divisors are inlined as literals in the @jit device helpers
-# (Triton kernels can't read module globals). _FOURBIT_BLOCK is the host-side block size.
-_FOURBIT_BLOCK = 128   # flat elements per 4-bit absmax block (matches _momentum_codec._FOURBIT_BLOCK)
+# (Triton kernels can't read module globals).
 
 
 # ============================================================ host-side reusable helpers
@@ -109,7 +106,7 @@ def fused_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP) -> bool:
     if p.dtype not in (torch.float32, torch.bfloat16):  # fp16 SR unsupported -> native
         return False
     BR, BC = next_pow2_tile(p.shape[0], p.shape[1])
-    return BR * BC <= tile_cap
+    return tile_cap >= BR * BC
 
 
 # ============================================================ device-side reusable helpers
@@ -420,211 +417,3 @@ class PointerArrayCache:
                 b["g_addr"] = torch.tensor([p.grad.data_ptr() for p in b["plist"]],
                                            dtype=torch.int64, device=DEV)
                 b["grad_first"] = gf
-
-
-# ============================================================ Adakaon-specific optimizer
-class FusedAdakaon(Optimizer):
-    """Adakaon-bf16 with a pointer-array fused Triton kernel for small 2-D weights; native otherwise.
-
-    Two fused paths, both covering momentum bf16/fp32/int8/4bit (1 / 0.5 B/param) with GC, cautious,
-    and decoupled (AdamW-style) ``weight_decay``: a one-block kernel for tiles ≤ ``tile_cap`` (quant
-    via the reusable in-kernel dequant/requant helpers) and a chunked multi-block path for larger 2-D
-    tensors (cheap reductions in torch + two elementwise kernels; int8/4bit via the shared codec on an
-    fp32 temp — ~2.5x over native fp32, ~1.7x over native quant on big weight matrices). Routed to an
-    inner :class:`kaon.Adakaon` (always correct): 1-D / conv tensors, fp16 params, and small not-one-
-    block tensors (e.g. odd-column 4bit at LoRA scale). Experimental: imported from
-    ``kaon._fused_triton``, not in the public API.
-    """
-
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps1=1e-30, clip=1.0,
-                 weight_decay=0.0, cautious=True, gradient_centralization=True,
-                 momentum_dtype="bfloat16", tile_cap=TILE_CAP):
-        if not _HAS_TRITON:
-            raise RuntimeError("FusedAdakaon requires Triton (a GPU-only optional dependency)")
-        if momentum_dtype not in ("bfloat16", "float32", "int8", "4bit"):
-            raise ValueError("FusedAdakaon momentum supports bf16/fp32/int8/4bit")
-        beta1, beta2 = betas
-        defaults = dict(lr=lr, beta1=float(beta1), beta2=float(beta2), eps1=eps1, clip=clip,
-                        wd=float(weight_decay), cautious=cautious, gc=gradient_centralization,
-                        mdtype=momentum_dtype, momentum_4bit_block=_FOURBIT_BLOCK)
-        super().__init__(params, defaults)
-        self._tile_cap = tile_cap
-        self._t = 0
-        self._partitioned = False
-        self._fused: list[torch.Tensor] = []         # one-block path (tile <= cap)
-        self._big: list[torch.Tensor] = []           # chunked path (2-D fp32/bf16-mom, tile > cap)
-        self._fused_group: dict[int, dict] = {}
-        self.inner = None        # native Adakaon over the fallback params
-        self._cache: PointerArrayCache | None = None
-        self._codecs: dict[str, object] = {}         # momentum codec per dtype (chunked quant path)
-
-    def _codec(self, group):
-        md = group["mdtype"]
-        c = self._codecs.get(md)
-        if c is None:
-            c = self._codecs[md] = _make_codec(md)
-        return c
-
-    def _partition(self):
-        from kaon import Adakaon
-        fb = []
-        for group in self.param_groups:
-            is_4bit = group["mdtype"] == "4bit"
-            for p in group["params"]:
-                ok = fused_eligible(p, self._tile_cap)
-                # 4bit packs 2 nibbles/byte over row-major-flat elements; an EVEN column count keeps
-                # each byte's pair within one row (clean reshape-pack). Odd C -> chunked/native.
-                if ok and is_4bit and p.shape[1] % 2 != 0:
-                    ok = False
-                big = (p.ndim == 2 and p.is_cuda and p.is_contiguous()
-                       and p.dtype in (torch.float32, torch.bfloat16)
-                       and next_pow2_tile(*p.shape)[0] * next_pow2_tile(*p.shape)[1] > self._tile_cap)
-                if ok:
-                    self._fused.append(p)
-                    self._fused_group[id(p)] = group
-                elif big:
-                    # genuinely too big for one block -> chunked path (fp32/bf16 direct; int8/4bit via
-                    # the codec). Small not-one-block tensors (e.g. odd-C 4bit) -> native (foreach).
-                    self._big.append(p)
-                    self._fused_group[id(p)] = group
-                else:
-                    fb.append(p)
-        if fb:
-            grp = self.param_groups[0]
-            self.inner = Adakaon(
-                fb, lr=grp["lr"], betas=(grp["beta1"], grp["beta2"]), eps=(grp["eps1"], 1e-30),
-                clip_threshold=grp["clip"], weight_decay=grp["wd"], cautious=grp["cautious"],
-                gradient_centralization=grp["gc"], momentum_dtype=grp["mdtype"],
-            )
-        self._partitioned = True
-
-    def _ensure_state(self, p):
-        st = self.state[p]
-        if "m" not in st:
-            R, C = p.shape
-            mdtype = self._fused_group[id(p)]["mdtype"]
-            if mdtype == "int8":
-                st["m"] = torch.zeros(R, C, dtype=torch.int8, device=p.device)
-                # per-row absmax scale; init to ones so a fresh (zero) momentum dequants to 0
-                st["m_scale"] = torch.ones(R, dtype=torch.float32, device=p.device)
-            elif mdtype == "4bit":
-                # packed nibbles [R, C//2] row-major (C even); 0x88 = two zero-level nibbles ->
-                # a fresh dequant returns 0. Per-128-block absmax scales, init to ones.
-                numel = R * C
-                blk = min(_FOURBIT_BLOCK, numel)
-                nblocks = (numel + blk - 1) // blk
-                st["m"] = torch.full((R * (C // 2),), 0x88, dtype=torch.uint8, device=p.device)
-                st["m_scale"] = torch.ones(nblocks, dtype=torch.float32, device=p.device)
-            else:
-                md = torch.bfloat16 if mdtype == "bfloat16" else torch.float32
-                st["m"] = torch.zeros(R, C, dtype=md, device=p.device)
-            st["row"] = torch.zeros(R, dtype=torch.float32, device=p.device)
-            st["col"] = torch.zeros(C, dtype=torch.float32, device=p.device)
-
-    def _chunked_reductions(self, p, group, st):
-        """Shared torch part of a big-tensor step: GC + row/col EMA + rms (matvec, no [R,C] temp).
-        Returns (g_centralized_fp32, r_factor, c_factor, inv_rms_lr)."""
-        R, C = p.shape
-        n = R * C
-        b2, eps1, clip, lr = group["beta2"], group["eps1"], group["clip"], group["lr"]
-        g = p.grad.float()
-        if group["gc"]:
-            g = g - g.mean(dim=1, keepdim=True)            # GC over fan-in (C)
-        g = g.contiguous()
-        gsq = g * g
-        st["row"].lerp_(gsq.mean(1).add_(eps1), 1.0 - b2)
-        st["col"].lerp_(gsq.mean(0).add_(eps1), 1.0 - b2)
-        r = st["row"].div(st["row"].mean()).rsqrt_()       # [R]
-        c = st["col"].rsqrt()                              # [C]
-        rms = (((r * r) * gsq.matmul(c * c)).sum() / n).sqrt_()           # matvec, no [R,C] temp
-        return g, r, c, lr / float(rms.div_(clip).clamp_(min=1.0))
-
-    @torch.no_grad()
-    def _chunked_step(self, p, group):
-        """One big 2-D tensor: cheap per-tensor reductions in torch, then two chunked elementwise
-        kernels for the heavy [R,C] passes. fp32/bf16 momentum stores directly; int8/4bit goes
-        through the codec (dequant -> fp32 temp -> kernels -> requant)."""
-        if group["mdtype"] in ("int8", "4bit"):
-            return self._chunked_step_quant(p, group)
-        self._ensure_state(p)
-        st = self.state[p]
-        n = p.numel()
-        b1, wd = group["beta1"], group["wd"]
-        g, r, c, inv_rms_lr = self._chunked_reductions(p, group, st)
-        cautious, sr = group["cautious"], p.dtype == torch.bfloat16
-        keep = torch.zeros(1, dtype=torch.int32, device=p.device)
-        gf, mf, pf = g.reshape(-1), st["m"].reshape(-1), p.reshape(-1)
-        grid = (triton.cdiv(n, 1024),)
-        _chunked_mom[grid](gf, mf, pf, r, c, keep, p.shape[1], n, inv_rms_lr, group["lr"] * wd, b1,
-                           CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
-        inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
-        _chunked_apply[grid](gf, mf, pf, n, inv_mean, group["lr"] * wd, self._t,
-                             CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024)
-
-    @torch.no_grad()
-    def _chunked_step_quant(self, p, group):
-        """Big-tensor chunked step with int8/4bit momentum, via the shared codec: dequant the stored
-        codes to an fp32 temp, run the EMA + apply kernels on it (so the WEIGHT update uses the exact
-        pre-requant fp32 momentum, like native), then requant the temp back to int8/4bit storage."""
-        R, C = p.shape
-        n = R * C
-        codec, md = self._codec(group), group["mdtype"]
-        st = self.state[p]
-        if "m" not in st:
-            codec.init_state(st, p.grad, group)
-            st["row"] = torch.zeros(R, dtype=torch.float32, device=p.device)
-            st["col"] = torch.zeros(C, dtype=torch.float32, device=p.device)
-        b1, wd = group["beta1"], group["wd"]
-        g, r, c, inv_rms_lr = self._chunked_reductions(p, group, st)
-        m_fp32 = codec.dequant_one(st, torch.empty(R, C, device=p.device)).reshape(R, C)
-        cautious, sr = group["cautious"], p.dtype == torch.bfloat16
-        keep = torch.zeros(1, dtype=torch.int32, device=p.device)
-        gf, mf, pf = g.reshape(-1), m_fp32.reshape(-1), p.reshape(-1)
-        grid = (triton.cdiv(n, 1024),)
-        _chunked_mom[grid](gf, mf, pf, r, c, keep, C, n, inv_rms_lr, group["lr"] * wd, b1,
-                           CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
-        # requant the updated fp32 momentum back into the codec's storage (per-row int8 / per-block 4bit)
-        if md == "int8":
-            st["m"], st["m_scale"] = _quant_int8(m_fp32)
-        else:
-            st["m"], st["m_scale"], _ = _quant_4bit(m_fp32.reshape(-1), st["m_block"])
-        inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
-        _chunked_apply[grid](gf, mf, pf, n, inv_mean, group["lr"] * wd, self._t,
-                             CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024)
-
-    @torch.no_grad()
-    def step(self, closure=None):  # noqa: ANN001
-        loss = closure() if closure is not None else None
-        self._t += 1
-        if not self._partitioned:
-            self._partition()
-
-        plist = [p for p in self._fused if p.grad is not None]
-        if plist:
-            ids = tuple(id(p) for p in plist)
-            if self._cache is None or self._cache.ids != ids:
-                for p in plist:
-                    self._ensure_state(p)
-                self._cache = PointerArrayCache(plist, lambda p: self.state[p], None)
-            self._cache.refresh_grads()
-            for b in self._cache.buckets:
-                grp = self._fused_group[id(b["plist"][0])]  # bucket shares one config (PoC limit)
-                lanes = b["BR"] * b["BC"]
-                _adakaon_tile_kernel[(len(b["plist"]),)](
-                    b["g_addr"], b["p_addr"], b["m_addr"], b["mscale_addr"], b["row_addr"], b["col_addr"],
-                    b["Rs"], b["Cs"],
-                    grp["lr"], grp["beta1"], grp["beta2"], grp["eps1"], grp["clip"], grp["wd"], self._t,
-                    LOWP=b["lowp"], MOM=b["mom"], CAUTIOUS=grp["cautious"], WD=grp["wd"] != 0,
-                    GC=grp["gc"], SR=b["lowp"], BR=b["BR"], BC=b["BC"], num_warps=warps_for(lanes),
-                )
-
-        for p in self._big:                              # chunked path for large 2-D tensors
-            if p.grad is not None:
-                self._chunked_step(p, self._fused_group[id(p)])
-
-        if self.inner is not None:
-            base = self.param_groups[0]
-            for ig in self.inner.param_groups:
-                ig["lr"] = base["lr"]
-            self.inner.step()
-        return loss
