@@ -118,7 +118,7 @@ class FusedAdamWInt8Mom(Optimizer):
                     st["m_codes"] = torch.zeros_like(p, dtype=torch.int8)
                     st["m_scale"] = torch.ones((), dtype=torch.float32, device=p.device)
                     st["v"] = torch.zeros_like(p)  # bf16 dense
-            for (device, dtype), parts in _buckets(
+            for (_device, dtype), parts in _buckets(
                 group, lambda p: self.state[p], ["m_codes", "m_scale", "v", "step"]  # noqa: B023
             ).items():
                 ps, gs, codes, scales, vs, ss = parts
