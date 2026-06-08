@@ -183,8 +183,8 @@ if _HAS_TRITON:
     @triton.jit
     def _adakaon_tile_kernel(
         g_addr, p_addr, m_addr, mscale_addr, row_addr, col_addr, Rs_ptr, Cs_ptr,
-        lr, beta1, beta2, eps1, clip, seed,
-        LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr,
+        lr, beta1, beta2, eps1, clip, wd, seed,
+        LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         GC: tl.constexpr, SR: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
     ):
         """One program == one tensor. Whole factored Adakaon step, in place via pointer-array.
@@ -273,17 +273,21 @@ if _HAS_TRITON:
         else:
             tl.store(mi.to(tl.pointer_type(tl.float32)) + idx, m_new, mask=m2)
 
-        # --- REUSABLE-ish: cautious masking + survivor rescale ---
+        # --- decoupled weight decay (AdamW-style): folded into delta BEFORE cautious, like native ---
+        p_old = tl.load(pp + idx, mask=m2, other=0.0).to(tl.float32)
         delta = m_new
+        if WD:
+            delta = delta + (lr * wd) * p_old          # momentum requant above used m_new (sans wd)
+
+        # --- REUSABLE-ish: cautious masking + survivor rescale (operates on delta incl. wd) ---
         if CAUTIOUS:
-            keep = (m_new * g) > 0.0
+            keep = (delta * g) > 0.0
             keepf = tl.where(keep, 1.0, 0.0)
             mm = tl.sum(keepf) / (Rf * Cf)
             mm = tl.where(mm < 1e-8, 1e-8, mm)
-            delta = tl.where(keep, m_new / mm, 0.0)
+            delta = tl.where(keep, delta / mm, 0.0)
 
         # --- weight write (plain fp32 or bf16 stochastic rounding) ---
-        p_old = tl.load(pp + idx, mask=m2, other=0.0).to(tl.float32)
         res = p_old - delta
         if SR:
             res = sr_round(res, seed + t, idx)
@@ -352,22 +356,23 @@ class FusedAdakaon(Optimizer):
     """Adakaon-bf16 with a pointer-array fused Triton kernel for small 2-D weights; native otherwise.
 
     Fuses ``momentum_dtype`` ∈ {bf16, fp32, int8, 4bit} in-kernel via the reusable dequant/requant
-    device helpers (per-row int8: 1 B/param; per-128-block 4bit: 0.5 B/param) at ``weight_decay == 0``.
-    Odd-column 4bit, weight decay, conv, and high-rank tensors are routed to an inner
-    :class:`kaon.Adakaon` (always correct). Experimental: imported from ``kaon._fused_triton``, not
-    yet in the public API.
+    device helpers (per-row int8: 1 B/param; per-128-block 4bit: 0.5 B/param), with optional decoupled
+    (AdamW-style) ``weight_decay``. Odd-column 4bit, conv, and high-rank tensors are routed to an inner
+    :class:`kaon.Adakaon` (always correct). Experimental: imported from ``kaon._fused_triton``, not yet
+    in the public API.
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps1=1e-30, clip=1.0,
-                 cautious=True, gradient_centralization=True, momentum_dtype="bfloat16",
-                 tile_cap=TILE_CAP):
+                 weight_decay=0.0, cautious=True, gradient_centralization=True,
+                 momentum_dtype="bfloat16", tile_cap=TILE_CAP):
         if not _HAS_TRITON:
             raise RuntimeError("FusedAdakaon requires Triton (a GPU-only optional dependency)")
         if momentum_dtype not in ("bfloat16", "float32", "int8", "4bit"):
-            raise ValueError("FusedAdakaon momentum supports bf16/fp32/int8 (4bit -> native fallback)")
+            raise ValueError("FusedAdakaon momentum supports bf16/fp32/int8/4bit")
         beta1, beta2 = betas
         defaults = dict(lr=lr, beta1=float(beta1), beta2=float(beta2), eps1=eps1, clip=clip,
-                        cautious=cautious, gc=gradient_centralization, mdtype=momentum_dtype)
+                        wd=float(weight_decay), cautious=cautious, gc=gradient_centralization,
+                        mdtype=momentum_dtype)
         super().__init__(params, defaults)
         self._tile_cap = tile_cap
         self._t = 0
@@ -397,7 +402,7 @@ class FusedAdakaon(Optimizer):
             grp = self.param_groups[0]
             self.inner = Adakaon(
                 fb, lr=grp["lr"], betas=(grp["beta1"], grp["beta2"]), eps=(grp["eps1"], 1e-30),
-                clip_threshold=grp["clip"], cautious=grp["cautious"],
+                clip_threshold=grp["clip"], weight_decay=grp["wd"], cautious=grp["cautious"],
                 gradient_centralization=grp["gc"], momentum_dtype=grp["mdtype"],
             )
         self._partitioned = True
@@ -446,9 +451,9 @@ class FusedAdakaon(Optimizer):
                 _adakaon_tile_kernel[(len(b["plist"]),)](
                     b["g_addr"], b["p_addr"], b["m_addr"], b["mscale_addr"], b["row_addr"], b["col_addr"],
                     b["Rs"], b["Cs"],
-                    grp["lr"], grp["beta1"], grp["beta2"], grp["eps1"], grp["clip"], self._t,
-                    LOWP=b["lowp"], MOM=b["mom"], CAUTIOUS=grp["cautious"], GC=grp["gc"],
-                    SR=b["lowp"], BR=b["BR"], BC=b["BC"], num_warps=warps_for(lanes),
+                    grp["lr"], grp["beta1"], grp["beta2"], grp["eps1"], grp["clip"], grp["wd"], self._t,
+                    LOWP=b["lowp"], MOM=b["mom"], CAUTIOUS=grp["cautious"], WD=grp["wd"] != 0,
+                    GC=grp["gc"], SR=b["lowp"], BR=b["BR"], BC=b["BC"], num_warps=warps_for(lanes),
                 )
 
         if self.inner is not None:

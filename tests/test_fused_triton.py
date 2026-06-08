@@ -36,9 +36,9 @@ def _clone(ps):
     return [p.detach().clone().requires_grad_(True) for p in ps]
 
 
-def _run_parity(shapes, dtype, mdtype, *, cautious=True, gc=True, steps=6, seed=1):
+def _run_parity(shapes, dtype, mdtype, *, cautious=True, gc=True, wd=0.0, steps=6, seed=1):
     """Step FusedAdakaon and native Adakaon on identical params+grads; return max|Δp| and scale."""
-    cfg = dict(lr=2e-3, betas=(0.9, 0.999), cautious=cautious,
+    cfg = dict(lr=2e-3, betas=(0.9, 0.999), weight_decay=wd, cautious=cautious,
                gradient_centralization=gc, momentum_dtype=mdtype)
     pv = _bag(shapes, dtype, seed)
     pn = _clone(pv)
@@ -103,6 +103,43 @@ def test_fp32_parity_mixed_shapes_multiple_buckets():
 def test_fp32_parity_lora_shapes():
     d, _, _ = _run_parity([(16, 320), (320, 16), (8, 1280)], torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+# ----------------------------------------------------------------- decoupled weight decay
+def test_weight_decay_parity_fp32():
+    # decoupled wd folded into delta before cautious -- must match native exactly (fp32)
+    d, scale, _ = _run_parity([(8, 16), (16, 8), (12, 20)], torch.float32, "float32", wd=0.05)
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("mdtype", ["int8", "4bit"])
+def test_weight_decay_parity_quant(mdtype):
+    d, scale, _ = _run_parity([(8, 16)] * 4, torch.float32, mdtype, wd=0.05)
+    assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
+
+
+def test_weight_decay_shrinks_weights():
+    # with no gradient signal pulling them, wd>0 should shrink weights vs wd=0
+    torch.manual_seed(0)
+    shapes = [(16, 32)] * 3
+    p0 = _bag(shapes, torch.float32, 5)
+    p_wd = [p.detach().clone().requires_grad_(True) for p in p0]
+    p_no = [p.detach().clone().requires_grad_(True) for p in p0]
+    o_wd = FusedAdakaon(p_wd, lr=1e-2, weight_decay=0.2, momentum_dtype="float32")
+    o_no = FusedAdakaon(p_no, lr=1e-2, weight_decay=0.0, momentum_dtype="float32")
+    gen = torch.Generator(device=DEV).manual_seed(9)
+    for _ in range(10):
+        gs = [torch.randn(*p.shape, generator=gen, device=DEV) * 0.01 for p in p0]
+        for p, g in zip(p_wd, gs):
+            p.grad = g.clone()
+        for p, g in zip(p_no, gs):
+            p.grad = g.clone()
+        o_wd.step()
+        o_no.step()
+    torch.cuda.synchronize()
+    n_wd = sum(p.norm().item() for p in p_wd)
+    n_no = sum(p.norm().item() for p in p_no)
+    assert n_wd < n_no, f"wd norm {n_wd:.3f} !< no-wd {n_no:.3f}"
 
 
 # ----------------------------------------------------------------- bf16 momentum / params
