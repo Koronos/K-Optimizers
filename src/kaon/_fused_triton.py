@@ -18,12 +18,21 @@ What is already optimizer-AGNOSTIC vs Adakaon-SPECIFIC here:
                                                    cached across steps (grad ptrs refreshed on
                                                    realloc). The hard, reusable plumbing.
 
-  Device-side ``@triton.jit`` helpers:
+  Device-side ``@triton.jit`` helpers (the device-side mirror of ``kaon._momentum_codec``):
     * ``sr_round``  (bf16 stochastic-rounding)   — REUSABLE by every bf16 optimizer (Lion, AdaPNM,
                                                    AdaMuon, …); pure, no Adakaon assumptions.
+    * ``dequant_int8`` / ``requant_int8``        — per-row int8 momentum codec, in-kernel. REUSABLE by
+                                                   any factored-family fused optimizer (the EMA formula
+                                                   between them is the only optimizer-specific part).
+    * ``dequant_4bit`` / ``requant_4bit``        — per-128-block 4-bit packed codec (segmented absmax +
+                                                   nibble pack via reshape/``tl.split``), in-kernel.
+                                                   REUSABLE the same way. 0.5 B/param at fused speed.
     * GC + factored row/col second moment        — currently INLINE in ``_adakaon_tile_kernel`` but
                                                    marked; reusable by the whole factored-Adam family
                                                    (Adakaon / AdaPNM / KProdigy) once extracted.
+
+  4bit packs 2 codes/byte over row-major-flat elements, so the fused path needs an EVEN column count
+  (keeps each byte's pair within one row); odd-C tensors route to the native Adakaon.
 
   Adakaon-SPECIFIC (the part each optimizer reimplements):
     * ``_adakaon_tile_kernel``                   — the factored step (r/c-factor + RMS-clip + EMA +
@@ -56,9 +65,10 @@ TILE_CAP = 1 << 16  # 65536 padded lanes — the largest tile we let a single pr
 DEV = "cuda"
 
 # Momentum storage kinds (passed to the kernel as a constexpr so the unused branches compile away).
-MOM_FP32, MOM_BF16, MOM_INT8 = 0, 1, 2
-_MOM_KIND = {"float32": MOM_FP32, "bfloat16": MOM_BF16, "int8": MOM_INT8}
-_INT8_ABSMAX = 127.0  # per-row symmetric int8 scale divisor (matches kaon._momentum_codec)
+MOM_FP32, MOM_BF16, MOM_INT8, MOM_4BIT = 0, 1, 2, 3
+# int8 (/127) and 4bit (/7) scale divisors are inlined as literals in the @jit device helpers
+# (Triton kernels can't read module globals). _FOURBIT_BLOCK is the host-side block size.
+_FOURBIT_BLOCK = 128   # flat elements per 4-bit absmax block (matches _momentum_codec._FOURBIT_BLOCK)
 
 
 # ============================================================ host-side reusable helpers
@@ -109,6 +119,66 @@ if _HAS_TRITON:
         noise = (tl.rand(seed, offs) * 65536.0).to(tl.int32)
         ibits = (ibits + noise) & -65536  # 0xFFFF0000 as a two's-complement int32
         return ibits.to(tl.float32, bitcast=True)
+
+    @triton.jit
+    def dequant_int8(code_ptr, idx, mask, scale_ptr, rr, R):
+        """Per-row int8 momentum codes -> fp32. REUSABLE by any factored-family fused optimizer.
+
+        ``code_ptr`` is the int8 [R,C] codes; ``scale_ptr`` the fp32 [R] per-row absmax scales.
+        Mirrors ``kaon._momentum_codec._Int8Codec`` dequant (code * row_scale)."""
+        scr = tl.load(scale_ptr + rr, mask=rr < R, other=0.0)          # [BR] per-row scale
+        code = tl.load(code_ptr + idx, mask=mask, other=0).to(tl.float32)
+        return code * scr[:, None]
+
+    @triton.jit
+    def requant_int8(m_new, m2, code_ptr, idx, scale_ptr, rr, R):
+        """fp32 momentum -> per-row int8 codes + scale, stored in place. REUSABLE.
+
+        Per-row (dim-0) absmax / 127, round half-to-even (libdevice.rint == torch.round), clamp
+        [-127, 127]. Element-for-element identical to ``_Int8Codec`` requant."""
+        amax = tl.max(tl.where(m2, tl.abs(m_new), 0.0), axis=1)        # [BR] per-row absmax
+        amax = tl.where(amax < 1e-12, 1e-12, amax)
+        new_scale = amax / 127.0                                       # symmetric int8 -> [-127, 127]
+        q = libdevice.rint(m_new / new_scale[:, None])
+        q = tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8)
+        tl.store(code_ptr + idx, q, mask=m2)
+        tl.store(scale_ptr + rr, new_scale, mask=rr < R)
+
+    @triton.jit
+    def dequant_4bit(packed_ptr, scale_ptr, ri, ci, idx, Chalf, mask, BLK):
+        """Per-block 4-bit packed momentum -> fp32. REUSABLE by any factored-family fused optimizer.
+
+        Nibble-packed (2 codes/byte) over the row-major-flattened tensor with a per-128-block absmax
+        scale; assumes an EVEN column count so a byte's pair stays within one row. Mirrors
+        ``kaon._momentum_codec._FourBitCodec`` dequant (unpack nibble - 8, * block scale)."""
+        byte = tl.load(packed_ptr + (ri * Chalf + ci // 2), mask=mask, other=0)
+        nib = tl.where((ci % 2) == 0, byte & 0xF, (byte >> 4) & 0xF)
+        q = nib.to(tl.float32) - 8.0
+        sc = tl.load(scale_ptr + (idx // BLK), mask=mask, other=0.0)    # per-block scale
+        return q * sc
+
+    @triton.jit
+    def requant_4bit(m_new, m2, idx, R, C, Chalf, packed_ptr, scale_ptr, NB, BLK,
+                     BR: tl.constexpr, BC: tl.constexpr):
+        """fp32 momentum -> per-block 4-bit codes + scale, stored in place. REUSABLE.
+
+        Pass 1: segmented per-128-block absmax / 7 (a runtime loop over the tensor's blocks). Pass 2:
+        round half-to-even (libdevice.rint) + clamp [-7, 7] + 8 shift -> nibbles, packed two-per-byte
+        via reshape + ``tl.split`` (no cross-lane write hazard). Element-identical to ``_FourBitCodec``."""
+        blk = idx // BLK
+        for b in range(NB):                                            # segmented per-block absmax
+            bmax = tl.max(tl.where((blk == b) & m2, tl.abs(m_new), 0.0))
+            bmax = tl.where(bmax < 1e-12, 1e-12, bmax)
+            tl.store(scale_ptr + b, bmax / 7.0)                        # symmetric 4-bit -> [-7, 7]
+        sc = tl.load(scale_ptr + blk, mask=m2, other=1.0)              # per-lane block scale
+        q = libdevice.rint(m_new / sc)
+        q = tl.minimum(tl.maximum(q, -7.0), 7.0)
+        nib = (q + 8.0).to(tl.uint8)                                   # [BR, BC]
+        lo, hi = tl.split(tl.reshape(nib, (BR, BC // 2, 2)))           # pair adjacent columns
+        byte = lo | (hi << 4)                                         # [BR, BC//2]
+        rr = tl.arange(0, BR)[:, None]
+        jj = tl.arange(0, BC // 2)[None, :]
+        tl.store(packed_ptr + rr * Chalf + jj, byte, mask=(rr < R) & (jj < Chalf))
 
     @triton.jit
     def _adakaon_tile_kernel(
@@ -175,13 +245,18 @@ if _HAS_TRITON:
         denom = tl.where(denom < 1.0, 1.0, denom)
         upd = upd * (lr / denom)
 
-        # --- momentum EMA (storage fp32 / bf16 / int8; EMA always runs in fp32) ---
-        # dequant the stored momentum to fp32
-        if MOM == 2:  # int8: per-row (dim-0) absmax scale, dequant = code * scale[row]
-            mscp = tl.load(mscale_addr + t).to(tl.pointer_type(tl.float32))
-            scr = tl.load(mscp + rr, mask=rr < R, other=0.0)                       # [BR]
-            mq = tl.load(mi.to(tl.pointer_type(tl.int8)) + idx, mask=m2, other=0).to(tl.float32)
-            m_old = mq * scr[:, None]
+        # --- momentum EMA (storage fp32 / bf16 / int8 / 4bit; EMA always runs in fp32) ---
+        # dequant the stored momentum to fp32 (quant primitives are codec-level -> reusable)
+        if MOM == 2:  # int8 codes + per-row scale
+            code_ptr = mi.to(tl.pointer_type(tl.int8))
+            scale_ptr = tl.load(mscale_addr + t).to(tl.pointer_type(tl.float32))
+            m_old = dequant_int8(code_ptr, idx, m2, scale_ptr, rr, R)
+        elif MOM == 3:  # 4bit packed codes + per-block scale (even C only; odd C -> native)
+            packed_ptr = mi.to(tl.pointer_type(tl.uint8))
+            scale_ptr = tl.load(mscale_addr + t).to(tl.pointer_type(tl.float32))
+            Chalf = C // 2
+            BLK = tl.minimum(R * C, 128)                               # flat elems per 4-bit block
+            m_old = dequant_4bit(packed_ptr, scale_ptr, ri, ci, idx, Chalf, m2, BLK)
         elif MOM == 1:  # bf16
             m_old = tl.load(mi.to(tl.pointer_type(tl.bfloat16)) + idx, mask=m2, other=0.0).to(tl.float32)
         else:  # fp32
@@ -189,13 +264,10 @@ if _HAS_TRITON:
         m_new = beta1 * m_old + (1.0 - beta1) * upd
         # requant the updated momentum back to storage (m_new stays fp32 for delta/cautious below)
         if MOM == 2:
-            amax = tl.max(tl.where(m2, tl.abs(m_new), 0.0), axis=1)                # [BR] per-row absmax
-            amax = tl.where(amax < 1e-12, 1e-12, amax)
-            new_scale = amax / 127.0
-            q = libdevice.rint(m_new / new_scale[:, None])                         # round half-to-even
-            q = tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8)
-            tl.store(mi.to(tl.pointer_type(tl.int8)) + idx, q, mask=m2)
-            tl.store(mscp + rr, new_scale, mask=rr < R)
+            requant_int8(m_new, m2, code_ptr, idx, scale_ptr, rr, R)
+        elif MOM == 3:
+            NB = (R * C + BLK - 1) // BLK
+            requant_4bit(m_new, m2, idx, R, C, Chalf, packed_ptr, scale_ptr, NB, BLK, BR, BC)
         elif MOM == 1:
             tl.store(mi.to(tl.pointer_type(tl.bfloat16)) + idx, m_new.to(tl.bfloat16), mask=m2)
         else:
@@ -240,11 +312,19 @@ class PointerArrayCache:
         for (BR, BC), bl in groups.items():  # noqa: N806
             st = [state_of(p) for p in bl]
             mdtype = st[0]["m"].dtype
-            mom = MOM_INT8 if mdtype == torch.int8 else (MOM_BF16 if mdtype == torch.bfloat16 else MOM_FP32)
+            if mdtype == torch.int8:
+                mom = MOM_INT8
+            elif mdtype == torch.uint8:
+                mom = MOM_4BIT
+            elif mdtype == torch.bfloat16:
+                mom = MOM_BF16
+            else:
+                mom = MOM_FP32
             m_addr = i64([s["m"].data_ptr() for s in st])
-            # int8 needs a per-tensor pointer array to the fp32 row scales; other kinds never
+            # int8/4bit need a per-tensor pointer array to the fp32 scales; float kinds never
             # dereference mscale (constexpr-elided), so reuse m_addr as a harmless valid pointer.
-            mscale_addr = i64([s["m_scale"].data_ptr() for s in st]) if mom == MOM_INT8 else m_addr
+            quant = mom in (MOM_INT8, MOM_4BIT)
+            mscale_addr = i64([s["m_scale"].data_ptr() for s in st]) if quant else m_addr
             self.buckets.append(dict(
                 plist=bl, BR=BR, BC=BC, mom=mom,
                 p_addr=i64([p.data_ptr() for p in bl]),
@@ -271,10 +351,11 @@ class PointerArrayCache:
 class FusedAdakaon(Optimizer):
     """Adakaon-bf16 with a pointer-array fused Triton kernel for small 2-D weights; native otherwise.
 
-    Currently covers ``momentum_dtype`` ∈ {bf16, fp32, int8} (per-row int8 dequant/requant in-kernel)
-    and ``weight_decay == 0``. 4bit momentum, weight decay, conv, and high-rank tensors are routed to
-    an inner :class:`kaon.Adakaon` (always correct). Experimental: imported from ``kaon._fused_triton``,
-    not yet in the public API.
+    Fuses ``momentum_dtype`` ∈ {bf16, fp32, int8, 4bit} in-kernel via the reusable dequant/requant
+    device helpers (per-row int8: 1 B/param; per-128-block 4bit: 0.5 B/param) at ``weight_decay == 0``.
+    Odd-column 4bit, weight decay, conv, and high-rank tensors are routed to an inner
+    :class:`kaon.Adakaon` (always correct). Experimental: imported from ``kaon._fused_triton``, not
+    yet in the public API.
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps1=1e-30, clip=1.0,
@@ -282,8 +363,8 @@ class FusedAdakaon(Optimizer):
                  tile_cap=TILE_CAP):
         if not _HAS_TRITON:
             raise RuntimeError("FusedAdakaon requires Triton (a GPU-only optional dependency)")
-        if momentum_dtype not in ("bfloat16", "float32", "int8"):
-            raise ValueError("FusedAdakaon momentum supports bf16/fp32/int8 (4bit: future work)")
+        if momentum_dtype not in ("bfloat16", "float32", "int8", "4bit"):
+            raise ValueError("FusedAdakaon momentum supports bf16/fp32/int8 (4bit -> native fallback)")
         beta1, beta2 = betas
         defaults = dict(lr=lr, beta1=float(beta1), beta2=float(beta2), eps1=eps1, clip=clip,
                         cautious=cautious, gc=gradient_centralization, mdtype=momentum_dtype)
@@ -300,8 +381,14 @@ class FusedAdakaon(Optimizer):
         from kaon import Adakaon
         fb = []
         for group in self.param_groups:
+            is_4bit = group["mdtype"] == "4bit"
             for p in group["params"]:
-                if fused_eligible(p, self._tile_cap):
+                ok = fused_eligible(p, self._tile_cap)
+                # 4bit packs 2 nibbles/byte over row-major-flat elements; an EVEN column count keeps
+                # each byte's pair within one row (clean reshape-pack). Odd C -> native.
+                if ok and is_4bit and p.shape[1] % 2 != 0:
+                    ok = False
+                if ok:
                     self._fused.append(p)
                     self._fused_group[id(p)] = group
                 else:
@@ -324,6 +411,14 @@ class FusedAdakaon(Optimizer):
                 st["m"] = torch.zeros(R, C, dtype=torch.int8, device=p.device)
                 # per-row absmax scale; init to ones so a fresh (zero) momentum dequants to 0
                 st["m_scale"] = torch.ones(R, dtype=torch.float32, device=p.device)
+            elif mdtype == "4bit":
+                # packed nibbles [R, C//2] row-major (C even); 0x88 = two zero-level nibbles ->
+                # a fresh dequant returns 0. Per-128-block absmax scales, init to ones.
+                numel = R * C
+                blk = min(_FOURBIT_BLOCK, numel)
+                nblocks = (numel + blk - 1) // blk
+                st["m"] = torch.full((R * (C // 2),), 0x88, dtype=torch.uint8, device=p.device)
+                st["m_scale"] = torch.ones(nblocks, dtype=torch.float32, device=p.device)
             else:
                 md = torch.bfloat16 if mdtype == "bfloat16" else torch.float32
                 st["m"] = torch.zeros(R, C, dtype=md, device=p.device)

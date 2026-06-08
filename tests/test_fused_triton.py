@@ -183,6 +183,124 @@ def test_int8_with_bf16_params():
     assert d / scale < 5e-2, f"rel={d/scale:.2e}"  # bf16-param SR -> expectation match
 
 
+def test_int8_quant_primitives_match_codec():
+    """The REUSABLE device primitive requant_int8 == native _quant_int8 (bit-for-bit)."""
+    import triton
+    import triton.language as tl
+
+    from kaon._fused_triton import requant_int8
+    from kaon._momentum_codec import _quant_int8
+
+    R, C, BR, BC = 8, 24, 8, 32
+
+    @triton.jit
+    def _probe(m_ptr, code_ptr, scale_ptr, R, C, BR: tl.constexpr, BC: tl.constexpr):
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        m2 = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        rr = tl.arange(0, BR)
+        m = tl.load(m_ptr + idx, mask=m2, other=0.0)
+        requant_int8(m, m2, code_ptr, idx, scale_ptr, rr, R)
+
+    m = torch.randn(R, C, device=DEV)
+    code = torch.zeros(R, C, dtype=torch.int8, device=DEV)
+    scale = torch.zeros(R, device=DEV)
+    _probe[(1,)](m, code, scale, R, C, BR=BR, BC=BC)
+    torch.cuda.synchronize()
+    q_ref, scale_ref = _quant_int8(m)
+    assert torch.equal(code, q_ref)                              # codes bit-identical
+    assert torch.allclose(scale, scale_ref.view(-1), atol=0, rtol=0)
+
+
+# ----------------------------------------------------------------- 4bit momentum (in-kernel)
+def test_4bit_parity_with_native():
+    # even-C 4bit fuses in-kernel; per-128-block dequant/requant matches native Adakaon(4bit) closely
+    d, scale, _ = _run_parity([(8, 16)] * 6, torch.float32, "4bit")
+    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+
+
+def test_4bit_parity_mixed_even_shapes():
+    shapes = [(8, 16), (16, 8), (12, 20), (16, 320)]           # all even C
+    d, scale, ov = _run_parity(shapes, torch.float32, "4bit")
+    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+    assert len(ov._fused) == len(shapes)                       # all fused (even C)
+
+
+def test_4bit_half_byte_per_param():
+    ps = _bag([(16, 64)] * 4, torch.float32)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    ov = FusedAdakaon(ps, momentum_dtype="4bit")
+    ov.step()
+    torch.cuda.synchronize()
+    st = ov.state[ps[0]]
+    assert st["m"].dtype == torch.uint8
+    assert st["m"].numel() == ps[0].numel() // 2               # packed two codes/byte -> 0.5 B/param
+
+
+def test_4bit_odd_C_routes_to_native():
+    # odd column count can't pack cleanly into bytes -> native fallback (still correct)
+    ps = _bag([(8, 15)], torch.float32)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    ov = FusedAdakaon(ps, momentum_dtype="4bit")
+    ov.step()
+    torch.cuda.synchronize()
+    assert len(ov._fused) == 0 and ov.inner is not None
+    assert ov.inner.state[ps[0]]["m"].dtype == torch.uint8     # 4bit on the native optimizer
+    assert torch.isfinite(ps[0]).all()
+
+
+def test_4bit_converges():
+    torch.manual_seed(0)
+    w = torch.randn(16, 24, device=DEV).requires_grad_(True)
+    target = torch.randn(16, 24, device=DEV)
+    opt = FusedAdakaon([w], lr=5e-2, momentum_dtype="4bit")
+    losses = []
+    for _ in range(80):
+        opt.zero_grad()
+        loss = (w - target).pow(2).mean()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    torch.cuda.synchronize()
+    assert torch.isfinite(w).all()
+    assert losses[-1] < losses[0] * 0.3, f"{losses[0]:.3f} -> {losses[-1]:.3f}"
+
+
+def test_4bit_quant_primitive_matches_codec():
+    """The REUSABLE device primitive requant_4bit == native _quant_4bit (packed bytes + scale)."""
+    import triton
+    import triton.language as tl
+
+    from kaon._fused_triton import requant_4bit
+    from kaon._momentum_codec import _quant_4bit
+
+    R, C, BR, BC = 8, 16, 8, 16
+    numel = R * C
+    Chalf, BLK = C // 2, min(128, numel)
+    NB = (numel + BLK - 1) // BLK
+
+    @triton.jit
+    def _probe(m_ptr, packed_ptr, scale_ptr, R, C, Chalf, NB, BLK, BR: tl.constexpr, BC: tl.constexpr):
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        m2 = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        m = tl.load(m_ptr + idx, mask=m2, other=0.0)
+        requant_4bit(m, m2, idx, R, C, Chalf, packed_ptr, scale_ptr, NB, BLK, BR, BC)
+
+    m = torch.randn(R, C, device=DEV)
+    packed = torch.zeros(R * Chalf, dtype=torch.uint8, device=DEV)
+    scale = torch.zeros(NB, device=DEV)
+    _probe[(1,)](m, packed, scale, R, C, Chalf, NB, BLK, BR=BR, BC=BC)
+    torch.cuda.synchronize()
+    p_ref, s_ref, _ = _quant_4bit(m, 128)
+    assert torch.equal(packed, p_ref)                          # packed bytes bit-identical
+    assert torch.allclose(scale, s_ref, atol=0, rtol=0)
+
+
 # ----------------------------------------------------------------- native fallback routing
 def test_fallback_routing_and_parity():
     # tiny fused + big-2D (tile>cap) + conv + 1-D -> the last three go to the inner native Adakaon
