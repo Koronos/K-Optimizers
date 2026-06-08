@@ -361,6 +361,152 @@ if _HAS_TRITON:
             res = sr_round(res, seed, offs)
         tl.store(p_ptr + offs, res.to(p_ptr.dtype.element_ty), mask=mask)
 
+    # ============================================================ AdaPNM (positive-negative momentum)
+    # Reuses the núcleo (gradient_centralize, factored_rc, dequant/requant_*, sr_round). New vs Adakaon:
+    # TWO momenta (pos/neg, roles alternate by step parity — the host passes them swapped), the
+    # raw-grad EMA on only the positive buffer (decay beta1^2), the pos-neg mix / noise_norm, decoupled
+    # WD applied BEFORE the step (p *= 1-lr*wd), and no RMS-clip (the factored 1/sqrt(v_hat) is the
+    # whole denominator). ``sc`` folds bc2_sq * step_size; ``inv_noise`` = 1/noise_norm.
+
+    @triton.jit
+    def _adapnm_tile_kernel(
+        g_addr, p_addr, pos_addr, neg_addr, posc_addr, negc_addr, row_addr, col_addr, Rs_ptr, Cs_ptr,
+        beta1_sq, beta0, inv_noise, beta2, sc, lrwd, eps1, seed,
+        LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
+        GC: tl.constexpr, SR: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+    ):
+        t = tl.program_id(0)
+        R = tl.load(Rs_ptr + t)
+        C = tl.load(Cs_ptr + t)
+        Rf = R.to(tl.float32)
+        Cf = C.to(tl.float32)
+        gi = tl.load(g_addr + t)
+        pi = tl.load(p_addr + t)
+        posi = tl.load(pos_addr + t)
+        negi = tl.load(neg_addr + t)
+        rowp = tl.load(row_addr + t).to(tl.pointer_type(tl.float32))
+        colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
+        if LOWP:
+            gp = gi.to(tl.pointer_type(tl.bfloat16))
+            pp = pi.to(tl.pointer_type(tl.bfloat16))
+        else:
+            gp = gi.to(tl.pointer_type(tl.float32))
+            pp = pi.to(tl.pointer_type(tl.float32))
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        rr = tl.arange(0, BR)
+        cc = tl.arange(0, BC)
+        m2 = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        g = tl.load(gp + idx, mask=m2, other=0.0).to(tl.float32)
+        if GC:
+            g = gradient_centralize(g, m2, Cf)
+        r_factor, c_factor = factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, beta2, eps1)
+
+        # dequant both momenta (codec-level, reusable); EMA only the positive
+        Chalf = C // 2
+        BLK = tl.minimum(R * C, 128)
+        if MOM == 2:  # int8 per-row
+            posp = posi.to(tl.pointer_type(tl.int8))
+            negp = negi.to(tl.pointer_type(tl.int8))
+            pscale = tl.load(posc_addr + t).to(tl.pointer_type(tl.float32))
+            nscale = tl.load(negc_addr + t).to(tl.pointer_type(tl.float32))
+            m_pos = dequant_int8(posp, idx, m2, pscale, rr, R)
+            m_neg = dequant_int8(negp, idx, m2, nscale, rr, R)
+        elif MOM == 3:  # 4bit per-block
+            posp = posi.to(tl.pointer_type(tl.uint8))
+            negp = negi.to(tl.pointer_type(tl.uint8))
+            pscale = tl.load(posc_addr + t).to(tl.pointer_type(tl.float32))
+            nscale = tl.load(negc_addr + t).to(tl.pointer_type(tl.float32))
+            m_pos = dequant_4bit(posp, pscale, ri, ci, idx, Chalf, m2, BLK)
+            m_neg = dequant_4bit(negp, nscale, ri, ci, idx, Chalf, m2, BLK)
+        elif MOM == 1:  # bf16
+            m_pos = tl.load(posi.to(tl.pointer_type(tl.bfloat16)) + idx, mask=m2, other=0.0).to(tl.float32)
+            m_neg = tl.load(negi.to(tl.pointer_type(tl.bfloat16)) + idx, mask=m2, other=0.0).to(tl.float32)
+        else:  # fp32
+            m_pos = tl.load(posi.to(tl.pointer_type(tl.float32)) + idx, mask=m2, other=0.0)
+            m_neg = tl.load(negi.to(tl.pointer_type(tl.float32)) + idx, mask=m2, other=0.0)
+        m_pos = beta1_sq * m_pos + (1.0 - beta1_sq) * g
+        if MOM == 2:
+            requant_int8(m_pos, m2, posp, idx, pscale, rr, R)
+        elif MOM == 3:
+            NB = (R * C + BLK - 1) // BLK
+            requant_4bit(m_pos, m2, idx, R, C, Chalf, posp, pscale, NB, BLK, BR, BC)
+        elif MOM == 1:
+            tl.store(posi.to(tl.pointer_type(tl.bfloat16)) + idx, m_pos.to(tl.bfloat16), mask=m2)
+        else:
+            tl.store(posi.to(tl.pointer_type(tl.float32)) + idx, m_pos, mask=m2)
+
+        pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
+        upd = tl.where(m2, pn * r_factor[:, None] * c_factor[None, :] * sc, 0.0)
+        delta = upd
+        if CAUTIOUS:
+            keep = (upd * g) > 0.0
+            keepf = tl.where(keep, 1.0, 0.0)
+            mm = tl.sum(keepf) / (Rf * Cf)
+            mm = tl.where(mm < 1e-8, 1e-8, mm)
+            delta = tl.where(keep, upd / mm, 0.0)
+        p_old = tl.load(pp + idx, mask=m2, other=0.0).to(tl.float32)
+        if WD:
+            p_old = p_old * (1.0 - lrwd)               # decoupled WD BEFORE (kozistr order)
+        res = p_old - delta
+        if SR:
+            res = sr_round(res, seed + t, idx)
+        tl.store(pp + idx, res.to(pp.dtype.element_ty), mask=m2)
+
+    @triton.jit
+    def _adapnm_chunked_mom(g_ptr, pos_ptr, neg_ptr, p_ptr, rfac_ptr, cfac_ptr, keep_ptr, C, n,
+                            beta1_sq, beta0, inv_noise, sc, lrwd, CAUTIOUS: tl.constexpr,
+                            WD: tl.constexpr, BLOCK: tl.constexpr):
+        """Chunked AdaPNM pass 1: EMA the positive momentum (pos_ptr is an fp32 temp), accumulate the
+        cautious keep-count on the pos-neg delta (incl. WD-on-p). pos/neg are fp32 temps; p is the weight."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs % C
+        g = tl.load(g_ptr + offs, mask=mask, other=0.0)
+        m_pos = tl.load(pos_ptr + offs, mask=mask, other=0.0)
+        m_neg = tl.load(neg_ptr + offs, mask=mask, other=0.0)
+        m_pos = beta1_sq * m_pos + (1.0 - beta1_sq) * g
+        tl.store(pos_ptr + offs, m_pos, mask=mask)
+        if CAUTIOUS:
+            rf = tl.load(rfac_ptr + i, mask=mask, other=0.0)
+            cf = tl.load(cfac_ptr + j, mask=mask, other=0.0)
+            pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
+            delta = pn * rf * cf * sc
+            keep = ((delta * g) > 0.0) & mask
+            tl.atomic_add(keep_ptr, tl.sum(keep.to(tl.int32)))
+
+    @triton.jit
+    def _adapnm_chunked_apply(g_ptr, pos_ptr, neg_ptr, p_ptr, rfac_ptr, cfac_ptr, C, n,
+                              beta0, inv_noise, sc, lrwd, inv_mean, seed,
+                              CAUTIOUS: tl.constexpr, WD: tl.constexpr, SR: tl.constexpr,
+                              BLOCK: tl.constexpr):
+        """Chunked AdaPNM pass 2: delta = cautious(pn * r*c * sc, g); p = p*(1-lr*wd) - delta."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs % C
+        m_pos = tl.load(pos_ptr + offs, mask=mask, other=0.0)
+        m_neg = tl.load(neg_ptr + offs, mask=mask, other=0.0)
+        rf = tl.load(rfac_ptr + i, mask=mask, other=0.0)
+        cf = tl.load(cfac_ptr + j, mask=mask, other=0.0)
+        pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
+        delta = pn * rf * cf * sc
+        if CAUTIOUS:
+            g = tl.load(g_ptr + offs, mask=mask, other=0.0)
+            keep = (delta * g) > 0.0
+            delta = tl.where(keep, delta * inv_mean, 0.0)
+        p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        if WD:
+            p = p * (1.0 - lrwd)
+        res = p - delta
+        if SR:
+            res = sr_round(res, seed, offs)
+        tl.store(p_ptr + offs, res.to(p_ptr.dtype.element_ty), mask=mask)
+
 
 # ============================================================ pointer-array cache (reusable)
 class PointerArrayCache:
@@ -417,3 +563,44 @@ class PointerArrayCache:
                 b["g_addr"] = torch.tensor([p.grad.data_ptr() for p in b["plist"]],
                                            dtype=torch.int64, device=DEV)
                 b["grad_first"] = gf
+
+
+class AdaPnmCache:
+    """Like :class:`PointerArrayCache` but for AdaPNM's TWO momenta (``m_pos`` / ``m_neg``).
+
+    Stores the two physical momentum buffers' pointer arrays (+ their fp32 scales for int8/4bit);
+    the optimizer passes them to the kernel in (positive, negative) order, swapping by step parity.
+    Bucketed by padded tile, grad pointers refreshed on realloc — same plumbing as the single-momentum
+    cache."""
+
+    def __init__(self, plist, state_of):
+        self.ids = tuple(id(p) for p in plist)
+        i64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=DEV)  # noqa: E731
+        i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=DEV)  # noqa: E731
+        groups: dict[tuple[int, int], list] = {}
+        for p in plist:
+            groups.setdefault(next_pow2_tile(p.shape[0], p.shape[1]), []).append(p)
+        self.buckets = []
+        for (BR, BC), bl in groups.items():  # noqa: N806
+            st = [state_of(p) for p in bl]
+            mdtype = st[0]["m_pos"].dtype
+            mom = (MOM_INT8 if mdtype == torch.int8 else MOM_4BIT if mdtype == torch.uint8
+                   else MOM_BF16 if mdtype == torch.bfloat16 else MOM_FP32)
+            quant = mom in (MOM_INT8, MOM_4BIT)
+            pos_addr = i64([s["m_pos"].data_ptr() for s in st])
+            neg_addr = i64([s["m_neg"].data_ptr() for s in st])
+            posc = i64([s["m_pos_scale"].data_ptr() for s in st]) if quant else pos_addr
+            negc = i64([s["m_neg_scale"].data_ptr() for s in st]) if quant else neg_addr
+            self.buckets.append(dict(
+                plist=bl, BR=BR, BC=BC, mom=mom,
+                p_addr=i64([p.data_ptr() for p in bl]),
+                pos_addr=pos_addr, neg_addr=neg_addr, posc_addr=posc, negc_addr=negc,
+                row_addr=i64([s["row"].data_ptr() for s in st]),
+                col_addr=i64([s["col"].data_ptr() for s in st]),
+                Rs=i32([p.shape[0] for p in bl]), Cs=i32([p.shape[1] for p in bl]),
+                lowp=bl[0].dtype == torch.bfloat16,
+                g_addr=i64([p.grad.data_ptr() for p in bl]),
+                grad_first=bl[0].grad.data_ptr(),
+            ))
+
+    refresh_grads = PointerArrayCache.refresh_grads

@@ -231,6 +231,8 @@ class AdaPNM(Optimizer):
         foreach: bool = True,
         foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
+        fused: bool = False,
+        fused_tile_cap: int | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -273,6 +275,17 @@ class AdaPNM(Optimizer):
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
+        # Optional Triton-fused step (same math + state). Eligible 2-D weights run through the fused
+        # PNM kernels (one-block / chunked); everything else falls back to the native path, in-place
+        # on the SAME state, so fused and non-fused interoperate and resume from each other.
+        self._fused = bool(fused)
+        self._fused_part: dict[int, tuple] = {}
+        self._fused_ob_caches: dict[int, Any] = {}
+        if self._fused:
+            from kaon._fused_triton import HAS_TRITON, TILE_CAP
+            if not HAS_TRITON:
+                raise RuntimeError("AdaPNM(fused=True) requires Triton (a GPU-only optional dependency)")
+            self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
     # ------------------------------------------------------------------- state
     @staticmethod
@@ -439,6 +452,8 @@ class AdaPNM(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        if self._fused:
+            return self._fused_step(loss)
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None]
             for p in params:
@@ -449,24 +464,151 @@ class AdaPNM(Optimizer):
                 continue
             if group["gradient_centralization"]:
                 centralize_grads_(params)
-            if self._foreach and self._group_foreach_eligible(group):
-                chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
-                cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)
-                fast: list[Tensor] = []
-                slow: list[Tensor] = []
-                for p in params:
-                    (fast if self._param_foreach_eligible(p, group, cutoff) else slow).append(p)
-                if len(fast) >= 2:
-                    self._step_foreach(fast, group, chunk_budget)
-                    for p in slow:
-                        self._step_one_param(p, group)
-                else:
-                    for p in params:
-                        self._step_one_param(p, group)
+            self._native_dispatch(params, group)
+        return loss
+
+    @torch.no_grad()
+    def _native_dispatch(self, params: list[Tensor], group: dict[str, Any]) -> None:
+        """The native (non-fused) step over ``params`` — foreach where eligible, else per-param.
+        Gradient Centralization is the caller's responsibility (done per-subset)."""
+        if not params:
+            return
+        if self._foreach and self._group_foreach_eligible(group):
+            chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
+            cutoff = min(self._foreach_batch_cutoff, chunk_budget // 2)
+            fast: list[Tensor] = []
+            slow: list[Tensor] = []
+            for p in params:
+                (fast if self._param_foreach_eligible(p, group, cutoff) else slow).append(p)
+            if len(fast) >= 2:
+                self._step_foreach(fast, group, chunk_budget)
+                for p in slow:
+                    self._step_one_param(p, group)
             else:
                 for p in params:
                     self._step_one_param(p, group)
+        else:
+            for p in params:
+                self._step_one_param(p, group)
+
+    # ----------------------------------------------------------- fused (Triton) step
+    @torch.no_grad()
+    def _fused_step(self, loss: Any) -> Any:
+        import kaon._fused_triton as ft
+
+        for group in self.param_groups:
+            params = [p for p in group["params"] if p.grad is not None]
+            for p in params:
+                if p.grad.is_sparse:
+                    raise RuntimeError("AdaPNM does not support sparse gradients")
+            group["step"] += 1
+            if not params:
+                continue
+            c = self._coeffs(group)
+            pos_pref, neg_pref = self._pos_neg_prefixes(group["step"])
+            one_block, big, native = self._fused_partition(group, params, ft)
+            if native:
+                if group["gradient_centralization"]:
+                    centralize_grads_(native)
+                self._native_dispatch(native, group)
+            if one_block:
+                self._fused_one_block(one_block, group, ft, c)
+            for p in big:
+                self._chunked_step(p, group, ft, c, pos_pref, neg_pref)
         return loss
+
+    def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
+        gid = id(group)
+        ids = tuple(id(p) for p in params)
+        cached = self._fused_part.get(gid)
+        if cached is not None and cached[0] == ids:
+            return cached[1], cached[2], cached[3]
+        md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
+        one_block: list[Tensor] = []
+        big: list[Tensor] = []
+        native: list[Tensor] = []
+        for p in params:
+            bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding")
+            ok = bf_ok and ft.fused_eligible(p, cap)
+            if ok and md == "4bit" and p.shape[1] % 2 != 0:
+                ok = False
+            big_ok = (bf_ok and p.ndim == 2 and p.is_cuda and p.is_contiguous()
+                      and p.dtype in (torch.float32, torch.bfloat16)
+                      and ft.next_pow2_tile(*p.shape)[0] * ft.next_pow2_tile(*p.shape)[1] > cap)
+            if ok:
+                one_block.append(p)
+            elif big_ok:
+                big.append(p)
+            else:
+                native.append(p)
+        self._fused_part[gid] = (ids, one_block, big, native)
+        return one_block, big, native
+
+    def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict) -> None:
+        for p in plist:
+            st = self.state[p]
+            if not st:
+                self._init_state(p, st, group)
+        ids = tuple(id(p) for p in plist)
+        gid = id(group)
+        cache = self._fused_ob_caches.get(gid)
+        if cache is None or cache.ids != ids:
+            cache = ft.AdaPnmCache(plist, lambda p: self.state[p])
+            self._fused_ob_caches[gid] = cache
+        cache.refresh_grads()
+        odd = group["step"] % 2 == 1
+        lr, wd, eps1 = group["lr"], group["weight_decay"], group["eps"]
+        cautious, gc = group["cautious"], group["gradient_centralization"]
+        sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
+        for bk in cache.buckets:
+            # which physical buffer plays positive this step (alternation): the m_pos slot if odd.
+            if odd:
+                kpos, kneg, kposc, knegc = bk["pos_addr"], bk["neg_addr"], bk["posc_addr"], bk["negc_addr"]
+            else:
+                kpos, kneg, kposc, knegc = bk["neg_addr"], bk["pos_addr"], bk["negc_addr"], bk["posc_addr"]
+            lanes = bk["BR"] * bk["BC"]
+            ft._adapnm_tile_kernel[(len(bk["plist"]),)](
+                bk["g_addr"], bk["p_addr"], kpos, kneg, kposc, knegc, bk["row_addr"], bk["col_addr"],
+                bk["Rs"], bk["Cs"], c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], sc, lr * wd, eps1,
+                group["step"], LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0, GC=gc,
+                SR=bk["lowp"], BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
+            )
+
+    def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:
+        b2, eps1 = group["betas"][1], group["eps"]
+        g = p.grad.float()
+        if group["gradient_centralization"]:
+            g = g - g.mean(dim=1, keepdim=True)
+        g = g.contiguous()
+        gsq = g * g
+        st["row"].lerp_(gsq.mean(1).add_(eps1), 1.0 - b2)
+        st["col"].lerp_(gsq.mean(0).add_(eps1), 1.0 - b2)
+        return g, st["row"].div(st["row"].mean()).rsqrt_(), st["col"].rsqrt()
+
+    def _chunked_step(self, p: Tensor, group: dict[str, Any], ft: Any, c: dict,
+                      pos_pref: str, neg_pref: str) -> None:
+        st = self.state[p]
+        if not st:
+            self._init_state(p, st, group)
+        R, C = p.shape  # noqa: N806 — matrix dims
+        n = R * C
+        md = group["momentum_dtype"]
+        lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
+        sr = (p.dtype == torch.bfloat16) and (group["bf16_method"] == "stochastic_rounding")
+        g, r, cfac = self._chunked_reductions(p, group, st)
+        m_pos = self._dequant_one(st, pos_pref, md, g).reshape(R, C)   # fp32 temp (EMA'd in-kernel)
+        m_neg = self._dequant_one(st, neg_pref, md, g).reshape(R, C)   # fp32 temp (read-only)
+        sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
+        keep = torch.zeros(1, dtype=torch.int32, device=p.device)
+        gf, posf, negf, pf = g.reshape(-1), m_pos.reshape(-1), m_neg.reshape(-1), p.reshape(-1)
+        grid = ((n + 1023) // 1024,)
+        ft._adapnm_chunked_mom[grid](gf, posf, negf, pf, r, cfac, keep, C, n, c["beta1_sq"], c["beta0"],
+                                     inv_noise, sc, lr * wd, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
+        self._store_one(st, pos_pref, md, m_pos)                       # requant/store updated positive
+        inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
+        ft._adapnm_chunked_apply[grid](gf, posf, negf, pf, r, cfac, C, n, c["beta0"], inv_noise, sc,
+                                       lr * wd, inv_mean, group["step"], CAUTIOUS=cautious, WD=wd != 0,
+                                       SR=sr, BLOCK=1024)
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving both quantized momenta's stored dtype.
