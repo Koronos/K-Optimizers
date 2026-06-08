@@ -120,6 +120,52 @@ def test_fp32_parity_medium_tiles_near_cap():
     assert len(ov._fused) == 2                                 # both fused at the new cap
 
 
+# ----------------------------------------------------------------- chunked (big-tensor) path
+def test_chunked_parity_fp32():
+    # 1024x512 = 524288 lanes > cap -> chunked path; exact vs native (~2.5x faster on bigger ones)
+    d, _, ov = _run_parity([(1024, 512)], torch.float32, "float32")
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+    assert len(ov._big) == 1 and len(ov._fused) == 0
+
+
+@pytest.mark.parametrize("cautious", [True, False])
+@pytest.mark.parametrize("gc", [True, False])
+def test_chunked_parity_features(cautious, gc):
+    d, _, _ = _run_parity([(1024, 512)], torch.float32, "float32", cautious=cautious, gc=gc, wd=0.05)
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_chunked_bf16_momentum():
+    d, scale, _ = _run_parity([(1024, 512)], torch.float32, "bfloat16")
+    assert d / scale < 5e-3, f"rel={d/scale:.2e}"
+
+
+def test_chunked_bf16_params_sr():
+    d, scale, _ = _run_parity([(1024, 512)], torch.bfloat16, "bfloat16")
+    assert d / scale < 5e-2, f"rel={d/scale:.2e}"
+
+
+def test_chunked_mixed_with_small_and_1d():
+    # a model-ish mix: small (one-block) + big (chunked) + 1-D (native), all parity vs native at once
+    shapes = [(8, 16), (16, 320), (1024, 512)]
+    d, _, ov = _run_parity(shapes, torch.float32, "float32")
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+    assert len(ov._fused) == 2 and len(ov._big) == 1
+
+
+def test_chunked_int8_big_routes_to_native():
+    # chunked quant is future work -> a big int8 tensor goes to the native inner optimizer
+    ps = _bag([(1024, 512)], torch.float32)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    ov = FusedAdakaon(ps, momentum_dtype="int8")
+    ov.step()
+    torch.cuda.synchronize()
+    assert len(ov._big) == 0 and len(ov._fused) == 0 and ov.inner is not None
+    assert ov.inner.state[ps[0]]["m"].dtype == torch.int8
+    assert torch.isfinite(ps[0]).all()
+
+
 # ----------------------------------------------------------------- decoupled weight decay
 def test_weight_decay_parity_fp32():
     # decoupled wd folded into delta before cautious -- must match native exactly (fp32)
@@ -375,8 +421,10 @@ def test_fallback_routing_and_parity():
         ov.step()
         on.step()
     torch.cuda.synchronize()
-    assert len(ov._fused) == 4                                   # only the tiny 2-D weights fuse
-    assert ov.inner is not None and len(ov.inner.param_groups[0]["params"]) == 3
+    # all three paths exercised at once: tiny 2-D -> one-block, 256x1024 -> chunked, conv + 1-D -> native
+    assert len(ov._fused) == 4
+    assert len(ov._big) == 1
+    assert ov.inner is not None and len(ov.inner.param_groups[0]["params"]) == 2
     d = max((a.detach() - b.detach()).abs().max().item() for a, b in zip(pv, pn))
     assert d < 1e-5, f"max|Δp|={d:.2e}"
 

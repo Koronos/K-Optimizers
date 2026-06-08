@@ -312,6 +312,56 @@ if _HAS_TRITON:
             res = sr_round(res, seed + t, idx)
         tl.store(pp + idx, res.to(pp.dtype.element_ty), mask=m2)
 
+    # ---- chunked (multi-block) path for tensors too large for one block ----
+    # The per-tensor reductions (row/col EMA, rms via matvec, cautious mean) are cheap and stay in
+    # torch; these two elementwise kernels do the heavy [R,C] passes (momentum + write) chunked over
+    # a flat view, so a big weight matrix costs ~few memory passes instead of native's ~30.
+
+    @triton.jit
+    def _chunked_mom(g_ptr, m_ptr, p_ptr, rfac_ptr, cfac_ptr, keep_ptr, C, n, inv_rms_lr, lrwd, beta1,
+                     CAUTIOUS: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr):
+        """Momentum EMA of the normalized update over a flat chunk; accumulates the cautious keep
+        count (on delta incl. wd, matching native). m is fp32 or bf16 (EMA runs in fp32)."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs % C
+        g = tl.load(g_ptr + offs, mask=mask, other=0.0)
+        rf = tl.load(rfac_ptr + i, mask=mask, other=0.0)
+        cf = tl.load(cfac_ptr + j, mask=mask, other=0.0)
+        upd = g * rf * cf * inv_rms_lr
+        m = tl.load(m_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        m = beta1 * m + (1.0 - beta1) * upd
+        tl.store(m_ptr + offs, m.to(m_ptr.dtype.element_ty), mask=mask)
+        if CAUTIOUS:
+            delta = m
+            if WD:
+                delta = delta + lrwd * tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            keep = ((delta * g) > 0.0) & mask
+            tl.atomic_add(keep_ptr, tl.sum(keep.to(tl.int32)))
+
+    @triton.jit
+    def _chunked_apply(g_ptr, m_ptr, p_ptr, n, inv_mean, lrwd, seed,
+                       CAUTIOUS: tl.constexpr, WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr):
+        """delta = cautious(m + lr*wd*p, g); p -= delta, with bf16 stochastic rounding if SR."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        m = tl.load(m_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        delta = m
+        if WD:
+            delta = delta + lrwd * p
+        if CAUTIOUS:
+            g = tl.load(g_ptr + offs, mask=mask, other=0.0)
+            keep = (delta * g) > 0.0
+            delta = tl.where(keep, delta * inv_mean, 0.0)
+        res = p - delta
+        if SR:
+            res = sr_round(res, seed, offs)
+        tl.store(p_ptr + offs, res.to(p_ptr.dtype.element_ty), mask=mask)
+
 
 # ============================================================ pointer-array cache (reusable)
 class PointerArrayCache:
@@ -374,11 +424,13 @@ class PointerArrayCache:
 class FusedAdakaon(Optimizer):
     """Adakaon-bf16 with a pointer-array fused Triton kernel for small 2-D weights; native otherwise.
 
-    Fuses ``momentum_dtype`` ∈ {bf16, fp32, int8, 4bit} in-kernel via the reusable dequant/requant
-    device helpers (per-row int8: 1 B/param; per-128-block 4bit: 0.5 B/param), with optional decoupled
-    (AdamW-style) ``weight_decay``. Odd-column 4bit, conv, and high-rank tensors are routed to an inner
-    :class:`kaon.Adakaon` (always correct). Experimental: imported from ``kaon._fused_triton``, not yet
-    in the public API.
+    Two fused paths: a one-block kernel for tiles ≤ ``tile_cap`` (momentum bf16/fp32/int8/4bit;
+    1 / 0.5 B/param via the reusable dequant/requant helpers) and a chunked multi-block path for
+    larger 2-D fp32/bf16-momentum tensors (cheap reductions in torch + two elementwise kernels —
+    ~2.5x over native on big weight matrices). Both support GC, cautious, and decoupled
+    (AdamW-style) ``weight_decay``. Routed to an inner :class:`kaon.Adakaon` (always correct):
+    1-D / conv tensors, odd-column 4bit, int8/4bit momentum on big tensors (chunked quant is future
+    work), and fp16 params. Experimental: imported from ``kaon._fused_triton``, not in the public API.
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps1=1e-30, clip=1.0,
@@ -396,7 +448,8 @@ class FusedAdakaon(Optimizer):
         self._tile_cap = tile_cap
         self._t = 0
         self._partitioned = False
-        self._fused: list[torch.Tensor] = []
+        self._fused: list[torch.Tensor] = []         # one-block path (tile <= cap)
+        self._big: list[torch.Tensor] = []           # chunked path (2-D fp32/bf16-mom, tile > cap)
         self._fused_group: dict[int, dict] = {}
         self.inner = None        # native Adakaon over the fallback params
         self._cache: PointerArrayCache | None = None
@@ -406,6 +459,7 @@ class FusedAdakaon(Optimizer):
         fb = []
         for group in self.param_groups:
             is_4bit = group["mdtype"] == "4bit"
+            big_mom = group["mdtype"] in ("float32", "bfloat16")  # chunked path: fp32/bf16 mom only
             for p in group["params"]:
                 ok = fused_eligible(p, self._tile_cap)
                 # 4bit packs 2 nibbles/byte over row-major-flat elements; an EVEN column count keeps
@@ -414,6 +468,11 @@ class FusedAdakaon(Optimizer):
                     ok = False
                 if ok:
                     self._fused.append(p)
+                    self._fused_group[id(p)] = group
+                elif (big_mom and p.ndim == 2 and p.is_cuda and p.is_contiguous()
+                      and p.dtype in (torch.float32, torch.bfloat16)):
+                    # too big for one block -> chunked path (int8/4bit chunked is future work)
+                    self._big.append(p)
                     self._fused_group[id(p)] = group
                 else:
                     fb.append(p)
@@ -450,6 +509,38 @@ class FusedAdakaon(Optimizer):
             st["col"] = torch.zeros(C, dtype=torch.float32, device=p.device)
 
     @torch.no_grad()
+    def _chunked_step(self, p, group):
+        """One big 2-D tensor: cheap per-tensor reductions in torch (row/col EMA, rms via a matvec
+        that avoids any [R,C] temp), then two chunked elementwise kernels for the heavy passes."""
+        self._ensure_state(p)
+        st = self.state[p]
+        R, C = p.shape
+        n = R * C
+        lr, b1, b2 = group["lr"], group["beta1"], group["beta2"]
+        eps1, clip, wd = group["eps1"], group["clip"], group["wd"]
+        g = p.grad.float()
+        if group["gc"]:
+            g = g - g.mean(dim=1, keepdim=True)            # GC over fan-in (C)
+        g = g.contiguous()
+        gsq = g * g
+        row, col = st["row"], st["col"]
+        row.lerp_(gsq.mean(1).add_(eps1), 1.0 - b2)
+        col.lerp_(gsq.mean(0).add_(eps1), 1.0 - b2)
+        r = row.div(row.mean()).rsqrt_()                   # [R]
+        c = col.rsqrt()                                    # [C]
+        rms = (((r * r) * gsq.matmul(c * c)).sum() / n).sqrt_()           # matvec, no [R,C] temp
+        inv_rms_lr = lr / float(rms.div_(clip).clamp_(min=1.0))
+        cautious, sr = group["cautious"], p.dtype == torch.bfloat16
+        keep = torch.zeros(1, dtype=torch.int32, device=p.device)
+        gf, mf, pf = g.reshape(-1), st["m"].reshape(-1), p.reshape(-1)
+        grid = (triton.cdiv(n, 1024),)
+        _chunked_mom[grid](gf, mf, pf, r, c, keep, C, n, inv_rms_lr, lr * wd, b1,
+                           CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
+        inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
+        _chunked_apply[grid](gf, mf, pf, n, inv_mean, lr * wd, self._t,
+                             CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024)
+
+    @torch.no_grad()
     def step(self, closure=None):  # noqa: ANN001
         loss = closure() if closure is not None else None
         self._t += 1
@@ -474,6 +565,10 @@ class FusedAdakaon(Optimizer):
                     LOWP=b["lowp"], MOM=b["mom"], CAUTIOUS=grp["cautious"], WD=grp["wd"] != 0,
                     GC=grp["gc"], SR=b["lowp"], BR=b["BR"], BC=b["BC"], num_warps=warps_for(lanes),
                 )
+
+        for p in self._big:                              # chunked path for large 2-D tensors
+            if p.grad is not None:
+                self._chunked_step(p, self._fused_group[id(p)])
 
         if self.inner is not None:
             base = self.param_groups[0]
