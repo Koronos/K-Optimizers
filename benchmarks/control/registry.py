@@ -50,6 +50,11 @@ OPTIMIZERS = {
         lr=1.2e-3, lr_const=1.2e-3, family="in-house",
         blurb="factored Adam, bf16 momentum (AdamW-quality, low memory)",
     ),
+    "Adakaon-bf16 (fused)": dict(
+        make=lambda p, lr: Adakaon(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16", fused=True),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="Adakaon-bf16 with the Triton-fused step — same quality/memory, fused LoRA speed",
+    ),
     # --- published algorithms on the kaon backend ---
     "Lion": dict(
         make=lambda p, lr: Lion(p, lr=lr, betas=(0.95, 0.98), cautious=True, momentum_dtype="bfloat16"),
@@ -67,6 +72,11 @@ OPTIMIZERS = {
             "beta0=0 (PNM off)": lambda p, lr: AdaPNM(p, lr=lr, betas=(0.8, 0.999), beta0=0.0, cautious=True, momentum_dtype="bfloat16"),
             "beta0=1 (full PNM)": lambda p, lr: AdaPNM(p, lr=lr, betas=(0.8, 0.999), beta0=1.0, cautious=True, momentum_dtype="bfloat16"),
         },
+    ),
+    "AdaPNM (fused)": dict(
+        make=lambda p, lr: AdaPNM(p, lr=lr, betas=(0.8, 0.999), beta0=0.5, cautious=True, momentum_dtype="bfloat16", fused=True),
+        lr=2.4e-3, lr_const=2.4e-3, family="published",
+        blurb="AdaPNM with the Triton-fused step — gap champion, now fast (no speed Achilles heel)",
     ),
     "AdaMuon": dict(
         make=lambda p, lr: AdaMuon(p, lr=lr, betas=(0.95, 0.999), ns_steps=2, cautious=True, momentum_dtype="int8"),
