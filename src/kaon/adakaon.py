@@ -257,8 +257,9 @@ class Adakaon(Optimizer):
         # False to revert to the batched-native-foreach path (the A/B baseline). See _fused_big.
         self._fused_big_batched = True
         self._t = 0
-        self._fused_part: dict[int, tuple] = {}          # group id -> cached (ids, one_block, big, native)
+        self._fused_part: dict[int, tuple] = {}          # group id -> cached (ids, one_block, big, one_dim, native)
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
+        self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPointerCache (1-D)
         if self._fused:
             from kaon._fused_triton import HAS_TRITON, TILE_CAP
             if not HAS_TRITON:
@@ -350,7 +351,7 @@ class Adakaon(Optimizer):
             for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("Adakaon does not support sparse gradients")
-            one_block, big, native = self._fused_partition(group, params, ft)
+            one_block, big, one_dim, native = self._fused_partition(group, params, ft)
             if native:  # GC for the native subset (fused subsets centralize in-kernel / in-reductions)
                 if group["gradient_centralization"]:
                     centralize_grads_(native)
@@ -359,6 +360,8 @@ class Adakaon(Optimizer):
                 self._fused_one_block(one_block, group, ft)
             if big:
                 self._fused_big(big, group, ft)
+            if one_dim:
+                self._fused_one_dim(one_dim, group, ft)
         return loss
 
     @torch.no_grad()
@@ -387,17 +390,19 @@ class Adakaon(Optimizer):
                 self._chunked_step(plist[0], group, ft)
 
     def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
-        """Split a group's params into (one-block, chunked-big, native), cached per param-set."""
+        """Split a group's params into (one-block, chunked-big, one-dim, native), cached per param-set."""
         gid = id(group)
         ids = tuple(id(p) for p in params)
         cached = self._fused_part.get(gid)
         if cached is not None and cached[0] == ids:
-            return cached[1], cached[2], cached[3]
+            return cached[1], cached[2], cached[3], cached[4]
         md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
         one_block: list[Tensor] = []
         big: list[Tensor] = []
+        one_dim: list[Tensor] = []
         native: list[Tensor] = []
         momentum = group["betas"][0] > 0  # the kernels assume a momentum buffer; beta1==0 -> native
+        float_mom = md in ("bfloat16", "float32")  # the 1-D kernel handles only fp32/bf16 momentum
         for p in params:
             # bf16 params need stochastic rounding (the kernel's only bf16 write); kahan/none -> native
             bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding")
@@ -410,10 +415,12 @@ class Adakaon(Optimizer):
                   and p.dtype in (torch.float32, torch.bfloat16)
                   and ft.next_pow2_tile(*p.shape)[0] * ft.next_pow2_tile(*p.shape)[1] > cap):
                 big.append(p)
+            elif momentum and bf_ok and float_mom and ft.fused_1d_eligible(p, cap):
+                one_dim.append(p)
             else:
                 native.append(p)
-        self._fused_part[gid] = (ids, one_block, big, native)
-        return one_block, big, native
+        self._fused_part[gid] = (ids, one_block, big, one_dim, native)
+        return one_block, big, one_dim, native
 
     def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
         """Launch the one-block pointer-array kernel over the eligible small 2-D weights."""
@@ -439,6 +446,32 @@ class Adakaon(Optimizer):
                 bk["Rs"], bk["Cs"], lr, b1, b2, eps1, clip, wd, self._t,
                 LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0, GC=gc, SR=bk["lowp"],
                 BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
+            )
+
+    def _fused_one_dim(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
+        """One-block non-factored kernel over the eligible 1-D weights (biases / norm scales). GC is a
+        no-op on 1-D (``centralize_grads_`` skips ndim<2), so it never enters this path."""
+        for p in plist:
+            st = self.state[p]
+            if not st:
+                self._init_state(p, st, group)
+        ids = tuple(id(p) for p in plist)
+        gid = id(group)
+        cache = self._fused_od_caches.get(gid)
+        if cache is None or cache.ids != ids:
+            cache = ft.OneDimPointerCache(plist, lambda p: self.state[p])
+            self._fused_od_caches[gid] = cache
+        cache.refresh_grads()
+        b1, b2 = group["betas"]
+        lr, eps1 = group["lr"], group["eps"][0]
+        clip, wd = group["clip_threshold"], group["weight_decay"]
+        cautious = group["cautious"]
+        for bk in cache.buckets:
+            ft._adam_1d_kernel[(len(bk["plist"]),)](
+                bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["v_addr"], bk["Ls"],
+                lr, b1, b2, eps1, clip, wd, self._t,
+                LOWP=bk["lowp"], MOM=bk["mom"], MOMENTUM=bk["momentum"], CAUTIOUS=cautious,
+                WD=wd != 0, SR=bk["lowp"], BL=bk["BL"], num_warps=ft.warps_for(bk["BL"]),
             )
 
     def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:

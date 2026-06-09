@@ -59,7 +59,7 @@ except ImportError:  # pragma: no cover - exercised only on triton-less installs
     tl = None
     _HAS_TRITON = False
 
-__all__ = ["fused_eligible", "warps_for", "next_pow2_tile", "TILE_CAP", "HAS_TRITON"]
+__all__ = ["fused_eligible", "fused_1d_eligible", "warps_for", "next_pow2_tile", "TILE_CAP", "HAS_TRITON"]
 
 HAS_TRITON = _HAS_TRITON
 # Largest padded tile a single program owns. Measured crossover (RTX 4080, fp32): the one-block
@@ -107,6 +107,20 @@ def fused_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP) -> bool:
         return False
     BR, BC = next_pow2_tile(p.shape[0], p.shape[1])
     return tile_cap >= BR * BC
+
+
+def fused_1d_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP) -> bool:
+    """Does ONE Triton block own this 1-D tensor? (1-D, contiguous, fp32/bf16, fits a block.)
+
+    The non-factored (full per-coordinate ``v``) Adam step for biases / norm scales. Same
+    one-block-per-tensor pointer-array idea as the 2-D path, so a bag of many tiny 1-D tensors
+    (the launch-bound regime) steps in one launch instead of a torch-foreach stack. Quant momentum
+    (int8/4bit) on 1-D is routed to native (its per-row codec has no 1-D analogue here)."""
+    if p.ndim != 1 or not p.is_cuda or not p.is_contiguous():
+        return False
+    if p.dtype not in (torch.float32, torch.bfloat16):
+        return False
+    return tile_cap >= triton.next_power_of_2(p.shape[0])
 
 
 # ============================================================ device-side reusable helpers
@@ -458,6 +472,81 @@ if _HAS_TRITON:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
+    # ---- one-block non-factored 1-D path (biases / norm scales) ----
+    # A bag of many tiny 1-D tensors is the same launch-bound regime the 2-D one-block kernel wins
+    # big on; a native torch-foreach stacks them (stack overhead dominates). This kernel owns one 1-D
+    # tensor per program and runs the whole non-factored Adam step (full per-coordinate v, in registers)
+    # — no row/col factoring. Momentum is fp32/bf16 in place (quant 1-D -> native). Same math as the
+    # native ``_nonfactored_bucket`` (eps1 added to grad^2; RMS-clip; momentum EMA on the clipped
+    # update; WD folded into delta before cautious; SR weight write).
+
+    @triton.jit
+    def _adam_1d_kernel(
+        g_addr, p_addr, m_addr, v_addr, Ls_ptr,
+        lr, beta1, beta2, eps1, clip, wd, seed,
+        LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr, CAUTIOUS: tl.constexpr,
+        WD: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr,
+    ):
+        """One program == one 1-D tensor. Whole non-factored Adam step, in place via pointer-array."""
+        t = tl.program_id(0)
+        L = tl.load(Ls_ptr + t)
+        Lf = L.to(tl.float32)
+        gi = tl.load(g_addr + t)
+        pi = tl.load(p_addr + t)
+        vp = tl.load(v_addr + t).to(tl.pointer_type(tl.float32))
+        if LOWP:
+            gp = gi.to(tl.pointer_type(tl.bfloat16))
+            pp = pi.to(tl.pointer_type(tl.bfloat16))
+        else:
+            gp = gi.to(tl.pointer_type(tl.float32))
+            pp = pi.to(tl.pointer_type(tl.float32))
+        offs = tl.arange(0, BL)
+        mask = offs < L
+        g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+
+        # full per-coordinate second moment (HF eps placement: eps1 into grad^2)
+        v = tl.load(vp + offs, mask=mask, other=0.0)
+        v = beta2 * v + (1.0 - beta2) * (g * g + eps1)
+        tl.store(vp + offs, v, mask=mask)
+        update = tl.where(mask, g * tl.rsqrt(v), 0.0)
+
+        # Adafactor RMS-clip on the update, then lr scale
+        rms = tl.sqrt(tl.sum(update * update) / Lf)
+        denom = rms / clip
+        denom = tl.where(denom < 1.0, 1.0, denom)
+        update = update * (lr / denom)
+
+        # momentum EMA (fp32/bf16 storage; EMA in fp32). delta == update if no momentum.
+        if MOMENTUM:
+            if MOM == 1:
+                mp = tl.load(m_addr + t).to(tl.pointer_type(tl.bfloat16))
+                m_old = tl.load(mp + offs, mask=mask, other=0.0).to(tl.float32)
+            else:
+                mp = tl.load(m_addr + t).to(tl.pointer_type(tl.float32))
+                m_old = tl.load(mp + offs, mask=mask, other=0.0)
+            m_new = beta1 * m_old + (1.0 - beta1) * update
+            if MOM == 1:
+                tl.store(mp + offs, m_new.to(tl.bfloat16), mask=mask)
+            else:
+                tl.store(mp + offs, m_new, mask=mask)
+            delta = m_new
+        else:
+            delta = update
+
+        p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if WD:
+            delta = delta + (lr * wd) * p_old
+        if CAUTIOUS:
+            keep = (delta * g) > 0.0
+            keepf = tl.where(keep, 1.0, 0.0)
+            mm = tl.sum(keepf) / Lf
+            mm = tl.where(mm < 1e-8, 1e-8, mm)
+            delta = tl.where(keep, delta / mm, 0.0)
+        res = p_old - delta
+        if SR:
+            res = sr_round(res, seed + t, offs)
+        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+
     # ============================================================ AdaPNM (positive-negative momentum)
     # Reuses the núcleo (gradient_centralize, factored_rc, dequant/requant_*, sr_round). New vs Adakaon:
     # TWO momenta (pos/neg, roles alternate by step parity — the host passes them swapped), the
@@ -710,6 +799,80 @@ if _HAS_TRITON:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
+    # ---- one-block non-factored 1-D AdaPNM path (biases / norm scales) ----
+    # Mirrors ``_adam_1d_kernel`` plus AdaPNM's two-momentum structure: full per-coordinate v, EMA only
+    # the positive (host passes pos/neg swapped by parity), pos-neg mix / noise_norm, eps on the denom
+    # (not eps1), RMS-clip on the v_hat-normalized update, decoupled WD on p (``p *= 1-lr*wd``). fp32/bf16
+    # momenta in place (quant 1-D and ams_bound -> native). Matches the native ``_nonfactored_bucket``.
+
+    @triton.jit
+    def _adapnm_1d_kernel(
+        g_addr, p_addr, pos_addr, neg_addr, v_addr, Ls_ptr,
+        beta1_sq, beta0, inv_noise, beta2, step_size, bc2_sq, eps, lrwd, clip, seed,
+        LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
+        CLIP: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr,
+    ):
+        """One program == one 1-D tensor. Whole non-factored AdaPNM step, in place via pointer-array."""
+        t = tl.program_id(0)
+        L = tl.load(Ls_ptr + t)
+        Lf = L.to(tl.float32)
+        gi = tl.load(g_addr + t)
+        pi = tl.load(p_addr + t)
+        vp = tl.load(v_addr + t).to(tl.pointer_type(tl.float32))
+        if LOWP:
+            gp = gi.to(tl.pointer_type(tl.bfloat16))
+            pp = pi.to(tl.pointer_type(tl.bfloat16))
+        else:
+            gp = gi.to(tl.pointer_type(tl.float32))
+            pp = pi.to(tl.pointer_type(tl.float32))
+        offs = tl.arange(0, BL)
+        mask = offs < L
+        g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+
+        # full per-coordinate second moment (no eps1 in grad^2 for AdaPNM; eps goes on the denom)
+        v = tl.load(vp + offs, mask=mask, other=0.0)
+        v = beta2 * v + (1.0 - beta2) * (g * g)
+        tl.store(vp + offs, v, mask=mask)
+
+        posi = tl.load(pos_addr + t)
+        negi = tl.load(neg_addr + t)
+        if MOM == 1:  # bf16
+            posp = posi.to(tl.pointer_type(tl.bfloat16))
+            m_pos = tl.load(posp + offs, mask=mask, other=0.0).to(tl.float32)
+            m_neg = tl.load(negi.to(tl.pointer_type(tl.bfloat16)) + offs, mask=mask, other=0.0).to(tl.float32)
+        else:         # fp32
+            posp = posi.to(tl.pointer_type(tl.float32))
+            m_pos = tl.load(posp + offs, mask=mask, other=0.0)
+            m_neg = tl.load(negi.to(tl.pointer_type(tl.float32)) + offs, mask=mask, other=0.0)
+        m_pos = beta1_sq * m_pos + (1.0 - beta1_sq) * g          # EMA only the positive
+        if MOM == 1:
+            tl.store(posp + offs, m_pos.to(tl.bfloat16), mask=mask)
+        else:
+            tl.store(posp + offs, m_pos, mask=mask)
+
+        denom = (tl.sqrt(v + 1e-15) + eps) / bc2_sq
+        pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
+        upd = tl.where(mask, pn / denom, 0.0)
+        if CLIP:
+            rms = tl.sqrt(tl.sum(upd * upd) / Lf)
+            d = rms / clip
+            d = tl.where(d < 1.0, 1.0, d)
+            upd = upd / d
+        delta = upd * step_size
+        if CAUTIOUS:
+            keep = (delta * g) > 0.0
+            keepf = tl.where(keep, 1.0, 0.0)
+            mm = tl.sum(keepf) / Lf
+            mm = tl.where(mm < 1e-8, 1e-8, mm)
+            delta = tl.where(keep, delta / mm, 0.0)
+        p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if WD:
+            p_old = p_old * (1.0 - lrwd)
+        res = p_old - delta
+        if SR:
+            res = sr_round(res, seed + t, offs)
+        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+
 
 # ============================================================ pointer-array cache (reusable)
 class PointerArrayCache:
@@ -801,6 +964,71 @@ class AdaPnmCache:
                 row_addr=i64([s["row"].data_ptr() for s in st]),
                 col_addr=i64([s["col"].data_ptr() for s in st]),
                 Rs=i32([p.shape[0] for p in bl]), Cs=i32([p.shape[1] for p in bl]),
+                lowp=bl[0].dtype == torch.bfloat16,
+                g_addr=i64([p.grad.data_ptr() for p in bl]),
+                grad_first=bl[0].grad.data_ptr(),
+            ))
+
+    refresh_grads = PointerArrayCache.refresh_grads
+
+
+class OneDimPointerCache:
+    """Per-tensor pointer arrays for the non-factored 1-D path, bucketed by padded block ``BL`` =
+    ``next_pow2(L)`` (one launch per distinct block size). Holds ``g/p/m/v`` base-address arrays + the
+    true lengths ``Ls`` (for masking). Only fp32/bf16 momentum reaches here (quant 1-D -> native);
+    ``beta1==0`` (no ``m``) reuses ``v_addr`` as a harmless valid pointer. Same plumbing as
+    :class:`PointerArrayCache` (grad pointers refreshed on realloc)."""
+
+    def __init__(self, plist, state_of):
+        self.ids = tuple(id(p) for p in plist)
+        i64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=DEV)  # noqa: E731
+        i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=DEV)  # noqa: E731
+        groups: dict[int, list] = {}
+        for p in plist:
+            groups.setdefault(triton.next_power_of_2(p.shape[0]), []).append(p)
+        self.buckets = []
+        for BL, bl in groups.items():  # noqa: N806
+            st = [state_of(p) for p in bl]
+            momentum = "m" in st[0]
+            mom = MOM_BF16 if (momentum and st[0]["m"].dtype == torch.bfloat16) else MOM_FP32
+            v_addr = i64([s["v"].data_ptr() for s in st])
+            m_addr = i64([s["m"].data_ptr() for s in st]) if momentum else v_addr
+            self.buckets.append(dict(
+                plist=bl, BL=BL, mom=mom, momentum=momentum,
+                p_addr=i64([p.data_ptr() for p in bl]),
+                m_addr=m_addr, v_addr=v_addr,
+                Ls=i32([p.shape[0] for p in bl]),
+                lowp=bl[0].dtype == torch.bfloat16,
+                g_addr=i64([p.grad.data_ptr() for p in bl]),
+                grad_first=bl[0].grad.data_ptr(),
+            ))
+
+    refresh_grads = PointerArrayCache.refresh_grads
+
+
+class OneDimPnmCache:
+    """Like :class:`OneDimPointerCache` but for AdaPNM's two 1-D momenta (``m_pos``/``m_neg``). Stores
+    both physical buffers' address arrays + ``v``; the optimizer passes them (positive, negative) by
+    step parity. fp32/bf16 only (quant 1-D and ams_bound route to native). Bucketed by ``next_pow2(L)``."""
+
+    def __init__(self, plist, state_of):
+        self.ids = tuple(id(p) for p in plist)
+        i64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=DEV)  # noqa: E731
+        i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=DEV)  # noqa: E731
+        groups: dict[int, list] = {}
+        for p in plist:
+            groups.setdefault(triton.next_power_of_2(p.shape[0]), []).append(p)
+        self.buckets = []
+        for BL, bl in groups.items():  # noqa: N806
+            st = [state_of(p) for p in bl]
+            mom = MOM_BF16 if st[0]["m_pos"].dtype == torch.bfloat16 else MOM_FP32
+            self.buckets.append(dict(
+                plist=bl, BL=BL, mom=mom,
+                p_addr=i64([p.data_ptr() for p in bl]),
+                pos_addr=i64([s["m_pos"].data_ptr() for s in st]),
+                neg_addr=i64([s["m_neg"].data_ptr() for s in st]),
+                v_addr=i64([s["v"].data_ptr() for s in st]),
+                Ls=i32([p.shape[0] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
                 grad_first=bl[0].grad.data_ptr(),

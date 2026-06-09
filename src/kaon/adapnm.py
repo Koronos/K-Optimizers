@@ -259,11 +259,13 @@ def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
     cached = opt._fused_part.get(id(group))
     if cached is None:
         return out
-    _ids, one_block, big, native = cached
+    _ids, one_block, big, one_dim, native = cached
     for p in one_block:
         out[id(p)] = "one_block"
     for p in big:
         out[id(p)] = "big"
+    for p in one_dim:
+        out[id(p)] = "one_dim"
     for p in native:
         out[id(p)] = "native"
     return out
@@ -413,6 +415,7 @@ class AdaPNM(Optimizer):
         self._fused_big_batched = True
         self._fused_part: dict[int, tuple] = {}
         self._fused_ob_caches: dict[int, Any] = {}
+        self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPnmCache (1-D)
         if self._fused:
             from kaon._fused_triton import HAS_TRITON, TILE_CAP
             if not HAS_TRITON:
@@ -630,7 +633,7 @@ class AdaPNM(Optimizer):
                 continue
             c = self._coeffs(group)
             pos_pref, neg_pref = self._pos_neg_prefixes(group["step"])
-            one_block, big, native = self._fused_partition(group, params, ft)
+            one_block, big, one_dim, native = self._fused_partition(group, params, ft)
             if native:
                 if group["gradient_centralization"]:
                     centralize_grads_(native)
@@ -639,6 +642,8 @@ class AdaPNM(Optimizer):
                 self._fused_one_block(one_block, group, ft, c)
             if big:
                 self._fused_big(big, group, ft, c, pos_pref, neg_pref)
+            if one_dim:
+                self._fused_one_dim(one_dim, group, ft, c, pos_pref, neg_pref)
             if _PROBE_LOG:
                 _probe_group(self, group)
         return loss
@@ -648,10 +653,13 @@ class AdaPNM(Optimizer):
         ids = tuple(id(p) for p in params)
         cached = self._fused_part.get(gid)
         if cached is not None and cached[0] == ids:
-            return cached[1], cached[2], cached[3]
+            return cached[1], cached[2], cached[3], cached[4]
         md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
+        float_mom = md in ("bfloat16", "float32")  # the 1-D kernel handles only fp32/bf16 momentum
+        no_ams = not group["ams_bound"]            # ams_bound 1-D (full max_v) -> native
         one_block: list[Tensor] = []
         big: list[Tensor] = []
+        one_dim: list[Tensor] = []
         native: list[Tensor] = []
         for p in params:
             bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding")
@@ -665,12 +673,14 @@ class AdaPNM(Optimizer):
                 one_block.append(p)
             elif big_ok:
                 big.append(p)
+            elif bf_ok and float_mom and no_ams and ft.fused_1d_eligible(p, cap):
+                one_dim.append(p)
             else:
                 native.append(p)
-        self._fused_part[gid] = (ids, one_block, big, native)
+        self._fused_part[gid] = (ids, one_block, big, one_dim, native)
         if _PROBE_LOG:
             _probe_census(one_block, big, native, md, bf16m, cap, ft)
-        return one_block, big, native
+        return one_block, big, one_dim, native
 
     def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict) -> None:
         for p in plist:
@@ -702,6 +712,35 @@ class AdaPNM(Optimizer):
                 bk["Rs"], bk["Cs"], c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], sc, lr * wd, eps1,
                 clip_eff, group["step"], LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0,
                 GC=gc, SR=bk["lowp"], CLIP=clip > 0.0, BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
+            )
+
+    def _fused_one_dim(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict,
+                       pos_pref: str, neg_pref: str) -> None:
+        """One-block non-factored kernel over eligible 1-D weights (biases / norm scales). GC is a no-op
+        on 1-D. fp32/bf16 momenta only; ams_bound and quant route to native (excluded in the partition)."""
+        for p in plist:
+            st = self.state[p]
+            if not st:
+                self._init_state(p, st, group)
+        ids = tuple(id(p) for p in plist)
+        gid = id(group)
+        cache = self._fused_od_caches.get(gid)
+        if cache is None or cache.ids != ids:
+            cache = ft.OneDimPnmCache(plist, lambda p: self.state[p])
+            self._fused_od_caches[gid] = cache
+        cache.refresh_grads()
+        odd = group["step"] % 2 == 1
+        lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
+        cautious, clip = group["cautious"], group["clip_threshold"]
+        inv_noise = 1.0 / c["noise_norm"]
+        for bk in cache.buckets:
+            # which physical buffer plays positive this step (alternation): the m_pos slot if odd.
+            kpos, kneg = (bk["pos_addr"], bk["neg_addr"]) if odd else (bk["neg_addr"], bk["pos_addr"])
+            ft._adapnm_1d_kernel[(len(bk["plist"]),)](
+                bk["g_addr"], bk["p_addr"], kpos, kneg, bk["v_addr"], bk["Ls"],
+                c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], c["step_size"], c["bc2_sq"], eps,
+                lr * wd, clip, group["step"], LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious,
+                WD=wd != 0, CLIP=clip > 0.0, SR=bk["lowp"], BL=bk["BL"], num_warps=ft.warps_for(bk["BL"]),
             )
 
     @torch.no_grad()

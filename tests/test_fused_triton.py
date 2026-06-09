@@ -20,6 +20,7 @@ from kaon import Adakaon
 from kaon._fused_triton import (
     HAS_TRITON,
     TILE_CAP,
+    fused_1d_eligible,
     fused_eligible,
     next_pow2_tile,
     warps_for,
@@ -40,13 +41,14 @@ def _fused(params, **kw):
 
 
 def _parts(opt):
-    """(one_block, big, native) param lists from the cached fused partition (after a step)."""
-    ob, big, nat = [], [], []
-    for (_ids, o, b, n) in opt._fused_part.values():
+    """(one_block, big, one_dim, native) param lists from the cached fused partition (after a step)."""
+    ob, big, od, nat = [], [], [], []
+    for (_ids, o, b, d, n) in opt._fused_part.values():
         ob += o
         big += b
+        od += d
         nat += n
-    return ob, big, nat
+    return ob, big, od, nat
 
 
 def _buckets(opt):
@@ -208,7 +210,7 @@ def test_chunked_quant_features(mdtype):
 # chunked kernel. Both must match native exactly (fp32) / within the dtype bound. 512x512 > cap.
 def test_big_batched_routes_and_parity_fp32():
     d, _, ov = _run_parity([(512, 512)] * 3, torch.float32, "float32")
-    ob, big, nat = _parts(ov)
+    ob, big, od, nat = _parts(ov)
     assert len(big) == 3 and len(ob) == 0 and len(nat) == 0   # all big, dispatched batched-chunked
     assert d < 1e-5, f"max|Δp|={d:.2e}"
 
@@ -259,10 +261,68 @@ def test_big_batched_matches_native_foreach_toggle():
             p.grad = g.clone()
         for p, g in zip(pn, gs):
             p.grad = g.clone()
-        ov.step(); on.step()
+        ov.step()
+        on.step()
     torch.cuda.synchronize()
     d = max((a - b).abs().max().item() for a, b in zip(pv, pn))
     assert d < 1e-5, f"batched vs native-foreach max|Δp|={d:.2e}"
+
+
+# ------------------------------------------------- one-block non-factored 1-D (biases / norm scales)
+# Many tiny 1-D tensors are the launch-bound regime (like the 2-D LoRA bag); the fused 1-D kernel owns
+# one per program. fp32/bf16 momentum only — int8/4bit 1-D routes to native.
+def test_one_dim_eligibility_predicate():
+    assert fused_1d_eligible(torch.zeros(1024, device=DEV))
+    assert fused_1d_eligible(torch.zeros(2048, device=DEV, dtype=torch.bfloat16))
+    assert not fused_1d_eligible(torch.zeros(8, 16, device=DEV))             # 2-D -> not the 1-D path
+    assert not fused_1d_eligible(torch.zeros(TILE_CAP * 2, device=DEV))      # too big for one block
+
+
+def test_one_dim_routes_and_parity_fp32():
+    d, _, ov = _run_parity([(1024,)] * 4, torch.float32, "float32")
+    ob, big, od, nat = _parts(ov)
+    assert len(od) == 4 and len(ob) == 0 and len(big) == 0 and len(nat) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("cautious", [True, False])
+def test_one_dim_features(cautious):
+    d, _, _ = _run_parity([(1024,), (512,)], torch.float32, "float32", cautious=cautious, wd=0.05)
+    assert d < 1e-5, f"cautious={cautious} max|Δp|={d:.2e}"
+
+
+def test_one_dim_bf16_momentum():
+    d, scale, _ = _run_parity([(1024,)] * 3, torch.float32, "bfloat16")
+    assert d / scale < 5e-3, f"rel={d/scale:.2e}"
+
+
+def test_one_dim_bf16_params_sr():
+    d, scale, _ = _run_parity([(1024,)] * 3, torch.bfloat16, "bfloat16")
+    assert d / scale < 5e-2, f"rel={d/scale:.2e}"
+
+
+def test_one_dim_mixed_lengths_bucketing():
+    # different lengths share a block bucket by next_pow2(L), masked by the true length
+    d, _, ov = _run_parity([(1000,), (1024,), (700,), (512,)], torch.float32, "float32")
+    assert len(_parts(ov)[2]) == 4
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("mdtype", ["int8", "4bit"])
+def test_one_dim_quant_routes_to_native(mdtype):
+    # quant momentum has no 1-D codec analogue here -> native (still correct)
+    d, scale, ov = _run_parity([(1024,)] * 3, torch.float32, mdtype)
+    ob, big, od, nat = _parts(ov)
+    assert len(od) == 0 and len(nat) == 3      # all on the native path
+    assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
+
+
+def test_one_dim_mixed_with_2d():
+    # a realistic mix: 2-D one-block + 1-D fused at once, all parity vs native
+    d, _, ov = _run_parity([(8, 16), (16, 16), (1024,), (256,)], torch.float32, "float32")
+    ob, big, od, nat = _parts(ov)
+    assert len(ob) == 2 and len(od) == 2 and len(nat) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
 
 
 # ----------------------------------------------------------------- decoupled weight decay
@@ -444,7 +504,7 @@ def test_4bit_odd_C_routes_to_native():
     ov = _fused(ps, momentum_dtype="4bit")
     ov.step()
     torch.cuda.synchronize()
-    ob, big, nat = _parts(ov)
+    ob, big, od, nat = _parts(ov)
     assert len(ob) == 0 and len(big) == 0 and len(nat) == 1    # small odd-C 4bit -> native subset
     assert ov.state[ps[0]]["m"].dtype == torch.uint8           # 4bit momentum on the native path
     assert torch.isfinite(ps[0]).all()
@@ -521,11 +581,13 @@ def test_fallback_routing_and_parity():
         ov.step()
         on.step()
     torch.cuda.synchronize()
-    # all three paths exercised at once: tiny 2-D -> one-block, 256x1024 -> chunked, conv + 1-D -> native
-    ob, big, nat = _parts(ov)
+    # all four paths exercised at once: tiny 2-D -> one-block, 256x1024 -> chunked, 1-D -> one-dim,
+    # conv (ndim>2) -> native
+    ob, big, od, nat = _parts(ov)
     assert len(ob) == 4
     assert len(big) == 1
-    assert len(nat) == 2                                       # conv + 1-D handled natively
+    assert len(od) == 1                                        # the (64,) 1-D weight -> fused 1-D path
+    assert len(nat) == 1                                       # only the conv (ndim>2) stays native
     d = max((a.detach() - b.detach()).abs().max().item() for a, b in zip(pv, pn))
     assert d < 1e-5, f"max|Δp|={d:.2e}"
 
