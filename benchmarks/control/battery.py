@@ -41,6 +41,9 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
+# Steps to skip before the ms/step clock starts (one-time JIT/cuDNN/CUDA-init warmup; see train()).
+TIMING_WARMUP = 10
+
 
 def _load(name, path):
     s = importlib.util.spec_from_file_location(name, path)
@@ -81,10 +84,19 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
     g = torch.Generator(device=DEV); g.manual_seed(seed + 12345)
     pos = 0; traj = []
     ckpt_every = max(1, n // checkpoints) if checkpoints else 0
-    if DEV == "cuda":
-        torch.cuda.synchronize()
-    t0 = time.time()
+    # Time STEADY-STATE ms/step: start the clock after a short warmup so the one-time costs (Triton
+    # JIT compilation of the fused kernels, cuDNN autotuning, lazy CUDA init) are NOT amortized into
+    # the per-step number. Timing the whole loop made a fused optimizer look ~15% slower purely from
+    # its first-step JIT spread over n — an artifact, not a real per-step regression. All n steps
+    # still run (training is unchanged); only the timing window excludes the warmup.
+    warm = min(TIMING_WARMUP, max(0, n - 1))
+    t0 = None
+    timed = 0
     for it, Rr in enumerate(seq):
+        if it == warm:
+            if DEV == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.time()
         mult = rex(it / n) if schedule == "rex" else 1.0
         for pg in opt.param_groups:
             pg["lr"] = lr * mult
@@ -92,11 +104,13 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
         opt.zero_grad()
         H.batch_loss(net, data[Rr], torch.tensor(idx, device=DEV), ac, g).backward()
         opt.step()
+        if it >= warm:
+            timed += 1
         if ckpt_every and (it + 1) % ckpt_every == 0:
             traj.append((it + 1, H.eval_loss(net, data[64], te, ac)))
     if DEV == "cuda":
         torch.cuda.synchronize()
-    ms_step = (time.time() - t0) / n * 1000.0
+    ms_step = (time.time() - t0) / max(timed, 1) * 1000.0
     tr_loss = H.eval_loss(net, data[64], tr, ac)
     te_loss = H.eval_loss(net, data[64], te, ac)
     bpp = H.opt_state_bytes_per_param(opt, params)
@@ -278,7 +292,9 @@ def main():
     ds = D.build_proxy_dataset()
     fp = D.fingerprint(ds)
     cfg = dict(C=C, N=N, seeds=SEEDS, bs=8, ckpt=16, fp=fp,
-               sig=f"C{C}_N{N}_s{SEEDS}_{fp[:8]}")
+               # 'w10' = steady-state timing (warmup-excluded ms/step); bump if the timing changes so
+               # cached entries re-measure under one consistent methodology.
+               sig=f"C{C}_N{N}_s{SEEDS}_w{TIMING_WARMUP}_{fp[:8]}")
     store = load_store(A.quick)
 
     if not A.render_only:
