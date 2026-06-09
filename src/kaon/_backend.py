@@ -12,6 +12,8 @@ All are bit-exact with the per-optimizer copies they replaced (same arithmetic);
 """
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -28,6 +30,7 @@ __all__ = [
     "centralize_grads_",
     "foreach_budget",
     "is_low_precision",
+    "rms",
     "subtract_batched_",
     "subtract_one_",
 ]
@@ -37,6 +40,11 @@ LOW_PRECISION = (torch.bfloat16, torch.float16)
 
 def is_low_precision(t: Tensor) -> bool:
     return t.dtype in LOW_PRECISION
+
+
+def rms(t: Tensor) -> Tensor:
+    """Root-mean-square of ``t`` (Adafactor-style update normalizer)."""
+    return t.norm(2) / math.sqrt(max(t.numel(), 1))
 
 
 # ----------------------------- foreach budget -----------------------------

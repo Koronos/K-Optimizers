@@ -29,13 +29,18 @@ def _bag(shapes, dtype=torch.float32, seed=0):
     return [torch.randn(*s, generator=g, device=DEV, dtype=dtype).requires_grad_(True) for s in shapes]
 
 
+def _clone(ps):
+    return [p.detach().clone().requires_grad_(True) for p in ps]
+
+
 def _parts(opt):
-    ob, big, nat = [], [], []
-    for (_ids, o, b, n) in opt._fused_part.values():
+    ob, big, od, nat = [], [], [], []
+    for (_ids, o, b, d, n) in opt._fused_part.values():
         ob += o
         big += b
+        od += d
         nat += n
-    return ob, big, nat
+    return ob, big, od, nat
 
 
 def _run_parity(shapes, dtype, mdtype, *, cautious=True, gc=True, wd=0.0, steps=6, seed=1):
@@ -106,12 +111,12 @@ def test_chunked_quant_parity(mdtype):
     assert len(_parts(ov)[1]) == 1
 
 
-def test_mixed_one_block_chunked_native():
-    # small (one-block) + big (chunked) + 1-D (native), all parity at once
+def test_mixed_one_block_chunked_onedim():
+    # small (one-block) + big (chunked) + 1-D (fused one-dim), all parity at once
     d, _, ov = _run_parity([(8, 16), (16, 320), (1024, 512), (64,)], torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
-    ob, big, nat = _parts(ov)
-    assert len(ob) == 2 and len(big) == 1 and len(nat) == 1
+    ob, big, od, nat = _parts(ov)
+    assert len(ob) == 2 and len(big) == 1 and len(od) == 1 and len(nat) == 0
 
 
 # ----------------------------------------------------------------- memory + convergence
@@ -207,10 +212,139 @@ def test_clip_chunked_parity_with_native():
     assert len(_parts(ov)[1]) == 1  # confirms it took the (single-big) chunked path
 
 
-def test_big_batched_routes_to_native():
-    # >=2 same-shape big (>cap) factors route through the batched native path (~5x faster than
-    # per-tensor fused-chunked on a real LoKr run); result still matches a pure-native AdaPNM.
+def test_big_batched_routes_and_parity():
+    # >=2 same-shape big (>cap) factors take the batched chunked kernel (~2 launches for the bucket);
+    # result must still match a pure-native AdaPNM exactly (fp32).
     d, _, ov = _run_parity([(1024, 512)] * 3, torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
-    ob, big, nat = _parts(ov)
-    assert len(big) == 3 and len(ob) == 0  # all classified big; dispatched batched-native
+    ob, big, od, nat = _parts(ov)
+    assert len(big) == 3 and len(ob) == 0  # all classified big; dispatched batched-chunked
+
+
+# ----------------------------------------------------------------- one-block 1-D (biases / norms)
+def test_one_dim_routes_and_parity_fp32():
+    d, _, ov = _run_parity([(1024,)] * 4, torch.float32, "float32")
+    ob, big, od, nat = _parts(ov)
+    assert len(od) == 4 and len(ob) == 0 and len(big) == 0 and len(nat) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("cautious", [True, False])
+def test_one_dim_features(cautious):
+    d, _, _ = _run_parity([(1024,), (512,)], torch.float32, "float32", cautious=cautious, wd=0.05)
+    assert d < 1e-5, f"cautious={cautious} max|Δp|={d:.2e}"
+
+
+def test_one_dim_bf16_momentum():
+    d, scale, _ = _run_parity([(1024,)] * 3, torch.float32, "bfloat16")
+    assert d / scale < 5e-3, f"rel={d/scale:.2e}"
+
+
+def test_one_dim_bf16_params_sr():
+    d, scale, _ = _run_parity([(1024,)] * 3, torch.bfloat16, "bfloat16")
+    assert d / scale < 5e-2, f"rel={d/scale:.2e}"
+
+
+def test_one_dim_alternation_many_steps():
+    # cross the pos/neg parity boundary several times in the 1-D path
+    d, _, _ = _run_parity([(1024,)] * 3, torch.float32, "float32", steps=11)
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("mdtype", ["int8", "4bit"])
+def test_one_dim_quant_routes_to_native(mdtype):
+    d, scale, ov = _run_parity([(1024,)] * 3, torch.float32, mdtype)
+    ob, big, od, nat = _parts(ov)
+    assert len(od) == 0 and len(nat) == 3
+    assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
+
+
+# ----------------------------------------------------------------- conv (ndim>2) matrixized
+def test_conv_one_block_parity():
+    d, _, ov = _run_parity([(16, 8, 3, 3)] * 4, torch.float32, "float32")   # eff (16,72) -> one-block
+    ob, big, od, nat = _parts(ov)
+    assert len(ob) == 4 and len(nat) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_conv_big_batched_parity():
+    d, _, ov = _run_parity([(256, 128, 3, 3)] * 3, torch.float32, "float32")  # eff (256,1152) -> big
+    assert len(_parts(ov)[1]) == 3
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_conv_quant_routes_to_native():
+    d, scale, ov = _run_parity([(16, 8, 3, 3)] * 4, torch.float32, "int8")
+    ob, big, od, nat = _parts(ov)
+    assert len(nat) == 4 and len(ob) == 0
+    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+
+
+# ----------------------------------------------------- candidate #4: fused reductions (no stack)
+@pytest.mark.parametrize("gc", [True, False])
+@pytest.mark.parametrize("shapes", [[(512, 512)] * 3, [(256, 128, 3, 3)] * 3])
+def test_fused_reductions_matches_torch_reductions_fp32(shapes, gc):
+    def run(fr):
+        ps = _bag(shapes, torch.float32, 3)
+        opt = AdaPNM(ps, fused=True, lr=2e-3, betas=(0.8, 0.999), beta0=0.5, eps=1e-30,
+                     weight_decay=0.05, cautious=True, gradient_centralization=gc, momentum_dtype="float32")
+        opt._fused_reductions = fr
+        gen = torch.Generator(device=DEV).manual_seed(11)
+        for _ in range(6):
+            for p in ps:
+                p.grad = torch.randn(*p.shape, generator=gen, device=DEV)
+            opt.step()
+        torch.cuda.synchronize()
+        return ps
+    a, b = run(False), run(True)
+    d = max((x.detach() - y.detach()).abs().max().item() for x, y in zip(a, b))
+    assert d < 1e-4, f"gc={gc} max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("cautious", [True, False])
+@pytest.mark.parametrize("gc", [True, False])
+def test_big_batched_features(cautious, gc):
+    d, _, _ = _run_parity([(512, 512)] * 3, torch.float32, "float32", cautious=cautious, gc=gc, wd=0.05)
+    assert d < 1e-5, f"cautious={cautious} gc={gc} max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("mdtype", ["bfloat16", "int8", "4bit"])
+def test_big_batched_quant_parity(mdtype):
+    d, scale, _ = _run_parity([(512, 512)] * 3, torch.float32, mdtype, wd=0.05)
+    bound = 5e-3 if mdtype == "bfloat16" else 5e-4
+    assert d / scale < bound, f"{mdtype} rel={d/scale:.2e}"
+
+
+def test_big_batched_bf16_params_sr():
+    d, scale, _ = _run_parity([(512, 512)] * 3, torch.bfloat16, "bfloat16")
+    assert d / scale < 5e-2, f"rel={d/scale:.2e}"
+
+
+def test_big_batched_alternation_many_steps():
+    # cross the pos/neg parity boundary several times in the batched path (both swap orderings).
+    d, _, _ = _run_parity([(512, 512)] * 3, torch.float32, "float32", steps=11)
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_big_batched_matches_native_foreach_toggle():
+    # batched chunked path (default) must equal the in-fused native-foreach fallback (toggle off).
+    # fp32 momentum so the two paths match near-exactly (bf16 momentum rounds differently per path).
+    cfg = dict(lr=2e-3, weight_decay=0.05, cautious=True, gradient_centralization=True,
+               momentum_dtype="float32")
+    pv = _bag([(512, 512)] * 3, torch.float32, seed=2)
+    pn = _clone(pv)
+    ov = AdaPNM(pv, fused=True, **cfg)
+    on = AdaPNM(pn, fused=True, **cfg)
+    on._fused_big_batched = False
+    gen = torch.Generator(device=DEV).manual_seed(9)
+    for _ in range(6):
+        gs = [torch.randn(*p.shape, generator=gen, device=DEV) for p in pv]
+        for p, g in zip(pv, gs):
+            p.grad = g.clone()
+        for p, g in zip(pn, gs):
+            p.grad = g.clone()
+        ov.step()
+        on.step()
+    torch.cuda.synchronize()
+    d = max((a - b).abs().max().item() for a, b in zip(pv, pn))
+    assert d < 1e-5, f"batched vs native-foreach max|Δp|={d:.2e}"

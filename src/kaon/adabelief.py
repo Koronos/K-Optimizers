@@ -103,6 +103,7 @@ from kaon._backend import (
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
+    fourbit_block_size,
     _FOURBIT_BLOCK,
     _dequant_4bit,
     _dequant_4bit_stacked,
@@ -222,12 +223,6 @@ class AdaBelief(Optimizer):
         self._foreach_stack_budget = foreach_stack_budget
 
     # ------------------------------------------------------------------- state
-    @staticmethod
-    def _block_size(grad: Tensor, group: dict[str, Any]) -> int:
-        bs = group["momentum_4bit_block"]
-        numel = grad.numel()
-        return numel if bs <= 0 else (min(bs, numel) if numel > 0 else 1)
-
     @torch.no_grad()
     def _alloc_momentum(
         self, prefix: str, grad: Tensor, state: dict[str, Any], group: dict[str, Any]
@@ -250,7 +245,7 @@ class AdaBelief(Optimizer):
             )
         else:  # 4bit
             numel = grad.numel()
-            bs = self._block_size(grad, group)
+            bs = fourbit_block_size(grad, group)
             nblocks = (numel + bs - 1) // bs
             state[prefix] = torch.full(
                 ((numel + 1) // 2,), 0x88, dtype=torch.uint8, device=grad.device
@@ -319,9 +314,7 @@ class AdaBelief(Optimizer):
     ) -> Tensor:
         """Stacked fp32 momentum ``[N, *shape]`` from per-param storage (see AdaPNM)."""
         n = len(states)
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if md in ("bfloat16", "float32"):
             return torch.stack([s["m"].reshape(shape) for s in states]).float()
         if md == "int8":
@@ -340,9 +333,7 @@ class AdaBelief(Optimizer):
         """Write stacked fp32 momentum ``[N, *shape]`` back into per-param storage."""
         n = m_fp32.shape[0]
         shape = tuple(m_fp32.shape[1:])
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if md in ("bfloat16", "float32"):
             ms = [s["m"].reshape(shape) for s in states]
             torch._foreach_copy_(ms, list(m_fp32.unbind(0)))

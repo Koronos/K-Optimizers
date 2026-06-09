@@ -13,7 +13,7 @@
 >
 > Training-tool / speed experiments (fp8, 4-bit base, compile) live in **renga-flow**'s graveyard, not here.
 
-Legend: ⛔ REJECTED (measured, no win) · ↩ SUPERSEDED (renamed/absorbed)
+Legend: ⛔ REJECTED (measured, no win) · ↩ SUPERSEDED (renamed/absorbed) · ⏸ PARKED (built or measured, pending decision/merge)
 
 > The candidates-v2 **winners were promoted to `main`** in commit `1879645` ("Promote 6 verified
 > candidate optimizers + wrapper mixins"): **AdaBelief, ScheduleFree, ADOPT, AdamP, Lookahead, SAM**.
@@ -42,6 +42,30 @@ candidates) on any axis that matters, so none was promoted. Confirmed absent fro
 - **Orphan** — `feat/orphan` (early in-house ADOPT on the factored/quantized backend) → reimplemented + promoted as **ADOPT** (on main).
 - **Gemini** — `feat/gemini` (early in-house AdEMAMix) → reimplemented as **AdEMAMix** in candidates-v2 — but AdEMAMix was then **rejected** (see above), so this line did not ship.
 - **integration/candidates** (v1) → superseded by **integration/candidates-v2**.
+
+---
+
+## ✅ BUILT + VERIFIED — "send more to Triton" campaign (fused kernels), 2026-06-09
+All four candidates BUILT, parity-verified, and unified on `feat/fused-extra-kernels` (pending merge
+to `main`). Measured with `benchmarks/fused/bench_fused.py` (new) + the battery's fused twins + a
+renga-flow Anima LoKr real-config A/B. Verdicts (RTX 4080), **native-foreach → fused-total** bf16:
+
+- **#1 batched chunked kernel** — many-same-shape >tile_cap factors (Cosmos LoKr 236× 512×512) step
+  through one batched pointer-array chunked kernel; **#4 fused reductions** then removes the 248 MB
+  fp32 grad stack + does GC in-kernel via dual row/col reduction kernels (subsumes #5 GC). Combined:
+  **big Adakaon 4.82×, AdaPNM 5.15×** (≈13–14 ms → 2.7 ms). **#2 fused 1-D** (biases/norms): 12–34×.
+  **#3 conv** `[out,in,kh,kw]` matrixized to `(out, in·kh·kw)`: 4.4–4.6×. Parity 522/522 + vs native
+  (fp32 ~5e-7, bf16 <2e-2, conv ~1e-7). Toggles `_fused_big_batched` / `_fused_reductions` (default on).
+- **HONEST real-workload caveat (the decisive measurement):** on the user's **Anima DiT LoKr at
+  512/768/1024 px**, real `iter_sec` is **unchanged within ~1–2 % noise** vs both the prior fused and
+  non-fused — because `optimizer.step` is **<1 % of the DiT iteration** at these resolutions (the
+  matmul/attention fwd/bwd dominates; see [[cosmos-lokr-step-profile]]). Loss parity across all
+  resolutions Δ~1e-4. So the **5× is a real optimizer-step win that only moves wall-clock in
+  optimizer-bound regimes** (tiny models, huge LoRA/LoKr bags, very low res, conv/1-D-heavy full
+  fine-tunes) — it is "free" (parity-correct, never slower) but NOT a throughput lever for high-res
+  DiT LoKr. Full design: [`docs/FUSED_REDUCTIONS_DESIGN.md`](FUSED_REDUCTIONS_DESIGN.md).
+- Side fix: the control battery now times **steady-state** ms/step (excludes one-time Triton JIT) —
+  that artifact had shown a *false* "fused UNet regression".
 
 ---
 

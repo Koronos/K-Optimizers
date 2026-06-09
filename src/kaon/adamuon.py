@@ -64,6 +64,7 @@ from kaon._backend import (
     centralize_grads_,
     foreach_budget,
     is_low_precision,
+    rms,
     subtract_batched_,
     subtract_one_,
 )
@@ -90,9 +91,6 @@ _UPDATE_RMS = 0.2
 # docs/foreach-batching.md for the rationale behind each constant.
 _STACK_BYTES_PER_ELEM = 48
 
-
-def _rms(t: Tensor) -> Tensor:
-    return t.norm(2) / math.sqrt(max(t.numel(), 1))
 
 
 def zeropower_via_newtonschulz5(grad: Tensor, steps: int) -> Tensor:
@@ -574,7 +572,7 @@ class AdaMuon(Optimizer):
             update = ortho.mul(r_factor).mul_(c_factor)                       # [R, C], RMS≈1
             # 4. Clip ceiling then constant scale; reshape back if conv.
             if clip > 0:
-                update.div_((_rms(update) / clip).clamp_(min=1.0))
+                update.div_((rms(update) / clip).clamp_(min=1.0))
             update.mul_(_UPDATE_RMS * lr)
             if matrixize:
                 update = update.view_as(grad_fp32)
@@ -589,7 +587,7 @@ class AdaMuon(Optimizer):
             v.lerp_(grad_sq, 1.0 - beta2)
             update = grad_fp32.mul(v.rsqrt())
             if clip > 0:
-                update.div_((_rms(update) / clip).clamp_(min=1.0))
+                update.div_((rms(update) / clip).clamp_(min=1.0))
             update.mul_(_UPDATE_RMS * lr)
             delta = self._codec(group).ema_one(state, update, beta1) if beta1 > 0 else update
             cautious_ref = grad_fp32

@@ -86,9 +86,6 @@ SecondMoment = Literal["full", "factored"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-def _rms(t: Tensor) -> Tensor:
-    return t.norm(2) / math.sqrt(max(t.numel(), 1))
-
 
 class KProdigy(Optimizer):
     """Memory-efficient Prodigy with parameter-free D-adaptation.
@@ -870,9 +867,7 @@ class KProdigy(Optimizer):
             for i in range(0, len(plist), step):
                 self._factored_bucket(plist[i:i + step], eff, matrixize, group, d, dlr)
         for (shape, _dt), plist in full_buckets.items():
-            per = 1
-            for s in shape:
-                per *= s
+            per = math.prod(shape)
             step = max(1, budget // max(per, 1))
             for i in range(0, len(plist), step):
                 self._full_bucket(plist[i:i + step], shape, group, d, dlr)

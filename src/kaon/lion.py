@@ -65,6 +65,7 @@ it drops into per-parameter / gradient-release training loops unchanged.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from typing import Any, Literal
 
@@ -83,6 +84,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._momentum_codec import (
+    fourbit_block_size,
     _FOURBIT_BLOCK,
     _dequant_4bit,
     _dequant_4bit_stacked,
@@ -197,12 +199,6 @@ class Lion(Optimizer):
         self._foreach_stack_budget = foreach_stack_budget
 
     # ------------------------------------------------------------------- state
-    @staticmethod
-    def _block_size(grad: Tensor, group: dict[str, Any]) -> int:
-        bs = group["momentum_4bit_block"]
-        numel = grad.numel()
-        return numel if bs <= 0 else (min(bs, numel) if numel > 0 else 1)
-
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
         """Allocate the single momentum buffer in the configured storage layout.
@@ -224,7 +220,7 @@ class Lion(Optimizer):
             )
         else:  # 4bit
             numel = grad.numel()
-            bs = self._block_size(grad, group)
+            bs = fourbit_block_size(grad, group)
             nblocks = (numel + bs - 1) // bs
             # zero momentum -> nibble 8 (zero level after the +8 shift); 0x88 byte.
             state["m"] = torch.full(
@@ -269,9 +265,7 @@ class Lion(Optimizer):
         4-bit uses the flat per-param block layout (block boundaries match).
         """
         n = len(states)
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if md in ("bfloat16", "float32"):
             return torch.stack([s["m"] for s in states]).float()
         if md == "int8":
@@ -293,9 +287,7 @@ class Lion(Optimizer):
         """Write stacked fp32 momentum ``[N, *shape]`` back into per-param storage."""
         n = m_fp32.shape[0]
         shape = tuple(m_fp32.shape[1:])
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if md in ("bfloat16", "float32"):
             ms = [s["m"] for s in states]
             torch._foreach_copy_(ms, list(m_fp32.unbind(0)))

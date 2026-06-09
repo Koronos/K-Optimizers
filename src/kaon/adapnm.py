@@ -127,11 +127,13 @@ from kaon._backend import (
     centralize_grads_,
     foreach_budget,
     is_low_precision,
+    rms,
     subtract_batched_,
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
+    fourbit_block_size,
     _FOURBIT_BLOCK,
     _dequant_4bit,
     _dequant_4bit_stacked,
@@ -150,14 +152,11 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 64  # two momenta + factored v: a touch above Adakaon's 48
 
 
-def _rms(t: Tensor) -> Tensor:
-    return t.norm(2) / math.sqrt(max(t.numel(), 1))
-
 
 def _rms_clip_one_(u: Tensor, clip: float) -> Tensor:
     """Adafactor RMS clip on a single normalized update: ``rms(u) <= clip``. In place."""
     if clip > 0.0:
-        u.div_((_rms(u) / clip).clamp_(min=1.0))
+        u.div_((rms(u) / clip).clamp_(min=1.0))
     return u
 
 
@@ -260,11 +259,13 @@ def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
     cached = opt._fused_part.get(id(group))
     if cached is None:
         return out
-    _ids, one_block, big, native = cached
+    _ids, one_block, big, one_dim, native = cached
     for p in one_block:
         out[id(p)] = "one_block"
     for p in big:
         out[id(p)] = "big"
+    for p in one_dim:
+        out[id(p)] = "one_dim"
     for p in native:
         out[id(p)] = "native"
     return out
@@ -409,8 +410,15 @@ class AdaPNM(Optimizer):
         # PNM kernels (one-block / chunked); everything else falls back to the native path, in-place
         # on the SAME state, so fused and non-fused interoperate and resume from each other.
         self._fused = bool(fused)
+        # When True, the many-same-shape big regime (>tile_cap) runs the batched chunked kernel; set
+        # False to revert to the batched-native-foreach path (the A/B baseline). See _fused_big.
+        self._fused_big_batched = True
+        # EXPERIMENTAL (candidate #4): fuse the batched-big reductions into Triton (grad via pointer
+        # array, no [N,R,C] stack, GC in-kernel). Default False until the A/B confirms a win.
+        self._fused_reductions = True
         self._fused_part: dict[int, tuple] = {}
         self._fused_ob_caches: dict[int, Any] = {}
+        self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPnmCache (1-D)
         if self._fused:
             from kaon._fused_triton import HAS_TRITON, TILE_CAP
             if not HAS_TRITON:
@@ -418,12 +426,6 @@ class AdaPNM(Optimizer):
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
     # ------------------------------------------------------------------- state
-    @staticmethod
-    def _block_size(grad: Tensor, group: dict[str, Any]) -> int:
-        bs = group["momentum_4bit_block"]
-        numel = grad.numel()
-        return numel if bs <= 0 else (min(bs, numel) if numel > 0 else 1)
-
     @torch.no_grad()
     def _alloc_momentum(
         self, prefix: str, grad: Tensor, state: dict[str, Any], group: dict[str, Any]
@@ -446,7 +448,7 @@ class AdaPNM(Optimizer):
             )
         else:  # 4bit
             numel = grad.numel()
-            bs = self._block_size(grad, group)
+            bs = fourbit_block_size(grad, group)
             nblocks = (numel + bs - 1) // bs
             state[prefix] = torch.full(
                 ((numel + 1) // 2,), 0x88, dtype=torch.uint8, device=grad.device
@@ -518,9 +520,7 @@ class AdaPNM(Optimizer):
     ) -> Tensor:
         """Stacked fp32 momentum ``[N, *shape]`` from per-param storage (see Lion)."""
         n = len(states)
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if md in ("bfloat16", "float32"):
             # Buffers are stored in the param's original shape; reshape to the
             # effective (matrixized [R, C] / flat [L]) view so stacking aligns.
@@ -543,9 +543,7 @@ class AdaPNM(Optimizer):
         """Write stacked fp32 momentum ``[N, *shape]`` back into per-param storage."""
         n = m_fp32.shape[0]
         shape = tuple(m_fp32.shape[1:])
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if md in ("bfloat16", "float32"):
             ms = [s[prefix].reshape(shape) for s in states]
             torch._foreach_copy_(ms, list(m_fp32.unbind(0)))
@@ -638,7 +636,7 @@ class AdaPNM(Optimizer):
                 continue
             c = self._coeffs(group)
             pos_pref, neg_pref = self._pos_neg_prefixes(group["step"])
-            one_block, big, native = self._fused_partition(group, params, ft)
+            one_block, big, one_dim, native = self._fused_partition(group, params, ft)
             if native:
                 if group["gradient_centralization"]:
                     centralize_grads_(native)
@@ -647,6 +645,8 @@ class AdaPNM(Optimizer):
                 self._fused_one_block(one_block, group, ft, c)
             if big:
                 self._fused_big(big, group, ft, c, pos_pref, neg_pref)
+            if one_dim:
+                self._fused_one_dim(one_dim, group, ft, c, pos_pref, neg_pref)
             if _PROBE_LOG:
                 _probe_group(self, group)
         return loss
@@ -656,29 +656,37 @@ class AdaPNM(Optimizer):
         ids = tuple(id(p) for p in params)
         cached = self._fused_part.get(gid)
         if cached is not None and cached[0] == ids:
-            return cached[1], cached[2], cached[3]
+            return cached[1], cached[2], cached[3], cached[4]
         md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
+        float_mom = md in ("bfloat16", "float32")  # the 1-D kernel handles only fp32/bf16 momentum
+        no_ams = not group["ams_bound"]            # ams_bound 1-D (full max_v) -> native
         one_block: list[Tensor] = []
         big: list[Tensor] = []
+        one_dim: list[Tensor] = []
         native: list[Tensor] = []
         for p in params:
             bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding")
-            ok = bf_ok and ft.fused_eligible(p, cap)
-            if ok and md == "4bit" and p.shape[1] % 2 != 0:
+            # ndim>2 (conv) is matrixized to (out, in*kh*kw); needs a contiguous grad + fp32/bf16
+            # momentum (quant's per-row requant would reshape the conv state) -> else native.
+            conv_ok = p.ndim <= 2 or (p.grad is not None and p.grad.is_contiguous() and float_mom)
+            ok = bf_ok and conv_ok and ft.fused_eligible(p, cap)
+            if ok and md == "4bit" and ft.eff_2d(p)[1] % 2 != 0:
                 ok = False
-            big_ok = (bf_ok and p.ndim == 2 and p.is_cuda and p.is_contiguous()
+            big_ok = (bf_ok and conv_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous()
                       and p.dtype in (torch.float32, torch.bfloat16)
-                      and ft.next_pow2_tile(*p.shape)[0] * ft.next_pow2_tile(*p.shape)[1] > cap)
+                      and ft.next_pow2_tile(*ft.eff_2d(p))[0] * ft.next_pow2_tile(*ft.eff_2d(p))[1] > cap)
             if ok:
                 one_block.append(p)
             elif big_ok:
                 big.append(p)
+            elif bf_ok and float_mom and no_ams and ft.fused_1d_eligible(p, cap):
+                one_dim.append(p)
             else:
                 native.append(p)
-        self._fused_part[gid] = (ids, one_block, big, native)
+        self._fused_part[gid] = (ids, one_block, big, one_dim, native)
         if _PROBE_LOG:
             _probe_census(one_block, big, native, md, bf16m, cap, ft)
-        return one_block, big, native
+        return one_block, big, one_dim, native
 
     def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict) -> None:
         for p in plist:
@@ -712,6 +720,35 @@ class AdaPNM(Optimizer):
                 GC=gc, SR=bk["lowp"], CLIP=clip > 0.0, BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
             )
 
+    def _fused_one_dim(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict,
+                       pos_pref: str, neg_pref: str) -> None:
+        """One-block non-factored kernel over eligible 1-D weights (biases / norm scales). GC is a no-op
+        on 1-D. fp32/bf16 momenta only; ams_bound and quant route to native (excluded in the partition)."""
+        for p in plist:
+            st = self.state[p]
+            if not st:
+                self._init_state(p, st, group)
+        ids = tuple(id(p) for p in plist)
+        gid = id(group)
+        cache = self._fused_od_caches.get(gid)
+        if cache is None or cache.ids != ids:
+            cache = ft.OneDimPnmCache(plist, lambda p: self.state[p])
+            self._fused_od_caches[gid] = cache
+        cache.refresh_grads()
+        odd = group["step"] % 2 == 1
+        lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
+        cautious, clip = group["cautious"], group["clip_threshold"]
+        inv_noise = 1.0 / c["noise_norm"]
+        for bk in cache.buckets:
+            # which physical buffer plays positive this step (alternation): the m_pos slot if odd.
+            kpos, kneg = (bk["pos_addr"], bk["neg_addr"]) if odd else (bk["neg_addr"], bk["pos_addr"])
+            ft._adapnm_1d_kernel[(len(bk["plist"]),)](
+                bk["g_addr"], bk["p_addr"], kpos, kneg, bk["v_addr"], bk["Ls"],
+                c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], c["step_size"], c["bc2_sq"], eps,
+                lr * wd, clip, group["step"], LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious,
+                WD=wd != 0, CLIP=clip > 0.0, SR=bk["lowp"], BL=bk["BL"], num_warps=ft.warps_for(bk["BL"]),
+            )
+
     @torch.no_grad()
     def _fused_big(self, big: list[Tensor], group: dict[str, Any], ft: Any, c: dict,
                    pos_pref: str, neg_pref: str) -> None:
@@ -723,17 +760,23 @@ class AdaPNM(Optimizer):
         and amortizes launches. A lone big tensor has no batch to amortize, so it keeps the
         fused-chunked kernel. Same math + state either way (both RMS-clip), so they interoperate.
         """
-        if len(big) >= 2:
+        if len(big) >= 2 and not self._fused_big_batched:
             if group["gradient_centralization"]:
                 centralize_grads_(big)
             self._native_dispatch(big, group)
-        else:
-            for p in big:
-                self._chunked_step(p, group, ft, c, pos_pref, neg_pref)
+            return
+        by_shape: dict[tuple[int, int], list[Tensor]] = {}
+        for p in big:
+            by_shape.setdefault(tuple(p.shape), []).append(p)
+        for plist in by_shape.values():
+            if len(plist) >= 2:
+                self._chunked_step_batched(plist, group, ft, c, pos_pref, neg_pref)
+            else:
+                self._chunked_step(plist[0], group, ft, c, pos_pref, neg_pref)
 
     def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:
         b2, eps1 = group["betas"][1], group["eps"]
-        g = p.grad.float()
+        g = p.grad.float().reshape(p.shape[0], p.numel() // p.shape[0])  # conv -> matrixized (out, in*kh*kw)
         if group["gradient_centralization"]:
             g = g - g.mean(dim=1, keepdim=True)
         g = g.contiguous()
@@ -747,7 +790,7 @@ class AdaPNM(Optimizer):
         st = self.state[p]
         if not st:
             self._init_state(p, st, group)
-        R, C = p.shape  # noqa: N806 — matrix dims
+        R, C = p.shape[0], p.numel() // p.shape[0]  # noqa: N806 — matrix dims (conv -> matrixized)
         n = R * C
         md = group["momentum_dtype"]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
@@ -775,6 +818,144 @@ class AdaPNM(Optimizer):
         ft._adapnm_chunked_apply[grid](gf, posf, negf, pf, r, cfac, C, n, c["beta0"], inv_noise, sc_apply,
                                        lr * wd, inv_mean, group["step"], CAUTIOUS=cautious, WD=wd != 0,
                                        SR=sr, BLOCK=1024)
+
+    # ----------------------------------------------- batched chunked (many same-shape big tensors)
+    @torch.no_grad()
+    def _chunked_reductions_batched(self, plist: list[Tensor], group: dict[str, Any]) -> tuple:
+        """Stacked AdaPNM reductions for a same-shape big bucket: GC (on the fp32 copy) + row/col EMA.
+        Returns the stacked fp32 grad ``[N, R, C]`` and the stacked r/c factors ``[N, R]``/``[N, C]``
+        (contiguous). Mirrors :meth:`_chunked_reductions` per tensor (eps1 on the means; no rms — the
+        AdaPNM clip is computed separately, folded into ``sc`` in :meth:`_chunked_step_batched`)."""
+        b2, eps1 = group["betas"][1], group["eps"]
+        states = [self.state[p] for p in plist]
+        R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]    # noqa: N806 — conv -> matrixized
+        g = torch.stack([p.grad.float().reshape(R, C) for p in plist])     # [N, R, C]
+        if group["gradient_centralization"]:
+            g.sub_(g.mean(dim=-1, keepdim=True))
+        gsq = g * g
+        row = torch.stack([s["row"] for s in states])                    # [N, R]
+        col = torch.stack([s["col"] for s in states])                    # [N, C]
+        row.lerp_(gsq.mean(dim=-1).add_(eps1), 1.0 - b2)
+        col.lerp_(gsq.mean(dim=-2).add_(eps1), 1.0 - b2)
+        torch._foreach_copy_([s["row"] for s in states], list(row.unbind(0)))
+        torch._foreach_copy_([s["col"] for s in states], list(col.unbind(0)))
+        r = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_()             # [N, R]
+        c = col.rsqrt()                                                  # [N, C]
+        return g, r.contiguous(), c.contiguous()
+
+    @torch.no_grad()
+    def _chunked_step_batched(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict,
+                              pos_pref: str, neg_pref: str) -> None:
+        """A bucket of >=2 same-shape big 2-D tensors via the batched AdaPNM chunked kernels (~2
+        launches). fp32/bf16 momenta are read/written in place via the pos/neg pointer arrays (no
+        temps); int8/4bit dequant to fp32 temps, step on them, requant the positive between passes.
+        The Adafactor RMS-clip's per-tensor sum-of-squares is accumulated in-kernel (no torch momentum
+        temp in the float case), turned into ``sc_apply[N]`` between passes."""
+        for p in plist:
+            st = self.state[p]
+            if not st:
+                self._init_state(p, st, group)
+        N = len(plist)  # noqa: N806
+        R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]  # noqa: N806 — conv -> matrixized
+        n = R * C
+        dev = plist[0].device
+        md = group["momentum_dtype"]
+        lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
+        clip = group["clip_threshold"]
+        gc = group["gradient_centralization"]
+        lowp = plist[0].dtype == torch.bfloat16
+        sr = lowp and (group["bf16_method"] == "stochastic_rounding")
+        states = [self.state[p] for p in plist]
+        fused_red = self._fused_reductions
+        if fused_red:  # grad via pointer array, no [N,R,C] stack (candidate #4); rowmean carries GC
+            g_addr, rowmean, r, cfac = self._chunked_reductions_fused(plist, group, ft, R, C, lowp)
+        else:
+            g, r, cfac = self._chunked_reductions_batched(plist, group)   # g [N,R,C], r [N,R], c [N,C]
+            gf = g.reshape(-1)
+        sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
+
+        quant = md in ("int8", "4bit")
+        if quant:  # dequant both momenta to stacked fp32 temps; arrays point at the temp slices
+            pos_temp = torch.empty(N, R, C, dtype=torch.float32, device=dev)
+            neg_temp = torch.empty(N, R, C, dtype=torch.float32, device=dev)
+            for i, st in enumerate(states):
+                pos_temp[i] = self._dequant_one(st, pos_pref, md, pos_temp[i])
+                neg_temp[i] = self._dequant_one(st, neg_pref, md, neg_temp[i])
+            pos_addr = ft.ptr_array(list(pos_temp), dev)
+            neg_addr = ft.ptr_array(list(neg_temp), dev)
+            mom = ft.MOM_FP32
+        else:      # fp32/bf16: pointer arrays straight to the stored buffers (EMA positive in place)
+            pos_addr = ft.ptr_array([s[pos_pref] for s in states], dev)
+            neg_addr = ft.ptr_array([s[neg_pref] for s in states], dev)
+            mom = ft.MOM_BF16 if md == "bfloat16" else ft.MOM_FP32
+        p_addr = ft.ptr_array(plist, dev)
+        keep = torch.zeros(N, dtype=torch.int32, device=dev)
+        rms_acc = torch.zeros(N, dtype=torch.float32, device=dev)
+        K = (n + 1023) // 1024  # noqa: N806
+        grid = (N * K,)
+        if fused_red:
+            ft._adapnm_chunked_mom_batched_g[grid](
+                g_addr, rowmean, pos_addr, neg_addr, r, cfac, keep, rms_acc, R, C, n, K,
+                c["beta1_sq"], c["beta0"], inv_noise,
+                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, CLIP=clip > 0.0, BLOCK=1024,
+            )
+        else:
+            ft._adapnm_chunked_mom_batched[grid](
+                gf, pos_addr, neg_addr, r, cfac, keep, rms_acc, R, C, n, K, c["beta1_sq"], c["beta0"],
+                inv_noise, MOM=mom, CAUTIOUS=cautious, CLIP=clip > 0.0, BLOCK=1024,
+            )
+        if quant:  # requant the updated positive temp back into storage (apply reads the temp)
+            for i, st in enumerate(states):
+                self._store_one(st, pos_pref, md, pos_temp[i])
+        # Per-tensor Adafactor RMS-clip: rms_u = bc2_sq * sqrt(rms_acc / n); fold into sc_apply[N].
+        if clip > 0.0:
+            rms_u = rms_acc.div_(n).sqrt_().mul_(c["bc2_sq"])             # [N]
+            sc_apply = (sc / rms_u.div_(clip).clamp_(min=1.0)).contiguous()
+        else:
+            sc_apply = torch.full((N,), sc, dtype=torch.float32, device=dev)
+        inv_mean = (1.0 / (keep.float() / n).clamp_(min=1e-8)) if cautious else torch.ones(N, device=dev)
+        if fused_red:
+            ft._adapnm_chunked_apply_batched_g[grid](
+                g_addr, rowmean, pos_addr, neg_addr, p_addr, r, cfac, sc_apply, inv_mean, R, C, n, K,
+                c["beta0"], inv_noise, lr * wd, group["step"],
+                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
+            )
+        else:
+            ft._adapnm_chunked_apply_batched[grid](
+                gf, pos_addr, neg_addr, p_addr, r, cfac, sc_apply, inv_mean, R, C, n, K, c["beta0"],
+                inv_noise, lr * wd, group["step"], LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0,
+                SR=sr, BLOCK=1024,
+            )
+
+    @torch.no_grad()
+    def _chunked_reductions_fused(self, plist, group, ft, R, C, lowp):  # noqa: N803
+        """Candidate #4 for AdaPNM: row/col EMA factors via the Triton reduction kernel reading grad
+        from a pointer array (no [N,R,C] stack; GC in-kernel). No rms here — AdaPNM's clip is computed
+        in the mom kernel. Returns (g_addr, rowmean, r_factor[N,R], c_factor[N,C])."""
+        b2, eps1 = group["betas"][1], group["eps"]
+        N = len(plist)  # noqa: N806
+        dev = plist[0].device
+        states = [self.state[p] for p in plist]
+        g_addr = ft.ptr_array([p.grad for p in plist], dev)
+        BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806
+        rowmean = torch.empty(N * R, dtype=torch.float32, device=dev)
+        rowsum = torch.empty(N * R, dtype=torch.float32, device=dev)
+        colsum = torch.zeros(N * C, dtype=torch.float32, device=dev)
+        ft._reduce_rowcol[(N * RB,)](
+            g_addr, rowmean, rowsum, colsum, R, C, RB,
+            LOWP=lowp, GC=group["gradient_centralization"], BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+        )
+        rowsum = rowsum.view(N, R)
+        colsum = colsum.view(N, C)
+        row = torch.stack([s["row"] for s in states])
+        col = torch.stack([s["col"] for s in states])
+        row.lerp_(rowsum.div(C).add_(eps1), 1.0 - b2)
+        col.lerp_(colsum.div(R).add_(eps1), 1.0 - b2)
+        torch._foreach_copy_([s["row"] for s in states], list(row.unbind(0)))
+        torch._foreach_copy_([s["col"] for s in states], list(col.unbind(0)))
+        r = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().contiguous()
+        cfac = col.rsqrt().contiguous()
+        return g_addr, rowmean, r, cfac
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving both quantized momenta's stored dtype.
