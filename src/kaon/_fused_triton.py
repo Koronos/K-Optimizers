@@ -82,6 +82,21 @@ def next_pow2_tile(R: int, C: int) -> tuple[int, int]:
     return triton.next_power_of_2(R), triton.next_power_of_2(C)
 
 
+def ptr_array(tensors: list, device) -> torch.Tensor:
+    """int64 device array of the tensors' base addresses — the MultiTensorApply-style pointer array a
+    batched kernel indexes by program id. Shared by every per-step host launch in the batched paths."""
+    return torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64, device=device)
+
+
+def reduction_tile(R: int, C: int, work: int = 16384) -> tuple[int, int, int]:
+    """Row-block sizing for the fused reduction kernels: ``(BR, BC, RB)`` — one program owns ``BR``
+    rows × ``BC = next_pow2(C)`` cols (≈ ``work`` lanes) and ``RB = ceil(R/BR)`` blocks tile the rows."""
+    BC = triton.next_power_of_2(C)  # noqa: N806
+    BR = max(1, min(R, max(1, work // BC)))  # noqa: N806
+    RB = (R + BR - 1) // BR  # noqa: N806
+    return BR, BC, RB
+
+
 def eff_2d(p: torch.Tensor) -> tuple[int, int]:
     """The effective 2-D matrix shape ``(R, C)`` the factored step works on.
 

@@ -881,14 +881,14 @@ class AdaPNM(Optimizer):
             for i, st in enumerate(states):
                 pos_temp[i] = self._dequant_one(st, pos_pref, md, pos_temp[i])
                 neg_temp[i] = self._dequant_one(st, neg_pref, md, neg_temp[i])
-            pos_addr = torch.tensor([pos_temp[i].data_ptr() for i in range(N)], dtype=torch.int64, device=dev)
-            neg_addr = torch.tensor([neg_temp[i].data_ptr() for i in range(N)], dtype=torch.int64, device=dev)
+            pos_addr = ft.ptr_array(list(pos_temp), dev)
+            neg_addr = ft.ptr_array(list(neg_temp), dev)
             mom = ft.MOM_FP32
         else:      # fp32/bf16: pointer arrays straight to the stored buffers (EMA positive in place)
-            pos_addr = torch.tensor([s[pos_pref].data_ptr() for s in states], dtype=torch.int64, device=dev)
-            neg_addr = torch.tensor([s[neg_pref].data_ptr() for s in states], dtype=torch.int64, device=dev)
+            pos_addr = ft.ptr_array([s[pos_pref] for s in states], dev)
+            neg_addr = ft.ptr_array([s[neg_pref] for s in states], dev)
             mom = ft.MOM_BF16 if md == "bfloat16" else ft.MOM_FP32
-        p_addr = torch.tensor([p.data_ptr() for p in plist], dtype=torch.int64, device=dev)
+        p_addr = ft.ptr_array(plist, dev)
         keep = torch.zeros(N, dtype=torch.int32, device=dev)
         rms_acc = torch.zeros(N, dtype=torch.float32, device=dev)
         K = (n + 1023) // 1024  # noqa: N806
@@ -936,10 +936,8 @@ class AdaPNM(Optimizer):
         N = len(plist)  # noqa: N806
         dev = plist[0].device
         states = [self.state[p] for p in plist]
-        g_addr = torch.tensor([p.grad.data_ptr() for p in plist], dtype=torch.int64, device=dev)
-        BC = ft.next_pow2_tile(R, C)[1]  # noqa: N806
-        BR = max(1, min(R, max(1, 16384 // BC)))  # noqa: N806
-        RB = (R + BR - 1) // BR  # noqa: N806
+        g_addr = ft.ptr_array([p.grad for p in plist], dev)
+        BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806
         rowmean = torch.empty(N * R, dtype=torch.float32, device=dev)
         rowsum = torch.empty(N * R, dtype=torch.float32, device=dev)
         colsum = torch.zeros(N * C, dtype=torch.float32, device=dev)

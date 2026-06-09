@@ -595,13 +595,13 @@ class Adakaon(Optimizer):
         if quant:  # dequant whole bucket to a stacked fp32 temp; kernel m pointers index its slices
             temp = torch.empty(N, R, C, dtype=torch.float32, device=dev)
             for i, st in enumerate(states):
-                temp[i] = self._codec(group).dequant_one(st, torch.empty(R, C, device=dev)).reshape(R, C)
-            m_addr = torch.tensor([temp[i].data_ptr() for i in range(N)], dtype=torch.int64, device=dev)
+                temp[i] = self._codec(group).dequant_one(st, temp[i]).reshape(R, C)  # temp[i] = shape template
+            m_addr = ft.ptr_array(list(temp), dev)
             mom = ft.MOM_FP32
         else:
-            m_addr = torch.tensor([st["m"].data_ptr() for st in states], dtype=torch.int64, device=dev)
+            m_addr = ft.ptr_array([st["m"] for st in states], dev)
             mom = ft.MOM_BF16 if md == "bfloat16" else ft.MOM_FP32
-        p_addr = torch.tensor([p.data_ptr() for p in plist], dtype=torch.int64, device=dev)
+        p_addr = ft.ptr_array(plist, dev)
         keep = torch.zeros(N, dtype=torch.int32, device=dev)
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
@@ -644,10 +644,8 @@ class Adakaon(Optimizer):
         N = len(plist)  # noqa: N806
         dev = plist[0].device
         states = [self.state[p] for p in plist]
-        g_addr = torch.tensor([p.grad.data_ptr() for p in plist], dtype=torch.int64, device=dev)
-        BC = ft.next_pow2_tile(R, C)[1]  # noqa: N806
-        BR = max(1, min(R, max(1, 16384 // BC)))  # noqa: N806 — BR*BC ~ one block of work per program
-        RB = (R + BR - 1) // BR  # noqa: N806
+        g_addr = ft.ptr_array([p.grad for p in plist], dev)
+        BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806
         rowmean = torch.empty(N * R, dtype=torch.float32, device=dev)
         rowsum = torch.empty(N * R, dtype=torch.float32, device=dev)
         colsum = torch.zeros(N * C, dtype=torch.float32, device=dev)  # atomic target
