@@ -24,6 +24,7 @@ Supported ``momentum_dtype`` codecs:
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -46,6 +47,7 @@ __all__ = [
     "_dequant_4bit",
     "_quant_4bit_stacked",
     "_dequant_4bit_stacked",
+    "fourbit_block_size",
 ]
 
 MomentumDtype = ("bfloat16", "float32", "int8", "4bit")
@@ -185,6 +187,17 @@ def _dequant_4bit_stacked(packed: Tensor, scale: Tensor, per: int, block_size: i
         q = torch.cat([q, q.new_zeros(n, pad)], dim=1)
     q = q.view(n, nblocks, block_size).mul_(scale.view(n, nblocks, 1))
     return q.reshape(n, -1)[:, :per]
+
+
+def fourbit_block_size(grad: Tensor, group: dict[str, Any]) -> int:
+    """4-bit absmax block size for ``grad`` under ``group["momentum_4bit_block"]``.
+
+    A non-positive block setting means "one block over the whole tensor"; otherwise
+    the block is clamped to the element count (and to 1 for an empty tensor).
+    """
+    bs = group["momentum_4bit_block"]
+    numel = grad.numel()
+    return numel if bs <= 0 else min(bs, numel) if numel > 0 else 1
 
 
 # --------------------------------------------------------------------- codecs
@@ -334,11 +347,7 @@ class _FourBitCodec(_MomentumCodec):
     param's flattened ``[per]`` view so block boundaries match the per-param path.
     """
 
-    @staticmethod
-    def _block_size(grad: Tensor, group: dict[str, Any]) -> int:
-        bs = group["momentum_4bit_block"]
-        numel = grad.numel()
-        return numel if bs <= 0 else min(bs, numel) if numel > 0 else 1
+    _block_size = staticmethod(fourbit_block_size)
 
     def init_state(self, state: dict[str, Any], grad: Tensor, group: dict[str, Any]) -> None:
         numel = grad.numel()
@@ -366,9 +375,7 @@ class _FourBitCodec(_MomentumCodec):
         self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
     ) -> Tensor:
         n = update.shape[0]
-        per = 1
-        for d in eff:
-            per *= d
+        per = math.prod(eff)
         bs = states[0]["m_block"]
         packed = torch.stack([s["m"] for s in states])              # [N, ceil(per/2)]
         sc = torch.stack([s["m_scale"] for s in states])            # [N, nblocks]
@@ -389,9 +396,7 @@ class _FourBitCodec(_MomentumCodec):
     def dequant_stacked(
         self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...]
     ) -> Tensor:
-        per = 1
-        for d in eff:
-            per *= d
+        per = math.prod(eff)
         bs = states[0]["m_block"]
         packed = torch.stack([s["m"] for s in states])
         sc = torch.stack([s["m_scale"] for s in states])

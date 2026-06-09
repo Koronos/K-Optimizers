@@ -47,6 +47,7 @@ from kaon._backend import (
     centralize_grads_,
     foreach_budget,
     is_low_precision,
+    rms,
     subtract_batched_,
     subtract_one_,
 )
@@ -109,9 +110,6 @@ _STACK_BYTES_PER_ELEM = 48
 # VRAM (so it must not scale with the card). 2 M sits in the middle of that
 # plateau. See docs/foreach-batching.md.
 
-
-def _rms(t: Tensor) -> Tensor:
-    return t.norm(2) / math.sqrt(max(t.numel(), 1))
 
 
 class Adakaon(Optimizer):
@@ -736,7 +734,7 @@ class Adakaon(Optimizer):
             update = grad_fp32.mul(v.rsqrt())
 
         if clip > 0:
-            update.div_((_rms(update) / clip).clamp_(min=1.0))
+            update.div_((rms(update) / clip).clamp_(min=1.0))
         update.mul_(lr)
 
         # Single codec call owns dequant → fp32 EMA → requant for every dtype.

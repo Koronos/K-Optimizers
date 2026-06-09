@@ -127,6 +127,7 @@ from kaon._backend import (
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
+    fourbit_block_size,
     _FOURBIT_BLOCK,
     _quant_4bit,
     _quant_int8,
@@ -290,12 +291,6 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
     # through the shared first-moment codec layout so a configured int8/4bit
     # momentum_dtype keeps z compact and resumes bit-exactly. The per-param and
     # stacked read/write helpers mirror AdaPNM's (one buffer instead of two).
-    @staticmethod
-    def _block_size(grad: Tensor, group: dict[str, Any]) -> int:
-        bs = group["momentum_4bit_block"]
-        numel = grad.numel()
-        return numel if bs <= 0 else (min(bs, numel) if numel > 0 else 1)
-
     @torch.no_grad()
     def _alloc_full(
         self, prefix: str, src: Tensor, state: dict[str, Any], group: dict[str, Any], *, copy: bool
@@ -326,7 +321,7 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
                 )
         else:  # 4bit
             numel = src.numel()
-            bs = self._block_size(src, group)
+            bs = fourbit_block_size(src, group)
             nblocks = (numel + bs - 1) // bs
             if copy:
                 packed, scale, _ = _quant_4bit(src.detach().float(), bs)

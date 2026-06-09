@@ -32,6 +32,7 @@ foreach↔per-param parity — are owned here once, so each wrapper stays small 
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from typing import Any
 
@@ -128,9 +129,7 @@ class CodecBuffer:
     ) -> Tensor:
         """Stacked fp32 buffer ``[N, *shape]`` from per-param storage (always a fresh tensor)."""
         n = len(states)
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if dtype in ("bfloat16", "float32"):
             return torch.stack([s[key].reshape(shape) for s in states]).float()
         if dtype == "int8":
@@ -151,9 +150,7 @@ class CodecBuffer:
         """Write a stacked fp32 buffer ``[N, *shape]`` back into per-param storage."""
         n = value_fp32.shape[0]
         shape = tuple(value_fp32.shape[1:])
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if dtype in ("bfloat16", "float32"):
             torch._foreach_copy_([s[key].reshape(shape) for s in states], list(value_fp32.unbind(0)))
         elif dtype == "int8":

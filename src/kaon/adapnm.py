@@ -127,11 +127,13 @@ from kaon._backend import (
     centralize_grads_,
     foreach_budget,
     is_low_precision,
+    rms,
     subtract_batched_,
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
+    fourbit_block_size,
     _FOURBIT_BLOCK,
     _dequant_4bit,
     _dequant_4bit_stacked,
@@ -150,14 +152,11 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 64  # two momenta + factored v: a touch above Adakaon's 48
 
 
-def _rms(t: Tensor) -> Tensor:
-    return t.norm(2) / math.sqrt(max(t.numel(), 1))
-
 
 def _rms_clip_one_(u: Tensor, clip: float) -> Tensor:
     """Adafactor RMS clip on a single normalized update: ``rms(u) <= clip``. In place."""
     if clip > 0.0:
-        u.div_((_rms(u) / clip).clamp_(min=1.0))
+        u.div_((rms(u) / clip).clamp_(min=1.0))
     return u
 
 
@@ -418,12 +417,6 @@ class AdaPNM(Optimizer):
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
     # ------------------------------------------------------------------- state
-    @staticmethod
-    def _block_size(grad: Tensor, group: dict[str, Any]) -> int:
-        bs = group["momentum_4bit_block"]
-        numel = grad.numel()
-        return numel if bs <= 0 else (min(bs, numel) if numel > 0 else 1)
-
     @torch.no_grad()
     def _alloc_momentum(
         self, prefix: str, grad: Tensor, state: dict[str, Any], group: dict[str, Any]
@@ -446,7 +439,7 @@ class AdaPNM(Optimizer):
             )
         else:  # 4bit
             numel = grad.numel()
-            bs = self._block_size(grad, group)
+            bs = fourbit_block_size(grad, group)
             nblocks = (numel + bs - 1) // bs
             state[prefix] = torch.full(
                 ((numel + 1) // 2,), 0x88, dtype=torch.uint8, device=grad.device
@@ -518,9 +511,7 @@ class AdaPNM(Optimizer):
     ) -> Tensor:
         """Stacked fp32 momentum ``[N, *shape]`` from per-param storage (see Lion)."""
         n = len(states)
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if md in ("bfloat16", "float32"):
             # Buffers are stored in the param's original shape; reshape to the
             # effective (matrixized [R, C] / flat [L]) view so stacking aligns.
@@ -543,9 +534,7 @@ class AdaPNM(Optimizer):
         """Write stacked fp32 momentum ``[N, *shape]`` back into per-param storage."""
         n = m_fp32.shape[0]
         shape = tuple(m_fp32.shape[1:])
-        per = 1
-        for d in shape:
-            per *= d
+        per = math.prod(shape)
         if md in ("bfloat16", "float32"):
             ms = [s[prefix].reshape(shape) for s in states]
             torch._foreach_copy_(ms, list(m_fp32.unbind(0)))
