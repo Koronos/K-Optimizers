@@ -47,7 +47,7 @@ def _bag(shapes: list[tuple[int, ...]], dtype: torch.dtype, seed: int = 0) -> li
     is representative; the momentum EMA evolving is irrelevant to wall-clock."""
     g = torch.Generator().manual_seed(seed)
     out = []
-    for i, sh in enumerate(shapes):
+    for sh in shapes:
         p = torch.randn(*sh, generator=g).to(DEV).to(dtype).requires_grad_(True)
         p.grad = torch.randn(*sh, generator=g).to(DEV).to(dtype)
         out.append(p)

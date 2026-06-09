@@ -408,6 +408,9 @@ class AdaPNM(Optimizer):
         # PNM kernels (one-block / chunked); everything else falls back to the native path, in-place
         # on the SAME state, so fused and non-fused interoperate and resume from each other.
         self._fused = bool(fused)
+        # When True, the many-same-shape big regime (>tile_cap) runs the batched chunked kernel; set
+        # False to revert to the batched-native-foreach path (the A/B baseline). See _fused_big.
+        self._fused_big_batched = True
         self._fused_part: dict[int, tuple] = {}
         self._fused_ob_caches: dict[int, Any] = {}
         if self._fused:
@@ -712,13 +715,19 @@ class AdaPNM(Optimizer):
         and amortizes launches. A lone big tensor has no batch to amortize, so it keeps the
         fused-chunked kernel. Same math + state either way (both RMS-clip), so they interoperate.
         """
-        if len(big) >= 2:
+        if len(big) >= 2 and not self._fused_big_batched:
             if group["gradient_centralization"]:
                 centralize_grads_(big)
             self._native_dispatch(big, group)
-        else:
-            for p in big:
-                self._chunked_step(p, group, ft, c, pos_pref, neg_pref)
+            return
+        by_shape: dict[tuple[int, int], list[Tensor]] = {}
+        for p in big:
+            by_shape.setdefault(tuple(p.shape), []).append(p)
+        for plist in by_shape.values():
+            if len(plist) >= 2:
+                self._chunked_step_batched(plist, group, ft, c, pos_pref, neg_pref)
+            else:
+                self._chunked_step(plist[0], group, ft, c, pos_pref, neg_pref)
 
     def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:
         b2, eps1 = group["betas"][1], group["eps"]
@@ -764,6 +773,79 @@ class AdaPNM(Optimizer):
         ft._adapnm_chunked_apply[grid](gf, posf, negf, pf, r, cfac, C, n, c["beta0"], inv_noise, sc_apply,
                                        lr * wd, inv_mean, group["step"], CAUTIOUS=cautious, WD=wd != 0,
                                        SR=sr, BLOCK=1024)
+
+    # ----------------------------------------------- batched chunked (many same-shape big tensors)
+    @torch.no_grad()
+    def _chunked_reductions_batched(self, plist: list[Tensor], group: dict[str, Any]) -> tuple:
+        """Stacked AdaPNM reductions for a same-shape big bucket: GC (on the fp32 copy) + row/col EMA.
+        Returns the stacked fp32 grad ``[N, R, C]`` and the stacked r/c factors ``[N, R]``/``[N, C]``
+        (contiguous). Mirrors :meth:`_chunked_reductions` per tensor (eps1 on the means; no rms — the
+        AdaPNM clip is computed separately, folded into ``sc`` in :meth:`_chunked_step_batched`)."""
+        b2, eps1 = group["betas"][1], group["eps"]
+        states = [self.state[p] for p in plist]
+        g = torch.stack([p.grad.float() for p in plist])                  # [N, R, C]
+        if group["gradient_centralization"]:
+            g.sub_(g.mean(dim=-1, keepdim=True))
+        gsq = g * g
+        row = torch.stack([s["row"] for s in states])                    # [N, R]
+        col = torch.stack([s["col"] for s in states])                    # [N, C]
+        row.lerp_(gsq.mean(dim=-1).add_(eps1), 1.0 - b2)
+        col.lerp_(gsq.mean(dim=-2).add_(eps1), 1.0 - b2)
+        torch._foreach_copy_([s["row"] for s in states], list(row.unbind(0)))
+        torch._foreach_copy_([s["col"] for s in states], list(col.unbind(0)))
+        r = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_()             # [N, R]
+        c = col.rsqrt()                                                  # [N, C]
+        return g, r.contiguous(), c.contiguous()
+
+    @torch.no_grad()
+    def _chunked_step_batched(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict,
+                              pos_pref: str, neg_pref: str) -> None:
+        """A bucket of >=2 same-shape big 2-D tensors via the batched AdaPNM chunked kernels. Both
+        momenta are fp32 stacked temps (dequant via the codec, EMA only the positive, requant between
+        passes) — only ``p`` is written in place via a pointer array. The Adafactor RMS-clip is folded
+        per-tensor into ``sc_apply[N]``; pass 1's keep-count uses the unclipped scalar (sign-invariant)."""
+        for p in plist:
+            st = self.state[p]
+            if not st:
+                self._init_state(p, st, group)
+        N = len(plist)  # noqa: N806
+        R, C = plist[0].shape  # noqa: N806
+        n = R * C
+        dev = plist[0].device
+        md = group["momentum_dtype"]
+        lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
+        lowp = plist[0].dtype == torch.bfloat16
+        sr = lowp and (group["bf16_method"] == "stochastic_rounding")
+        states = [self.state[p] for p in plist]
+        g, r, cfac = self._chunked_reductions_batched(plist, group)       # g [N,R,C], r [N,R], c [N,C]
+
+        m_pos = self._dequant_stacked(states, pos_pref, md, (R, C)).reshape(N, R, C)  # fp32 temp
+        m_neg = self._dequant_stacked(states, neg_pref, md, (R, C)).reshape(N, R, C)  # fp32 temp (RO)
+        sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
+        p_addr = torch.tensor([p.data_ptr() for p in plist], dtype=torch.int64, device=dev)
+        keep = torch.zeros(N, dtype=torch.int32, device=dev)
+        gf, posf, negf = g.reshape(-1), m_pos.reshape(-1), m_neg.reshape(-1)
+        K = (n + 1023) // 1024  # noqa: N806
+        grid = (N * K,)
+        ft._adapnm_chunked_mom_batched[grid](
+            gf, posf, negf, r, cfac, keep, R, C, n, K, c["beta1_sq"], c["beta0"], inv_noise, sc,
+            CAUTIOUS=cautious, BLOCK=1024,
+        )
+        self._store_stacked(states, pos_pref, md, m_pos)                  # requant/store updated positive
+        # Per-tensor Adafactor RMS-clip on U = pn * r * c * bc2_sq, folded into sc_apply[N].
+        clip = group["clip_threshold"]
+        if clip > 0.0:
+            u = m_pos.mul(1.0 + c["beta0"]).sub_(m_neg, alpha=c["beta0"])  # [N,R,C] pn numerator temp
+            u.mul_(r.unsqueeze(-1)).mul_(cfac.unsqueeze(-2))
+            rms_u = u.reshape(N, -1).norm(2, dim=1).mul_(inv_noise * c["bc2_sq"] / math.sqrt(n))  # [N]
+            sc_apply = (sc / rms_u.div_(clip).clamp_(min=1.0)).contiguous()
+        else:
+            sc_apply = torch.full((N,), sc, dtype=torch.float32, device=dev)
+        inv_mean = (1.0 / (keep.float() / n).clamp_(min=1e-8)) if cautious else torch.ones(N, device=dev)
+        ft._adapnm_chunked_apply_batched[grid](
+            gf, posf, negf, p_addr, r, cfac, sc_apply, inv_mean, R, C, n, K, c["beta0"], inv_noise,
+            lr * wd, group["step"], LOWP=lowp, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
+        )
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving both quantized momenta's stored dtype.

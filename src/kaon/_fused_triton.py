@@ -361,6 +361,103 @@ if _HAS_TRITON:
             res = sr_round(res, seed, offs)
         tl.store(p_ptr + offs, res.to(p_ptr.dtype.element_ty), mask=mask)
 
+    # ---- batched chunked (multi-block, pointer-array) path for the many-same-shape big regime ----
+    # The dominant real workload (Cosmos LoKr: 236x 512x512 factors, all > TILE_CAP) used to route
+    # to native torch foreach (~15-25 launches + ~10 full [N,R,C] passes per bucket). These two
+    # kernels run the heavy [N,R,C] elementwise work (momentum EMA, cautious keep-count, WD, subtract,
+    # SR) over the WHOLE same-shape bucket in ONE launch each, reading p/m per-tensor from a pointer
+    # array (write IN PLACE, no stacking of p/m). The cheap reductions (row/col EMA, rms via matvec)
+    # stay in torch on the stacked grad — see ``Adakaon._chunked_reductions_batched``. Same math +
+    # state as the per-tensor ``_chunked_mom``/``_chunked_apply`` (which a lone big tensor still uses).
+    #
+    # Grid is ``(N * K,)`` with ``K = ceil(n/BLOCK)`` chunks per tensor (same n=R*C across the bucket,
+    # so K is a constant): ``t = pid // K`` selects the tensor, ``k = pid % K`` the chunk. Grad is the
+    # stacked fp32 [N, n] (GC already folded into the copy); r/c factors are stacked [N, R]/[N, C];
+    # per-tensor scalars (``inv_rms_lr``/``inv_mean``) are float32[N] arrays indexed by ``t``. Momentum
+    # is read/written via the m pointer array with the same MOM constexpr as the one-block kernel for
+    # fp32/bf16; int8/4bit momentum is dequant'd to an fp32 temp host-side (the m array then points at
+    # the temp's per-tensor slices, MOM==FP32) and requant'd in torch between the two passes — exactly
+    # the per-tensor ``_chunked_step`` precedent, so odd-C 4bit works (it packs flat, not per-tile).
+
+    @triton.jit
+    def _chunked_mom_batched(
+        g_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, inv_rms_lr_ptr,
+        lrwd, beta1, R, C, n, K,
+        LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Batched pass 1: momentum EMA of the normalized update over a flat chunk of tensor ``t``;
+        accumulates the cautious keep-count (on delta incl. WD, matching native) into ``keep_ptr[t]``."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs % C
+        g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)            # stacked fp32 grad (GC'd)
+        rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+        cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+        inv_rms_lr = tl.load(inv_rms_lr_ptr + t)
+        upd = g * rf * cf * inv_rms_lr
+        mi = tl.load(m_addr + t)
+        if MOM == 1:  # bf16 storage
+            mp = mi.to(tl.pointer_type(tl.bfloat16))
+            m = tl.load(mp + offs, mask=mask, other=0.0).to(tl.float32)
+        else:         # fp32 storage (also the dequant'd int8/4bit temp)
+            mp = mi.to(tl.pointer_type(tl.float32))
+            m = tl.load(mp + offs, mask=mask, other=0.0)
+        m = beta1 * m + (1.0 - beta1) * upd
+        if MOM == 1:
+            tl.store(mp + offs, m.to(tl.bfloat16), mask=mask)
+        else:
+            tl.store(mp + offs, m, mask=mask)
+        if CAUTIOUS:
+            delta = m
+            if WD:
+                pi = tl.load(p_addr + t)
+                if LOWP:
+                    pp = pi.to(tl.pointer_type(tl.bfloat16))
+                else:
+                    pp = pi.to(tl.pointer_type(tl.float32))
+                p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+                delta = delta + lrwd * p_old
+            keep = ((delta * g) > 0.0) & mask
+            tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
+
+    @triton.jit
+    def _chunked_apply_batched(
+        g_ptr, m_addr, p_addr, inv_mean_ptr, lrwd, seed, n, K,
+        LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
+        SR: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """Batched pass 2: delta = cautious(m + lr*wd*p, g); p -= delta (bf16 SR if LOWP+SR)."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        mi = tl.load(m_addr + t)
+        if MOM == 1:
+            m = tl.load(mi.to(tl.pointer_type(tl.bfloat16)) + offs, mask=mask, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(mi.to(tl.pointer_type(tl.float32)) + offs, mask=mask, other=0.0)
+        pi = tl.load(p_addr + t)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
+        p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        delta = m
+        if WD:
+            delta = delta + lrwd * p
+        if CAUTIOUS:
+            g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)
+            inv_mean = tl.load(inv_mean_ptr + t)
+            keep = (delta * g) > 0.0
+            delta = tl.where(keep, delta * inv_mean, 0.0)
+        res = p - delta
+        if SR:
+            res = sr_round(res, seed + t, offs)
+        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+
     # ============================================================ AdaPNM (positive-negative momentum)
     # Reuses the núcleo (gradient_centralize, factored_rc, dequant/requant_*, sr_round). New vs Adakaon:
     # TWO momenta (pos/neg, roles alternate by step parity — the host passes them swapped), the
@@ -514,6 +611,83 @@ if _HAS_TRITON:
         if SR:
             res = sr_round(res, seed, offs)
         tl.store(p_ptr + offs, res.to(p_ptr.dtype.element_ty), mask=mask)
+
+    # ---- batched chunked (multi-block, pointer-array) AdaPNM path for the many-same-shape big regime ----
+    # Mirrors the Adakaon batched pair, plus AdaPNM's two-momentum structure. As in the per-tensor
+    # AdaPNM chunked path, BOTH momenta are fp32 stacked temps (dequant'd host-side via the codec,
+    # EMA only the positive, requant'd back after pass 1) — so pos/neg are passed as stacked fp32
+    # ``[N, n]`` (flat ``t*n + offs``), not pointer arrays; only the weight ``p`` is a per-tensor
+    # pointer array written in place. Grad is stacked fp32 (GC folded in). The Adafactor RMS-clip is
+    # folded per-tensor into ``sc_ptr[N]`` host-side (pass 2 only — pass 1's keep-count is
+    # sign-invariant to the positive ``sc`` scalar, so it uses the unclipped scalar, matching native).
+    # WD is decoupled-on-p (``p *= 1-lr*wd``), applied in pass 2 and NOT gated by cautious.
+
+    @triton.jit
+    def _adapnm_chunked_mom_batched(
+        g_ptr, pos_ptr, neg_ptr, rfac_ptr, cfac_ptr, keep_ptr,
+        R, C, n, K, beta1_sq, beta0, inv_noise, sc,
+        CAUTIOUS: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """Batched AdaPNM pass 1: EMA the positive momentum (fp32 stacked temp); accumulate the
+        cautious keep-count on the pos-neg delta into ``keep_ptr[t]`` (sc is the unclipped scalar)."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        base = t * n + offs
+        g = tl.load(g_ptr + base, mask=mask, other=0.0)
+        m_pos = tl.load(pos_ptr + base, mask=mask, other=0.0)
+        m_pos = beta1_sq * m_pos + (1.0 - beta1_sq) * g
+        tl.store(pos_ptr + base, m_pos, mask=mask)
+        if CAUTIOUS:
+            m_neg = tl.load(neg_ptr + base, mask=mask, other=0.0)
+            i = offs // C
+            j = offs % C
+            rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+            cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+            pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
+            delta = pn * rf * cf * sc
+            keep = ((delta * g) > 0.0) & mask
+            tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
+
+    @triton.jit
+    def _adapnm_chunked_apply_batched(
+        g_ptr, pos_ptr, neg_ptr, p_addr, rfac_ptr, cfac_ptr, sc_ptr, inv_mean_ptr,
+        R, C, n, K, beta0, inv_noise, lrwd, seed,
+        LOWP: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr, SR: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Batched AdaPNM pass 2: delta = cautious(pn * r*c * sc[t], g); p = p*(1-lr*wd) - delta."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        base = t * n + offs
+        i = offs // C
+        j = offs % C
+        m_pos = tl.load(pos_ptr + base, mask=mask, other=0.0)
+        m_neg = tl.load(neg_ptr + base, mask=mask, other=0.0)
+        rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+        cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+        sc = tl.load(sc_ptr + t)
+        pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
+        delta = pn * rf * cf * sc
+        if CAUTIOUS:
+            g = tl.load(g_ptr + base, mask=mask, other=0.0)
+            inv_mean = tl.load(inv_mean_ptr + t)
+            keep = (delta * g) > 0.0
+            delta = tl.where(keep, delta * inv_mean, 0.0)
+        pi = tl.load(p_addr + t)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
+        p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if WD:
+            p = p * (1.0 - lrwd)
+        res = p - delta
+        if SR:
+            res = sr_round(res, seed + t, offs)
+        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
 
 # ============================================================ pointer-array cache (reusable)

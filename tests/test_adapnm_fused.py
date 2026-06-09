@@ -29,6 +29,10 @@ def _bag(shapes, dtype=torch.float32, seed=0):
     return [torch.randn(*s, generator=g, device=DEV, dtype=dtype).requires_grad_(True) for s in shapes]
 
 
+def _clone(ps):
+    return [p.detach().clone().requires_grad_(True) for p in ps]
+
+
 def _parts(opt):
     ob, big, nat = [], [], []
     for (_ids, o, b, n) in opt._fused_part.values():
@@ -207,10 +211,57 @@ def test_clip_chunked_parity_with_native():
     assert len(_parts(ov)[1]) == 1  # confirms it took the (single-big) chunked path
 
 
-def test_big_batched_routes_to_native():
-    # >=2 same-shape big (>cap) factors route through the batched native path (~5x faster than
-    # per-tensor fused-chunked on a real LoKr run); result still matches a pure-native AdaPNM.
+def test_big_batched_routes_and_parity():
+    # >=2 same-shape big (>cap) factors take the batched chunked kernel (~2 launches for the bucket);
+    # result must still match a pure-native AdaPNM exactly (fp32).
     d, _, ov = _run_parity([(1024, 512)] * 3, torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
     ob, big, nat = _parts(ov)
-    assert len(big) == 3 and len(ob) == 0  # all classified big; dispatched batched-native
+    assert len(big) == 3 and len(ob) == 0  # all classified big; dispatched batched-chunked
+
+
+@pytest.mark.parametrize("cautious", [True, False])
+@pytest.mark.parametrize("gc", [True, False])
+def test_big_batched_features(cautious, gc):
+    d, _, _ = _run_parity([(512, 512)] * 3, torch.float32, "float32", cautious=cautious, gc=gc, wd=0.05)
+    assert d < 1e-5, f"cautious={cautious} gc={gc} max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("mdtype", ["bfloat16", "int8", "4bit"])
+def test_big_batched_quant_parity(mdtype):
+    d, scale, _ = _run_parity([(512, 512)] * 3, torch.float32, mdtype, wd=0.05)
+    bound = 5e-3 if mdtype == "bfloat16" else 5e-4
+    assert d / scale < bound, f"{mdtype} rel={d/scale:.2e}"
+
+
+def test_big_batched_bf16_params_sr():
+    d, scale, _ = _run_parity([(512, 512)] * 3, torch.bfloat16, "bfloat16")
+    assert d / scale < 5e-2, f"rel={d/scale:.2e}"
+
+
+def test_big_batched_alternation_many_steps():
+    # cross the pos/neg parity boundary several times in the batched path (both swap orderings).
+    d, _, _ = _run_parity([(512, 512)] * 3, torch.float32, "float32", steps=11)
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_big_batched_matches_native_foreach_toggle():
+    # batched chunked path (default) must equal the in-fused native-foreach fallback (toggle off).
+    cfg = dict(lr=2e-3, weight_decay=0.05, cautious=True, gradient_centralization=True,
+               momentum_dtype="bfloat16")
+    pv = _bag([(512, 512)] * 3, torch.float32, seed=2)
+    pn = _clone(pv)
+    ov = AdaPNM(pv, fused=True, **cfg)
+    on = AdaPNM(pn, fused=True, **cfg)
+    on._fused_big_batched = False
+    gen = torch.Generator(device=DEV).manual_seed(9)
+    for _ in range(6):
+        gs = [torch.randn(*p.shape, generator=gen, device=DEV) for p in pv]
+        for p, g in zip(pv, gs):
+            p.grad = g.clone()
+        for p, g in zip(pn, gs):
+            p.grad = g.clone()
+        ov.step(); on.step()
+    torch.cuda.synchronize()
+    d = max((a - b).abs().max().item() for a, b in zip(pv, pn))
+    assert d < 1e-5, f"batched vs native-foreach max|Δp|={d:.2e}"

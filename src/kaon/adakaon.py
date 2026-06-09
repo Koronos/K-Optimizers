@@ -253,6 +253,9 @@ class Adakaon(Optimizer):
         # to the native path below, in-place on the SAME state, so fused/non-fused interoperate and
         # resume from each other's checkpoints.
         self._fused = bool(fused)
+        # When True, the many-same-shape big regime (>tile_cap) runs the batched chunked kernel; set
+        # False to revert to the batched-native-foreach path (the A/B baseline). See _fused_big.
+        self._fused_big_batched = True
         self._t = 0
         self._fused_part: dict[int, tuple] = {}          # group id -> cached (ids, one_block, big, native)
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
@@ -362,16 +365,26 @@ class Adakaon(Optimizer):
     def _fused_big(self, big: list[Tensor], group: dict[str, Any], ft: Any) -> None:
         """Dispatch the >tile-cap ("big") 2-D weights. The per-tensor fused-chunked kernel is
         launch-bound (~7 kernels/tensor); for the many same-shape big factors a real LoKr run has
-        (e.g. 236x 512x512) the batched native foreach is ~5x faster (measured 11.6ms vs 68ms). A
-        lone big tensor has no batch to amortize, so it keeps the fused-chunked kernel. Same math +
-        state either way."""
-        if len(big) >= 2:
+        (e.g. 236x 512x512) we run the **batched chunked kernel** (``_chunked_step_batched``) —
+        the whole same-shape bucket in ~2 launches, p/m written in place via a pointer array. A lone
+        big tensor has no batch to amortize, so it keeps the per-tensor fused-chunked kernel. Same
+        math + state either way. ``self._fused_big_batched=False`` reverts the multi-tensor case to
+        the batched-native-foreach path (the A/B baseline)."""
+        if len(big) >= 2 and not self._fused_big_batched:
             if group["gradient_centralization"]:
                 centralize_grads_(big)
             self._native_dispatch(big, group)
-        else:
-            for p in big:
-                self._chunked_step(p, group, ft)
+            return
+        # Group by EXACT shape; same-shape buckets of >=2 take the batched chunked kernel, lone
+        # tensors take the per-tensor chunked kernel.
+        by_shape: dict[tuple[int, int], list[Tensor]] = {}
+        for p in big:
+            by_shape.setdefault(tuple(p.shape), []).append(p)
+        for plist in by_shape.values():
+            if len(plist) >= 2:
+                self._chunked_step_batched(plist, group, ft)
+            else:
+                self._chunked_step(plist[0], group, ft)
 
     def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
         """Split a group's params into (one-block, chunked-big, native), cached per param-set."""
@@ -476,6 +489,88 @@ class Adakaon(Optimizer):
         inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
         ft._chunked_apply[grid](gf, mf, pf, n, inv_mean, lr * wd, self._t,
                                 CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024)
+
+    # ----------------------------------------------- batched chunked (many same-shape big tensors)
+    @torch.no_grad()
+    def _chunked_reductions_batched(self, plist: list[Tensor], group: dict[str, Any]) -> tuple:
+        """Stacked torch reductions for a same-shape big bucket: GC (on the fp32 copy) + row/col EMA
+        + per-tensor rms (matvec, no [N,R,C] beyond grad/gsq). Returns the stacked fp32 grad ``[N,n]``,
+        the stacked r/c factors ``[N,R]``/``[N,C]`` (contiguous), and ``inv_rms_lr`` ``[N]`` — the same
+        quantities ``_chunked_reductions`` returns per tensor. Mirrors that math exactly (eps1 added to
+        the row/col means; rms uses raw gsq)."""
+        b2, eps1 = group["betas"][1], group["eps"][0]
+        clip, lr = group["clip_threshold"], group["lr"]
+        N = len(plist)  # noqa: N806
+        R, C = plist[0].shape  # noqa: N806
+        n = R * C
+        states = [self.state[p] for p in plist]
+        g = torch.stack([p.grad.float() for p in plist])                  # [N, R, C]
+        if group["gradient_centralization"]:
+            g.sub_(g.mean(dim=-1, keepdim=True))                          # GC on the fp32 copy
+        gsq = g * g                                                       # raw (eps1 goes on the means)
+        row = torch.stack([s["row"] for s in states])                    # [N, R]
+        col = torch.stack([s["col"] for s in states])                    # [N, C]
+        row.lerp_(gsq.mean(dim=-1).add_(eps1), 1.0 - b2)
+        col.lerp_(gsq.mean(dim=-2).add_(eps1), 1.0 - b2)
+        torch._foreach_copy_([s["row"] for s in states], list(row.unbind(0)))
+        torch._foreach_copy_([s["col"] for s in states], list(col.unbind(0)))
+        r = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_()             # [N, R]
+        c = col.rsqrt()                                                  # [N, C]
+        # rms per tensor via matvec: sqrt( sum_i r_i^2 * (gsq @ c^2)_i / n )  (no [N,R,C] temp)
+        rms = (r * r).mul_(torch.bmm(gsq, (c * c).unsqueeze(-1)).squeeze(-1)).sum(-1).div_(n).sqrt_()
+        inv_rms_lr = lr / rms.div_(clip).clamp_(min=1.0)                 # [N]
+        return g.reshape(N, n), r.contiguous(), c.contiguous(), inv_rms_lr.contiguous()
+
+    @torch.no_grad()
+    def _chunked_step_batched(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
+        """A bucket of >=2 same-shape big 2-D tensors via the batched chunked kernels (~2 launches).
+        fp32/bf16 momentum is read/written in place via the m pointer array; int8/4bit is dequant'd to
+        a stacked fp32 temp, stepped on the temp, requant'd between passes (the ``_chunked_step``
+        precedent), so the weight update uses the exact pre-requant momentum."""
+        for p in plist:
+            st = self.state[p]
+            if not st:
+                self._init_state(p, st, group)
+        N = len(plist)  # noqa: N806
+        R, C = plist[0].shape  # noqa: N806
+        n = R * C
+        dev = plist[0].device
+        md, b1 = group["momentum_dtype"], group["betas"][0]
+        lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
+        lowp = plist[0].dtype == torch.bfloat16
+        sr = lowp and (group["bf16_method"] == "stochastic_rounding")
+        states = [self.state[p] for p in plist]
+        g, r, c, inv_rms_lr = self._chunked_reductions_batched(plist, group)
+
+        quant = md in ("int8", "4bit")
+        if quant:  # dequant whole bucket to a stacked fp32 temp; kernel m pointers index its slices
+            temp = torch.empty(N, R, C, dtype=torch.float32, device=dev)
+            for i, st in enumerate(states):
+                temp[i] = self._codec(group).dequant_one(st, torch.empty(R, C, device=dev)).reshape(R, C)
+            m_addr = torch.tensor([temp[i].data_ptr() for i in range(N)], dtype=torch.int64, device=dev)
+            mom = ft.MOM_FP32
+        else:
+            m_addr = torch.tensor([st["m"].data_ptr() for st in states], dtype=torch.int64, device=dev)
+            mom = ft.MOM_BF16 if md == "bfloat16" else ft.MOM_FP32
+        p_addr = torch.tensor([p.data_ptr() for p in plist], dtype=torch.int64, device=dev)
+        keep = torch.zeros(N, dtype=torch.int32, device=dev)
+        K = (n + 1023) // 1024  # noqa: N806
+        grid = (N * K,)
+        ft._chunked_mom_batched[grid](
+            g, m_addr, p_addr, r, c, keep, inv_rms_lr, lr * wd, b1, R, C, n, K,
+            LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024,
+        )
+        if quant:  # requant the updated fp32 temp back into per-tensor storage (apply reads the temp)
+            for i, st in enumerate(states):
+                if md == "int8":
+                    st["m"], st["m_scale"] = _quant_int8(temp[i])
+                else:
+                    st["m"], st["m_scale"], _ = _quant_4bit(temp[i].reshape(-1), st["m_block"])
+        inv_mean = (1.0 / (keep.float() / n).clamp_(min=1e-8)) if cautious else torch.ones(N, device=dev)
+        ft._chunked_apply_batched[grid](
+            g, m_addr, p_addr, inv_mean, lr * wd, self._t, n, K,
+            LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
+        )
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized first moment's stored dtype.
