@@ -406,14 +406,17 @@ class Adakaon(Optimizer):
         for p in params:
             # bf16 params need stochastic rounding (the kernel's only bf16 write); kahan/none -> native
             bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding")
-            ok = momentum and bf_ok and ft.fused_eligible(p, cap)
-            if ok and md == "4bit" and p.shape[1] % 2 != 0:
+            # ndim>2 (conv) is matrixized to (out, in*kh*kw); the reshape needs a contiguous grad, and
+            # only fp32/bf16 momentum (quant's per-row requant would reshape the conv state) -> native.
+            conv_ok = p.ndim <= 2 or (p.grad is not None and p.grad.is_contiguous() and float_mom)
+            two_d = momentum and bf_ok and conv_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous() \
+                and p.dtype in (torch.float32, torch.bfloat16)
+            ok = momentum and bf_ok and conv_ok and ft.fused_eligible(p, cap)
+            if ok and md == "4bit" and ft.eff_2d(p)[1] % 2 != 0:
                 ok = False                                  # one-block 4bit needs even C
             if ok:
                 one_block.append(p)
-            elif (momentum and bf_ok and p.ndim == 2 and p.is_cuda and p.is_contiguous()
-                  and p.dtype in (torch.float32, torch.bfloat16)
-                  and ft.next_pow2_tile(*p.shape)[0] * ft.next_pow2_tile(*p.shape)[1] > cap):
+            elif two_d and ft.next_pow2_tile(*ft.eff_2d(p))[0] * ft.next_pow2_tile(*ft.eff_2d(p))[1] > cap:
                 big.append(p)
             elif momentum and bf_ok and float_mom and ft.fused_1d_eligible(p, cap):
                 one_dim.append(p)
@@ -475,11 +478,13 @@ class Adakaon(Optimizer):
             )
 
     def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:
-        """Shared torch part of a big-tensor step: GC + row/col EMA + rms (matvec, no [R,C] temp)."""
+        """Shared torch part of a big-tensor step: GC + row/col EMA + rms (matvec, no [R,C] temp).
+        ``ndim>2`` convs are matrixized to ``(out, in*kh*kw)`` (the row/col state's shape)."""
         n = p.numel()
+        R = p.shape[0]  # noqa: N806
         b2, eps1 = group["betas"][1], group["eps"][0]
         clip, lr = group["clip_threshold"], group["lr"]
-        g = p.grad.float()
+        g = p.grad.float().reshape(R, n // R)
         if group["gradient_centralization"]:
             g = g - g.mean(dim=1, keepdim=True)
         g = g.contiguous()
@@ -497,7 +502,7 @@ class Adakaon(Optimizer):
         st = self.state[p]
         if not st:
             self._init_state(p, st, group)
-        R, C = p.shape  # noqa: N806 — matrix dims
+        R, C = p.shape[0], p.numel() // p.shape[0]  # noqa: N806 — matrix dims (conv -> matrixized)
         n = R * C
         md, b1 = group["momentum_dtype"], group["betas"][0]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
@@ -534,10 +539,10 @@ class Adakaon(Optimizer):
         b2, eps1 = group["betas"][1], group["eps"][0]
         clip, lr = group["clip_threshold"], group["lr"]
         N = len(plist)  # noqa: N806
-        R, C = plist[0].shape  # noqa: N806
+        R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]  # noqa: N806 — conv -> matrixized
         n = R * C
         states = [self.state[p] for p in plist]
-        g = torch.stack([p.grad.float() for p in plist])                  # [N, R, C]
+        g = torch.stack([p.grad.float().reshape(R, C) for p in plist])     # [N, R, C]
         if group["gradient_centralization"]:
             g.sub_(g.mean(dim=-1, keepdim=True))                          # GC on the fp32 copy
         gsq = g * g                                                       # raw (eps1 goes on the means)
@@ -565,7 +570,7 @@ class Adakaon(Optimizer):
             if not st:
                 self._init_state(p, st, group)
         N = len(plist)  # noqa: N806
-        R, C = plist[0].shape  # noqa: N806
+        R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]  # noqa: N806 — conv -> matrixized
         n = R * C
         dev = plist[0].device
         md, b1 = group["momentum_dtype"], group["betas"][0]

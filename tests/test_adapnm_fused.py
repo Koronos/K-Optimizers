@@ -259,6 +259,27 @@ def test_one_dim_quant_routes_to_native(mdtype):
     assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
 
 
+# ----------------------------------------------------------------- conv (ndim>2) matrixized
+def test_conv_one_block_parity():
+    d, _, ov = _run_parity([(16, 8, 3, 3)] * 4, torch.float32, "float32")   # eff (16,72) -> one-block
+    ob, big, od, nat = _parts(ov)
+    assert len(ob) == 4 and len(nat) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_conv_big_batched_parity():
+    d, _, ov = _run_parity([(256, 128, 3, 3)] * 3, torch.float32, "float32")  # eff (256,1152) -> big
+    assert len(_parts(ov)[1]) == 3
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_conv_quant_routes_to_native():
+    d, scale, ov = _run_parity([(16, 8, 3, 3)] * 4, torch.float32, "int8")
+    ob, big, od, nat = _parts(ov)
+    assert len(nat) == 4 and len(ob) == 0
+    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+
+
 @pytest.mark.parametrize("cautious", [True, False])
 @pytest.mark.parametrize("gc", [True, False])
 def test_big_batched_features(cautious, gc):

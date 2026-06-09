@@ -96,7 +96,8 @@ def test_eligibility_predicate():
     assert fused_eligible(torch.zeros(16, 320, device=DEV, dtype=torch.bfloat16))
     assert fused_eligible(torch.zeros(128, 1024, device=DEV))        # 131072 lanes == cap (medium)
     assert not fused_eligible(torch.zeros(128, device=DEV))          # 1-D
-    assert not fused_eligible(torch.zeros(8, 8, 3, 3, device=DEV))   # conv ndim>2
+    assert fused_eligible(torch.zeros(8, 8, 3, 3, device=DEV))       # conv ndim>2 -> matrixized (8,72)
+    assert not fused_eligible(torch.zeros(8, 8, 256, 256, device=DEV))  # conv too big for one block
     assert not fused_eligible(torch.zeros(8, 16))                    # cpu
     assert not fused_eligible(torch.zeros(8, 16, device=DEV, dtype=torch.float16))  # fp16
     assert not fused_eligible(torch.zeros(512, 1024, device=DEV))    # 524288 lanes > cap -> native
@@ -323,6 +324,43 @@ def test_one_dim_mixed_with_2d():
     ob, big, od, nat = _parts(ov)
     assert len(ob) == 2 and len(od) == 2 and len(nat) == 0
     assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+# ------------------------------------------------- conv (ndim>2) matrixized to (out, in*kh*kw)
+# A contiguous conv's row-major storage IS its (out, in*kh*kw) view, so it rides the 2-D fused paths
+# (one-block when small, chunked when big) with no copy. fp32/bf16 momentum only (quant -> native).
+def test_conv_one_block_routes_and_parity():
+    d, _, ov = _run_parity([(16, 8, 3, 3)] * 4, torch.float32, "float32")   # eff (16,72) -> one-block
+    ob, big, od, nat = _parts(ov)
+    assert len(ob) == 4 and len(big) == 0 and len(nat) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("cautious", [True, False])
+def test_conv_one_block_features(cautious):
+    d, _, _ = _run_parity([(16, 8, 3, 3), (24, 8, 3, 3)], torch.float32, "float32", cautious=cautious, wd=0.05)
+    assert d < 1e-5, f"cautious={cautious} max|Δp|={d:.2e}"
+
+
+def test_conv_big_batched_routes_and_parity():
+    d, _, ov = _run_parity([(256, 128, 3, 3)] * 3, torch.float32, "float32")  # eff (256,1152) -> chunked big
+    ob, big, od, nat = _parts(ov)
+    assert len(big) == 3 and len(ob) == 0 and len(nat) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_conv_bf16_momentum():
+    d, scale, _ = _run_parity([(16, 8, 3, 3)] * 4, torch.float32, "bfloat16")
+    assert d / scale < 5e-3, f"rel={d/scale:.2e}"
+
+
+@pytest.mark.parametrize("mdtype", ["int8", "4bit"])
+def test_conv_quant_routes_to_native(mdtype):
+    # quant momentum's per-row requant would reshape the conv state -> conv routes to native
+    d, scale, ov = _run_parity([(16, 8, 3, 3)] * 4, torch.float32, mdtype)
+    ob, big, od, nat = _parts(ov)
+    assert len(nat) == 4 and len(ob) == 0 and len(big) == 0
+    assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
 
 
 # ----------------------------------------------------------------- decoupled weight decay
@@ -559,14 +597,16 @@ def test_4bit_quant_primitive_matches_codec():
     assert torch.allclose(scale, s_ref, atol=0, rtol=0)
 
 
-# ----------------------------------------------------------------- native fallback routing
+# ----------------------------------------------------------------- routing across all paths
 def test_fallback_routing_and_parity():
-    # tiny fused + big-2D (tile>cap) + conv + 1-D -> the last three go to the inner native Adakaon
+    # all paths at once: tiny 2-D -> one-block, small conv -> one-block (matrixized), big 2-D ->
+    # chunked, 1-D -> one-dim, and a non-contiguous 2-D -> native fallback. All parity vs native.
     shapes = [(8, 16)] * 4 + [(256, 1024)] + [(64,)]
     pv = _bag(shapes, torch.float32, 1)
-    # add a conv param (ndim>2)
-    convv = torch.randn(8, 8, 3, 3, device=DEV).requires_grad_(True)
+    convv = torch.randn(8, 8, 3, 3, device=DEV).requires_grad_(True)   # ndim>2 -> one-block (eff 8x72)
     pv.append(convv)
+    noncontig = torch.randn(32, 16, device=DEV).t().requires_grad_(True)  # non-contiguous -> native
+    pv.append(noncontig)
     pn = _clone(pv)
     cfg = dict(lr=2e-3, betas=(0.9, 0.999), cautious=True, gradient_centralization=True,
                momentum_dtype="float32")
@@ -581,13 +621,11 @@ def test_fallback_routing_and_parity():
         ov.step()
         on.step()
     torch.cuda.synchronize()
-    # all four paths exercised at once: tiny 2-D -> one-block, 256x1024 -> chunked, 1-D -> one-dim,
-    # conv (ndim>2) -> native
     ob, big, od, nat = _parts(ov)
-    assert len(ob) == 4
-    assert len(big) == 1
+    assert len(ob) == 5                                        # 4 tiny 2-D + the small conv
+    assert len(big) == 1                                       # 256x1024 -> chunked
     assert len(od) == 1                                        # the (64,) 1-D weight -> fused 1-D path
-    assert len(nat) == 1                                       # only the conv (ndim>2) stays native
+    assert len(nat) == 1                                       # the non-contiguous 2-D stays native
     d = max((a.detach() - b.detach()).abs().max().item() for a, b in zip(pv, pn))
     assert d < 1e-5, f"max|Δp|={d:.2e}"
 

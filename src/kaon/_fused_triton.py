@@ -59,7 +59,7 @@ except ImportError:  # pragma: no cover - exercised only on triton-less installs
     tl = None
     _HAS_TRITON = False
 
-__all__ = ["fused_eligible", "fused_1d_eligible", "warps_for", "next_pow2_tile", "TILE_CAP", "HAS_TRITON"]
+__all__ = ["fused_eligible", "fused_1d_eligible", "eff_2d", "warps_for", "next_pow2_tile", "TILE_CAP", "HAS_TRITON"]
 
 HAS_TRITON = _HAS_TRITON
 # Largest padded tile a single program owns. Measured crossover (RTX 4080, fp32): the one-block
@@ -82,6 +82,18 @@ def next_pow2_tile(R: int, C: int) -> tuple[int, int]:
     return triton.next_power_of_2(R), triton.next_power_of_2(C)
 
 
+def eff_2d(p: torch.Tensor) -> tuple[int, int]:
+    """The effective 2-D matrix shape ``(R, C)`` the factored step works on.
+
+    For a plain 2-D weight this is ``p.shape``. For an ``ndim>2`` conv kernel
+    ``[out, in, kh, kw]`` it is the conv-aware matrixization ``(out, in*kh*kw)`` — and because a
+    CONTIGUOUS tensor's row-major storage is identical under that reshape, the fused kernels (which
+    index the flat buffer as ``ri*C + ci``) operate on a conv exactly as on the 2-D view, with no
+    copy. The row/col second-moment state is already allocated in this matrixized shape (see each
+    optimizer's ``_init_state``)."""
+    return p.shape[0], p.numel() // p.shape[0]
+
+
 def warps_for(lanes: int) -> int:
     """num_warps for a per-tensor program owning ``lanes`` padded elements. Optimizer-agnostic."""
     if lanes <= 512:
@@ -96,16 +108,18 @@ def warps_for(lanes: int) -> int:
 
 
 def fused_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP) -> bool:
-    """Does ONE Triton block own this tensor? (2-D, contiguous, fp32/bf16, fits a tile.)
+    """Does ONE Triton block own this tensor? (ndim>=2, contiguous, fp32/bf16, fits a tile.)
 
-    Optimizer-agnostic: any single-block fused kernel shares this predicate. Everything that
-    returns False is routed to the native fallback.
+    Optimizer-agnostic: any single-block fused kernel shares this predicate. ``ndim>2`` conv kernels
+    are matrixized to ``(out, in*kh*kw)`` via :func:`eff_2d` (valid because they're contiguous); the
+    caller must also confirm the GRAD is contiguous (the matrixized write-back needs it). Everything
+    that returns False is routed to the native fallback.
     """
-    if p.ndim != 2 or not p.is_cuda or not p.is_contiguous():
+    if p.ndim < 2 or not p.is_cuda or not p.is_contiguous():
         return False
     if p.dtype not in (torch.float32, torch.bfloat16):  # fp16 SR unsupported -> native
         return False
-    BR, BC = next_pow2_tile(p.shape[0], p.shape[1])
+    BR, BC = next_pow2_tile(*eff_2d(p))
     return tile_cap >= BR * BC
 
 
@@ -891,7 +905,7 @@ class PointerArrayCache:
         i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=DEV)  # noqa: E731
         groups: dict[tuple[int, int], list] = {}
         for p in plist:
-            groups.setdefault(next_pow2_tile(p.shape[0], p.shape[1]), []).append(p)
+            groups.setdefault(next_pow2_tile(*eff_2d(p)), []).append(p)
         self.buckets = []
         for (BR, BC), bl in groups.items():  # noqa: N806
             st = [state_of(p) for p in bl]
@@ -915,7 +929,7 @@ class PointerArrayCache:
                 m_addr=m_addr, mscale_addr=mscale_addr,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
                 col_addr=i64([s["col"].data_ptr() for s in st]),
-                Rs=i32([p.shape[0] for p in bl]), Cs=i32([p.shape[1] for p in bl]),
+                Rs=i32([p.shape[0] for p in bl]), Cs=i32([eff_2d(p)[1] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
                 grad_first=bl[0].grad.data_ptr(),
@@ -945,7 +959,7 @@ class AdaPnmCache:
         i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=DEV)  # noqa: E731
         groups: dict[tuple[int, int], list] = {}
         for p in plist:
-            groups.setdefault(next_pow2_tile(p.shape[0], p.shape[1]), []).append(p)
+            groups.setdefault(next_pow2_tile(*eff_2d(p)), []).append(p)
         self.buckets = []
         for (BR, BC), bl in groups.items():  # noqa: N806
             st = [state_of(p) for p in bl]
@@ -963,7 +977,7 @@ class AdaPnmCache:
                 pos_addr=pos_addr, neg_addr=neg_addr, posc_addr=posc, negc_addr=negc,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
                 col_addr=i64([s["col"].data_ptr() for s in st]),
-                Rs=i32([p.shape[0] for p in bl]), Cs=i32([p.shape[1] for p in bl]),
+                Rs=i32([p.shape[0] for p in bl]), Cs=i32([eff_2d(p)[1] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
                 grad_first=bl[0].grad.data_ptr(),

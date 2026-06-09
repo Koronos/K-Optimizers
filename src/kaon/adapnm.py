@@ -663,12 +663,15 @@ class AdaPNM(Optimizer):
         native: list[Tensor] = []
         for p in params:
             bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding")
-            ok = bf_ok and ft.fused_eligible(p, cap)
-            if ok and md == "4bit" and p.shape[1] % 2 != 0:
+            # ndim>2 (conv) is matrixized to (out, in*kh*kw); needs a contiguous grad + fp32/bf16
+            # momentum (quant's per-row requant would reshape the conv state) -> else native.
+            conv_ok = p.ndim <= 2 or (p.grad is not None and p.grad.is_contiguous() and float_mom)
+            ok = bf_ok and conv_ok and ft.fused_eligible(p, cap)
+            if ok and md == "4bit" and ft.eff_2d(p)[1] % 2 != 0:
                 ok = False
-            big_ok = (bf_ok and p.ndim == 2 and p.is_cuda and p.is_contiguous()
+            big_ok = (bf_ok and conv_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous()
                       and p.dtype in (torch.float32, torch.bfloat16)
-                      and ft.next_pow2_tile(*p.shape)[0] * ft.next_pow2_tile(*p.shape)[1] > cap)
+                      and ft.next_pow2_tile(*ft.eff_2d(p))[0] * ft.next_pow2_tile(*ft.eff_2d(p))[1] > cap)
             if ok:
                 one_block.append(p)
             elif big_ok:
@@ -770,7 +773,7 @@ class AdaPNM(Optimizer):
 
     def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:
         b2, eps1 = group["betas"][1], group["eps"]
-        g = p.grad.float()
+        g = p.grad.float().reshape(p.shape[0], p.numel() // p.shape[0])  # conv -> matrixized (out, in*kh*kw)
         if group["gradient_centralization"]:
             g = g - g.mean(dim=1, keepdim=True)
         g = g.contiguous()
@@ -784,7 +787,7 @@ class AdaPNM(Optimizer):
         st = self.state[p]
         if not st:
             self._init_state(p, st, group)
-        R, C = p.shape  # noqa: N806 — matrix dims
+        R, C = p.shape[0], p.numel() // p.shape[0]  # noqa: N806 — matrix dims (conv -> matrixized)
         n = R * C
         md = group["momentum_dtype"]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
@@ -822,7 +825,8 @@ class AdaPNM(Optimizer):
         AdaPNM clip is computed separately, folded into ``sc`` in :meth:`_chunked_step_batched`)."""
         b2, eps1 = group["betas"][1], group["eps"]
         states = [self.state[p] for p in plist]
-        g = torch.stack([p.grad.float() for p in plist])                  # [N, R, C]
+        R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]    # noqa: N806 — conv -> matrixized
+        g = torch.stack([p.grad.float().reshape(R, C) for p in plist])     # [N, R, C]
         if group["gradient_centralization"]:
             g.sub_(g.mean(dim=-1, keepdim=True))
         gsq = g * g
@@ -849,7 +853,7 @@ class AdaPNM(Optimizer):
             if not st:
                 self._init_state(p, st, group)
         N = len(plist)  # noqa: N806
-        R, C = plist[0].shape  # noqa: N806
+        R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]  # noqa: N806 — conv -> matrixized
         n = R * C
         dev = plist[0].device
         md = group["momentum_dtype"]
