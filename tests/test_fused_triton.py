@@ -244,8 +244,9 @@ def test_big_batched_4bit_odd_C():
 
 def test_big_batched_matches_native_foreach_toggle():
     # the batched chunked path (default) must equal the in-fused native-foreach fallback (toggle off).
+    # fp32 momentum so the two paths match near-exactly (bf16 momentum rounds differently per path).
     cfg = dict(lr=2e-3, weight_decay=0.05, cautious=True, gradient_centralization=True,
-               momentum_dtype="bfloat16")
+               momentum_dtype="float32")
     pv = _bag([(512, 512)] * 3, torch.float32, seed=2)
     pn = _clone(pv)
     ov = Adakaon(pv, fused=True, **cfg)              # batched chunked

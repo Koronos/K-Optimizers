@@ -615,48 +615,64 @@ if _HAS_TRITON:
     # ---- batched chunked (multi-block, pointer-array) AdaPNM path for the many-same-shape big regime ----
     # Mirrors the Adakaon batched pair, plus AdaPNM's two-momentum structure. As in the per-tensor
     # AdaPNM chunked path, BOTH momenta are fp32 stacked temps (dequant'd host-side via the codec,
-    # EMA only the positive, requant'd back after pass 1) — so pos/neg are passed as stacked fp32
-    # ``[N, n]`` (flat ``t*n + offs``), not pointer arrays; only the weight ``p`` is a per-tensor
-    # pointer array written in place. Grad is stacked fp32 (GC folded in). The Adafactor RMS-clip is
-    # folded per-tensor into ``sc_ptr[N]`` host-side (pass 2 only — pass 1's keep-count is
-    # sign-invariant to the positive ``sc`` scalar, so it uses the unclipped scalar, matching native).
+    # EMA only the positive) — both momenta are read/written IN PLACE via the pos/neg pointer arrays
+    # (fp32 or bf16, MOM constexpr; int8/4bit dequant'd to fp32 temps host-side, the arrays then point
+    # at the temps and the positive is requant'd between passes). Only ``p`` and the two momenta are
+    # per-tensor pointer arrays; grad and r/c are stacked fp32 (GC folded into grad). The Adafactor
+    # RMS-clip's per-tensor ``sum((pn*r*c)^2)`` is accumulated IN-KERNEL (``rms_ptr[t]``, atomic) so the
+    # float case needs NO torch momentum temp at all — host turns it into ``sc_ptr[N]`` between passes.
     # WD is decoupled-on-p (``p *= 1-lr*wd``), applied in pass 2 and NOT gated by cautious.
 
     @triton.jit
     def _adapnm_chunked_mom_batched(
-        g_ptr, pos_ptr, neg_ptr, rfac_ptr, cfac_ptr, keep_ptr,
-        R, C, n, K, beta1_sq, beta0, inv_noise, sc,
-        CAUTIOUS: tl.constexpr, BLOCK: tl.constexpr,
+        g_ptr, pos_addr, neg_addr, rfac_ptr, cfac_ptr, keep_ptr, rms_ptr,
+        R, C, n, K, beta1_sq, beta0, inv_noise,
+        MOM: tl.constexpr, CAUTIOUS: tl.constexpr, CLIP: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        """Batched AdaPNM pass 1: EMA the positive momentum (fp32 stacked temp); accumulate the
-        cautious keep-count on the pos-neg delta into ``keep_ptr[t]`` (sc is the unclipped scalar)."""
+        """Batched AdaPNM pass 1: EMA the positive momentum in place (via pos pointer array). Per
+        tensor, accumulate the cautious keep-count (``keep_ptr[t]``) and the clip's running
+        ``sum((pn*r*c)^2)`` (``rms_ptr[t]``) from the pos-neg numerator."""
         pid = tl.program_id(0)
         t = pid // K
         k = pid % K
         offs = k * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
-        base = t * n + offs
-        g = tl.load(g_ptr + base, mask=mask, other=0.0)
-        m_pos = tl.load(pos_ptr + base, mask=mask, other=0.0)
+        g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)
+        posi = tl.load(pos_addr + t)
+        if MOM == 1:  # bf16 storage
+            posp = posi.to(tl.pointer_type(tl.bfloat16))
+            m_pos = tl.load(posp + offs, mask=mask, other=0.0).to(tl.float32)
+        else:         # fp32 storage (also the dequant'd int8/4bit temp)
+            posp = posi.to(tl.pointer_type(tl.float32))
+            m_pos = tl.load(posp + offs, mask=mask, other=0.0)
         m_pos = beta1_sq * m_pos + (1.0 - beta1_sq) * g
-        tl.store(pos_ptr + base, m_pos, mask=mask)
-        if CAUTIOUS:
-            m_neg = tl.load(neg_ptr + base, mask=mask, other=0.0)
+        if MOM == 1:
+            tl.store(posp + offs, m_pos.to(tl.bfloat16), mask=mask)
+        else:
+            tl.store(posp + offs, m_pos, mask=mask)
+        if CAUTIOUS or CLIP:
+            negi = tl.load(neg_addr + t)
+            if MOM == 1:
+                m_neg = tl.load(negi.to(tl.pointer_type(tl.bfloat16)) + offs, mask=mask, other=0.0).to(tl.float32)
+            else:
+                m_neg = tl.load(negi.to(tl.pointer_type(tl.float32)) + offs, mask=mask, other=0.0)
             i = offs // C
             j = offs % C
             rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
             cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
-            pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
-            delta = pn * rf * cf * sc
-            keep = ((delta * g) > 0.0) & mask
-            tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
+            urc = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise * rf * cf  # == U / bc2_sq
+            if CLIP:
+                tl.atomic_add(rms_ptr + t, tl.sum(tl.where(mask, urc * urc, 0.0)))
+            if CAUTIOUS:
+                keep = ((urc * g) > 0.0) & mask                    # sign-invariant to the positive sc
+                tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
     @triton.jit
     def _adapnm_chunked_apply_batched(
-        g_ptr, pos_ptr, neg_ptr, p_addr, rfac_ptr, cfac_ptr, sc_ptr, inv_mean_ptr,
+        g_ptr, pos_addr, neg_addr, p_addr, rfac_ptr, cfac_ptr, sc_ptr, inv_mean_ptr,
         R, C, n, K, beta0, inv_noise, lrwd, seed,
-        LOWP: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr, SR: tl.constexpr,
-        BLOCK: tl.constexpr,
+        LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
+        SR: tl.constexpr, BLOCK: tl.constexpr,
     ):
         """Batched AdaPNM pass 2: delta = cautious(pn * r*c * sc[t], g); p = p*(1-lr*wd) - delta."""
         pid = tl.program_id(0)
@@ -664,18 +680,23 @@ if _HAS_TRITON:
         k = pid % K
         offs = k * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
-        base = t * n + offs
         i = offs // C
         j = offs % C
-        m_pos = tl.load(pos_ptr + base, mask=mask, other=0.0)
-        m_neg = tl.load(neg_ptr + base, mask=mask, other=0.0)
+        posi = tl.load(pos_addr + t)
+        negi = tl.load(neg_addr + t)
+        if MOM == 1:
+            m_pos = tl.load(posi.to(tl.pointer_type(tl.bfloat16)) + offs, mask=mask, other=0.0).to(tl.float32)
+            m_neg = tl.load(negi.to(tl.pointer_type(tl.bfloat16)) + offs, mask=mask, other=0.0).to(tl.float32)
+        else:
+            m_pos = tl.load(posi.to(tl.pointer_type(tl.float32)) + offs, mask=mask, other=0.0)
+            m_neg = tl.load(negi.to(tl.pointer_type(tl.float32)) + offs, mask=mask, other=0.0)
         rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
         cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
         sc = tl.load(sc_ptr + t)
         pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
         delta = pn * rf * cf * sc
         if CAUTIOUS:
-            g = tl.load(g_ptr + base, mask=mask, other=0.0)
+            g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)
             inv_mean = tl.load(inv_mean_ptr + t)
             keep = (delta * g) > 0.0
             delta = tl.where(keep, delta * inv_mean, 0.0)

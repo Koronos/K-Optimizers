@@ -800,10 +800,11 @@ class AdaPNM(Optimizer):
     @torch.no_grad()
     def _chunked_step_batched(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict,
                               pos_pref: str, neg_pref: str) -> None:
-        """A bucket of >=2 same-shape big 2-D tensors via the batched AdaPNM chunked kernels. Both
-        momenta are fp32 stacked temps (dequant via the codec, EMA only the positive, requant between
-        passes) — only ``p`` is written in place via a pointer array. The Adafactor RMS-clip is folded
-        per-tensor into ``sc_apply[N]``; pass 1's keep-count uses the unclipped scalar (sign-invariant)."""
+        """A bucket of >=2 same-shape big 2-D tensors via the batched AdaPNM chunked kernels (~2
+        launches). fp32/bf16 momenta are read/written in place via the pos/neg pointer arrays (no
+        temps); int8/4bit dequant to fp32 temps, step on them, requant the positive between passes.
+        The Adafactor RMS-clip's per-tensor sum-of-squares is accumulated in-kernel (no torch momentum
+        temp in the float case), turned into ``sc_apply[N]`` between passes."""
         for p in plist:
             st = self.state[p]
             if not st:
@@ -814,37 +815,51 @@ class AdaPNM(Optimizer):
         dev = plist[0].device
         md = group["momentum_dtype"]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
+        clip = group["clip_threshold"]
         lowp = plist[0].dtype == torch.bfloat16
         sr = lowp and (group["bf16_method"] == "stochastic_rounding")
         states = [self.state[p] for p in plist]
         g, r, cfac = self._chunked_reductions_batched(plist, group)       # g [N,R,C], r [N,R], c [N,C]
-
-        m_pos = self._dequant_stacked(states, pos_pref, md, (R, C)).reshape(N, R, C)  # fp32 temp
-        m_neg = self._dequant_stacked(states, neg_pref, md, (R, C)).reshape(N, R, C)  # fp32 temp (RO)
         sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
+
+        quant = md in ("int8", "4bit")
+        if quant:  # dequant both momenta to stacked fp32 temps; arrays point at the temp slices
+            pos_temp = torch.empty(N, R, C, dtype=torch.float32, device=dev)
+            neg_temp = torch.empty(N, R, C, dtype=torch.float32, device=dev)
+            for i, st in enumerate(states):
+                pos_temp[i] = self._dequant_one(st, pos_pref, md, pos_temp[i])
+                neg_temp[i] = self._dequant_one(st, neg_pref, md, neg_temp[i])
+            pos_addr = torch.tensor([pos_temp[i].data_ptr() for i in range(N)], dtype=torch.int64, device=dev)
+            neg_addr = torch.tensor([neg_temp[i].data_ptr() for i in range(N)], dtype=torch.int64, device=dev)
+            mom = ft.MOM_FP32
+        else:      # fp32/bf16: pointer arrays straight to the stored buffers (EMA positive in place)
+            pos_addr = torch.tensor([s[pos_pref].data_ptr() for s in states], dtype=torch.int64, device=dev)
+            neg_addr = torch.tensor([s[neg_pref].data_ptr() for s in states], dtype=torch.int64, device=dev)
+            mom = ft.MOM_BF16 if md == "bfloat16" else ft.MOM_FP32
         p_addr = torch.tensor([p.data_ptr() for p in plist], dtype=torch.int64, device=dev)
         keep = torch.zeros(N, dtype=torch.int32, device=dev)
-        gf, posf, negf = g.reshape(-1), m_pos.reshape(-1), m_neg.reshape(-1)
+        rms_acc = torch.zeros(N, dtype=torch.float32, device=dev)
+        gf = g.reshape(-1)
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         ft._adapnm_chunked_mom_batched[grid](
-            gf, posf, negf, r, cfac, keep, R, C, n, K, c["beta1_sq"], c["beta0"], inv_noise, sc,
-            CAUTIOUS=cautious, BLOCK=1024,
+            gf, pos_addr, neg_addr, r, cfac, keep, rms_acc, R, C, n, K, c["beta1_sq"], c["beta0"],
+            inv_noise, MOM=mom, CAUTIOUS=cautious, CLIP=clip > 0.0, BLOCK=1024,
         )
-        self._store_stacked(states, pos_pref, md, m_pos)                  # requant/store updated positive
-        # Per-tensor Adafactor RMS-clip on U = pn * r * c * bc2_sq, folded into sc_apply[N].
-        clip = group["clip_threshold"]
+        if quant:  # requant the updated positive temp back into storage (apply reads the temp)
+            for i, st in enumerate(states):
+                self._store_one(st, pos_pref, md, pos_temp[i])
+        # Per-tensor Adafactor RMS-clip: rms_u = bc2_sq * sqrt(rms_acc / n); fold into sc_apply[N].
         if clip > 0.0:
-            u = m_pos.mul(1.0 + c["beta0"]).sub_(m_neg, alpha=c["beta0"])  # [N,R,C] pn numerator temp
-            u.mul_(r.unsqueeze(-1)).mul_(cfac.unsqueeze(-2))
-            rms_u = u.reshape(N, -1).norm(2, dim=1).mul_(inv_noise * c["bc2_sq"] / math.sqrt(n))  # [N]
+            rms_u = rms_acc.div_(n).sqrt_().mul_(c["bc2_sq"])             # [N]
             sc_apply = (sc / rms_u.div_(clip).clamp_(min=1.0)).contiguous()
         else:
             sc_apply = torch.full((N,), sc, dtype=torch.float32, device=dev)
         inv_mean = (1.0 / (keep.float() / n).clamp_(min=1e-8)) if cautious else torch.ones(N, device=dev)
         ft._adapnm_chunked_apply_batched[grid](
-            gf, posf, negf, p_addr, r, cfac, sc_apply, inv_mean, R, C, n, K, c["beta0"], inv_noise,
-            lr * wd, group["step"], LOWP=lowp, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
+            gf, pos_addr, neg_addr, p_addr, r, cfac, sc_apply, inv_mean, R, C, n, K, c["beta0"],
+            inv_noise, lr * wd, group["step"], LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0,
+            SR=sr, BLOCK=1024,
         )
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
