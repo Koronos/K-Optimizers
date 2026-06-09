@@ -363,6 +363,37 @@ def test_conv_quant_routes_to_native(mdtype):
     assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
 
 
+# ------------------------------------------------- candidate #4: fused reductions (no [N,R,C] stack)
+def _run_toggle(shapes, dtype, mdtype, *, fused_red, cautious=True, gc=True, wd=0.05, steps=6, seed=3):
+    cfg = dict(lr=2e-3, betas=(0.9, 0.999), weight_decay=wd, cautious=cautious,
+               gradient_centralization=gc, momentum_dtype=mdtype)
+    ps = _bag(shapes, dtype, seed)
+    opt = Adakaon(ps, fused=True, **cfg)
+    opt._fused_reductions = fused_red
+    gen = torch.Generator(device=DEV).manual_seed(11)
+    for _ in range(steps):
+        for p in ps:
+            p.grad = torch.randn(*p.shape, generator=gen, device=DEV, dtype=dtype)
+        opt.step()
+    torch.cuda.synchronize()
+    return ps
+
+
+@pytest.mark.parametrize("gc", [True, False])
+@pytest.mark.parametrize("shapes", [[(512, 512)] * 3, [(256, 128, 3, 3)] * 3])
+def test_fused_reductions_matches_torch_reductions_fp32(shapes, gc):
+    a = _run_toggle(shapes, torch.float32, "float32", fused_red=False, gc=gc)
+    b = _run_toggle(shapes, torch.float32, "float32", fused_red=True, gc=gc)
+    d = max((x.detach() - y.detach()).abs().max().item() for x, y in zip(a, b))
+    assert d < 1e-4, f"gc={gc} max|Δp|={d:.2e}"   # atomic reduction order -> ~1e-7, well under
+
+
+def test_fused_reductions_matches_native_bf16():
+    # default path (fused reductions ON) must still match native within the bf16 bound
+    d, scale, _ = _run_parity([(512, 512)] * 3, torch.bfloat16, "bfloat16")
+    assert d / scale < 5e-2, f"rel={d/scale:.2e}"
+
+
 # ----------------------------------------------------------------- decoupled weight decay
 def test_weight_decay_parity_fp32():
     # decoupled wd folded into delta before cautious -- must match native exactly (fp32)
