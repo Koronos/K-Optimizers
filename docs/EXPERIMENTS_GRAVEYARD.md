@@ -13,7 +13,7 @@
 >
 > Training-tool / speed experiments (fp8, 4-bit base, compile) live in **renga-flow**'s graveyard, not here.
 
-Legend: ⛔ REJECTED (measured, no win) · ↩ SUPERSEDED (renamed/absorbed)
+Legend: ⛔ REJECTED (measured, no win) · ↩ SUPERSEDED (renamed/absorbed) · ⏸ PARKED (built or measured, pending decision/merge)
 
 > The candidates-v2 **winners were promoted to `main`** in commit `1879645` ("Promote 6 verified
 > candidate optimizers + wrapper mixins"): **AdaBelief, ScheduleFree, ADOPT, AdamP, Lookahead, SAM**.
@@ -42,6 +42,29 @@ candidates) on any axis that matters, so none was promoted. Confirmed absent fro
 - **Orphan** — `feat/orphan` (early in-house ADOPT on the factored/quantized backend) → reimplemented + promoted as **ADOPT** (on main).
 - **Gemini** — `feat/gemini` (early in-house AdEMAMix) → reimplemented as **AdEMAMix** in candidates-v2 — but AdEMAMix was then **rejected** (see above), so this line did not ship.
 - **integration/candidates** (v1) → superseded by **integration/candidates-v2**.
+
+---
+
+## ⏸ PARKED — "send more to Triton" campaign (fused kernels), 2026-06-09
+A campaign to move native-torch parts of `Adakaon`/`AdaPNM` into the Triton núcleo, each measured with
+`benchmarks/fused/bench_fused.py` (new) and the control battery's fused twins. Verdicts (RTX 4080):
+
+- **#1 batched chunked kernel · #2 fused 1-D · #3 conv (ndim>2)** — `feat/fused-extra-kernels`.
+  **VERIFIED + measured wins, pending merge to `main`.** (1) Many-same-shape >tile_cap factors (the
+  Cosmos LoKr 236× 512×512 regime) now step through one batched pointer-array chunked kernel instead
+  of torch foreach — **Adakaon 1.65–1.79×, AdaPNM 1.93–2.06×**. (2) Biases/norms (1-D) get a
+  one-block non-factored kernel — **12–34×** on a 1-D bag (was unfused). (3) Conv `[out,in,kh,kw]` is
+  matrixized to `(out, in·kh·kw)` (its contiguous storage IS that view) and rides the 2-D paths —
+  **1.75–2.06×**. Parity **513/513**; renga-flow **Anima LoKr** real-config sanity = no iter_sec
+  regression (~2 % faster) + bit-near-identical loss. Side fix: the battery now times **steady-state**
+  ms/step (excludes one-time Triton JIT) — that artifact had shown a *false* "fused UNet regression".
+- **#4 fused reductions (subsumes #5 GC)** — `feat/fused-reductions` +
+  [`docs/FUSED_REDUCTIONS_DESIGN.md`](FUSED_REDUCTIONS_DESIGN.md). **MEASURED HIGH-VALUE, not built.**
+  The torch reductions are **73–80 % of the batched big step** (dominated by the 248 MB fp32 stack +
+  GC); a pointer-array reduction (no stack, GC in-kernel) could ~2× the real big step *again*. Parked
+  (NOT rejected) because it reaches the verified #1 mom/apply kernels (they'd read grad via pointer
+  array + GC in-kernel once the stack is gone) and needs a perf-tuned dual row/col reduction (atomics)
+  — a careful job. Resume steps + full design in the doc.
 
 ---
 
