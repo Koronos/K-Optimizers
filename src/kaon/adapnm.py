@@ -413,6 +413,9 @@ class AdaPNM(Optimizer):
         # When True, the many-same-shape big regime (>tile_cap) runs the batched chunked kernel; set
         # False to revert to the batched-native-foreach path (the A/B baseline). See _fused_big.
         self._fused_big_batched = True
+        # EXPERIMENTAL (candidate #4): fuse the batched-big reductions into Triton (grad via pointer
+        # array, no [N,R,C] stack, GC in-kernel). Default False until the A/B confirms a win.
+        self._fused_reductions = True
         self._fused_part: dict[int, tuple] = {}
         self._fused_ob_caches: dict[int, Any] = {}
         self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPnmCache (1-D)
@@ -859,10 +862,16 @@ class AdaPNM(Optimizer):
         md = group["momentum_dtype"]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
         clip = group["clip_threshold"]
+        gc = group["gradient_centralization"]
         lowp = plist[0].dtype == torch.bfloat16
         sr = lowp and (group["bf16_method"] == "stochastic_rounding")
         states = [self.state[p] for p in plist]
-        g, r, cfac = self._chunked_reductions_batched(plist, group)       # g [N,R,C], r [N,R], c [N,C]
+        fused_red = self._fused_reductions
+        if fused_red:  # grad via pointer array, no [N,R,C] stack (candidate #4); rowmean carries GC
+            g_addr, rowmean, r, cfac = self._chunked_reductions_fused(plist, group, ft, R, C, lowp)
+        else:
+            g, r, cfac = self._chunked_reductions_batched(plist, group)   # g [N,R,C], r [N,R], c [N,C]
+            gf = g.reshape(-1)
         sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
 
         quant = md in ("int8", "4bit")
@@ -882,13 +891,19 @@ class AdaPNM(Optimizer):
         p_addr = torch.tensor([p.data_ptr() for p in plist], dtype=torch.int64, device=dev)
         keep = torch.zeros(N, dtype=torch.int32, device=dev)
         rms_acc = torch.zeros(N, dtype=torch.float32, device=dev)
-        gf = g.reshape(-1)
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
-        ft._adapnm_chunked_mom_batched[grid](
-            gf, pos_addr, neg_addr, r, cfac, keep, rms_acc, R, C, n, K, c["beta1_sq"], c["beta0"],
-            inv_noise, MOM=mom, CAUTIOUS=cautious, CLIP=clip > 0.0, BLOCK=1024,
-        )
+        if fused_red:
+            ft._adapnm_chunked_mom_batched_g[grid](
+                g_addr, rowmean, pos_addr, neg_addr, r, cfac, keep, rms_acc, R, C, n, K,
+                c["beta1_sq"], c["beta0"], inv_noise,
+                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, CLIP=clip > 0.0, BLOCK=1024,
+            )
+        else:
+            ft._adapnm_chunked_mom_batched[grid](
+                gf, pos_addr, neg_addr, r, cfac, keep, rms_acc, R, C, n, K, c["beta1_sq"], c["beta0"],
+                inv_noise, MOM=mom, CAUTIOUS=cautious, CLIP=clip > 0.0, BLOCK=1024,
+            )
         if quant:  # requant the updated positive temp back into storage (apply reads the temp)
             for i, st in enumerate(states):
                 self._store_one(st, pos_pref, md, pos_temp[i])
@@ -899,11 +914,50 @@ class AdaPNM(Optimizer):
         else:
             sc_apply = torch.full((N,), sc, dtype=torch.float32, device=dev)
         inv_mean = (1.0 / (keep.float() / n).clamp_(min=1e-8)) if cautious else torch.ones(N, device=dev)
-        ft._adapnm_chunked_apply_batched[grid](
-            gf, pos_addr, neg_addr, p_addr, r, cfac, sc_apply, inv_mean, R, C, n, K, c["beta0"],
-            inv_noise, lr * wd, group["step"], LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0,
-            SR=sr, BLOCK=1024,
+        if fused_red:
+            ft._adapnm_chunked_apply_batched_g[grid](
+                g_addr, rowmean, pos_addr, neg_addr, p_addr, r, cfac, sc_apply, inv_mean, R, C, n, K,
+                c["beta0"], inv_noise, lr * wd, group["step"],
+                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
+            )
+        else:
+            ft._adapnm_chunked_apply_batched[grid](
+                gf, pos_addr, neg_addr, p_addr, r, cfac, sc_apply, inv_mean, R, C, n, K, c["beta0"],
+                inv_noise, lr * wd, group["step"], LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0,
+                SR=sr, BLOCK=1024,
+            )
+
+    @torch.no_grad()
+    def _chunked_reductions_fused(self, plist, group, ft, R, C, lowp):  # noqa: N803
+        """Candidate #4 for AdaPNM: row/col EMA factors via the Triton reduction kernel reading grad
+        from a pointer array (no [N,R,C] stack; GC in-kernel). No rms here — AdaPNM's clip is computed
+        in the mom kernel. Returns (g_addr, rowmean, r_factor[N,R], c_factor[N,C])."""
+        b2, eps1 = group["betas"][1], group["eps"]
+        N = len(plist)  # noqa: N806
+        dev = plist[0].device
+        states = [self.state[p] for p in plist]
+        g_addr = torch.tensor([p.grad.data_ptr() for p in plist], dtype=torch.int64, device=dev)
+        BC = ft.next_pow2_tile(R, C)[1]  # noqa: N806
+        BR = max(1, min(R, max(1, 16384 // BC)))  # noqa: N806
+        RB = (R + BR - 1) // BR  # noqa: N806
+        rowmean = torch.empty(N * R, dtype=torch.float32, device=dev)
+        rowsum = torch.empty(N * R, dtype=torch.float32, device=dev)
+        colsum = torch.zeros(N * C, dtype=torch.float32, device=dev)
+        ft._reduce_rowcol[(N * RB,)](
+            g_addr, rowmean, rowsum, colsum, R, C, RB,
+            LOWP=lowp, GC=group["gradient_centralization"], BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
         )
+        rowsum = rowsum.view(N, R)
+        colsum = colsum.view(N, C)
+        row = torch.stack([s["row"] for s in states])
+        col = torch.stack([s["col"] for s in states])
+        row.lerp_(rowsum.div(C).add_(eps1), 1.0 - b2)
+        col.lerp_(colsum.div(R).add_(eps1), 1.0 - b2)
+        torch._foreach_copy_([s["row"] for s in states], list(row.unbind(0)))
+        torch._foreach_copy_([s["col"] for s in states], list(col.unbind(0)))
+        r = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().contiguous()
+        cfac = col.rsqrt().contiguous()
+        return g_addr, rowmean, r, cfac
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving both quantized momenta's stored dtype.

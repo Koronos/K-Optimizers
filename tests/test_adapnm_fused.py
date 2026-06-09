@@ -280,6 +280,27 @@ def test_conv_quant_routes_to_native():
     assert d / scale < 5e-4, f"rel={d/scale:.2e}"
 
 
+# ----------------------------------------------------- candidate #4: fused reductions (no stack)
+@pytest.mark.parametrize("gc", [True, False])
+@pytest.mark.parametrize("shapes", [[(512, 512)] * 3, [(256, 128, 3, 3)] * 3])
+def test_fused_reductions_matches_torch_reductions_fp32(shapes, gc):
+    def run(fr):
+        ps = _bag(shapes, torch.float32, 3)
+        opt = AdaPNM(ps, fused=True, lr=2e-3, betas=(0.8, 0.999), beta0=0.5, eps=1e-30,
+                     weight_decay=0.05, cautious=True, gradient_centralization=gc, momentum_dtype="float32")
+        opt._fused_reductions = fr
+        gen = torch.Generator(device=DEV).manual_seed(11)
+        for _ in range(6):
+            for p in ps:
+                p.grad = torch.randn(*p.shape, generator=gen, device=DEV)
+            opt.step()
+        torch.cuda.synchronize()
+        return ps
+    a, b = run(False), run(True)
+    d = max((x.detach() - y.detach()).abs().max().item() for x, y in zip(a, b))
+    assert d < 1e-4, f"gc={gc} max|Δp|={d:.2e}"
+
+
 @pytest.mark.parametrize("cautious", [True, False])
 @pytest.mark.parametrize("gc", [True, False])
 def test_big_batched_features(cautious, gc):

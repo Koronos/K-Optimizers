@@ -486,6 +486,151 @@ if _HAS_TRITON:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
+    # ---- candidate #4: FUSED REDUCTIONS for the batched big regime (no 248MB torch stack) ----
+    # The torch reductions (stack -> GC -> gsq -> row/col EMA -> rms) were measured at 73-80% of the
+    # batched big step, dominated by the [N,R,C] fp32 stack + the GC pass. These kernels read each
+    # tensor's grad straight from a POINTER ARRAY (no stack), do GC in-kernel, and produce the per-
+    # tensor row/col sums + rms; the mom/apply "_g" variants below then re-read grad via the same
+    # pointer array (GC via the precomputed rowmean) so NOTHING materializes the [N,R,C] grad.
+    # One program owns BR rows x C cols of tensor t (grid = N * ceil(R/BR)). rowsum/rowmean are stored
+    # directly (the program owns those rows); colsum accumulates across row-blocks via atomic_add.
+
+    @triton.jit
+    def _reduce_rowcol(
+        g_addr, rowmean_ptr, rowsum_ptr, colsum_ptr, R, C, RB,
+        LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+    ):
+        """Per (tensor, row-block): GC (per-row mean over C) -> rowmean[N,R], rowsum_gsq[N,R] (direct),
+        colsum_gsq[N,C] (atomic). Padded cols load 0 so the per-row mean over the real C is exact."""
+        pid = tl.program_id(0)
+        t = pid // RB
+        rb = pid % RB
+        ri = rb * BR + tl.arange(0, BR)
+        ci = tl.arange(0, BC)
+        rmask = ri < R
+        cmask = ci < C
+        m2 = rmask[:, None] & cmask[None, :]
+        gbase = tl.load(g_addr + t)
+        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
+        if GC:
+            rmean = tl.sum(g, axis=1) / C.to(tl.float32)        # [BR] per-row mean over real C
+            tl.store(rowmean_ptr + t * R + ri, rmean, mask=rmask)
+            g = tl.where(m2, g - rmean[:, None], 0.0)
+        gsq = g * g
+        tl.store(rowsum_ptr + t * R + ri, tl.sum(gsq, axis=1), mask=rmask)
+        tl.atomic_add(colsum_ptr + t * C + ci, tl.sum(gsq, axis=0), mask=cmask)
+
+    @triton.jit
+    def _reduce_rms(
+        g_addr, rowmean_ptr, rfac_ptr, cfac_ptr, rms_ptr, R, C, RB,
+        LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+    ):
+        """Per (tensor, row-block): accumulate sum( (g' * r_factor * c_factor)^2 ) into rms_ptr[t]
+        (atomic), re-reading grad via the pointer array and GC via the precomputed rowmean."""
+        pid = tl.program_id(0)
+        t = pid // RB
+        rb = pid % RB
+        ri = rb * BR + tl.arange(0, BR)
+        ci = tl.arange(0, BC)
+        rmask = ri < R
+        cmask = ci < C
+        m2 = rmask[:, None] & cmask[None, :]
+        gbase = tl.load(g_addr + t)
+        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
+        if GC:
+            rmean = tl.load(rowmean_ptr + t * R + ri, mask=rmask, other=0.0)
+            g = tl.where(m2, g - rmean[:, None], 0.0)
+        rf = tl.load(rfac_ptr + t * R + ri, mask=rmask, other=0.0)
+        cf = tl.load(cfac_ptr + t * C + ci, mask=cmask, other=0.0)
+        u = g * rf[:, None] * cf[None, :]
+        tl.atomic_add(rms_ptr + t, tl.sum(u * u))
+
+    # mom/apply that read grad via the pointer array (+ GC via rowmean) instead of a stacked g_ptr.
+    @triton.jit
+    def _chunked_mom_batched_g(
+        g_addr, rowmean_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, inv_rms_lr_ptr,
+        lrwd, beta1, R, C, n, K,
+        LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
+        WD: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """As ``_chunked_mom_batched`` but grad comes from the pointer array (GC via rowmean[t, row])."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs % C
+        gbase = tl.load(g_addr + t)
+        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+        if GC:
+            g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
+        rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+        cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+        inv_rms_lr = tl.load(inv_rms_lr_ptr + t)
+        upd = g * rf * cf * inv_rms_lr
+        mi = tl.load(m_addr + t)
+        if MOM == 1:
+            mp = mi.to(tl.pointer_type(tl.bfloat16))
+            m = tl.load(mp + offs, mask=mask, other=0.0).to(tl.float32)
+        else:
+            mp = mi.to(tl.pointer_type(tl.float32))
+            m = tl.load(mp + offs, mask=mask, other=0.0)
+        m = beta1 * m + (1.0 - beta1) * upd
+        if MOM == 1:
+            tl.store(mp + offs, m.to(tl.bfloat16), mask=mask)
+        else:
+            tl.store(mp + offs, m, mask=mask)
+        if CAUTIOUS:
+            delta = m
+            if WD:
+                pi = tl.load(p_addr + t)
+                pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
+                delta = delta + lrwd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+            keep = ((delta * g) > 0.0) & mask
+            tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
+
+    @triton.jit
+    def _chunked_apply_batched_g(
+        g_addr, rowmean_ptr, m_addr, p_addr, inv_mean_ptr, lrwd, seed, R, C, n, K,
+        LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
+        WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """As ``_chunked_apply_batched`` but grad (for cautious) comes from the pointer array + GC."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        mi = tl.load(m_addr + t)
+        if MOM == 1:
+            m = tl.load(mi.to(tl.pointer_type(tl.bfloat16)) + offs, mask=mask, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(mi.to(tl.pointer_type(tl.float32)) + offs, mask=mask, other=0.0)
+        pi = tl.load(p_addr + t)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
+        p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        delta = m
+        if WD:
+            delta = delta + lrwd * p
+        if CAUTIOUS:
+            i = offs // C
+            gbase = tl.load(g_addr + t)
+            gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+            g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+            if GC:
+                g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
+            inv_mean = tl.load(inv_mean_ptr + t)
+            keep = (delta * g) > 0.0
+            delta = tl.where(keep, delta * inv_mean, 0.0)
+        res = p - delta
+        if SR:
+            res = sr_round(res, seed + t, offs)
+        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+
     # ---- one-block non-factored 1-D path (biases / norm scales) ----
     # A bag of many tiny 1-D tensors is the same launch-bound regime the 2-D one-block kernel wins
     # big on; a native torch-foreach stacks them (stack overhead dominates). This kernel owns one 1-D
@@ -800,6 +945,101 @@ if _HAS_TRITON:
         delta = pn * rf * cf * sc
         if CAUTIOUS:
             g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)
+            inv_mean = tl.load(inv_mean_ptr + t)
+            keep = (delta * g) > 0.0
+            delta = tl.where(keep, delta * inv_mean, 0.0)
+        pi = tl.load(p_addr + t)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
+        p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if WD:
+            p = p * (1.0 - lrwd)
+        res = p - delta
+        if SR:
+            res = sr_round(res, seed + t, offs)
+        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+
+    # AdaPNM mom/apply that read grad via the pointer array (+ GC via rowmean) — candidate #4 path.
+    @triton.jit
+    def _adapnm_chunked_mom_batched_g(
+        g_addr, rowmean_ptr, pos_addr, neg_addr, rfac_ptr, cfac_ptr, keep_ptr, rms_ptr,
+        R, C, n, K, beta1_sq, beta0, inv_noise,
+        LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
+        CLIP: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """As ``_adapnm_chunked_mom_batched`` but grad comes from the pointer array (GC via rowmean)."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        gbase = tl.load(g_addr + t)
+        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+        if GC:
+            g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
+        posi = tl.load(pos_addr + t)
+        if MOM == 1:
+            posp = posi.to(tl.pointer_type(tl.bfloat16))
+            m_pos = tl.load(posp + offs, mask=mask, other=0.0).to(tl.float32)
+        else:
+            posp = posi.to(tl.pointer_type(tl.float32))
+            m_pos = tl.load(posp + offs, mask=mask, other=0.0)
+        m_pos = beta1_sq * m_pos + (1.0 - beta1_sq) * g
+        if MOM == 1:
+            tl.store(posp + offs, m_pos.to(tl.bfloat16), mask=mask)
+        else:
+            tl.store(posp + offs, m_pos, mask=mask)
+        if CAUTIOUS or CLIP:
+            negi = tl.load(neg_addr + t)
+            if MOM == 1:
+                m_neg = tl.load(negi.to(tl.pointer_type(tl.bfloat16)) + offs, mask=mask, other=0.0).to(tl.float32)
+            else:
+                m_neg = tl.load(negi.to(tl.pointer_type(tl.float32)) + offs, mask=mask, other=0.0)
+            j = offs % C
+            rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+            cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+            urc = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise * rf * cf
+            if CLIP:
+                tl.atomic_add(rms_ptr + t, tl.sum(tl.where(mask, urc * urc, 0.0)))
+            if CAUTIOUS:
+                keep = ((urc * g) > 0.0) & mask
+                tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
+
+    @triton.jit
+    def _adapnm_chunked_apply_batched_g(
+        g_addr, rowmean_ptr, pos_addr, neg_addr, p_addr, rfac_ptr, cfac_ptr, sc_ptr, inv_mean_ptr,
+        R, C, n, K, beta0, inv_noise, lrwd, seed,
+        LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
+        WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """As ``_adapnm_chunked_apply_batched`` but grad (for cautious) comes from the pointer array + GC."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs % C
+        posi = tl.load(pos_addr + t)
+        negi = tl.load(neg_addr + t)
+        if MOM == 1:
+            m_pos = tl.load(posi.to(tl.pointer_type(tl.bfloat16)) + offs, mask=mask, other=0.0).to(tl.float32)
+            m_neg = tl.load(negi.to(tl.pointer_type(tl.bfloat16)) + offs, mask=mask, other=0.0).to(tl.float32)
+        else:
+            m_pos = tl.load(posi.to(tl.pointer_type(tl.float32)) + offs, mask=mask, other=0.0)
+            m_neg = tl.load(negi.to(tl.pointer_type(tl.float32)) + offs, mask=mask, other=0.0)
+        rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+        cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+        sc = tl.load(sc_ptr + t)
+        pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
+        delta = pn * rf * cf * sc
+        if CAUTIOUS:
+            gbase = tl.load(g_addr + t)
+            gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+            g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+            if GC:
+                g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
             inv_mean = tl.load(inv_mean_ptr + t)
             keep = (delta * g) > 0.0
             delta = tl.where(keep, delta * inv_mean, 0.0)
