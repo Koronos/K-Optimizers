@@ -1,8 +1,12 @@
-# Candidate #4 (+#5): fuse the factored reductions into Triton — DESIGN / PARKED (high-value)
+# Candidate #4 (+#5): fuse the factored reductions into Triton — BUILT + VERIFIED
 
-**Status:** PARKED on branch `feat/fused-reductions` (off the verified `feat/fused-extra-kernels`).
-Measured high-value; not rejected. Needs a careful, perf-tuned implementation (atomics), so it was
-parked rather than rushed. Subsumes candidate #5 (GC), which is part of the reductions.
+**Status:** BUILT and merged into `feat/fused-extra-kernels` (toggle `_fused_reductions`, default ON).
+Measured ANOTHER 2.76–2.79× on top of #1 (big regime → ~5× over native-foreach); parity vs native
+fp32 ~5e-7 / bf16 <2e-2; full repo 522/522. Subsumes candidate #5 (GC is done in the reduction
+kernel). This doc is kept as the implementation record. **Real-workload caveat:** on Anima DiT LoKr
+at 512–1024 px the 5× optimizer win is invisible in `iter_sec` (optimizer is <1 % of the DiT step);
+it's "free" + correct, and a real lever only in optimizer-bound regimes. The design below is what
+shipped.
 
 ## The finding (measured, RTX 4080)
 

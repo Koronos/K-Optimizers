@@ -45,26 +45,27 @@ candidates) on any axis that matters, so none was promoted. Confirmed absent fro
 
 ---
 
-## ⏸ PARKED — "send more to Triton" campaign (fused kernels), 2026-06-09
-A campaign to move native-torch parts of `Adakaon`/`AdaPNM` into the Triton núcleo, each measured with
-`benchmarks/fused/bench_fused.py` (new) and the control battery's fused twins. Verdicts (RTX 4080):
+## ✅ BUILT + VERIFIED — "send more to Triton" campaign (fused kernels), 2026-06-09
+All four candidates BUILT, parity-verified, and unified on `feat/fused-extra-kernels` (pending merge
+to `main`). Measured with `benchmarks/fused/bench_fused.py` (new) + the battery's fused twins + a
+renga-flow Anima LoKr real-config A/B. Verdicts (RTX 4080), **native-foreach → fused-total** bf16:
 
-- **#1 batched chunked kernel · #2 fused 1-D · #3 conv (ndim>2)** — `feat/fused-extra-kernels`.
-  **VERIFIED + measured wins, pending merge to `main`.** (1) Many-same-shape >tile_cap factors (the
-  Cosmos LoKr 236× 512×512 regime) now step through one batched pointer-array chunked kernel instead
-  of torch foreach — **Adakaon 1.65–1.79×, AdaPNM 1.93–2.06×**. (2) Biases/norms (1-D) get a
-  one-block non-factored kernel — **12–34×** on a 1-D bag (was unfused). (3) Conv `[out,in,kh,kw]` is
-  matrixized to `(out, in·kh·kw)` (its contiguous storage IS that view) and rides the 2-D paths —
-  **1.75–2.06×**. Parity **513/513**; renga-flow **Anima LoKr** real-config sanity = no iter_sec
-  regression (~2 % faster) + bit-near-identical loss. Side fix: the battery now times **steady-state**
-  ms/step (excludes one-time Triton JIT) — that artifact had shown a *false* "fused UNet regression".
-- **#4 fused reductions (subsumes #5 GC)** — `feat/fused-reductions` +
-  [`docs/FUSED_REDUCTIONS_DESIGN.md`](FUSED_REDUCTIONS_DESIGN.md). **MEASURED HIGH-VALUE, not built.**
-  The torch reductions are **73–80 % of the batched big step** (dominated by the 248 MB fp32 stack +
-  GC); a pointer-array reduction (no stack, GC in-kernel) could ~2× the real big step *again*. Parked
-  (NOT rejected) because it reaches the verified #1 mom/apply kernels (they'd read grad via pointer
-  array + GC in-kernel once the stack is gone) and needs a perf-tuned dual row/col reduction (atomics)
-  — a careful job. Resume steps + full design in the doc.
+- **#1 batched chunked kernel** — many-same-shape >tile_cap factors (Cosmos LoKr 236× 512×512) step
+  through one batched pointer-array chunked kernel; **#4 fused reductions** then removes the 248 MB
+  fp32 grad stack + does GC in-kernel via dual row/col reduction kernels (subsumes #5 GC). Combined:
+  **big Adakaon 4.82×, AdaPNM 5.15×** (≈13–14 ms → 2.7 ms). **#2 fused 1-D** (biases/norms): 12–34×.
+  **#3 conv** `[out,in,kh,kw]` matrixized to `(out, in·kh·kw)`: 4.4–4.6×. Parity 522/522 + vs native
+  (fp32 ~5e-7, bf16 <2e-2, conv ~1e-7). Toggles `_fused_big_batched` / `_fused_reductions` (default on).
+- **HONEST real-workload caveat (the decisive measurement):** on the user's **Anima DiT LoKr at
+  512/768/1024 px**, real `iter_sec` is **unchanged within ~1–2 % noise** vs both the prior fused and
+  non-fused — because `optimizer.step` is **<1 % of the DiT iteration** at these resolutions (the
+  matmul/attention fwd/bwd dominates; see [[cosmos-lokr-step-profile]]). Loss parity across all
+  resolutions Δ~1e-4. So the **5× is a real optimizer-step win that only moves wall-clock in
+  optimizer-bound regimes** (tiny models, huge LoRA/LoKr bags, very low res, conv/1-D-heavy full
+  fine-tunes) — it is "free" (parity-correct, never slower) but NOT a throughput lever for high-res
+  DiT LoKr. Full design: [`docs/FUSED_REDUCTIONS_DESIGN.md`](FUSED_REDUCTIONS_DESIGN.md).
+- Side fix: the control battery now times **steady-state** ms/step (excludes one-time Triton JIT) —
+  that artifact had shown a *false* "fused UNet regression".
 
 ---
 
