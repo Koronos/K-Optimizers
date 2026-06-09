@@ -10,37 +10,43 @@
 
 | # | optimizer | mean rank | 🥇 wins (rank 1) | identity |
 |---|---|---|---|---|
-| 1 | **Adakaon-nomom** | 2.7 | 🥇 memory | factored Adam, no momentum (minimum VRAM, regularizing) |
-| 2 | **Lion** | 3.0 | — | sign-momentum, no 2nd moment (lightest state) |
-| 3 | **torch.AdamW (fused)** | 3.6 | 🥇 iter-speed, LoRA-speed | torch.optim.AdamW, fused kernel — the EXTERNAL reference (not a kaon optimizer) |
-| 4 | **Adakaon-bf16** | 3.7 | 🥇 convergence, loss | factored Adam, bf16 momentum (AdamW-quality, low memory) |
-| 5 | **AdaPNM** | 3.9 | 🥇 generalization, constant-LR | positive-negative momentum (best generalization / constant-LR) |
-| 6 | **AdaMuon** | 4.1 | — | orthogonalized momentum + factored 2nd moment (convergence) |
+| 1 | **Adakaon-nomom** | 3.6 | 🥇 memory | factored Adam, no momentum (minimum VRAM, regularizing) |
+| 2 | **Lion** | 3.9 | — | sign-momentum, no 2nd moment (lightest state) |
+| 3 | **Adakaon-bf16-fused** | 4.0 | 🥇 LoRA-speed, loss | Adakaon-bf16, Triton-fused step (same math; speed twin of Adakaon-bf16) |
+| 4 | **Adakaon-bf16** | 4.6 | 🥇 convergence | factored Adam, bf16 momentum (AdamW-quality, low memory) |
+| 5 | **torch.AdamW (fused)** | 4.7 | 🥇 iter-speed | torch.optim.AdamW, fused kernel — the EXTERNAL reference (not a kaon optimizer) |
+| 6 | **AdaPNM-fused** | 4.9 | 🥇 generalization, constant-LR | AdaPNM, Triton-fused step (same math; speed twin of AdaPNM) |
+| 7 | **AdaPNM** | 5.0 | — | positive-negative momentum (best generalization / constant-LR) |
+| 8 | **AdaMuon** | 5.4 | — | orthogonalized momentum + factored 2nd moment (convergence) |
 ## 🎯 Loss × generalization (scheduled, progressive curriculum)
 
 The headline for small-data fine-tuning: rank by the **train–val gap**, not the loss.
 
 | # (by gap) | optimizer | held-out loss | train–val gap |
 |---|---|---|---|
-| 1 | AdaPNM | 0.0813 | +0.0079 |
-| 2 | torch.AdamW (fused) | 0.0799 | +0.0103 |
-| 3 | Lion | 0.0766 | +0.0142 |
-| 4 | Adakaon-nomom | 0.0796 | +0.0170 |
-| 5 | AdaMuon | 0.0759 | +0.0186 |
-| 6 | Adakaon-bf16 | 0.0733 | +0.0204 |
+| 1 | AdaPNM-fused | 0.0822 | +0.0078 |
+| 2 | AdaPNM | 0.0817 | +0.0085 |
+| 3 | torch.AdamW (fused) | 0.0799 | +0.0103 |
+| 4 | Lion | 0.0766 | +0.0142 |
+| 5 | Adakaon-nomom | 0.0796 | +0.0170 |
+| 6 | Adakaon-bf16-fused | 0.0721 | +0.0173 |
+| 7 | AdaMuon | 0.0759 | +0.0186 |
+| 8 | Adakaon-bf16 | 0.0741 | +0.0213 |
 
-## ⏱️ Convergence speed & time×quality (target held-out loss ≤ 0.0813)
+## ⏱️ Convergence speed & time×quality (target held-out loss ≤ 0.0822)
 
 `steps→target` = how fast it reaches the common quality bar; `time→target` folds in the per-step cost (the metric that actually matters in wall-clock).
 
 | # (by time×quality) | optimizer | steps→target | ms/step | time→target (s) |
 |---|---|---|---|---|
-| 1 | Adakaon-bf16 | 1500 | 14.8 | 22.14 |
+| 1 | Adakaon-bf16 | 1500 | 14.5 | 21.70 |
 | 2 | Lion | 1750 | 13.4 | 23.42 |
 | 3 | Adakaon-nomom | 1875 | 13.4 | 25.04 |
 | 4 | torch.AdamW (fused) | 2000 | 12.7 | 25.48 |
-| 5 | AdaMuon | 1625 | 16.9 | 27.52 |
-| 6 | AdaPNM | 2000 | 14.5 | 29.03 |
+| 5 | Adakaon-bf16-fused | 1625 | 16.4 | 26.57 |
+| 6 | AdaMuon | 1625 | 16.9 | 27.52 |
+| 7 | AdaPNM | 2000 | 15.0 | 30.02 |
+| 8 | AdaPNM-fused | 2000 | 16.5 | 32.96 |
 
 ## ⚡ Per-iteration speed
 
@@ -51,9 +57,11 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 1 | torch.AdamW (fused) | 12.7 | 0.88 |
 | 2 | Adakaon-nomom | 13.4 | 2.96 |
 | 3 | Lion | 13.4 | 3.32 |
-| 4 | AdaPNM | 14.5 | 5.38 |
-| 5 | Adakaon-bf16 | 14.8 | 3.54 |
-| 6 | AdaMuon | 16.9 | 6.55 |
+| 4 | Adakaon-bf16 | 14.5 | 3.66 |
+| 5 | AdaPNM | 15.0 | 5.73 |
+| 6 | Adakaon-bf16-fused | 16.4 | 0.27 |
+| 7 | AdaPNM-fused | 16.5 | 0.30 |
+| 8 | AdaMuon | 16.9 | 6.55 |
 
 ## 💾 Memory (measured optimizer state)
 
@@ -63,8 +71,10 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 2 | AdaMuon | 1.04 |
 | 3 | Lion | 2.00 |
 | 4 | Adakaon-bf16 | 2.03 |
-| 5 | AdaPNM | 4.03 |
-| 6 | torch.AdamW (fused) | 8.00 |
+| 5 | Adakaon-bf16-fused | 2.03 |
+| 6 | AdaPNM | 4.03 |
+| 7 | AdaPNM-fused | 4.03 |
+| 8 | torch.AdamW (fused) | 8.00 |
 
 ## 🔁 Continuity — robustness at constant LR (resumable, no schedule)
 
@@ -72,9 +82,11 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 
 | # (by const gap) | optimizer | const-LR gap | Δ vs scheduled |
 |---|---|---|---|
-| 1 | AdaPNM | +0.0063 | -0.0015 |
-| 2 | Adakaon-nomom | +0.0075 | -0.0095 |
-| 3 | Lion | +0.0090 | -0.0052 |
-| 4 | torch.AdamW (fused) | +0.0108 | +0.0005 |
-| 5 | Adakaon-bf16 | +0.0168 | -0.0036 |
-| 6 | AdaMuon | +0.0175 | -0.0011 |
+| 1 | AdaPNM-fused | +0.0049 | -0.0029 |
+| 2 | AdaPNM | +0.0068 | -0.0017 |
+| 3 | Adakaon-nomom | +0.0075 | -0.0095 |
+| 4 | Lion | +0.0090 | -0.0052 |
+| 5 | torch.AdamW (fused) | +0.0108 | +0.0005 |
+| 6 | Adakaon-bf16-fused | +0.0148 | -0.0025 |
+| 7 | Adakaon-bf16 | +0.0159 | -0.0054 |
+| 8 | AdaMuon | +0.0175 | -0.0011 |

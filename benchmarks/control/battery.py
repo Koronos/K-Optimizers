@@ -36,8 +36,10 @@ import time
 
 import torch
 
-REPO = "/media/koronos/arca/repos/K-Optimizers"
-HERE = f"{REPO}/benchmarks/control"
+# Resolve paths relative to THIS file so the battery works in a git worktree (reads the worktree's
+# registry/harness and writes its own results.json/RANKINGS.md) instead of always hitting main.
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
 
 
 def _load(name, path):
