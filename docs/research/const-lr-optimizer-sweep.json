@@ -1,0 +1,495 @@
+{
+  "_meta": {
+    "what": "AdaPNM/Adakaon/AdamW/SAM gap\u00d7loss sweep on the kaon control battery (CONSTANT-LR focus)",
+    "generated": "session e9b03ea2 (2026-06-09/10)",
+    "battery_sig": "C128_N2000_s2_w10_f1775030",
+    "target_box": "const-LR loss 0.070-0.080 AND const-LR gap 0.0070-0.0080",
+    "caveat": "proxy (C128 UNet), NOT FID; LRs ~100x real; confirm by eye on real LoKr"
+  },
+  "results": {
+    "AdaPNM": {
+      "config": {
+        "base": "AdaPNM",
+        "lr": 0.0024,
+        "betas": [
+          0.8,
+          0.999
+        ],
+        "beta0": 0.5,
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "weight_decay": 0.0
+      },
+      "scheduled": {
+        "loss": 0.0817,
+        "gap": 0.0085,
+        "train": 0.0732
+      },
+      "constant": {
+        "loss": 0.0977,
+        "gap": 0.0068,
+        "train": 0.0908
+      }
+    },
+    "AdaPNM-b0.2": {
+      "config": {
+        "base": "AdaPNM",
+        "lr": 0.0024,
+        "betas": [
+          0.8,
+          0.999
+        ],
+        "beta0": 0.2,
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "weight_decay": 0.0
+      },
+      "scheduled": {
+        "loss": 0.0803,
+        "gap": 0.0092,
+        "train": 0.0711
+      },
+      "constant": {
+        "loss": 0.0887,
+        "gap": 0.0078,
+        "train": 0.081
+      }
+    },
+    "AdaPNM-wd0.01": {
+      "config": {
+        "base": "AdaPNM",
+        "lr": 0.0024,
+        "betas": [
+          0.8,
+          0.999
+        ],
+        "beta0": 0.5,
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "weight_decay": 0.01
+      },
+      "scheduled": {
+        "loss": 0.0807,
+        "gap": 0.0079,
+        "train": 0.0728
+      },
+      "constant": {
+        "loss": 0.0918,
+        "gap": 0.0063,
+        "train": 0.0854
+      }
+    },
+    "AdaPNM-wd0.1": {
+      "config": {
+        "base": "AdaPNM",
+        "lr": 0.0024,
+        "betas": [
+          0.8,
+          0.999
+        ],
+        "beta0": 0.5,
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "weight_decay": 0.1
+      },
+      "scheduled": {
+        "loss": 0.0774,
+        "gap": 0.0078,
+        "train": 0.0695
+      },
+      "constant": {
+        "loss": 0.0933,
+        "gap": 0.0052,
+        "train": 0.0881
+      }
+    },
+    "AdamW-wd0": {
+      "config": {
+        "base": "torch.AdamW",
+        "lr": 0.0012,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "fused": true,
+        "weight_decay": 0.0
+      },
+      "scheduled": {
+        "loss": 0.0794,
+        "gap": 0.0098,
+        "train": 0.0696
+      },
+      "constant": {
+        "loss": 0.0816,
+        "gap": 0.0101,
+        "train": 0.0715
+      }
+    },
+    "torch.AdamW (fused)": {
+      "config": {
+        "base": "torch.AdamW",
+        "lr": 0.0012,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "fused": true,
+        "weight_decay": 0.01,
+        "note": "torch default wd"
+      },
+      "scheduled": {
+        "loss": 0.0805,
+        "gap": 0.0114,
+        "train": 0.0691
+      },
+      "constant": {
+        "loss": 0.0839,
+        "gap": 0.0124,
+        "train": 0.0715
+      }
+    },
+    "AdamW-wd0.1": {
+      "config": {
+        "base": "torch.AdamW",
+        "lr": 0.0012,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "fused": true,
+        "weight_decay": 0.1
+      },
+      "scheduled": {
+        "loss": 0.0782,
+        "gap": 0.0114,
+        "train": 0.0668
+      },
+      "constant": {
+        "loss": 0.0798,
+        "gap": 0.0104,
+        "train": 0.0694
+      }
+    },
+    "Adakaon-bf16": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0012,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "weight_decay": 0.0
+      },
+      "scheduled": {
+        "loss": 0.0741,
+        "gap": 0.0213,
+        "train": 0.0528
+      },
+      "constant": {
+        "loss": 0.0732,
+        "gap": 0.0159,
+        "train": 0.0573
+      }
+    },
+    "Adakaon-nomom": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0006,
+        "lr_const": 0.0012,
+        "betas": [
+          0.0,
+          0.999
+        ],
+        "cautious": false,
+        "momentum_dtype": "bfloat16",
+        "weight_decay": 0.0
+      },
+      "scheduled": {
+        "loss": 0.0795,
+        "gap": 0.0169,
+        "train": 0.0626
+      },
+      "constant": {
+        "loss": 0.0896,
+        "gap": 0.0074,
+        "train": 0.0822
+      }
+    },
+    "Adakaon-nomom-wd0.01": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0006,
+        "lr_const": 0.0012,
+        "betas": [
+          0.0,
+          0.999
+        ],
+        "cautious": false,
+        "momentum_dtype": "bfloat16",
+        "weight_decay": 0.01
+      },
+      "scheduled": {
+        "loss": 0.0796,
+        "gap": 0.0171,
+        "train": 0.0625
+      },
+      "constant": {
+        "loss": 0.0867,
+        "gap": 0.0076,
+        "train": 0.0791
+      }
+    },
+    "Adakaon-nomom-wd0.1": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0006,
+        "lr_const": 0.0012,
+        "betas": [
+          0.0,
+          0.999
+        ],
+        "cautious": false,
+        "momentum_dtype": "bfloat16",
+        "weight_decay": 0.1
+      },
+      "scheduled": {
+        "loss": 0.0793,
+        "gap": 0.0165,
+        "train": 0.0627
+      },
+      "constant": {
+        "loss": 0.0871,
+        "gap": 0.009,
+        "train": 0.0781
+      }
+    },
+    "Adakaon-fused-wd0.01": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0012,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "fused": true,
+        "weight_decay": 0.01
+      },
+      "scheduled": {
+        "loss": 0.0746,
+        "gap": 0.0211,
+        "train": 0.0535
+      },
+      "constant": {
+        "loss": 0.0734,
+        "gap": 0.0154,
+        "train": 0.058
+      }
+    },
+    "Adakaon-fused-wd0.1": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0012,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "fused": true,
+        "weight_decay": 0.1
+      },
+      "scheduled": {
+        "loss": 0.0705,
+        "gap": 0.0177,
+        "train": 0.0528
+      },
+      "constant": {
+        "loss": 0.0718,
+        "gap": 0.0147,
+        "train": 0.0571
+      }
+    },
+    "Adakaon-b1-0.7": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0012,
+        "betas": [
+          0.7,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "fused": true
+      },
+      "scheduled": {
+        "loss": 0.0769,
+        "gap": 0.0134,
+        "train": 0.0636
+      },
+      "constant": {
+        "loss": 0.0795,
+        "gap": 0.0117,
+        "train": 0.0678
+      }
+    },
+    "Adakaon-b1-0.5": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0012,
+        "betas": [
+          0.5,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "fused": true
+      },
+      "scheduled": {
+        "loss": 0.0742,
+        "gap": 0.0108,
+        "train": 0.0634
+      },
+      "constant": {
+        "loss": 0.0795,
+        "gap": 0.0092,
+        "train": 0.0702
+      }
+    },
+    "Adakaon-b1-0.3": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0012,
+        "betas": [
+          0.3,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "fused": true
+      },
+      "scheduled": {
+        "loss": 0.0763,
+        "gap": 0.0126,
+        "train": 0.0638
+      },
+      "constant": {
+        "loss": 0.0797,
+        "gap": 0.0097,
+        "train": 0.07
+      }
+    },
+    "Adakaon-b1-0.2": {
+      "config": {
+        "base": "Adakaon",
+        "lr": 0.0012,
+        "betas": [
+          0.2,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "fused": true
+      },
+      "scheduled": {
+        "loss": 0.0789,
+        "gap": 0.009,
+        "train": 0.0699
+      },
+      "constant": {
+        "loss": 0.0806,
+        "gap": 0.0086,
+        "train": 0.072
+      }
+    },
+    "Lion": {
+      "config": {
+        "base": "Lion",
+        "note": "in-house Lion at its tuned proxy lr (see registry)"
+      },
+      "scheduled": {
+        "loss": 0.0768,
+        "gap": 0.0144,
+        "train": 0.0624
+      },
+      "constant": {
+        "loss": 0.0806,
+        "gap": 0.0084,
+        "train": 0.0722
+      }
+    },
+    "SAM-b1-0.2-r0.05": {
+      "config": {
+        "base": "SAM(Adakaon)",
+        "lr": 0.0012,
+        "betas": [
+          0.2,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "rho": 0.05
+      },
+      "scheduled": {
+        "loss": 0.0837,
+        "gap": 0.0059,
+        "train": 0.0778
+      },
+      "constant": {
+        "loss": 0.0858,
+        "gap": 0.0055,
+        "train": 0.0802
+      }
+    },
+    "SAM-b1-0.2-r0.1": {
+      "config": {
+        "base": "SAM(Adakaon)",
+        "lr": 0.0012,
+        "betas": [
+          0.2,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "rho": 0.1
+      },
+      "scheduled": {
+        "loss": 0.0926,
+        "gap": 0.0035,
+        "train": 0.0891
+      },
+      "constant": {
+        "loss": 0.0944,
+        "gap": 0.0025,
+        "train": 0.0919
+      }
+    },
+    "SAM-b1-0.2-r0.05-fused": {
+      "config": {
+        "base": "SAM(Adakaon)",
+        "lr": 0.0012,
+        "betas": [
+          0.2,
+          0.999
+        ],
+        "cautious": true,
+        "momentum_dtype": "bfloat16",
+        "fused": true,
+        "rho": 0.05
+      },
+      "scheduled": {
+        "loss": 0.0837,
+        "gap": 0.0054,
+        "train": 0.0783
+      },
+      "constant": {
+        "loss": 0.086,
+        "gap": 0.0046,
+        "train": 0.0814
+      }
+    }
+  }
+}
