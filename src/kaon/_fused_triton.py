@@ -1169,6 +1169,7 @@ if _HAS_TRITON:
         sc = tl.load(scp + offs // FBLOCK, mask=mask, other=0.0)
         m = (nib - 8.0) * sc
         e = alpha * m
+        e = tl.where(e != e, 0.0, e)  # NaN (e.g. 0*inf from a blown block scale) -> zero climb
         e = tl.minimum(tl.maximum(e, -clamp), clamp)  # per-element climb bound (MSAM._climb_bound)
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))

@@ -214,6 +214,22 @@ def test_none_norm_spike_is_clamped():
         assert torch.equal(a.data, w)
 
 
+def test_none_norm_nonfinite_momentum_cannot_poison_weights():
+    """A non-finite momentum coordinate (e.g. 0*inf from a blown quant block scale) must
+    contribute ZERO climb — NaN passes through clamp(), so the sanitization is load-bearing
+    (second real-training NaN, 2026-06-10)."""
+    pa = _params()
+    opt = MSAM(pa, rho=-1.5, norm="none", **KW)
+    _attach_grads(pa, 1)
+    opt.step()
+    opt.eval()
+    st = opt._momentum_owner().state[pa[0]]
+    st["m"][0, 0] = float("nan")
+    st["m"][0, 1] = float("inf")
+    opt.train()  # re-climb through the poisoned momentum
+    assert all(torch.isfinite(p).all() for p in pa), "climb wrote non-finite weights"
+
+
 def test_climb_bound_frozen_across_lr_change():
     """An LR-scheduler change between steps must not corrupt the removal: the bound is
     frozen at climb time, so (climb at lr1) -> (lr change) -> (removal) is exact."""

@@ -58,6 +58,17 @@ from kaon._wrappers import CodecBuffer, WrapsInnerOptimizer
 
 __all__ = ["MSAM"]
 
+# Env-gated divergence probe (zero overhead when unset; same env var as AdaPNM's probe).
+# Set KAON_PROBE_LOG=/path/to/log to record, per step, the FIRST non-finite tensor and the
+# PHASE it appeared in — the discriminating fact for a real-training NaN:
+#   [GRAD]  non-finite gradient on entry      -> NaN entered via the forward/backward at the
+#           perturbed point (suspect the batch/bucket/precision, not the optimizer state)
+#   [STATE] weights/momentum non-finite after the inner step -> inner optimizer channel
+#   [CLIMB] weights non-finite after the climb -> the perturbation itself wrote it
+import os  # noqa: E402
+
+_PROBE_LOG = os.environ.get("KAON_PROBE_LOG")
+
 
 class MSAM(WrapsInnerOptimizer, Optimizer):
     """Momentum-SAM wrapping a base kaon optimizer (default :class:`~kaon.adakaon.Adakaon`).
@@ -212,6 +223,10 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             else:  # "none": raw momentum — rho is a lookahead in OPTIMIZER-STEP units
                 m.mul_(sign * self.rho)
                 bound = self._climb_bound(group, sign)
+                # NaN passes through clamp(): a non-finite momentum coordinate (e.g. a
+                # 0*inf from a blown 4-bit block scale) must contribute ZERO climb, never
+                # poison the weights. inf is mapped to +-bound by the clamp either way.
+                torch.nan_to_num_(m, nan=0.0, posinf=bound, neginf=-bound)
                 m.clamp_(-bound, bound)  # per-element stability cap (see _climb_bound)
             if plist[0].dtype == torch.float32:
                 torch._foreach_add_([p.data for p in plist], list(m.unbind(0)))
@@ -295,6 +310,28 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             self._apply(+1.0)
         self._train_mode = True
 
+    # ------------------------------------------------------------------- probe
+    @torch.no_grad()
+    def _probe(self, phase: str) -> None:
+        """Log the first non-finite tensor for ``phase`` (see module docstring). Probe-only."""
+        self._probe_step = getattr(self, "_probe_step", 0)
+        for p, st, md, _group in self._momentum_params():
+            bad = None
+            if phase == "GRAD" and p.grad is not None and not torch.isfinite(p.grad).all():
+                bad = f"grad absmax={p.grad.abs().max().item():.3e}"
+            elif not torch.isfinite(p.data).all():
+                bad = f"weight absmax={p.data.detach().abs().max().item():.3e}"
+            elif phase == "STATE":
+                m = CodecBuffer.read(st, "m", md, p)
+                if not torch.isfinite(m).all():
+                    sc = st.get("m_scale")
+                    bad = (f"momentum (codec {md}; scale absmax="
+                           f"{sc.abs().max().item():.3e})" if sc is not None else f"momentum ({md})")
+            if bad is not None:
+                with open(_PROBE_LOG, "a") as fh:  # noqa: SIM115 — diagnostics only
+                    fh.write(f"[{phase}] step={self._probe_step} shape={tuple(p.shape)} {bad}\n")
+                return
+
     # --------------------------------------------------------------------- step
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
@@ -303,6 +340,9 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 "MSAM.step() called outside train mode. Call optimizer.train() before the "
                 "training step (and optimizer.eval() before sampling / checkpointing)."
             )
+        if _PROBE_LOG:
+            self._probe_step = getattr(self, "_probe_step", 0) + 1
+            self._probe("GRAD")
         # 1) remove the previous climb — the incoming p.grad was computed at the
         #    perturbed point (that is the SAM gradient); the update belongs at the base.
         if self._has_e:
@@ -311,6 +351,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._eclamp.clear()  # next climb re-freezes the per-element bound at the CURRENT lr
         # 2) base step at the true weights, with the perturbed-point gradient.
         loss = self.inner.step(closure)
+        if _PROBE_LOG:
+            self._probe("STATE")
         # 3) climb along the refreshed momentum for the NEXT forward/backward.
         if self.rho != 0.0:
             if self.norm == "global":
@@ -321,6 +363,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             if climb:
                 self._apply(+1.0)
                 self._has_e = True
+        if _PROBE_LOG:
+            self._probe("CLIMB")
         return loss
 
     # -------------------------------------------------------------- state_dict
