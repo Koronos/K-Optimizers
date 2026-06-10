@@ -1144,7 +1144,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _axpy_4bit_batched(
-        p_addr, pk_addr, sc_addr, alpha, n, K, seed,
+        p_addr, pk_addr, sc_addr, alpha, clamp, n, K, seed,
         FBLOCK: tl.constexpr, LOWP: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
     ):
         """``p += alpha * dequant_4bit(m)`` over a same-shape bucket, one pass, no fp32 temp.
@@ -1168,9 +1168,11 @@ if _HAS_TRITON:
         scp = tl.load(sc_addr + t).to(tl.pointer_type(tl.float32))
         sc = tl.load(scp + offs // FBLOCK, mask=mask, other=0.0)
         m = (nib - 8.0) * sc
+        e = alpha * m
+        e = tl.minimum(tl.maximum(e, -clamp), clamp)  # per-element climb bound (MSAM._climb_bound)
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-        res = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32) + alpha * m
+        res = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32) + e
         if LOWP and SR:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)

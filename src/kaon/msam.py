@@ -117,6 +117,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._mnorm = 0.0  # global ||m|| cached at climb time (m is unchanged until the next inner step)
         self._axpy_cache: dict[str, Any] | None = None  # Triton 4bit fast-path pointer arrays
         self._axpy_seed = 0                             # SR seed counter for the fused axpy
+        self._eclamp: dict[int, float] = {}             # per-group climb bound, frozen per cycle
 
     # ------------------------------------------------------------- perturbation
     def _momentum_owner(self) -> Any:
@@ -128,8 +129,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             owner = owner.inner
         return owner
 
-    def _momentum_params(self) -> list[tuple[Tensor, dict[str, Any], str]]:
-        """Every (param, inner_state, momentum_dtype) that has a momentum buffer."""
+    def _momentum_params(self) -> list[tuple[Tensor, dict[str, Any], str, dict[str, Any]]]:
+        """Every (param, inner_state, momentum_dtype, group) that has a momentum buffer."""
         out = []
         owner_state = self._momentum_owner().state
         for group in self.param_groups:
@@ -137,27 +138,50 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             for p in group["params"]:
                 st = owner_state.get(p)
                 if st and "m" in st:
-                    out.append((p, st, md))
+                    out.append((p, st, md, group))
         return out
 
-    def _buckets(self) -> list[tuple[list[Tensor], list[dict[str, Any]], str, tuple[int, ...]]]:
-        """Group the momentum-carrying params by (shape, dtype, momentum_dtype) so the
-        perturbation reads/applies as a few stacked ops instead of a per-param loop (the
-        per-param dequant x2 per step made the 512-tiny-tensor LoRA regime ~10x slower)."""
-        by_key: dict[tuple[Any, ...], tuple[list[Tensor], list[dict[str, Any]]]] = {}
-        for p, st, md in self._momentum_params():
-            key = (tuple(p.shape), p.dtype, md)
-            plist, states = by_key.setdefault(key, ([], []))
+    def _buckets(self) -> list[tuple[list[Tensor], list[dict[str, Any]], str, tuple[int, ...], dict[str, Any]]]:
+        """Group the momentum-carrying params by (shape, dtype, momentum_dtype, group) so
+        the perturbation reads/applies as a few stacked ops instead of a per-param loop
+        (the per-param dequant x2 per step made the 512-tiny-tensor LoRA regime ~10x
+        slower). Buckets never mix param groups: the per-element climb bound is a
+        per-group quantity (it reads the group's lr / clip_threshold)."""
+        by_key: dict[tuple[Any, ...], tuple[list[Tensor], list[dict[str, Any]], dict[str, Any]]] = {}
+        for p, st, md, group in self._momentum_params():
+            key = (tuple(p.shape), p.dtype, md, id(group))
+            plist, states, _g = by_key.setdefault(key, ([], [], group))
             plist.append(p)
             states.append(st)
-        return [(plist, states, key[2], key[0]) for key, (plist, states) in by_key.items()]
+        return [(plist, states, key[2], key[0], g) for key, (plist, states, g) in by_key.items()]
+
+    def _climb_bound(self, group: dict[str, Any], sign: float) -> float:
+        """Per-element cap on the climb: ``|e_i| <= |rho| * clip_threshold * lr``.
+
+        The stability guard for ``norm="none"`` (the same failure channel AdaPNM's
+        ``clip_threshold`` closed): Adakaon's RMS clip bounds the update's *RMS*, not its
+        per-element max, so a near-zero factored col-EMA concentrates ~sqrt(n)*lr spikes
+        on a few coordinates; the momentum accumulates them and the lookahead would hold
+        the weights displaced k-fold along the spike between steps (and the 4-bit codec
+        smears a spike over its 128-block neighbours) — measured NaN on a real Cosmos
+        LoKr run at step ~406. The cap says: no coordinate may be displaced further than
+        ``k`` maximum-allowed update steps. Inactive in the normal regime (typical
+        ``|m_i| ~ lr``), it bites exactly on the runaway channel.
+
+        The bound is FROZEN at climb time (keyed per group) and reused for the removal /
+        eval / train swaps — an LR-scheduler change between steps must not change the
+        ``e`` being removed. ``step()`` clears the cache after each removal."""
+        gid = id(group)
+        if sign > 0 and gid not in self._eclamp:
+            self._eclamp[gid] = abs(self.rho) * group.get("clip_threshold", 1.0) * group["lr"]
+        return self._eclamp[gid]
 
     @torch.no_grad()
     def _global_mnorm(self) -> float:
         """Global L2 norm over all momenta, via ``(m*m).sum()`` (``torch.dot`` is avoided
         deliberately — it SIGFPEs on some GPUs; see SAM._grad_norm)."""
         sq = None
-        for _plist, states, md, shape in self._buckets():
+        for _plist, states, md, shape, _group in self._buckets():
             m = CodecBuffer.read_stacked(states, "m", md, shape)
             s = (m * m).sum()
             sq = s if sq is None else sq + s
@@ -176,7 +200,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         bf16-SR axpy in ONE launch per bucket (measured ~4.4 ms/step -> sub-ms on the
         C=128 proxy). Ineligible params (non-contiguous, exotic dtype) fall back here."""
         leftover = self._apply_fused_4bit(sign) if self.norm == "none" else None
-        for plist, states, md, shape in (self._buckets() if leftover is None else leftover):
+        for plist, states, md, shape, group in (self._buckets() if leftover is None else leftover):
             m = CodecBuffer.read_stacked(states, "m", md, shape)  # [N, *shape] fp32
             n = m.shape[0]
             if self.norm == "global":
@@ -187,6 +211,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 m.mul_(scales.view(n, *([1] * (m.ndim - 1))))
             else:  # "none": raw momentum — rho is a lookahead in OPTIMIZER-STEP units
                 m.mul_(sign * self.rho)
+                bound = self._climb_bound(group, sign)
+                m.clamp_(-bound, bound)  # per-element stability cap (see _climb_bound)
             if plist[0].dtype == torch.float32:
                 torch._foreach_add_([p.data for p in plist], list(m.unbind(0)))
             else:  # low-precision weights: stochastic-rounding write per slice
@@ -207,25 +233,25 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 return None
         except Exception:  # noqa: BLE001 — optional dependency; torch path is always correct
             return None
-        eligible: dict[tuple[int, Any, int], tuple[list[Tensor], list[dict[str, Any]]]] = {}
-        leftover: dict[tuple[Any, ...], tuple[list[Tensor], list[dict[str, Any]], str, tuple[int, ...]]] = {}
-        for plist, states, md, shape in self._buckets():
+        eligible: dict[tuple[int, Any, int, int], tuple[list[Tensor], list[dict[str, Any]], dict[str, Any]]] = {}
+        leftover: dict[tuple[Any, ...], tuple[list[Tensor], list[dict[str, Any]], str, tuple[int, ...], dict[str, Any]]] = {}
+        for plist, states, md, shape, group in self._buckets():
             ok = md == "4bit" and all(
                 p.is_cuda and p.data.is_contiguous() and p.dtype in (torch.float32, torch.bfloat16)
                 for p in plist
             )
             if ok:
-                key = (plist[0].numel(), plist[0].dtype, states[0]["m_block"])
-                lp, ls = eligible.setdefault(key, ([], []))
+                key = (plist[0].numel(), plist[0].dtype, states[0]["m_block"], id(group))
+                lp, ls, _g = eligible.setdefault(key, ([], [], group))
                 lp.extend(plist)
                 ls.extend(states)
             else:
-                leftover[(shape, md)] = (plist, states, md, shape)
-        ids = tuple(id(st["m"]) for _k, (_lp, ls) in sorted(eligible.items(), key=lambda kv: kv[0][0]) for st in ls)
+                leftover[(shape, md, id(group))] = (plist, states, md, shape, group)
+        ids = tuple(id(st["m"]) for _k, (_lp, ls, _g) in sorted(eligible.items(), key=lambda kv: kv[0][0]) for st in ls)
         cache = self._axpy_cache
         if cache is None or cache["ids"] != ids:
             buckets = []
-            for (n, dtype, block), (plist, states) in eligible.items():
+            for (n, dtype, block, _gid), (plist, states, group) in eligible.items():
                 dev = plist[0].device
                 buckets.append(dict(
                     p_addr=ft.ptr_array(plist, dev),
@@ -233,13 +259,17 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                     sc_addr=ft.ptr_array([st["m_scale"] for st in states], dev),
                     n=n, K=(n + 1023) // 1024, N=len(plist), block=block,
                     lowp=dtype == torch.bfloat16,
+                    # frozen at climb time (cache rebuilds exactly once per climb — requant
+                    # replaces the m buffers, changing the ids): the removal/eval/train
+                    # swaps must subtract the SAME clamped e even if a scheduler moved lr.
+                    bound=self._climb_bound(group, sign),
                 ))
             cache = self._axpy_cache = {"ids": ids, "buckets": buckets}
         self._axpy_seed += 1
         alpha = sign * self.rho
         for bk in cache["buckets"]:
             ft._axpy_4bit_batched[(bk["N"] * bk["K"],)](
-                bk["p_addr"], bk["pk_addr"], bk["sc_addr"], alpha, bk["n"], bk["K"],
+                bk["p_addr"], bk["pk_addr"], bk["sc_addr"], alpha, bk["bound"], bk["n"], bk["K"],
                 self._axpy_seed, FBLOCK=bk["block"], LOWP=bk["lowp"], SR=bk["lowp"], BLOCK=1024,
             )
         return list(leftover.values())
@@ -278,6 +308,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         if self._has_e:
             self._apply(-1.0)
             self._has_e = False
+        self._eclamp.clear()  # next climb re-freezes the per-element bound at the CURRENT lr
         # 2) base step at the true weights, with the perturbed-point gradient.
         loss = self.inner.step(closure)
         # 3) climb along the refreshed momentum for the NEXT forward/backward.
@@ -304,3 +335,5 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._train_mode = True
         self._has_e = False
         self._mnorm = 0.0
+        self._eclamp.clear()
+        self._axpy_cache = None

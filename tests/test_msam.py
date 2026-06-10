@@ -150,7 +150,8 @@ def test_codec_momenta_climb_norm():
 
 
 def test_none_norm_is_step_scaled():
-    """norm='none': the climb is exactly rho * m (raw momentum, step-unit lookahead)."""
+    """norm='none': the climb is exactly rho * m (raw momentum, step-unit lookahead),
+    capped per element at |rho| * clip_threshold * lr (the stability bound)."""
     rho = -1.5
     pa = _params()
     opt = MSAM(pa, rho=rho, norm="none", **KW)
@@ -159,9 +160,13 @@ def test_none_norm_is_step_scaled():
     mom = _read_momenta(opt)
     live = [p.data.clone() for p in pa]
     opt.eval()
+    bound = abs(rho) * 1.0 * KW["lr"]
     for w, p in zip(live, pa, strict=True):
-        expected = rho * mom[p]
-        assert torch.allclose(w - p.data, expected, atol=1e-7, rtol=1e-6)
+        expected = (rho * mom[p]).clamp(-bound, bound)
+        # atol 1e-6: (w - p) reconstructs e through an fp32 add at |p|~1, whose
+        # cancellation error (~ulp(|p|)) sits just above 1e-7. Round-trip exactness is
+        # asserted separately with torch.equal below.
+        assert torch.allclose(w - p.data, expected, atol=1e-6, rtol=1e-6)
     opt.train()
     for a, w in zip(pa, live, strict=True):
         assert torch.equal(a.data, w)
@@ -180,6 +185,46 @@ def test_tensor_norm_per_param_radius():
     for w, p in zip(live, pa, strict=True):
         climb = math.sqrt(float(((w - p.data) ** 2).sum()))
         assert abs(climb - 0.25) < 1e-4, f"per-tensor climb {climb} != |rho|"
+    opt.train()
+    for a, w in zip(pa, live, strict=True):
+        assert torch.equal(a.data, w)
+
+
+def test_none_norm_spike_is_clamped():
+    """The real-training NaN channel: a momentum spike (e.g. a dead factored channel
+    concentrating ~sqrt(n)*lr on one coordinate) must NOT displace any weight beyond
+    ``|rho| * clip_threshold * lr`` — and the climb/removal round trip stays exact."""
+    rho, lr = -1.5, 1e-3
+    pa = _params()
+    opt = MSAM(pa, rho=rho, norm="none", lr=lr, betas=(0.2, 0.999), momentum_dtype="float32", foreach=False)
+    _attach_grads(pa, 1)
+    opt.step()
+    # inject a runaway spike into the stored momentum (1000x any sane update)
+    st = opt._momentum_owner().state[pa[0]]
+    st["m"][0, 0] = 1.0
+    _attach_grads(pa, 2)
+    opt.step()  # removal of old climb + base step + NEW climb rides the spiked m
+    live = [p.data.clone() for p in pa]
+    opt.eval()
+    bound = abs(rho) * 1.0 * lr  # |rho| * clip_threshold * lr
+    worst = max((w - p.data).abs().max().item() for w, p in zip(live, pa, strict=True))
+    assert worst <= bound * (1 + 1e-5), f"climb {worst} exceeds the per-element bound {bound}"
+    opt.train()
+    for a, w in zip(pa, live, strict=True):  # exact restore with the frozen bound
+        assert torch.equal(a.data, w)
+
+
+def test_climb_bound_frozen_across_lr_change():
+    """An LR-scheduler change between steps must not corrupt the removal: the bound is
+    frozen at climb time, so (climb at lr1) -> (lr change) -> (removal) is exact."""
+    pa = _params()
+    opt = MSAM(pa, rho=-1.5, norm="none", lr=1e-3, betas=(0.2, 0.999), momentum_dtype="float32", foreach=False)
+    _attach_grads(pa, 1)
+    opt.step()                                  # climb frozen at lr=1e-3
+    for g in opt.param_groups:
+        g["lr"] = 1e-4                          # scheduler moves lr between steps
+    live = [p.data.clone() for p in pa]
+    opt.eval()                                  # removal must subtract the SAME e
     opt.train()
     for a, w in zip(pa, live, strict=True):
         assert torch.equal(a.data, w)

@@ -11,16 +11,16 @@
 | # | optimizer | mean rank | 🥇 wins (rank 1) | identity |
 |---|---|---|---|---|
 | 1 | **Adakaon-bf16-fused** | 4.7 | 🥇 LoRA-speed, convergence, loss | Adakaon-bf16, Triton-fused step (same math; speed twin of Adakaon-bf16) |
-| 2 | **Nekaon-fused** | 4.9 | 🥇 generalization, constant-LR | Nekaon, Triton-fused inner step (same math; speed twin of Nekaon) |
-| 3 | **Adakaon-nomom** | 5.3 | 🥇 memory | factored Adam, no momentum (minimum VRAM, regularizing) |
-| 4 | **Lion** | 5.3 | — | sign-momentum, no 2nd moment (lightest state) |
-| 5 | **AdaPNM-fused** | 6.1 | — | AdaPNM, Triton-fused step (same math; speed twin of AdaPNM) |
-| 6 | **Nekaon** | 6.6 | — | Adakaon + k-step negative momentum-lookahead (zero-cost flat-minima; beta1 = regime knob) |
+| 2 | **Adakaon-nomom** | 5.3 | 🥇 memory | factored Adam, no momentum (minimum VRAM, regularizing) |
+| 3 | **Lion** | 5.3 | — | sign-momentum, no 2nd moment (lightest state) |
+| 4 | **Nekaon-fused** | 5.6 | — | Nekaon, Triton-fused inner step (same math; speed twin of Nekaon) |
+| 5 | **AdaPNM-fused** | 5.9 | 🥇 generalization, constant-LR | AdaPNM, Triton-fused step (same math; speed twin of AdaPNM) |
+| 6 | **Nekaon** | 6.3 | — | Adakaon + k-step negative momentum-lookahead (zero-cost flat-minima; beta1 = regime knob) |
 | 7 | **Adakaon-bf16** | 6.7 | — | factored Adam, bf16 momentum (AdamW-quality, low memory) |
 | 8 | **torch.AdamW (fused)** | 7.1 | 🥇 iter-speed | torch.optim.AdamW, fused kernel — the EXTERNAL reference (not a kaon optimizer) |
 | 9 | **AdamP** | 7.4 | — | AdamW minus the radial update on scale-invariant weights (gap-oriented; no fused twin) |
 | 10 | **AdaPNM** | 7.6 | — | positive-negative momentum (best generalization / constant-LR) |
-| 11 | **AdaMuon** | 7.9 | — | orthogonalized momentum + factored 2nd moment (convergence) |
+| 11 | **AdaMuon** | 7.7 | — | orthogonalized momentum + factored 2nd moment (convergence) |
 | 12 | **ScheduleFree** | 8.4 | — | Schedule-Free AdamW (iterate averaging, no schedule) — constant-LR continuity probe |
 ## 🎯 Loss × generalization (scheduled, progressive curriculum)
 
@@ -28,10 +28,10 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 
 | # (by gap) | optimizer | held-out loss | train–val gap |
 |---|---|---|---|
-| 1 | Nekaon-fused | 0.0798 | +0.0077 |
-| 2 | AdaPNM-fused | 0.0820 | +0.0077 |
+| 1 | AdaPNM-fused | 0.0820 | +0.0077 |
+| 2 | Nekaon | 0.0789 | +0.0084 |
 | 3 | AdaPNM | 0.0817 | +0.0085 |
-| 4 | Nekaon | 0.0791 | +0.0087 |
+| 4 | Nekaon-fused | 0.0798 | +0.0088 |
 | 5 | ScheduleFree | 0.0828 | +0.0100 |
 | 6 | torch.AdamW (fused) | 0.0805 | +0.0114 |
 | 7 | AdamP | 0.0742 | +0.0130 |
@@ -57,8 +57,8 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 8 | ScheduleFree | 2000 | 14.3 | 28.52 |
 | 9 | AdamP | 1625 | 17.8 | 28.86 |
 | 10 | AdaPNM | 2000 | 14.7 | 29.45 |
-| 11 | Nekaon-fused | 1875 | 15.8 | 29.63 |
-| 12 | Nekaon | 1875 | 18.0 | 33.66 |
+| 11 | Nekaon-fused | 1875 | 16.4 | 30.69 |
+| 12 | Nekaon | 1875 | 17.9 | 33.49 |
 
 ## ⚡ Per-iteration speed
 
@@ -74,10 +74,10 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 6 | ScheduleFree | 14.3 | 4.82 |
 | 7 | Adakaon-bf16 | 14.3 | 3.60 |
 | 8 | AdaPNM | 14.7 | 5.67 |
-| 9 | Nekaon-fused | 15.8 | 1.48 |
-| 10 | AdaMuon | 16.2 | 6.61 |
+| 9 | AdaMuon | 16.2 | 6.61 |
+| 10 | Nekaon-fused | 16.4 | 1.60 |
 | 11 | AdamP | 17.8 | 7.24 |
-| 12 | Nekaon | 18.0 | 7.73 |
+| 12 | Nekaon | 17.9 | 7.73 |
 
 ## 💾 Memory (measured optimizer state)
 
@@ -102,9 +102,9 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 
 | # (by const gap) | optimizer | const-LR loss | const-LR gap | Δ vs scheduled |
 |---|---|---|---|---|
-| 1 | Nekaon-fused | 0.0819 | +0.0059 | -0.0019 |
-| 2 | AdaPNM-fused | 0.0954 | +0.0061 | -0.0016 |
-| 3 | Nekaon | 0.0801 | +0.0067 | -0.0020 |
+| 1 | AdaPNM-fused | 0.0954 | +0.0061 | -0.0016 |
+| 2 | Nekaon-fused | 0.0802 | +0.0064 | -0.0024 |
+| 3 | Nekaon | 0.0808 | +0.0064 | -0.0020 |
 | 4 | AdaPNM | 0.0977 | +0.0068 | -0.0017 |
 | 5 | Adakaon-nomom | 0.0896 | +0.0074 | -0.0095 |
 | 6 | Lion | 0.0806 | +0.0084 | -0.0059 |

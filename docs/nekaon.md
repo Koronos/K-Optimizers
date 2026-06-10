@@ -110,6 +110,28 @@ training (the continuity scenario), where it keeps (rather than loses) its gener
   unexercised further because on a real DiT step (GEMM-bound) the optimizer is <1% of
   the iteration — vs SAM's +100%.
 
+## Stability — the per-element climb bound
+
+A real Cosmos LoKr run NaN'd at step ~406 (triggered by an extreme-aspect resolution
+bucket). Same failure channel that once NaN'd AdaPNM: a near-zero factored col-EMA makes
+the denominator explode on one channel, and the Adafactor RMS clip bounds the update's
+*RMS*, **not its per-element max** — so a runaway channel concentrates ~`sqrt(n)*lr`
+spikes on a few coordinates. The lookahead then *amplifies* what plain Adakaon survives:
+the momentum accumulates the spike, the weights live displaced `k`-fold along it between
+steps (feedback through the gradient), and the 4-bit codec smears a spiked block's absmax
+over its 128 neighbours.
+
+The guard (always on, no new knob): every coordinate's climb is capped at
+
+```
+|e_i| <= |k| * clip_threshold * lr      # "no further than k maximum-allowed update steps"
+```
+
+frozen at climb time per group (an LR-scheduler change between steps must not corrupt the
+exact removal). Inactive in the normal regime (typical `|m_i| ~ lr`); it bites exactly on
+the runaway channel. The same cap runs inside the Triton 4-bit kernel. This is the moral
+twin of the `clip_threshold` that fixed AdaPNM's real-training divergence.
+
 ## train() / eval() contract
 
 Between steps the live weights deliberately sit at the lookahead point. **Sampling,
