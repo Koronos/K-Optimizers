@@ -35,6 +35,29 @@ candidates) on any axis that matters, so none was promoted. Confirmed absent fro
 - **Adai** — adaptive per-coord inertia (flat-minima); heavy (fp32 beta1_prod), SGD-scale LR. Mid-pack (~12.0).
 - **SMMF factored sign-magnitude momentum** — `feat/smmf-momentum`. Negative: **worse fidelity AND slower** than the shipped int8 momentum codec.
 - **fp8 (E4M3) momentum** — `feat/4bit-momentum` (commit `c948e86`, 2026-06-04). 1 B/param, no scale/packing (just a bf16↔e4m3 cast). **DOMINATED by int8**, which is *also* 1 B/param but near-lossless and robust — fp8 occupies no useful point on the memory/fidelity frontier (int8 owns 1 B/p, 4bit owns 0.5 B/p). And it's **regime-fragile**: with small steady increments pure RTN *stalls* (EMA freezes on the coarse grid — the commit's finding, fixed with SR); but with noisier grads the per-element SR *destroys* the direction (measured weight-delta cosine vs fp32 = **0.495** SR vs int8's 0.99999, on a 15-tensor×150-step CPU replay). One mode or the other breaks depending on gradient stats — int8 at the same byte budget has neither failure. **The `4bit` momentum from this same branch DID ship to main** (`momentum_dtype="4bit"`, ~0.5 B/p, cosine ~0.975–0.99); only fp8 is rejected.
+- **PAdam partial adaptivity** (`adaptivity` p<0.5 on Adakaon, 2026-06-10, MSAM campaign round 5) — the research-catalog "generalize like SGD, converge like Adam" bet (`1806.06763`). Measured on the control battery at `b1=0.9 + wd0.1`, `lr=1.2e-3`: **p=0.25 underfits badly** (te 0.0951 vs 0.0741 base), p=0.375 costs loss with NO gap win (te 0.0779, cgap +0.0152 ≈ base), composed with MSAM− it collapses further (te 0.1056; the tight cgap +0.0040 there is the consistent-underfit mirage, same trap as AdaPNM-const). The Adafactor RMS-clip does NOT make p LR-invariant in practice — convergence slows hard at fixed budget. *Caveat (per the graveyard-is-not-a-verdict rule): only tested at lr=1.2e-3, one beta1, fixed 2000-step budget; a p-specific LR sweep was not done.* The `adaptivity` knob was reverted from Adakaon at ship-time cleanup (measured-null-knob purge precedent: `decay_rate`).
+- **AdamP beta1 dial** (`betas[0]` 0.5/0.2/0.0 on AdamP+wd0.05, 2026-06-10) — does cutting momentum tighten AdamP's gap while keeping the projection? **No win at any point**: b1=0.5 diverged on the scheduled run (te 0.4119), b1=0.2/0.0 trade loss away (te 0.0781/0.0790 vs 0.0742 default) for ~no scheduled-gap gain; only b1=0.0 tightens const-gap (+0.0077) but from a *worse* const loss (0.4801 — broken). Default `beta1=0.9` stays.
+
+## 📉 Nekaon campaign side-results (2026-06-10) — measured, not shipped
+The campaign that produced **Nekaon** (negative momentum-lookahead; ON main with the MSAM wrapper)
+also measured these. Numbers in `battery_round*.log` (job tmp) and the campaign probes (pruned from
+`results.json` at ship; reproducible from `registry.py` history).
+
+- **Uphill (SAM-sign) momentum climb** — MSAM as published (`rho>0`): DOMINATED by the negative
+  direction on both loss and gap at the same |rho| (cte 0.0883/+0.0079 vs 0.0875/+0.0066 at b1=0.2).
+  The wrapper keeps `rho>0` available for ablation, but the kaon default direction is negative.
+- **Iterate averaging at constant LR** — Lookahead(k=5,a=0.5) and ScheduleFree do NOT cut the
+  const-LR noise floor on this proxy (cte 0.0825 / 0.0814 vs base 0.0805); the const-LR loss lever
+  is momentum (b1→0.9), not averaging. (ScheduleFree IS now honestly measured — the battery's
+  `evald()` fix evaluates it at its averaged `x`.)
+- **Per-tensor perturbation radius at the global-radius rho** — `norm="tensor"` with rho=0.3 is
+  ~12x the total perturbation (no √T split) → destroys training (te 0.17). Not an apples
+  comparison; re-probe at rho/√T if single-pass fusion ever needs it. The shipped step-scaled
+  `norm="none"` needs no cross-param sync anyway.
+- **`lr_const` micro-tuning** — slides the (cte, cgap) trade at every beta1 (tiny genuine move at
+  b1=0.5–0.7, ~noise scale); exactly the proxy-budget-specific knob the robust design avoids.
+  Nekaon ships with `lr_const = lr` semantics (no special const-LR value).
+- **beta1=0.95** — no gain over 0.9 anywhere on the dial.
 
 ## ↩ SUPERSEDED — early names that became the shipped versions
 - **Janus** — `feat/janus` → became **AdaPNM** (on main; constant-LR generalization champion).
@@ -70,7 +93,7 @@ renga-flow Anima LoKr real-config A/B. Verdicts (RTX 4080), **native-foreach →
 ---
 
 ## Already on `main` (NOT graveyard — for contrast, so nobody re-litigates)
-- **In-house:** Lion, Adakaon (factored/quantized; nomom + bf16/int8/**4bit** momentum), AdaPNM (+ RMS-clip divergence fix), AdaMuon, KProdigy, Autokaon, Gradient Centralization, the momentum codec, the control battery / RANKINGS infra.
+- **In-house:** **Nekaon** (Adakaon + k-step negative momentum-lookahead — zero-cost flat-minima; the 2026-06-10 campaign flagship, with the **MSAM** wrapper it generalizes), Lion, Adakaon (factored/quantized; nomom + bf16/int8/**4bit** momentum), AdaPNM (+ RMS-clip divergence fix), AdaMuon, KProdigy, Autokaon, Gradient Centralization, the momentum codec, the control battery / RANKINGS infra.
 - **Promoted candidates (`1879645`):** **AdaBelief, ScheduleFree, ADOPT, AdamP, Lookahead, SAM** (+ the WrapsOptimizer/SlowWeights schedule-free mixin and the `opt_state_bytes_per_param` wrapper-traversal fix — the "backend dividend").
   - Open validation note (not a graveyard status): **ADOPT** reaches its rank-1 gap partly by *underfitting*, and **SAM** moves the gap frontier at ~2×/step — both still want a real FID/KID LoRA test to confirm the perceptual payoff.
 

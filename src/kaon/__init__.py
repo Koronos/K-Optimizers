@@ -13,6 +13,10 @@ Optimizers:
     AdamP: AdamW minus the radial update component on scale-invariant weights (candidate).
     Lookahead: k-step slow-weight averaging wrapper over Adakaon (candidate wrapper).
     SAM: Sharpness-Aware Minimization (two-pass flat-minima) wrapper over Adakaon (candidate wrapper).
+    MSAM: Momentum-SAM (Becker et al. 2024) — SAM's perturbation along the stored momentum,
+        zero extra passes / zero extra state (wrapper).
+    Nekaon: Adakaon + k-step negative momentum-lookahead — the in-house flat-minima flagship
+        (gradient evaluated k steps ahead at zero extra cost; beta1 = the loss<->gap regime knob).
 
 Quickstart::
 
@@ -37,6 +41,8 @@ from kaon.autokaon import Autokaon
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
 from kaon.lookahead import Lookahead
+from kaon.msam import MSAM
+from kaon.nekaon import Nekaon
 from kaon.sam import SAM
 from kaon.schedulefree import ScheduleFree
 
@@ -51,6 +57,8 @@ __all__ = [
     "KProdigy",
     "Lion",
     "Lookahead",
+    "MSAM",
+    "Nekaon",
     "SAM",
     "ScheduleFree",
     "__version__",

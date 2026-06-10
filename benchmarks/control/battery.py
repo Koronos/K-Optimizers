@@ -74,6 +74,20 @@ def seq_prog(n):
 
 
 # ----------------------------- one training run -----------------------------
+def evald(opt, fn):
+    """Evaluate ``fn()`` at the optimizer's EVAL weights. Optimizers that keep an averaged /
+    perturbed view (ScheduleFree's x, Lookahead's phi, MSAM's unperturbed w) expose
+    ``eval()``/``train()``; bracket the measurement so they are scored on the weights a real
+    run would sample/checkpoint. A plain optimizer (no ``eval`` attr) measures unchanged."""
+    swap = hasattr(opt, "eval") and hasattr(opt, "train")
+    if swap:
+        opt.eval()
+    out = fn()
+    if swap:
+        opt.train()
+    return out
+
+
 def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, checkpoints=0):
     torch.manual_seed(seed)
     if DEV == "cuda":
@@ -107,12 +121,13 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
         if it >= warm:
             timed += 1
         if ckpt_every and (it + 1) % ckpt_every == 0:
-            traj.append((it + 1, H.eval_loss(net, data[64], te, ac)))
+            traj.append((it + 1, evald(opt, lambda: H.eval_loss(net, data[64], te, ac))))
     if DEV == "cuda":
         torch.cuda.synchronize()
     ms_step = (time.time() - t0) / max(timed, 1) * 1000.0
-    tr_loss = H.eval_loss(net, data[64], tr, ac)
-    te_loss = H.eval_loss(net, data[64], te, ac)
+    tr_loss, te_loss = evald(
+        opt, lambda: (H.eval_loss(net, data[64], tr, ac), H.eval_loss(net, data[64], te, ac))
+    )
     bpp = H.opt_state_bytes_per_param(opt, params)
     return dict(tr=tr_loss, te=te_loss, gap=te_loss - tr_loss, ms=ms_step, bpp=bpp, traj=traj)
 

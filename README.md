@@ -9,6 +9,15 @@
 `kaon` is a small collection of optimizers aimed at training diffusion models on
 commodity GPUs, where optimizer state is precious and weights are bf16.
 
+- **`Nekaon`** — **Adakaon + k-step negative momentum-lookahead**: every gradient is
+  evaluated *k optimizer-steps ahead* along the smoothed update direction, a
+  flat-minima / anti-memorization bias at **zero extra passes and zero extra state**
+  (it solves SAM's 2×-forward/backward problem) — and at **0.56 B/param by default**
+  (4-bit momentum carries the mechanism with no measured loss; int8/bf16 dial up).
+  `beta1` is the regime knob — `0.2` cuts the constant-LR train–val gap **−45%** vs
+  its own no-lookahead twin (field record), `0.9` is the fidelity mode; the lookahead
+  `k` is measured in *steps*, so it self-scales across LRs/schedules/models (validated
+  under LR ×0.5/×2 at fixed `k`). → [docs/nekaon.md](docs/nekaon.md)
 - **`Adakaon`** — a conv-aware factored optimizer. Reaches **AdamW-level quality
   at a fraction of AdamW's optimizer memory**, with bf16-correct weight updates
   (stochastic rounding — *no* Kahan buffer, *no* CPU offload).

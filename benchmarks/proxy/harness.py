@@ -95,11 +95,20 @@ def eval_loss(net, x, idx, ac, reps=8, seed0=5000):
 
 # ----------------------------- memory -----------------------------
 def opt_state_bytes_per_param(opt, params):
+    """Measured optimizer-state bytes/param, INCLUDING wrapped inner optimizers.
+
+    A wrapper (Lookahead/SAM/MSAM via ``WrapsInnerOptimizer``) keeps its own per-param
+    ``state`` (e.g. phi) separate from the inner optimizer's (momentum/factored v) — count
+    the whole ``.inner`` chain, else a wrapper under-reports (MSAM read 0.00 B/p, Lookahead
+    2.00 instead of ~4.03)."""
     b = 0
-    for st in opt.state.values():
-        for v in st.values():
-            if torch.is_tensor(v):
-                b += v.numel() * v.element_size()
+    o = opt
+    while o is not None:
+        for st in o.state.values():
+            for v in st.values():
+                if torch.is_tensor(v):
+                    b += v.numel() * v.element_size()
+        o = getattr(o, "inner", None)
     nparam = sum(p.numel() for p in params)
     return b / max(1, nparam)
 

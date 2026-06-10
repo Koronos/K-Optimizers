@@ -1142,6 +1142,39 @@ if _HAS_TRITON:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
+    @triton.jit
+    def _axpy_4bit_batched(
+        p_addr, pk_addr, sc_addr, alpha, n, K, seed,
+        FBLOCK: tl.constexpr, LOWP: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """``p += alpha * dequant_4bit(m)`` over a same-shape bucket, one pass, no fp32 temp.
+
+        The MSAM/Nekaon perturbation reads the 4-bit momentum twice per step (climb +
+        removal); the torch path materializes the fp32 momentum (unpack nibbles -> sub
+        zero -> scale -> stack -> axpy, several kernels + temps). This does the whole
+        thing in one launch per bucket: per flat element ``i`` of tensor ``t``,
+        ``m = (nibble(i) - 8) * scale[i // FBLOCK]`` (the exact `_dequant_4bit` math:
+        low nibble at even ``i``, high at odd), then a bf16-SR-correct in-place axpy.
+        Determinism note: dequant is exact, so a +alpha/-alpha round trip lands where
+        the torch path lands (same fp32 adds)."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        pkp = tl.load(pk_addr + t).to(tl.pointer_type(tl.uint8))
+        byte = tl.load(pkp + (offs >> 1), mask=mask, other=0)
+        nib = tl.where((offs & 1) == 0, byte & 0x0F, (byte >> 4) & 0x0F).to(tl.float32)
+        scp = tl.load(sc_addr + t).to(tl.pointer_type(tl.float32))
+        sc = tl.load(scp + offs // FBLOCK, mask=mask, other=0.0)
+        m = (nib - 8.0) * sc
+        pbase = tl.load(p_addr + t)
+        pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
+        res = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32) + alpha * m
+        if LOWP and SR:
+            res = sr_round(res, seed + t, offs)
+        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+
 
 # ============================================================ pointer-array cache (reusable)
 class PointerArrayCache:

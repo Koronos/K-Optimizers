@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from kaon import Adakaon, AdaMuon, AdaPNM, Lion
+from kaon import Adakaon, AdaMuon, AdaPNM, AdamP, Lion, Nekaon, ScheduleFree
 
 OPTIMIZERS = {
     # --- reference baseline ---
@@ -29,6 +29,27 @@ OPTIMIZERS = {
         frozen=True,
     ),
     # --- in-house (kaon family) ---
+    "Nekaon": dict(
+        make=lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.5, 0.999), weight_decay=0.1, momentum_dtype="4bit"),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="Adakaon + k-step negative momentum-lookahead (zero-cost flat-minima; beta1 = regime knob)",
+        # The regime dial (the profiler's A/B): beta1 picks the operating point on the
+        # loss<->gap frontier at the same structural k=1.5.
+        variants={
+            "balanced (b1=0.5)": lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.5, 0.999), weight_decay=0.1, momentum_dtype="bfloat16"),
+            "gap mode (b1=0.2)": lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.2, 0.999), weight_decay=0.1, momentum_dtype="bfloat16"),
+            "frontier (b1=0.7)": lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.7, 0.999), weight_decay=0.1, momentum_dtype="bfloat16"),
+            "fidelity (b1=0.9)": lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.9, 0.999), weight_decay=0.1, momentum_dtype="bfloat16"),
+            "k=0 (plain Adakaon+wd)": lambda p, lr: Nekaon(p, lr=lr, k=0.0, betas=(0.5, 0.999), weight_decay=0.1, momentum_dtype="4bit"),
+            "int8 momentum (1.04 B/p)": lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.5, 0.999), weight_decay=0.1, momentum_dtype="int8"),
+            "bf16 momentum (2.03 B/p)": lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.5, 0.999), weight_decay=0.1, momentum_dtype="bfloat16"),
+        },
+    ),
+    "Nekaon-fused": dict(
+        make=lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.5, 0.999), weight_decay=0.1, momentum_dtype="4bit", fused=True),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="Nekaon, Triton-fused inner step (same math; speed twin of Nekaon)",
+    ),
     "Adakaon-nomom": dict(
         make=lambda p, lr: Adakaon(p, lr=lr, betas=(0.0, 0.999), cautious=False, momentum_dtype="bfloat16"),
         lr=6e-4, lr_const=1.2e-3, family="in-house",
@@ -74,5 +95,15 @@ OPTIMIZERS = {
         make=lambda p, lr: AdaMuon(p, lr=lr, betas=(0.95, 0.999), ns_steps=2, cautious=True, momentum_dtype="int8"),
         lr=2.4e-3, lr_const=2.4e-3, family="published",
         blurb="orthogonalized momentum + factored 2nd moment (convergence)",
+    ),
+    "AdamP": dict(
+        make=lambda p, lr: AdamP(p, lr=lr, weight_decay=0.05, cautious=True, momentum_dtype="bfloat16"),
+        lr=1e-3, lr_const=1e-3, family="published",
+        blurb="AdamW minus the radial update on scale-invariant weights (gap-oriented; no fused twin)",
+    ),
+    "ScheduleFree": dict(
+        make=lambda p, lr: ScheduleFree(p, lr=lr, betas=(0.9, 0.999), momentum_dtype="bfloat16"),
+        lr=2.5e-3, lr_const=2.5e-3, family="published",
+        blurb="Schedule-Free AdamW (iterate averaging, no schedule) — evaluated at its averaged x",
     ),
 }
