@@ -78,15 +78,15 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 
 ## 🔁 Continuity — robustness at constant LR (resumable, no schedule)
 
-`const gap` is the train–val gap with **no scheduler**; `Δ vs sched` ≤ 0 means the optimizer *keeps* (or improves) its generalization without the decaying-schedule crutch — the property you want for open-ended / resumable runs.
+`const loss` is the held-out loss at **constant LR**; `const gap` is the train–val gap there; `Δ vs sched` ≤ 0 means the optimizer *keeps* (or improves) its generalization without the decaying-schedule crutch — the property you want for open-ended / resumable runs. **Read loss AND gap together**: a tight gap on a high loss is consistent underfitting, not quality (e.g. AdaPNM nails the gap but collapses on const-LR loss).
 
-| # (by const gap) | optimizer | const-LR gap | Δ vs scheduled |
-|---|---|---|---|
-| 1 | AdaPNM-fused | +0.0061 | -0.0016 |
-| 2 | AdaPNM | +0.0068 | -0.0017 |
-| 3 | Adakaon-nomom | +0.0074 | -0.0095 |
-| 4 | Lion | +0.0084 | -0.0059 |
-| 5 | torch.AdamW (fused) | +0.0124 | +0.0010 |
-| 6 | Adakaon-bf16-fused | +0.0152 | -0.0042 |
-| 7 | Adakaon-bf16 | +0.0159 | -0.0054 |
-| 8 | AdaMuon | +0.0181 | -0.0022 |
+| # (by const gap) | optimizer | const-LR loss | const-LR gap | Δ vs scheduled |
+|---|---|---|---|---|
+| 1 | AdaPNM-fused | 0.0954 | +0.0061 | -0.0016 |
+| 2 | AdaPNM | 0.0977 | +0.0068 | -0.0017 |
+| 3 | Adakaon-nomom | 0.0896 | +0.0074 | -0.0095 |
+| 4 | Lion | 0.0806 | +0.0084 | -0.0059 |
+| 5 | torch.AdamW (fused) | 0.0839 | +0.0124 | +0.0010 |
+| 6 | Adakaon-bf16-fused | 0.0743 | +0.0152 | -0.0042 |
+| 7 | Adakaon-bf16 | 0.0732 | +0.0159 | -0.0054 |
+| 8 | AdaMuon | 0.0809 | +0.0181 | -0.0022 |

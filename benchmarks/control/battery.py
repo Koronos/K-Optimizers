@@ -295,11 +295,13 @@ def render(store, cfg, quick):
                  [lambda m: f"{m['bpp']:.2f}"]))
 
     L.append("\n## 🔁 Continuity — robustness at constant LR (resumable, no schedule)\n")
-    L.append("`const gap` is the train–val gap with **no scheduler**; `Δ vs sched` ≤ 0 means the "
-             "optimizer *keeps* (or improves) its generalization without the decaying-schedule crutch "
-             "— the property you want for open-ended / resumable runs.\n")
-    L.append(tbl("cgap", ["# (by const gap)", "optimizer", "const-LR gap", "Δ vs scheduled"],
-                 [lambda m: f"{m['cgap']:+.4f}", lambda m: f"{m['dgap']:+.4f}"]))
+    L.append("`const loss` is the held-out loss at **constant LR**; `const gap` is the train–val gap "
+             "there; `Δ vs sched` ≤ 0 means the optimizer *keeps* (or improves) its generalization "
+             "without the decaying-schedule crutch — the property you want for open-ended / resumable "
+             "runs. **Read loss AND gap together**: a tight gap on a high loss is consistent underfitting, "
+             "not quality (e.g. AdaPNM nails the gap but collapses on const-LR loss).\n")
+    L.append(tbl("cgap", ["# (by const gap)", "optimizer", "const-LR loss", "const-LR gap", "Δ vs scheduled"],
+                 [lambda m: f"{m['cte']:.4f}", lambda m: f"{m['cgap']:+.4f}", lambda m: f"{m['dgap']:+.4f}"]))
 
     if stale:
         L.append(f"\n> ⚠️ Not shown (measured at different settings — re-run to include): "
