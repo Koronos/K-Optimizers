@@ -58,6 +58,13 @@ also measured these. Numbers in `battery_round*.log` (job tmp) and the campaign 
   b1=0.5–0.7, ~noise scale); exactly the proxy-budget-specific knob the robust design avoids.
   Nekaon ships with `lr_const = lr` semantics (no special const-LR value).
 - **beta1=0.95** — no gain over 0.9 anywhere on the dial.
+- **MSAM over AdaMuon** (PoC, post-ship) — "loss specialist + gap mechanism = balance"? **No: strictly
+  dominated by Nekaon on both axes** at every rho (best point rho=0.6: cte 0.0867/cgap +0.0147 vs
+  Nekaon's 0.0801/+0.0067; rho=0.3 worsens BOTH vs bare AdaMuon). Mechanistic read: AdaMuon's real
+  update is the Newton-Schulz *orthogonalization* of its momentum, so a perturbation along the raw
+  momentum is decorrelated from where the update actually goes — the lookahead loses its
+  anticipation property and degrades to badly-aimed noise. The lookahead needs a base whose update
+  follows its momentum (the Adakaon family).
 
 ## ↩ SUPERSEDED — early names that became the shipped versions
 - **Janus** — `feat/janus` → became **AdaPNM** (on main; constant-LR generalization champion).
