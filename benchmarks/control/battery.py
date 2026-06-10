@@ -141,6 +141,37 @@ def mean(xs):
     return sum(xs) / len(xs)
 
 
+def _jsonsafe(v):
+    """Coerce an optimizer hyperparameter to a JSON-able scalar/list (tuples->lists; enums/dtypes->str)."""
+    if isinstance(v, bool) or isinstance(v, (int, float, str)) or v is None:
+        return v
+    if isinstance(v, (tuple, list)):
+        return [_jsonsafe(x) for x in v]
+    return str(v)
+
+
+def optimizer_config(make, lr, spec):
+    """Self-describe HOW a result was generated: snapshot the actual hyperparameters of the built
+    optimizer (its ``param_groups[0]`` + ``defaults``, minus the param tensors) so ``results.json`` is
+    reproducible on its own — no need to keep the registry lambda around. Works for any optimizer
+    (incl. wrappers like SAM/Lookahead) via introspection; never fails the run if it can't read one."""
+    cfg = {"class": None, "lr": spec.get("lr"), "lr_const": spec.get("lr_const")}
+    try:
+        probe = make([torch.zeros(2, 2, device=DEV, requires_grad=True)], lr)
+        cfg["class"] = type(probe).__name__
+        src = {}
+        src.update(getattr(probe, "defaults", {}) or {})
+        if getattr(probe, "param_groups", None):
+            src.update(probe.param_groups[0])
+        for k, v in src.items():
+            if k in ("params", "step"):  # tensors / mutable state, not config
+                continue
+            cfg[k] = _jsonsafe(v)
+    except Exception as e:  # introspection is best-effort; a result is still valid without it
+        cfg["introspect_error"] = f"{type(e).__name__}: {e}"
+    return cfg
+
+
 # ----------------------------- measure ONE optimizer -----------------------------
 def measure(name, spec, cfg, data, tr, te, ac, seqp):
     """Run the A (scheduled+prog), B (constant+prog), and lora-bag probes for one optimizer.
@@ -160,6 +191,7 @@ def measure(name, spec, cfg, data, tr, te, ac, seqp):
         bpp=mean([a["bpp"] for a in As]), cgap=mean([b["gap"] for b in Bs]),
         cte=mean([b["te"] for b in Bs]), lms=lms, traj=traj,
         family=spec["family"], blurb=spec["blurb"], sig=cfg["sig"],
+        config=optimizer_config(spec["make"], spec["lr"], spec),
     )
 
 
