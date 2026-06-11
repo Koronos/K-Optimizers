@@ -1223,17 +1223,26 @@ class PointerArrayCache:
                 Rs=i32([p.shape[0] for p in bl]), Cs=i32([eff_2d(p)[1] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
-                grad_first=bl[0].grad.data_ptr(),
+                grad_ptrs=tuple(p.grad.data_ptr() for p in bl),
             ))
 
     def refresh_grads(self):
-        """Rebuild a bucket's grad pointer array iff its first grad tensor was reallocated."""
+        """Rebuild a bucket's grad pointer array iff ANY grad tensor was reallocated.
+
+        The staleness sentinel must cover EVERY grad in the bucket. The original
+        first-grad-only check silently kept stale pointers whenever the caching
+        allocator reused tensor #0's address while moving the others — which is
+        exactly what happens when a new latent shape changes the backward's
+        allocation pattern. The kernels then read freed/reused memory as gradients
+        (garbage/NaN) and the row/col EMAs rot from arithmetically-impossible
+        inputs. Root cause of the 2026-06-10 real-training Nekaon NaN (forensics:
+        finite tiny grads + 100% NaN row/col, reproducibly adjacent to a
+        "[compile] new latent shape" event). Full-tuple compare costs ~µs/step."""
         for b in self.buckets:
-            gf = b["plist"][0].grad.data_ptr()
-            if b["grad_first"] != gf:
-                b["g_addr"] = torch.tensor([p.grad.data_ptr() for p in b["plist"]],
-                                           dtype=torch.int64, device=DEV)
-                b["grad_first"] = gf
+            ptrs = tuple(p.grad.data_ptr() for p in b["plist"])
+            if b["grad_ptrs"] != ptrs:
+                b["g_addr"] = torch.tensor(ptrs, dtype=torch.int64, device=DEV)
+                b["grad_ptrs"] = ptrs
 
 
 class AdaPnmCache:
@@ -1271,7 +1280,7 @@ class AdaPnmCache:
                 Rs=i32([p.shape[0] for p in bl]), Cs=i32([eff_2d(p)[1] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
-                grad_first=bl[0].grad.data_ptr(),
+                grad_ptrs=tuple(p.grad.data_ptr() for p in bl),
             ))
 
     refresh_grads = PointerArrayCache.refresh_grads
@@ -1305,7 +1314,7 @@ class OneDimPointerCache:
                 Ls=i32([p.shape[0] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
-                grad_first=bl[0].grad.data_ptr(),
+                grad_ptrs=tuple(p.grad.data_ptr() for p in bl),
             ))
 
     refresh_grads = PointerArrayCache.refresh_grads
@@ -1336,7 +1345,7 @@ class OneDimPnmCache:
                 Ls=i32([p.shape[0] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
-                grad_first=bl[0].grad.data_ptr(),
+                grad_ptrs=tuple(p.grad.data_ptr() for p in bl),
             ))
 
     refresh_grads = PointerArrayCache.refresh_grads

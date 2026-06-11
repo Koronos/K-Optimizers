@@ -83,6 +83,17 @@ _ = (
 
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
+# Diagnostic kernel-routing override (env-gated, zero cost when unset): a comma list of
+# fused subsets to force onto the native path — e.g. KAON_FUSED_DISABLE="one_block" or
+# "big,one_dim". Used to bisect which Triton kernel a real-training divergence lives in
+# (the 2026-06-10 Nekaon NaN hunt); harmless to leave in.
+import os as _os  # noqa: E402
+
+_FUSED_DISABLE = frozenset(
+    s.strip() for s in _os.environ.get("KAON_FUSED_DISABLE", "").split(",") if s.strip()
+)
+_PROBE_LOG_PATH = _os.environ.get("KAON_PROBE_LOG")
+
 # Stacking a foreach bucket allocates several transient copies of the stacked
 # tensor (grad fp32, the reconstruction, the SR intermediate, ...), so an unbounded
 # bucket of large weights can OOM a full fine-tune — which would undercut
@@ -426,6 +437,20 @@ class Adakaon(Optimizer):
                 one_dim.append(p)
             else:
                 native.append(p)
+        if _FUSED_DISABLE:  # diagnostic routing override (see module note)
+            if "one_block" in _FUSED_DISABLE:
+                native += one_block; one_block = []
+            if "big" in _FUSED_DISABLE:
+                native += big; big = []
+            if "one_dim" in _FUSED_DISABLE:
+                native += one_dim; one_dim = []
+        if _PROBE_LOG_PATH:  # routing census + grad-contiguity audit (probe runs only)
+            noncontig = [tuple(p.shape) for p in params if p.grad is not None and not p.grad.is_contiguous()]
+            with open(_PROBE_LOG_PATH, "a") as fh:  # noqa: SIM115 — diagnostics only
+                fh.write(
+                    f"[census] one_block={len(one_block)} big={len(big)} one_dim={len(one_dim)} "
+                    f"native={len(native)} noncontig_grads={noncontig[:8]} disable={sorted(_FUSED_DISABLE)}\n"
+                )
         self._fused_part[gid] = (ids, one_block, big, one_dim, native)
         return one_block, big, one_dim, native
 

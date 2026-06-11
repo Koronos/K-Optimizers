@@ -846,3 +846,39 @@ def test_fused_and_native_share_state_format():
         for k in sa:
             if torch.is_tensor(sa[k]):
                 assert sa[k].dtype == sb[k].dtype and sa[k].shape == sb[k].shape, f"{k}: {sa[k].shape}"
+
+
+# --------------------------------------------------- stale grad-pointer regression (real NaN)
+def test_refresh_grads_revalidates_every_pointer():
+    """Root cause of the 2026-06-10 real-training Nekaon NaN: ``refresh_grads`` used only
+    the FIRST tensor's grad address as the staleness sentinel, so when the caching
+    allocator reused tensor #0's address while moving the others (the pattern a new
+    latent shape's backward produces), the kernels read freed memory as gradients.
+    This reproduces the allocator pattern — param #0's grad keeps its address (same
+    tensor refilled), the rest are fresh tensors and their OLD buffers are poisoned —
+    and demands bit-parity with the native path."""
+
+    def run(fused):
+        torch.manual_seed(0)
+        ps = [(torch.randn(64, 48, device="cuda") * 0.01).requires_grad_(True) for _ in range(4)]
+        opt = Adakaon(ps, lr=1e-3, betas=(0.6, 0.999), momentum_dtype="int8", fused=fused)
+        g = torch.Generator(device="cuda").manual_seed(1)
+        old = [torch.randn(p.shape, generator=g, device="cuda") for p in ps]
+        for p, gr in zip(ps, old, strict=True):
+            p.grad = gr
+        opt.step()
+        new = [torch.randn(p.shape, generator=g, device="cuda") for p in ps]
+        ps[0].grad.copy_(new[0])                 # SAME address, new values
+        for i in (1, 2, 3):
+            ps[i].grad = new[i].clone()          # NEW addresses
+            old[i].fill_(float("nan"))           # poison the freed-and-reused-memory stand-in
+        opt.step()
+        return [p.detach().clone() for p in ps], opt
+
+    w_fused, of = run(True)
+    w_native, _ = run(False)
+    for a, b in zip(w_fused, w_native, strict=True):
+        assert torch.allclose(a, b, atol=1e-5), "fused path read stale grad pointers"
+    for p in of.param_groups[0]["params"]:
+        st = of.state[p]
+        assert torch.isfinite(st["row"]).all() and torch.isfinite(st["col"]).all()

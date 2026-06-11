@@ -315,6 +315,18 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
     def _probe(self, phase: str) -> None:
         """Log the first non-finite tensor for ``phase`` (see module docstring). Probe-only."""
         self._probe_step = getattr(self, "_probe_step", 0)
+        if phase == "GRAD" and not getattr(self, "_probe_dumped", False):
+            # Rolling 1-step snapshot of the full optimizer state (cpu): the NaN is BORN
+            # inside a step, so the replayable forensics need the PRE-step state. Cheap on
+            # an adapter run (a few MB); probe-only.
+            self._probe_snap = {
+                id(p): {
+                    "grad": p.grad.detach().cpu() if p.grad is not None else None,
+                    "p": p.data.detach().cpu(),
+                    "state": {k: (v.detach().cpu().clone() if torch.is_tensor(v) else v) for k, v in st.items()},
+                }
+                for p, st, _md, _g in self._momentum_params()
+            }
         for p, st, md, _group in self._momentum_params():
             bad = None
             if phase == "GRAD" and p.grad is not None and not torch.isfinite(p.grad).all():
@@ -327,6 +339,32 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                     sc = st.get("m_scale")
                     bad = (f"momentum (codec {md}; scale absmax="
                            f"{sc.abs().max().item():.3e})" if sc is not None else f"momentum ({md})")
+                    # FORENSICS (first occurrence only): full stats + a replayable dump of the
+                    # offending tensor's grad/state, so the exact step can be re-run offline.
+                    if not getattr(self, "_probe_dumped", False):
+                        self._probe_dumped = True
+                        row, col = st.get("row"), st.get("col")
+                        nan_rows = int(torch.isnan(m).any(dim=-1).sum()) if m.ndim >= 2 else -1
+                        with open(_PROBE_LOG, "a") as fh:  # noqa: SIM115
+                            fh.write(
+                                f"[FORENSICS] step={self._probe_step} shape={tuple(p.shape)} "
+                                f"m: nan={int(torch.isnan(m).sum())} inf={int(torch.isinf(m).sum())} "
+                                f"nan_rows={nan_rows} | "
+                                f"row[min={row.min().item():.3e},max={row.max().item():.3e}] "
+                                f"col[min={col.min().item():.3e},max={col.max().item():.3e}] | "
+                                f"grad absmax={p.grad.abs().max().item():.3e} "
+                                f"p absmax={p.data.abs().max().item():.3e} dtype={p.dtype}\n"
+                                if row is not None and col is not None and p.grad is not None else
+                                f"[FORENSICS] step={self._probe_step} shape={tuple(p.shape)} (1-D or no grad)\n"
+                            )
+                        dump = {
+                            "shape": tuple(p.shape), "step": self._probe_step, "dtype": str(p.dtype),
+                            "p": p.data.detach().cpu(), "grad": (p.grad.detach().cpu() if p.grad is not None else None),
+                            "state": {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in st.items()},
+                            # the PRE-step snapshot (grad/p/state at this step's GRAD phase) — replayable
+                            "pre": getattr(self, "_probe_snap", {}).get(id(p)),
+                        }
+                        torch.save(dump, _PROBE_LOG + ".forensics.pt")
             if bad is not None:
                 with open(_PROBE_LOG, "a") as fh:  # noqa: SIM115 — diagnostics only
                     fh.write(f"[{phase}] step={self._probe_step} shape={tuple(p.shape)} {bad}\n")
