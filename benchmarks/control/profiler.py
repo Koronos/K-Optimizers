@@ -75,19 +75,32 @@ def run(make, lr, *, schedule, warm, seq, seed, data, tr, te, ac, C, bs, n):
     net = H.UNet(C=C).to(DEV).to(H.DT)
     params = [p for p in net.parameters() if p.requires_grad]
     opt = make(params, lr)
+    # Each group keeps ITS OWN base lr (relative to `lr`) through the schedule — a flat
+    # overwrite to `lr * ...` would clobber any per-group lr ratio a multi-group optimizer
+    # was constructed with (e.g. Nekaon's low_vram_lr_ratio), silently forcing every group
+    # to the same lr regardless of what `make()` set up.
+    base_lrs = [pg["lr"] for pg in opt.param_groups]
     g = torch.Generator(device=DEV); g.manual_seed(seed + 12345); pos = 0
     for it, Rr in enumerate(seq):
         p = it / n
         w = (p / warm) if (warm and p < warm) else 1.0
-        for pg in opt.param_groups:
-            pg["lr"] = lr * w * sched_base(schedule, p)
+        for pg, base in zip(opt.param_groups, base_lrs):
+            pg["lr"] = base * w * sched_base(schedule, p)
         idx = [tr[(pos + j) % len(tr)] for j in range(bs)]; pos += bs
         opt.zero_grad()
         H.batch_loss(net, data[Rr], torch.tensor(idx, device=DEV), ac, g).backward()
         opt.step()
     if DEV == "cuda":
         torch.cuda.synchronize()
+    # Optimizers that keep an averaged / perturbed view (ScheduleFree's x, Lookahead's phi,
+    # MSAM's unperturbed w — e.g. Nekaon) expose eval()/train(); bracket the measurement so
+    # it scores the weights a real run would sample/checkpoint. Mirrors battery.py's evald().
+    swap = hasattr(opt, "eval") and hasattr(opt, "train")
+    if swap:
+        opt.eval()
     tr_l = H.eval_loss(net, data[64], tr, ac); te_l = H.eval_loss(net, data[64], te, ac)
+    if swap:
+        opt.train()
     return te_l, te_l - tr_l  # (loss, gap)
 
 

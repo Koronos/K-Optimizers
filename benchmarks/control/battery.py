@@ -95,6 +95,10 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
     net = H.UNet(C=channels).to(DEV).to(H.DT)
     params = [p for p in net.parameters() if p.requires_grad]
     opt = make(params, lr)
+    # Preserve each group's own base lr (relative to `lr`) through the schedule — see the
+    # matching fix/comment in profiler.py's run(); a flat `lr * mult` overwrite would
+    # clobber any per-group lr ratio (e.g. Nekaon's low_vram_lr_ratio).
+    base_lrs = [pg["lr"] for pg in opt.param_groups]
     g = torch.Generator(device=DEV); g.manual_seed(seed + 12345)
     pos = 0; traj = []
     ckpt_every = max(1, n // checkpoints) if checkpoints else 0
@@ -112,8 +116,8 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
                 torch.cuda.synchronize()
             t0 = time.time()
         mult = rex(it / n) if schedule == "rex" else 1.0
-        for pg in opt.param_groups:
-            pg["lr"] = lr * mult
+        for pg, base in zip(opt.param_groups, base_lrs):
+            pg["lr"] = base * mult
         idx = [tr[(pos + j) % len(tr)] for j in range(bs)]; pos += bs
         opt.zero_grad()
         H.batch_loss(net, data[Rr], torch.tensor(idx, device=DEV), ac, g).backward()

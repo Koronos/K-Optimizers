@@ -41,6 +41,34 @@ iterate: call :meth:`eval` before sampling / validation / checkpointing and
 Implementation: a thin preset over :class:`~kaon.msam.MSAM` (``norm="none"``,
 ``rho=-k``) wrapping Adakaon — one tested mechanism, one code path. ``k=0`` is exactly
 Adakaon.
+
+Low-VRAM mode (``low_vram_above``): on a full fine-tune, most bytes live in a few big
+weight matrices, while the lookahead's loss/gap win is measured to matter most on the
+many-small-tensor regime (biases, norms, LoRA/LoKr factors) — exactly where kaon's
+foreach kernels already dominate on speed too. Setting ``low_vram_above`` routes tensors
+bigger than that (in ``numel()``) into a momentum-free group (``betas=(0, betas[1])``,
+``lr * low_vram_lr_ratio``): Adakaon's own per-group gate (``betas[0] > 0``) skips
+allocating a momentum buffer for that group, and MSAM's lookahead only climbs params
+that HAVE one — so the big group transparently gets plain momentum-free Adakaon, no
+separate optimizer needed. Default ``None`` is the original behavior (momentum + lookahead everywhere), replacing
+the standalone ``NekaonAlloc`` PoC — cuts optimizer-state memory from 0.56 to ~0.05
+B/param (LoRA/LoKr adapters are too small in absolute bytes for this to matter either
+way; it's a full-fine-tune lever).
+
+``low_vram_lr_ratio`` and ``low_vram_above`` defaults are MEASURED, not guessed (2026-07-03
+sweep, proxy `C=128`/`N=1400`; caught and fixed a battery/profiler bug along the way where
+the schedule loop overwrote every param group's lr to the SAME value every step, silently
+defeating any per-group lr ratio — the fix preserves each group's own base lr through the
+schedule). At threshold=65536: ratio sweep te 0.0884/0.0806/**0.0789**/0.0801/0.0812 for
+ratio 0.1/0.25/**0.5**/0.75/1.0 — ``0.5`` is a genuine U-shaped minimum, not a flat/inert
+knob. Surprising result vs plain Nekaon (no split, te 0.0846/gap +0.0058): the split at
+``ratio=0.5`` **improves loss** (0.0789) at a gap cost (+0.0102) — this is a real loss<->gap
+trade, not a strict quality regression, so the "low-VRAM mode" name undersells it; it may be
+worth trying even when memory isn't the constraint. If gap matters more than loss,
+``ratio=0.75`` (te 0.0801, gap +0.0073) is the pick. Threshold sweep at ratio=0.5: 32768 and
+65536 tie for best loss (both 0.0789/+0.0102); 8192 is close behind with a tighter gap
+(0.0795/+0.0087); 262144/2_000_000 (~no split on this proxy model) degrade back toward the
+no-split number.
 """
 
 from __future__ import annotations
@@ -77,6 +105,14 @@ class Nekaon(MSAM):
             +0.0056, both within the proxy's noise and under the gap target).
             ``"int8"`` (~1.04 B/param) and ``"bfloat16"`` (~2.03 B/param) are the
             higher-fidelity stops of the same measured-flat dial.
+        low_vram_above: tensors with ``numel() > low_vram_above`` skip momentum and
+            the lookahead (plain Adakaon at ``lr * low_vram_lr_ratio``) — see "Low-VRAM
+            mode" above. Default ``None`` disables this (momentum + lookahead on every
+            tensor, the original behavior). Not compatible with passing your own
+            param-group dicts in ``params`` (this splits a flat param list itself).
+        low_vram_lr_ratio: the low-VRAM group's LR relative to ``lr``, when
+            ``low_vram_above`` is set. Default ``0.5``, matching the registry's
+            precedent that momentum-free Adakaon wants roughly half of Nekaon's LR.
         **adakaon_kwargs: forwarded verbatim to the inner
             :class:`~kaon.adakaon.Adakaon` (``eps``, ``cautious``,
             ``gradient_centralization``, ``foreach``, ...).
@@ -90,12 +126,34 @@ class Nekaon(MSAM):
         betas: tuple[float, float] = (0.5, 0.999),
         weight_decay: float = 0.1,
         momentum_dtype: str = "4bit",
+        *,
+        low_vram_above: int | None = None,
+        low_vram_lr_ratio: float = 0.5,
         **adakaon_kwargs: Any,
     ) -> None:
         if k < 0.0:
             raise ValueError(f"k must be >= 0 (lookahead steps), got {k}")
         if betas[0] <= 0.0:
             raise ValueError("Nekaon requires betas[0] > 0 (the lookahead rides the momentum)")
+        if low_vram_above is not None:
+            if low_vram_above < 0:
+                raise ValueError(f"low_vram_above must be >= 0, got {low_vram_above}")
+            params = list(params)
+            if params and isinstance(params[0], dict):
+                raise TypeError(
+                    "low_vram_above does not support param-group dicts — pass a flat "
+                    "parameter iterable; Nekaon builds its own small/big groups by tensor size."
+                )
+            small = [p for p in params if p.numel() <= low_vram_above]
+            big = [p for p in params if p.numel() > low_vram_above]
+            if not small and not big:
+                raise ValueError("Nekaon got no parameters")
+            groups: list[dict[str, Any]] = []
+            if small:
+                groups.append({"params": small})
+            if big:
+                groups.append({"params": big, "lr": lr * low_vram_lr_ratio, "betas": (0.0, betas[1])})
+            params = groups
         super().__init__(
             params,
             rho=-float(k),

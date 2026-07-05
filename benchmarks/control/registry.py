@@ -50,6 +50,23 @@ OPTIMIZERS = {
         lr=1.2e-3, lr_const=1.2e-3, family="in-house",
         blurb="Nekaon, Triton-fused inner step (same math; speed twin of Nekaon)",
     ),
+    # wd-sweep finding (2026-06-15): default wd=0.1 is under-regularized; the long-run const-LR
+    # sweet spot is the basin ~0.25-0.35. beta1 then dials fidelity<->gap at constant te.
+    "Nekaon-wd0.3": dict(
+        make=lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.5, 0.999), weight_decay=0.3, momentum_dtype="4bit"),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="Nekaon at the wd=0.3 long-run sweet spot (b1=0.5; generalization-best of the basin)",
+    ),
+    "Nekaon-b0.7-wd0.3": dict(
+        make=lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.7, 0.999), weight_decay=0.3, momentum_dtype="4bit"),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="Nekaon wd=0.3 + beta1=0.7 (fidelity ~free over b1=0.5: lower train loss, te tie)",
+    ),
+    "Nekaon-b0.9-wd0.3": dict(
+        make=lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.9, 0.999), weight_decay=0.3, momentum_dtype="4bit"),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="Nekaon wd=0.3 + beta1=0.9 (max fidelity; wider gap, same te as b1=0.7)",
+    ),
     "Adakaon-nomom": dict(
         make=lambda p, lr: Adakaon(p, lr=lr, betas=(0.0, 0.999), cautious=False, momentum_dtype="bfloat16"),
         lr=6e-4, lr_const=1.2e-3, family="in-house",

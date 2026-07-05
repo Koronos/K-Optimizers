@@ -1,0 +1,102 @@
+{
+ "AdaPNM": {
+  "warmup=0": {
+   "axis": "warmup",
+   "scheduler": "constant",
+   "lr": 0.0024,
+   "lr_mult": 1.0,
+   "warmup": 0,
+   "te": 0.10755750350654125,
+   "gap": 0.0028477213345468044,
+   "tr": 0.10470978217199445,
+   "naninf": false,
+   "sig": "C96_N800_s2"
+  },
+  "warmup=50": {
+   "axis": "warmup",
+   "scheduler": "constant",
+   "lr": 0.0024,
+   "lr_mult": 1.0,
+   "warmup": 50,
+   "te": 0.10426585655659437,
+   "gap": 0.007581224897876382,
+   "tr": 0.09668463165871799,
+   "naninf": false,
+   "sig": "C96_N800_s2"
+  },
+  "warmup=100": {
+   "axis": "warmup",
+   "scheduler": "constant",
+   "lr": 0.0024,
+   "lr_mult": 1.0,
+   "warmup": 100,
+   "te": 0.10238597728312016,
+   "gap": 0.00831442279741168,
+   "tr": 0.09407155448570848,
+   "naninf": false,
+   "sig": "C96_N800_s2"
+  },
+  "warmup=200": {
+   "axis": "warmup",
+   "scheduler": "constant",
+   "lr": 0.0024,
+   "lr_mult": 1.0,
+   "warmup": 200,
+   "te": 0.102608613204211,
+   "gap": 0.00863009411841631,
+   "tr": 0.09397851908579469,
+   "naninf": false,
+   "sig": "C96_N800_s2"
+  }
+ },
+ "AdamW": {
+  "warmup=0": {
+   "axis": "warmup",
+   "scheduler": "constant",
+   "lr": 0.0012,
+   "lr_mult": 1.0,
+   "warmup": 0,
+   "te": 0.09541935846209526,
+   "gap": 0.004868518561124802,
+   "tr": 0.09055083990097046,
+   "naninf": false,
+   "sig": "C96_N800_s2"
+  },
+  "warmup=50": {
+   "axis": "warmup",
+   "scheduler": "constant",
+   "lr": 0.0012,
+   "lr_mult": 1.0,
+   "warmup": 50,
+   "te": 0.09186409879475832,
+   "gap": 0.007191511336714029,
+   "tr": 0.08467258745804429,
+   "naninf": false,
+   "sig": "C96_N800_s2"
+  },
+  "warmup=100": {
+   "axis": "warmup",
+   "scheduler": "constant",
+   "lr": 0.0012,
+   "lr_mult": 1.0,
+   "warmup": 100,
+   "te": 0.09112017415463924,
+   "gap": 0.006690544541925192,
+   "tr": 0.08442962961271405,
+   "naninf": false,
+   "sig": "C96_N800_s2"
+  },
+  "warmup=200": {
+   "axis": "warmup",
+   "scheduler": "constant",
+   "lr": 0.0012,
+   "lr_mult": 1.0,
+   "warmup": 200,
+   "te": 0.09161999961361289,
+   "gap": 0.009225953835994005,
+   "tr": 0.08239404577761889,
+   "naninf": false,
+   "sig": "C96_N800_s2"
+  }
+ }
+}

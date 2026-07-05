@@ -73,3 +73,38 @@ def test_eval_shows_true_weights_and_train_restores():
     opt.train()
     for a, w in zip(pa, live, strict=True):
         assert torch.equal(a.data, w)
+
+
+def test_low_vram_above_splits_momentum_by_tensor_size():
+    """Tensors over the threshold route to a momentum-free (and lookahead-free) group —
+    replaces the standalone NekaonAlloc PoC with one optimizer instance."""
+    big, small = _params()  # (4,3)=numel 12 > threshold; (5,)=numel 5 <= threshold
+    opt = Nekaon([big, small], lr=1e-3, k=1.5, betas=(0.9, 0.999),
+                 momentum_dtype="float32", foreach=False, low_vram_above=10)
+    _run([big, small], opt, seeds=(1,))
+    state = opt.base_optimizer.state
+    assert "m" in state[small]
+    assert "m" not in state[big]
+    big_group = next(g for g in opt.param_groups if any(p is big for p in g["params"]))
+    assert big_group["lr"] == 1e-3 * 0.5
+    assert big_group["betas"] == (0.0, 0.999)
+
+
+def test_low_vram_above_none_is_unaffected():
+    """Default (no low_vram_above) keeps momentum on every tensor, same as the base preset."""
+    pa, pb = _params(), _params()
+    a = Nekaon(pa, lr=1e-3, k=1.5, betas=(0.9, 0.999), momentum_dtype="float32", foreach=False)
+    b = Nekaon(pb, lr=1e-3, k=1.5, betas=(0.9, 0.999), momentum_dtype="float32", foreach=False,
+               low_vram_above=None)
+    _run(pa, a)
+    _run(pb, b)
+    for x, y in zip(pa, pb, strict=True):
+        assert torch.equal(x.data, y.data)
+
+
+def test_low_vram_above_rejects_param_group_dicts():
+    try:
+        Nekaon([{"params": _params()}], low_vram_above=10)
+        raise AssertionError("param-group dicts must be rejected with low_vram_above")
+    except TypeError:
+        pass
