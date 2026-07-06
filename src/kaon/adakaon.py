@@ -618,9 +618,10 @@ class Adakaon(Optimizer):
 
         quant = md in ("int8", "4bit")
         if quant:  # dequant whole bucket to a stacked fp32 temp; kernel m pointers index its slices
-            temp = torch.empty(N, R, C, dtype=torch.float32, device=dev)
-            for i, st in enumerate(states):
-                temp[i] = self._codec(group).dequant_one(st, temp[i]).reshape(R, C)  # temp[i] = shape template
+            # Batched: dequant_stacked runs the whole bucket's codec in a handful of kernels.
+            # The per-tensor dequant_one loop was ~8 tiny torch ops x N tensors, CPU-dispatch
+            # bound: measured ~87 ms/step on a 528-tensor LoRA-r32 fleet (4080), vs <2 ms batched.
+            temp = self._codec(group).dequant_stacked(states, lambda t: t, (R, C)).contiguous()
             m_addr = ft.ptr_array(list(temp), dev)
             mom = ft.MOM_FP32
         else:
@@ -641,11 +642,18 @@ class Adakaon(Optimizer):
                 LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024,
             )
         if quant:  # requant the updated fp32 temp back into per-tensor storage (apply reads the temp)
-            for i, st in enumerate(states):
-                if md == "int8":
-                    st["m"], st["m_scale"] = _quant_int8(temp[i])
-                else:
-                    st["m"], st["m_scale"], _ = _quant_4bit(temp[i].reshape(-1), st["m_block"])
+            # Batched requant (same write pattern as ema_stacked: in-place copies keep the
+            # state tensors' identities stable for pointer-array caches).
+            if md == "int8":
+                q8, new_scale = _quant_int8_stacked(temp)            # per-row scale, [N, R, 1]
+                torch._foreach_copy_([st["m"] for st in states], list(q8.unbind(0)))
+                for st, sc in zip(states, new_scale.unbind(0)):
+                    st["m_scale"].copy_(sc.view_as(st["m_scale"]))
+            else:
+                new_packed, new_scale = _quant_4bit_stacked(temp.reshape(N, -1), states[0]["m_block"])
+                torch._foreach_copy_([st["m"] for st in states], list(new_packed.unbind(0)))
+                for st, sc in zip(states, new_scale.unbind(0)):
+                    st["m_scale"].copy_(sc)
         inv_mean = (1.0 / (keep.float() / n).clamp_(min=1e-8)) if cautious else torch.ones(N, device=dev)
         if fused_red:
             ft._chunked_apply_batched_g[grid](
