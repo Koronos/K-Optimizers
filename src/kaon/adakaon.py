@@ -52,6 +52,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._mechanic import MechanicTuner
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -210,6 +211,10 @@ class Adakaon(Optimizer):
         foreach_stack_budget: int | None = None,
         fused: bool = False,
         fused_tile_cap: int | None = None,
+        auto_lr: bool = False,
+        auto_lr_freeze: int | str | None = "auto",
+        auto_lr_scale: float = 1.0,
+        auto_lr_cap_rel: float = 6.0,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -281,6 +286,16 @@ class Adakaon(Optimizer):
                 raise RuntimeError("Adakaon(fused=True) requires Triton (a GPU-only optional dependency)")
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
+        # Optional parameter-free LR: a Mechanic tuner that discovers the scale and
+        # freezes back to plain Adakaon. When on, it forces group["lr"]=1.0 during
+        # adaptation (the base lr is ignored — see MechanicTuner) and drives the
+        # step via _step_impl. Off (default) -> zero overhead, step == _step_impl.
+        self._mech_tuner: MechanicTuner | None = (
+            MechanicTuner(self, lr_freeze=auto_lr_freeze, scale=auto_lr_scale, cap_rel=auto_lr_cap_rel)
+            if auto_lr
+            else None
+        )
+
     def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
         md = group["momentum_dtype"]
         codec = self._codecs.get(md)
@@ -309,6 +324,16 @@ class Adakaon(Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
+        # auto_lr on and still adapting -> the Mechanic tuner drives the step
+        # (snapshot -> _step_impl -> rescale). Off, or frozen -> plain base
+        # (post-freeze the tuner has folded S into group["lr"], so _step_impl at
+        # lr=S reproduces the frozen trajectory).
+        if self._mech_tuner is not None and not self._mech_tuner.frozen:
+            return self._mech_tuner.step(closure)
+        return self._step_impl(closure)
+
+    @torch.no_grad()
+    def _step_impl(self, closure: Any = None) -> Any:
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -705,6 +730,15 @@ class Adakaon(Optimizer):
         inv_rms_lr = lr / rms.div_(n).sqrt_().div_(clip).clamp_(min=1.0)
         return g_addr, rowmean, r, c, inv_rms_lr
 
+    def state_dict(self) -> dict[str, Any]:
+        """Base state, plus the Mechanic tuner blob under ``_mechanic`` when
+        ``auto_lr`` is on (so a checkpoint mid-warmup / frozen round-trips the
+        discovered LR instead of cold-starting adaptation on resume)."""
+        sd = super().state_dict()
+        if self._mech_tuner is not None:
+            sd["_mechanic"] = self._mech_tuner.state_blob()
+        return sd
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized first moment's stored dtype.
 
@@ -712,9 +746,25 @@ class Adakaon(Optimizer):
         param's dtype (fp32), which would silently inflate a bf16/int8/4bit
         ``momentum_dtype`` back to fp32 on resume — losing the memory the codec
         was chosen to save and breaking bit-exact resume. Delegate to the shared
-        helper that restores each tensor to how it was checkpointed.
+        helper that restores each tensor to how it was checkpointed. The Mechanic
+        tuner blob (when present) is peeled off first and restored separately.
         """
-        load_state_dict_preserving_dtypes(self, state_dict)
+        sd = dict(state_dict)
+        blob = sd.pop("_mechanic", None)
+        load_state_dict_preserving_dtypes(self, sd)
+        if self._mech_tuner is not None and blob is not None:
+            self._mech_tuner.load_blob(blob)
+
+    # -- auto_lr introspection (no-op passthroughs when auto_lr is off) -----
+    def get_d(self) -> float:
+        """Discovered effective LR under ``auto_lr`` (else the plain group lr)."""
+        if self._mech_tuner is not None:
+            return self._mech_tuner.get_d()
+        return float(self.param_groups[0]["lr"])
+
+    def is_frozen(self) -> bool:
+        """Whether ``auto_lr`` has frozen to a fixed LR (False when auto_lr is off)."""
+        return self._mech_tuner is not None and self._mech_tuner.frozen
 
     # ----------------------------------------------------------------- foreach
 
