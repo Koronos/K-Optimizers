@@ -72,6 +72,16 @@ OPTIMIZERS = {
         lr=6e-4, lr_const=1.2e-3, family="in-house",
         blurb="factored Adam, no momentum (minimum VRAM, regularizing)",
     ),
+    # auto_lr twin of Adakaon-nomom: SAME config + Mechanic LR discovery (auto_lr=True).
+    # The base lr is IGNORED (the tuner owns the scale); the tuner forces group lr=1.0, so
+    # the CONSTANT-LR scenario runs at unit lr (fair) while the REX-scheduled scenario fights
+    # the tuner (auto_lr *is* the schedule-finder). Read this on the continuity dimension: the
+    # claim is "matches the tuned lr_const WITHOUT tuning", not "beats a well-tuned baseline".
+    "Adakaon-nomom (auto_lr)": dict(
+        make=lambda p, lr: Adakaon(p, betas=(0.0, 0.999), cautious=False, momentum_dtype="bfloat16", auto_lr=True),
+        lr=6e-4, lr_const=1.2e-3, family="in-house",
+        blurb="Adakaon-nomom + auto_lr (Mechanic) — discovers the LR itself; constant-LR is its home turf",
+    ),
     "Adakaon-bf16": dict(
         make=lambda p, lr: Adakaon(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16"),
         lr=1.2e-3, lr_const=1.2e-3, family="in-house",

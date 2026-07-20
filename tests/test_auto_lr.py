@@ -117,6 +117,26 @@ def test_parity_with_autokaon() -> None:
         assert torch.allclose(pa, pb, rtol=1e-4, atol=1e-6)
 
 
+def test_survives_harness_lr_clobber() -> None:
+    # External trainers (renga-flow, kohya, the control battery) rewrite
+    # group["lr"] every step. auto_lr must impose its own effective LR each
+    # iteration — a one-time fold into group["lr"] gets clobbered, and a frozen
+    # base run at the harness's lr (here 1.0, ~2000x too hot) diverges.
+    model, x, y = _tiny_problem(seed=7)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True, auto_lr_freeze=10)
+    c = _closure(model, x, y, opt)
+    with torch.no_grad():
+        start = float(torch.nn.functional.mse_loss(model(x), y))
+    for _ in range(150):
+        for g in opt.param_groups:      # the harness clobber, every step
+            g["lr"] = 1.0
+        opt.step(c)
+    assert opt.is_frozen()
+    with torch.no_grad():
+        end = float(torch.nn.functional.mse_loss(model(x), y))
+    assert end < 0.5 * start, f"must survive per-step lr clobber, not diverge ({start:g} -> {end:g})"
+
+
 def test_state_dict_resume() -> None:
     model, x, y = _tiny_problem(seed=5)
     opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True, auto_lr_freeze=None)

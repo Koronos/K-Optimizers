@@ -325,11 +325,17 @@ class Adakaon(Optimizer):
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
         # auto_lr on and still adapting -> the Mechanic tuner drives the step
-        # (snapshot -> _step_impl -> rescale). Off, or frozen -> plain base
-        # (post-freeze the tuner has folded S into group["lr"], so _step_impl at
-        # lr=S reproduces the frozen trajectory).
-        if self._mech_tuner is not None and not self._mech_tuner.frozen:
-            return self._mech_tuner.step(closure)
+        # (snapshot -> _step_impl -> rescale; it forces unit lr internally).
+        # Frozen -> plain base at the discovered S, imposed *each step* so an
+        # external harness that rewrites group["lr"] per iteration (renga-flow/
+        # kohya schedulers, the control battery) can't clobber it back to a stale
+        # value (which would run the frozen base at the wrong LR and diverge).
+        t = self._mech_tuner
+        if t is not None:
+            if not t.frozen:
+                return t.step(closure)
+            for group in self.param_groups:
+                group["lr"] = t.frozen_lr
         return self._step_impl(closure)
 
     @torch.no_grad()

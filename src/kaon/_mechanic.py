@@ -193,8 +193,15 @@ class MechanicTuner:
             # tracks the problem's LR scale. Load-bearing on short horizons.
             self._scale_cap = self._cap_rel * max(self._s_init, 1e-8)
 
-        # 2) base update at lr=1. u_t = p_after - prev is the base update vector.
-        self.opt._step_impl()  # type: ignore[attr-defined]
+        # 2) base update at UNIT lr. Force it *each step* right before the base
+        #    update: an external harness (renga-flow/kohya LR schedulers, the
+        #    control battery) rewrites group["lr"] every iteration, so a one-time
+        #    force in __init__ gets clobbered and the base would step at the
+        #    harness's lr instead of 1.0 — breaking the tuner's unit-update
+        #    assumption. auto_lr owns the LR, so we overrule the harness here.
+        for grp in self.opt.param_groups:
+            grp["lr"] = 1.0
+        self.opt._step_impl()  # type: ignore[attr-defined]  # u_t = p_after - prev
 
         s = mech["s"]
         s_sum = float(s.sum().item())
