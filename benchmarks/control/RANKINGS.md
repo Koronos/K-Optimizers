@@ -10,22 +10,22 @@
 
 | # | optimizer | mean rank | 🥇 wins (rank 1) | identity |
 |---|---|---|---|---|
-| 1 | **Adakaon-nomom** | 6.7 | 🥇 memory | factored Adam, no momentum (minimum VRAM, regularizing) |
-| 2 | **Adakaon-bf16-fused** | 6.7 | 🥇 LoRA-speed | Adakaon-bf16, Triton-fused step (same math; speed twin of Adakaon-bf16) |
-| 3 | **Nekaon-fused** | 6.9 | — | Nekaon, Triton-fused inner step (same math; speed twin of Nekaon) |
-| 4 | **Lion** | 7.1 | — | sign-momentum, no 2nd moment (lightest state) |
+| 1 | **Adakaon-bf16-fused** | 6.7 | 🥇 LoRA-speed | Adakaon-bf16, Triton-fused step (same math; speed twin of Adakaon-bf16) |
+| 2 | **Adakaon-nomom** | 6.9 | 🥇 memory | factored Adam, no momentum (minimum VRAM, regularizing) |
+| 3 | **Nekaon-fused** | 7.0 | — | Nekaon, Triton-fused inner step (same math; speed twin of Nekaon) |
+| 4 | **Lion** | 7.3 | — | sign-momentum, no 2nd moment (lightest state) |
 | 5 | **AdaPNM-fused** | 7.6 | 🥇 generalization, constant-LR | AdaPNM, Triton-fused step (same math; speed twin of AdaPNM) |
-| 6 | **Nekaon** | 8.0 | — | Adakaon + k-step negative momentum-lookahead (zero-cost flat-minima; beta1 = regime knob) |
+| 6 | **Nekaon** | 8.1 | — | Adakaon + k-step negative momentum-lookahead (zero-cost flat-minima; beta1 = regime knob) |
 | 7 | **Nekaon-b0.9-wd0.3** | 8.1 | 🥇 convergence, loss | Nekaon wd=0.3 + beta1=0.9 (max fidelity; wider gap, same te as b1=0.7) |
-| 8 | **Nekaon-wd0.3** | 8.4 | — | Nekaon at the wd=0.3 long-run sweet spot (b1=0.5; generalization-best of the basin) |
-| 9 | **Nekaon-b0.7-wd0.3** | 8.4 | — | Nekaon wd=0.3 + beta1=0.7 (fidelity ~free over b1=0.5: lower train loss, te tie) |
+| 8 | **Nekaon-b0.7-wd0.3** | 8.4 | — | Nekaon wd=0.3 + beta1=0.7 (fidelity ~free over b1=0.5: lower train loss, te tie) |
+| 9 | **Nekaon-wd0.3** | 8.6 | — | Nekaon at the wd=0.3 long-run sweet spot (b1=0.5; generalization-best of the basin) |
 | 10 | **Adakaon-bf16** | 8.7 | — | factored Adam, bf16 momentum (AdamW-quality, low memory) |
-| 11 | **AdaPNM** | 9.3 | — | positive-negative momentum (best generalization / constant-LR) |
-| 12 | **torch.AdamW (fused)** | 9.3 | 🥇 iter-speed | torch.optim.AdamW, fused kernel — the EXTERNAL reference (not a kaon optimizer) |
-| 13 | **AdamP** | 9.4 | — | AdamW minus the radial update on scale-invariant weights (gap-oriented; no fused twin) |
+| 11 | **torch.AdamW (fused)** | 9.3 | 🥇 iter-speed | torch.optim.AdamW, fused kernel — the EXTERNAL reference (not a kaon optimizer) |
+| 12 | **AdamP** | 9.3 | — | AdamW minus the radial update on scale-invariant weights (gap-oriented; no fused twin) |
+| 13 | **AdaPNM** | 9.4 | — | positive-negative momentum (best generalization / constant-LR) |
 | 14 | **AdaMuon** | 10.0 | — | orthogonalized momentum + factored 2nd moment (convergence) |
-| 15 | **ScheduleFree** | 10.6 | — | Schedule-Free AdamW (iterate averaging, no schedule) — constant-LR continuity probe |
-| 16 | **Adakaon-nomom (auto_lr)** | 10.7 | — | Adakaon-nomom + auto_lr (update-space DoWG) — discovers the LR itself, no tuning |
+| 15 | **Adakaon-nomom (auto_lr)** | 10.0 | — | Adakaon-nomom + auto_lr (update-space DoWG) — discovers the LR itself, no tuning |
+| 16 | **ScheduleFree** | 10.6 | — | Schedule-Free AdamW (iterate averaging, no schedule) — constant-LR continuity probe |
 ## 🎯 Loss × generalization (scheduled, progressive curriculum)
 
 The headline for small-data fine-tuning: rank by the **train–val gap**, not the loss.
@@ -40,8 +40,8 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 6 | ScheduleFree | 0.0828 | +0.0100 |
 | 7 | torch.AdamW (fused) | 0.0805 | +0.0114 |
 | 8 | Nekaon-b0.7-wd0.3 | 0.0758 | +0.0118 |
-| 9 | Adakaon-nomom (auto_lr) | 0.0818 | +0.0127 |
-| 10 | AdamP | 0.0742 | +0.0130 |
+| 9 | AdamP | 0.0742 | +0.0130 |
+| 10 | Adakaon-nomom (auto_lr) | 0.0818 | +0.0132 |
 | 11 | Lion | 0.0768 | +0.0144 |
 | 12 | Nekaon-b0.9-wd0.3 | 0.0692 | +0.0160 |
 | 13 | Adakaon-nomom | 0.0795 | +0.0169 |
@@ -59,11 +59,11 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 2 | Adakaon-bf16-fused | 1375 | 13.6 | 18.72 |
 | 3 | Adakaon-bf16 | 1500 | 14.3 | 21.47 |
 | 4 | Lion | 1750 | 13.4 | 23.37 |
-| 5 | Adakaon-nomom | 1750 | 13.7 | 23.94 |
-| 6 | torch.AdamW (fused) | 2000 | 13.1 | 26.18 |
-| 7 | AdaMuon | 1625 | 16.2 | 26.35 |
-| 8 | AdaPNM-fused | 2000 | 13.6 | 27.25 |
-| 9 | Adakaon-nomom (auto_lr) | 1875 | 14.7 | 27.66 |
+| 5 | Adakaon-nomom (auto_lr) | 1625 | 14.6 | 23.70 |
+| 6 | Adakaon-nomom | 1750 | 13.7 | 23.94 |
+| 7 | torch.AdamW (fused) | 2000 | 13.1 | 26.18 |
+| 8 | AdaMuon | 1625 | 16.2 | 26.35 |
+| 9 | AdaPNM-fused | 2000 | 13.6 | 27.25 |
 | 10 | Nekaon-b0.7-wd0.3 | 1625 | 17.5 | 28.37 |
 | 11 | ScheduleFree | 2000 | 14.3 | 28.52 |
 | 12 | AdamP | 1625 | 17.8 | 28.86 |
@@ -85,8 +85,8 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 5 | Adakaon-nomom | 13.7 | 2.97 |
 | 6 | ScheduleFree | 14.3 | 4.82 |
 | 7 | Adakaon-bf16 | 14.3 | 3.60 |
-| 8 | AdaPNM | 14.7 | 5.67 |
-| 9 | Adakaon-nomom (auto_lr) | 14.7 | 39.01 |
+| 8 | Adakaon-nomom (auto_lr) | 14.6 | 12.23 |
+| 9 | AdaPNM | 14.7 | 5.67 |
 | 10 | AdaMuon | 16.2 | 6.61 |
 | 11 | Nekaon-fused | 16.4 | 1.60 |
 | 12 | Nekaon-b0.7-wd0.3 | 17.5 | 7.82 |
@@ -134,7 +134,7 @@ The headline for small-data fine-tuning: rank by the **train–val gap**, not th
 | 10 | AdamP | 0.0752 | +0.0115 | -0.0015 |
 | 11 | Nekaon-b0.9-wd0.3 | 0.0691 | +0.0116 | -0.0044 |
 | 12 | torch.AdamW (fused) | 0.0839 | +0.0124 | +0.0010 |
-| 13 | Adakaon-nomom (auto_lr) | 0.0812 | +0.0124 | -0.0002 |
+| 13 | Adakaon-nomom (auto_lr) | 0.0826 | +0.0127 | -0.0005 |
 | 14 | Adakaon-bf16-fused | 0.0743 | +0.0152 | -0.0042 |
 | 15 | Adakaon-bf16 | 0.0732 | +0.0159 | -0.0054 |
 | 16 | AdaMuon | 0.0809 | +0.0181 | -0.0022 |

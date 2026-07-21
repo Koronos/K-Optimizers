@@ -147,18 +147,22 @@ class AutoLRTuner:
         # so an external harness rewriting group["lr"] can't clobber the discovered LR.
         for g in self.opt.param_groups:
             g["lr"] = s_prev
-        prev = [p.detach().clone() for p in params]
+        # fp32 pre-step snapshot (copy=True so it never aliases an fp32 param the
+        # base is about to mutate). fp32 avoids bf16 catastrophic cancellation on the
+        # small step / early displacement.
+        prev_f = [p.detach().to(torch.float32, copy=True) for p in params]
         self.opt._step_impl()  # type: ignore[attr-defined]
 
-        # ‖u_t‖² (unit-update norm²) from the applied displacement, and the
-        # running-max distance from x0. Both are plain reductions over the params.
-        un2 = 0.0
-        dist2 = 0.0
-        for p, pv in zip(params, prev, strict=True):
-            d = (p.detach() - pv).float()
-            un2 += float((d * d).sum())
-            diff = p.detach().float() - self._x0[p].float()
-            dist2 += float((diff * diff).sum())
+        # ‖u_t‖² (unit-update norm²) and dist² = ‖x−x0‖², batched with
+        # torch._foreach_* so the cost is a handful of kernel launches + two syncs,
+        # not ~8 launches + 2 syncs *per tensor* (the launch-bound blowup on
+        # many-small-tensor LoRA/LoKr fleets). ``.float()`` is a no-op on fp32 params.
+        cur_f = [p.detach().float() for p in params]
+        x0_f = [self._x0[p].float() for p in params]
+        du = torch._foreach_sub(cur_f, prev_f)          # Δp
+        ddist = torch._foreach_sub(cur_f, x0_f)         # x − x0
+        un2 = float(torch.stack(torch._foreach_norm(du)).square_().sum())
+        dist2 = float(torch.stack(torch._foreach_norm(ddist)).square_().sum())
         un2 = un2 / (s_prev * s_prev + _EPS)  # divide out S² -> unit-update norm²
 
         dist = math.sqrt(dist2)
