@@ -147,10 +147,14 @@ class AutoLRTuner:
         # so an external harness rewriting group["lr"] can't clobber the discovered LR.
         for g in self.opt.param_groups:
             g["lr"] = s_prev
-        # fp32 pre-step snapshot (copy=True so it never aliases an fp32 param the
-        # base is about to mutate). fp32 avoids bf16 catastrophic cancellation on the
-        # small step / early displacement.
-        prev_f = [p.detach().to(torch.float32, copy=True) for p in params]
+        # fp32 pre-step snapshot. fp32 avoids bf16 catastrophic cancellation on the
+        # small step / early displacement. ``.float()`` gives a safe fp32 copy for a
+        # low-precision param; an fp32 param needs ``.clone()`` (``.float()`` would
+        # alias the param the base is about to mutate).
+        prev_f = [
+            p.detach().float() if p.dtype != torch.float32 else p.detach().clone()
+            for p in params
+        ]
         self.opt._step_impl()  # type: ignore[attr-defined]
 
         # ‖u_t‖² (unit-update norm²) and dist² = ‖x−x0‖², batched with
