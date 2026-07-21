@@ -52,7 +52,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
-from kaon._mechanic import MechanicTuner
+from kaon._autolr import AutoLRTuner
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -212,9 +212,9 @@ class Adakaon(Optimizer):
         fused: bool = False,
         fused_tile_cap: int | None = None,
         auto_lr: bool = False,
-        auto_lr_freeze: int | str | None = "auto",
+        auto_lr_freeze: int | None = 1000,
         auto_lr_scale: float = 1.0,
-        auto_lr_cap_rel: float = 6.0,
+        auto_lr_fuse_rel: float = 100.0,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -288,10 +288,10 @@ class Adakaon(Optimizer):
 
         # Optional parameter-free LR: a Mechanic tuner that discovers the scale and
         # freezes back to plain Adakaon. When on, it forces group["lr"]=1.0 during
-        # adaptation (the base lr is ignored — see MechanicTuner) and drives the
+        # adaptation (the base lr is ignored — see AutoLRTuner) and drives the
         # step via _step_impl. Off (default) -> zero overhead, step == _step_impl.
-        self._mech_tuner: MechanicTuner | None = (
-            MechanicTuner(self, lr_freeze=auto_lr_freeze, scale=auto_lr_scale, cap_rel=auto_lr_cap_rel)
+        self._autolr: AutoLRTuner | None = (
+            AutoLRTuner(self, freeze=auto_lr_freeze, scale=auto_lr_scale, fuse_rel=auto_lr_fuse_rel)
             if auto_lr
             else None
         )
@@ -324,13 +324,13 @@ class Adakaon(Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
-        # auto_lr on and still adapting -> the Mechanic tuner drives the step
-        # (snapshot -> _step_impl -> rescale; it forces unit lr internally).
-        # Frozen -> plain base at the discovered S, imposed *each step* so an
-        # external harness that rewrites group["lr"] per iteration (renga-flow/
-        # kohya schedulers, the control battery) can't clobber it back to a stale
-        # value (which would run the frozen base at the wrong LR and diverge).
-        t = self._mech_tuner
+        # auto_lr on and still adapting -> the DoWG tuner drives the step (it sets
+        # group["lr"]=S and steps the base). Frozen -> plain base at the discovered
+        # S, imposed *each step* so an external harness that rewrites group["lr"]
+        # per iteration (renga-flow/kohya schedulers, the control battery) can't
+        # clobber it back to a stale value (which would run the frozen base at the
+        # wrong LR and diverge).
+        t = self._autolr
         if t is not None:
             if not t.frozen:
                 return t.step(closure)
@@ -737,12 +737,12 @@ class Adakaon(Optimizer):
         return g_addr, rowmean, r, c, inv_rms_lr
 
     def state_dict(self) -> dict[str, Any]:
-        """Base state, plus the Mechanic tuner blob under ``_mechanic`` when
+        """Base state, plus the auto_lr tuner blob under ``_autolr`` when
         ``auto_lr`` is on (so a checkpoint mid-warmup / frozen round-trips the
         discovered LR instead of cold-starting adaptation on resume)."""
         sd = super().state_dict()
-        if self._mech_tuner is not None:
-            sd["_mechanic"] = self._mech_tuner.state_blob()
+        if self._autolr is not None:
+            sd["_autolr"] = self._autolr.state_blob()
         return sd
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -752,25 +752,25 @@ class Adakaon(Optimizer):
         param's dtype (fp32), which would silently inflate a bf16/int8/4bit
         ``momentum_dtype`` back to fp32 on resume — losing the memory the codec
         was chosen to save and breaking bit-exact resume. Delegate to the shared
-        helper that restores each tensor to how it was checkpointed. The Mechanic
+        helper that restores each tensor to how it was checkpointed. The auto_lr
         tuner blob (when present) is peeled off first and restored separately.
         """
         sd = dict(state_dict)
-        blob = sd.pop("_mechanic", None)
+        blob = sd.pop("_autolr", None)
         load_state_dict_preserving_dtypes(self, sd)
-        if self._mech_tuner is not None and blob is not None:
-            self._mech_tuner.load_blob(blob)
+        if self._autolr is not None and blob is not None:
+            self._autolr.load_blob(blob)
 
     # -- auto_lr introspection (no-op passthroughs when auto_lr is off) -----
     def get_d(self) -> float:
         """Discovered effective LR under ``auto_lr`` (else the plain group lr)."""
-        if self._mech_tuner is not None:
-            return self._mech_tuner.get_d()
+        if self._autolr is not None:
+            return self._autolr.get_d()
         return float(self.param_groups[0]["lr"])
 
     def is_frozen(self) -> bool:
         """Whether ``auto_lr`` has frozen to a fixed LR (False when auto_lr is off)."""
-        return self._mech_tuner is not None and self._mech_tuner.frozen
+        return self._autolr is not None and self._autolr.frozen
 
     # ----------------------------------------------------------------- foreach
 

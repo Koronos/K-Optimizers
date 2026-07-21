@@ -4,7 +4,7 @@ Optimizers:
     Adakaon: conv-aware factored optimizer (AdamW-quality at Adafactor memory).
     AdaMuon: orthogonalized momentum + factored quantized variance (Adafactor memory).
     KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
-    Autokaon: parameter-free LR on Adakaon via a Mechanic tuner (freeze-to-free).
+    Adakaon(auto_lr=True): composable parameter-free LR (update-space DoWG) on any kaon base.
     Lion: sign-momentum (EvoLved Sign Momentum) on Adakaon's quantized-momentum backend (experimental).
     AdaPNM: Adam + positive-negative momentum on the factored/quantized backend (experimental).
     AdaBelief: Adam on the variance of the gradient residual (g - m) on the factored backend (candidate).
@@ -37,7 +37,6 @@ from kaon.adamp import AdamP
 from kaon.adamuon import AdaMuon
 from kaon.adapnm import AdaPNM
 from kaon.adopt import ADOPT
-from kaon.autokaon import Autokaon
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
 from kaon.lookahead import Lookahead
@@ -53,7 +52,6 @@ __all__ = [
     "AdaPNM",
     "Adakaon",
     "AdamP",
-    "Autokaon",
     "KProdigy",
     "Lion",
     "Lookahead",
