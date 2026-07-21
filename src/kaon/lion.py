@@ -73,6 +73,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._autolr import AutoLRTuner
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
@@ -163,6 +164,10 @@ class Lion(Optimizer):
         foreach: bool = True,
         foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
+        auto_lr: bool = False,
+        auto_lr_freeze: int | None = 1000,
+        auto_lr_scale: float = 1.0,
+        auto_lr_fuse_rel: float = 100.0,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -197,6 +202,13 @@ class Lion(Optimizer):
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
+        # Composable parameter-free LR (update-space DoWG). When on, drives the step
+        # via _step_impl at the discovered lr=S; off (default) -> step == _step_impl.
+        self._autolr: AutoLRTuner | None = (
+            AutoLRTuner(self, freeze=auto_lr_freeze, scale=auto_lr_scale, fuse_rel=auto_lr_fuse_rel)
+            if auto_lr
+            else None
+        )
 
     # ------------------------------------------------------------------- state
     @torch.no_grad()
@@ -311,6 +323,19 @@ class Lion(Optimizer):
     # -------------------------------------------------------------------- step
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
+        # auto_lr on and adapting -> the DoWG tuner drives the step (sets lr=S).
+        # Frozen -> plain base at the discovered S, imposed each step so an external
+        # harness rewriting group["lr"] can't clobber it. Off -> step == _step_impl.
+        t = self._autolr
+        if t is not None:
+            if not t.frozen:
+                return t.step(closure)
+            for group in self.param_groups:
+                group["lr"] = t.frozen_lr
+        return self._step_impl(closure)
+
+    @torch.no_grad()
+    def _step_impl(self, closure: Any = None) -> Any:
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -341,15 +366,37 @@ class Lion(Optimizer):
                     self._step_one_param(p, group)
         return loss
 
+    def state_dict(self) -> dict[str, Any]:
+        """Base state, plus the auto_lr tuner blob under ``_autolr`` when on."""
+        sd = super().state_dict()
+        if self._autolr is not None:
+            sd["_autolr"] = self._autolr.state_blob()
+        return sd
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized momentum's stored dtype.
 
         torch's default ``load_state_dict`` upcasts every state tensor to the
         param's dtype (fp32), which would silently inflate a bf16/int8/4bit
         momentum back to fp32 on resume. Delegate to the shared helper that
-        restores each tensor to how it was checkpointed.
+        restores each tensor to how it was checkpointed. The auto_lr tuner blob
+        (when present) is peeled off first and restored separately.
         """
-        load_state_dict_preserving_dtypes(self, state_dict)
+        sd = dict(state_dict)
+        blob = sd.pop("_autolr", None)
+        load_state_dict_preserving_dtypes(self, sd)
+        if self._autolr is not None and blob is not None:
+            self._autolr.load_blob(blob)
+
+    def get_d(self) -> float:
+        """Discovered effective LR under ``auto_lr`` (else the plain group lr)."""
+        if self._autolr is not None:
+            return self._autolr.get_d()
+        return float(self.param_groups[0]["lr"])
+
+    def is_frozen(self) -> bool:
+        """Whether ``auto_lr`` has frozen to a fixed LR (False when auto_lr is off)."""
+        return self._autolr is not None and self._autolr.frozen
 
     # ----------------------------------------------------------------- foreach
 
