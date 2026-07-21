@@ -186,6 +186,15 @@ class AutoLRTuner:
         dist2 = float(torch.stack(torch._foreach_norm(ddist)).square_().sum())
         un2 = un2 / (s_prev * s_prev + _EPS)  # divide out S² -> unit-update norm²
 
+        if un2 <= 0.0:
+            # The base produced NO update this step (e.g. ADOPT's v-lag warmup no-op, which
+            # only initializes the second moment). Feeding un2=0 into the ratio leaves v ~ 0,
+            # so S = r̄²/√v would blow up to the fuse (and r̄ would pick up the bf16 x0
+            # quantization error as spurious "distance"). Skip the estimate — keep S at its
+            # seed until the base actually moves.
+            self._t += 1
+            return loss
+
         dist = math.sqrt(dist2)
         if dist > self._rbar:
             self._rbar = dist
