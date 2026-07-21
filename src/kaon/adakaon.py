@@ -52,7 +52,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
-from kaon._autolr import AutoLRTuner
+from kaon._autolr import AutoLRMixin
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -124,7 +124,7 @@ _STACK_BYTES_PER_ELEM = 48
 
 
 
-class Adakaon(Optimizer):
+class Adakaon(AutoLRMixin, Optimizer):
     """Conv-aware factored optimizer with optional bf16 momentum.
 
     Args:
@@ -288,13 +288,9 @@ class Adakaon(Optimizer):
 
         # Optional parameter-free LR: a Mechanic tuner that discovers the scale and
         # freezes back to plain Adakaon. When on, it forces group["lr"]=1.0 during
-        # adaptation (the base lr is ignored — see AutoLRTuner) and drives the
-        # step via _step_impl. Off (default) -> zero overhead, step == _step_impl.
-        self._autolr: AutoLRTuner | None = (
-            AutoLRTuner(self, freeze=auto_lr_freeze, scale=auto_lr_scale, fuse_rel=auto_lr_fuse_rel)
-            if auto_lr
-            else None
-        )
+        # adaptation (the base lr is ignored) and drives the step via _step_impl.
+        # Off (default) -> zero overhead, step == _step_impl.
+        self._init_autolr(auto_lr, auto_lr_freeze, auto_lr_scale, auto_lr_fuse_rel)
 
     def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
         md = group["momentum_dtype"]
@@ -322,22 +318,8 @@ class Adakaon(Optimizer):
         if is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
 
-    @torch.no_grad()
-    def step(self, closure: Any = None) -> Any:
-        # auto_lr on and still adapting -> the DoWG tuner drives the step (it sets
-        # group["lr"]=S and steps the base). Frozen -> plain base at the discovered
-        # S, imposed *each step* so an external harness that rewrites group["lr"]
-        # per iteration (renga-flow/kohya schedulers, the control battery) can't
-        # clobber it back to a stale value (which would run the frozen base at the
-        # wrong LR and diverge).
-        t = self._autolr
-        if t is not None:
-            if not t.frozen:
-                return t.step(closure)
-            for group in self.param_groups:
-                group["lr"] = t.frozen_lr
-        return self._step_impl(closure)
-
+    # step() is the AutoLRMixin router (drives the DoWG tuner when auto_lr is on, else
+    # calls _step_impl); it also re-imposes the frozen LR each step vs a harness clobber.
     @torch.no_grad()
     def _step_impl(self, closure: Any = None) -> Any:
         loss = None
@@ -737,40 +719,18 @@ class Adakaon(Optimizer):
         return g_addr, rowmean, r, c, inv_rms_lr
 
     def state_dict(self) -> dict[str, Any]:
-        """Base state, plus the auto_lr tuner blob under ``_autolr`` when
-        ``auto_lr`` is on (so a checkpoint mid-warmup / frozen round-trips the
-        discovered LR instead of cold-starting adaptation on resume)."""
-        sd = super().state_dict()
-        if self._autolr is not None:
-            sd["_autolr"] = self._autolr.state_blob()
-        return sd
+        """Base state + the auto_lr tuner blob (via AutoLRMixin) when auto_lr is on."""
+        return self._autolr_state_dict(super().state_dict())
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized first moment's stored dtype.
 
-        torch's default ``load_state_dict`` upcasts every state tensor to the
-        param's dtype (fp32), which would silently inflate a bf16/int8/4bit
-        ``momentum_dtype`` back to fp32 on resume — losing the memory the codec
-        was chosen to save and breaking bit-exact resume. Delegate to the shared
-        helper that restores each tensor to how it was checkpointed. The auto_lr
-        tuner blob (when present) is peeled off first and restored separately.
+        torch's default ``load_state_dict`` upcasts every state tensor to the param's
+        dtype (fp32), silently inflating a bf16/int8/4bit ``momentum_dtype`` back to fp32
+        on resume — losing the memory the codec was chosen to save. Delegate to the
+        preserving helper; the auto_lr tuner blob is peeled off first by AutoLRMixin.
         """
-        sd = dict(state_dict)
-        blob = sd.pop("_autolr", None)
-        load_state_dict_preserving_dtypes(self, sd)
-        if self._autolr is not None and blob is not None:
-            self._autolr.load_blob(blob)
-
-    # -- auto_lr introspection (no-op passthroughs when auto_lr is off) -----
-    def get_d(self) -> float:
-        """Discovered effective LR under ``auto_lr`` (else the plain group lr)."""
-        if self._autolr is not None:
-            return self._autolr.get_d()
-        return float(self.param_groups[0]["lr"])
-
-    def is_frozen(self) -> bool:
-        """Whether ``auto_lr`` has frozen to a fixed LR (False when auto_lr is off)."""
-        return self._autolr is not None and self._autolr.frozen
+        self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
 
     # ----------------------------------------------------------------- foreach
 

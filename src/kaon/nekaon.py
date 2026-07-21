@@ -76,12 +76,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from kaon._autolr import AutoLRMixin
 from kaon.msam import MSAM
 
 __all__ = ["Nekaon"]
 
 
-class Nekaon(MSAM):
+class Nekaon(AutoLRMixin, MSAM):
     """Adakaon + k-step negative momentum-lookahead (zero-cost flat-minima bias).
 
     Args:
@@ -129,6 +130,10 @@ class Nekaon(MSAM):
         *,
         low_vram_above: int | None = None,
         low_vram_lr_ratio: float = 0.5,
+        auto_lr: bool = False,
+        auto_lr_freeze: int | str | None = "auto",
+        auto_lr_scale: float = 1.0,
+        auto_lr_fuse_rel: float = 100.0,
         **adakaon_kwargs: Any,
     ) -> None:
         if k < 0.0:
@@ -165,3 +170,22 @@ class Nekaon(MSAM):
             **adakaon_kwargs,
         )
         self.k = float(k)
+        if auto_lr and low_vram_above is not None:
+            raise ValueError(
+                "Nekaon(auto_lr=True) is incompatible with low_vram_above: auto_lr forces one "
+                "discovered LR on all groups each step, which would clobber the per-group "
+                "low-VRAM lr ratio. Use one or the other."
+            )
+        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
+        self._init_autolr(auto_lr, auto_lr_freeze, auto_lr_scale, auto_lr_fuse_rel)
+
+    # step() is the AutoLRMixin router; _step_impl is the full Nekaon step (SAM declimb ->
+    # inner base -> climb) — DoWG measures the net displacement, so it composes over the lookahead.
+    def _step_impl(self, closure: Any = None) -> Any:
+        return MSAM.step(self, closure)  # explicit: super() would hit AutoLRMixin.step (the router)
+
+    def state_dict(self) -> dict[str, Any]:
+        return self._autolr_state_dict(super().state_dict())
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._autolr_load(state_dict, lambda sd: MSAM.load_state_dict(self, sd))

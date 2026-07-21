@@ -60,7 +60,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-__all__ = ["AutoLRTuner"]
+__all__ = ["AutoLRMixin", "AutoLRTuner"]
 
 _SEED_REL: float = 3e-3   # data-relative seed = _SEED_REL * RMS(params); below the operating LR
 _EPS: float = 1e-30
@@ -256,3 +256,65 @@ class AutoLRTuner:
                 self._x0[params[i]] = r.to(params[i].device)
         self.frozen = bool(blob["frozen"])
         self.frozen_lr = blob["frozen_lr"]
+
+
+class AutoLRMixin:
+    """Turns an ``auto_lr`` flag into the composable DoWG tuner, so each base optimizer only
+    hooks up in ~4 lines. Recipe: inherit this FIRST (``class Foo(AutoLRMixin, Optimizer)``),
+    call ``self._init_autolr(...)`` at the end of ``__init__``, expose the base's one-step
+    update as ``_step_impl(closure=None)`` (rename the old ``step`` for a flat optimizer, or
+    delegate to the wrapped ``step`` for a wrapper), and route ``state_dict`` / ``load_state_dict``
+    through the two helpers here. The step router (with the freeze-time harness-clobber guard),
+    ``get_d`` / ``is_frozen``, and the checkpoint plumbing are shared here — no per-optimizer copy.
+    """
+
+    _autolr: "AutoLRTuner | None"
+
+    def _init_autolr(self, auto_lr: bool, freeze: int | str | None, scale: float, fuse_rel: float) -> None:
+        """Call at the END of ``__init__`` (after ``super().__init__`` / param_groups exist)."""
+        self._autolr = (
+            AutoLRTuner(self, freeze=freeze, scale=scale, fuse_rel=fuse_rel)  # type: ignore[arg-type]
+            if auto_lr
+            else None
+        )
+
+    @torch.no_grad()
+    def step(self, closure: Any = None) -> Any:
+        # Adapting -> the DoWG tuner drives the step at the discovered lr=S. Frozen -> plain base
+        # at S, imposed EACH step so an external harness rewriting group["lr"] (renga/kohya
+        # schedulers, the control battery) can't clobber it. Off -> step == _step_impl (zero overhead).
+        t = self._autolr
+        if t is not None:
+            if not t.frozen:
+                return t.step(closure)
+            for group in self.param_groups:  # type: ignore[attr-defined]
+                group["lr"] = t.frozen_lr
+        return self._step_impl(closure)
+
+    def _step_impl(self, closure: Any = None) -> Any:
+        raise NotImplementedError("optimizer using AutoLRMixin must provide _step_impl")
+
+    def get_d(self) -> float:
+        """Discovered effective LR under ``auto_lr`` (else the plain group lr)."""
+        if self._autolr is not None:
+            return self._autolr.get_d()
+        return float(self.param_groups[0]["lr"])  # type: ignore[attr-defined]
+
+    def is_frozen(self) -> bool:
+        """Whether ``auto_lr`` has frozen to a fixed LR (False when auto_lr is off)."""
+        return self._autolr is not None and self._autolr.frozen
+
+    # -- checkpoint helpers (the host's state_dict/load_state_dict call these) --
+    def _autolr_state_dict(self, sd: dict[str, Any]) -> dict[str, Any]:
+        """``def state_dict(self): return self._autolr_state_dict(super().state_dict())``"""
+        if self._autolr is not None:
+            sd["_autolr"] = self._autolr.state_blob()
+        return sd
+
+    def _autolr_load(self, state_dict: dict[str, Any], inner_load: Any) -> None:
+        """``def load_state_dict(self, sd): self._autolr_load(sd, lambda s: <base restore>(s))``"""
+        sd = dict(state_dict)
+        blob = sd.pop("_autolr", None)
+        inner_load(sd)
+        if self._autolr is not None and blob is not None:
+            self._autolr.load_blob(blob)
