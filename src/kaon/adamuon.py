@@ -68,6 +68,7 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
 )
+from kaon._autolr import AutoLRMixin
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -148,7 +149,7 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
     return x
 
 
-class AdaMuon(Optimizer):
+class AdaMuon(AutoLRMixin, Optimizer):
     """Orthogonalized-momentum optimizer with factored quantized variance.
 
     Args:
@@ -231,6 +232,10 @@ class AdaMuon(Optimizer):
         foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
         compile: bool = False,  # noqa: A002 — public kwarg name
+        auto_lr: bool = False,
+        auto_lr_freeze: int | str | None = "auto",
+        auto_lr_scale: float = 1.0,
+        auto_lr_fuse_rel: float = 100.0,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -279,6 +284,9 @@ class AdaMuon(Optimizer):
         # One momentum codec per dtype string (stateless beyond the dtype).
         self._codecs: dict[str, _MomentumCodec] = {}
 
+        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
+        self._init_autolr(auto_lr, auto_lr_freeze, auto_lr_scale, auto_lr_fuse_rel)
+
     def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
         md = group["momentum_dtype"]
         codec = self._codecs.get(md)
@@ -308,7 +316,7 @@ class AdaMuon(Optimizer):
             state["shift"] = torch.zeros_like(p)
 
     @torch.no_grad()
-    def step(self, closure: Any = None) -> Any:
+    def _step_impl(self, closure: Any = None) -> Any:
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -343,6 +351,10 @@ class AdaMuon(Optimizer):
                 for p in params:
                     self._step_one_param(p, group)
 
+    def state_dict(self) -> dict[str, Any]:
+        """Base state + the auto_lr tuner blob (via AutoLRMixin) when auto_lr is on."""
+        return self._autolr_state_dict(super().state_dict())
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized first moment's stored dtype.
 
@@ -351,7 +363,7 @@ class AdaMuon(Optimizer):
         fp32 on resume — losing the memory the codec saves and breaking bit-exact
         resume. Delegate to the shared dtype-preserving helper.
         """
-        load_state_dict_preserving_dtypes(self, state_dict)
+        self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
 
     # ----------------------------------------------------------------- foreach
 

@@ -131,6 +131,7 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
 )
+from kaon._autolr import AutoLRMixin
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     fourbit_block_size,
@@ -271,7 +272,7 @@ def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
     return out
 
 
-class AdaPNM(Optimizer):
+class AdaPNM(AutoLRMixin, Optimizer):
     """AdaPNM (Adam + Positive-Negative Momentum) on Adakaon's memory backend.
 
     Args:
@@ -361,6 +362,10 @@ class AdaPNM(Optimizer):
         foreach_stack_budget: int | None = None,
         fused: bool = False,
         fused_tile_cap: int | None = None,
+        auto_lr: bool = False,
+        auto_lr_freeze: int | str | None = "auto",
+        auto_lr_scale: float = 1.0,
+        auto_lr_fuse_rel: float = 100.0,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -424,6 +429,9 @@ class AdaPNM(Optimizer):
             if not HAS_TRITON:
                 raise RuntimeError("AdaPNM(fused=True) requires Triton (a GPU-only optional dependency)")
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
+
+        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
+        self._init_autolr(auto_lr, auto_lr_freeze, auto_lr_scale, auto_lr_fuse_rel)
 
     # ------------------------------------------------------------------- state
     @torch.no_grad()
@@ -575,7 +583,7 @@ class AdaPNM(Optimizer):
 
     # -------------------------------------------------------------------- step
     @torch.no_grad()
-    def step(self, closure: Any = None) -> Any:
+    def _step_impl(self, closure: Any = None) -> Any:
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -957,6 +965,10 @@ class AdaPNM(Optimizer):
         cfac = col.rsqrt().contiguous()
         return g_addr, rowmean, r, cfac
 
+    def state_dict(self) -> dict[str, Any]:
+        """Base state + the auto_lr tuner blob (via AutoLRMixin) when auto_lr is on."""
+        return self._autolr_state_dict(super().state_dict())
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving both quantized momenta's stored dtype.
 
@@ -965,7 +977,7 @@ class AdaPNM(Optimizer):
         back to fp32 on resume. Delegate to the shared helper that restores each
         tensor to how it was checkpointed.
         """
-        load_state_dict_preserving_dtypes(self, state_dict)
+        self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
 
     # ----------------------------------------------------------- coefficients
     @staticmethod

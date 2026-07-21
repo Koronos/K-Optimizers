@@ -107,6 +107,7 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
 )
+from kaon._autolr import AutoLRMixin
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -122,7 +123,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class ADOPT(Optimizer):
+class ADOPT(AutoLRMixin, Optimizer):
     """ADOPT (any-beta2 modified Adam) on Adakaon's memory backend.
 
     Args:
@@ -183,6 +184,10 @@ class ADOPT(Optimizer):
         foreach: bool = True,
         foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
+        auto_lr: bool = False,
+        auto_lr_freeze: int | str | None = "auto",
+        auto_lr_scale: float = 1.0,
+        auto_lr_fuse_rel: float = 100.0,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -224,6 +229,9 @@ class ADOPT(Optimizer):
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
 
+        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
+        self._init_autolr(auto_lr, auto_lr_freeze, auto_lr_scale, auto_lr_fuse_rel)
+
     # ------------------------------------------------------------------- state
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
@@ -243,7 +251,7 @@ class ADOPT(Optimizer):
 
     # -------------------------------------------------------------------- step
     @torch.no_grad()
-    def step(self, closure: Any = None) -> Any:
+    def _step_impl(self, closure: Any = None) -> Any:
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -280,6 +288,10 @@ class ADOPT(Optimizer):
                     self._step_one_param(p, group)
         return loss
 
+    def state_dict(self) -> dict[str, Any]:
+        """Base state + the auto_lr tuner blob (via AutoLRMixin) when auto_lr is on."""
+        return self._autolr_state_dict(super().state_dict())
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized momentum's stored dtype.
 
@@ -287,7 +299,7 @@ class ADOPT(Optimizer):
         param's dtype (fp32), which would silently inflate bf16/int8/4bit momentum
         back to fp32 on resume. Delegate to the shared dtype-preserving helper.
         """
-        load_state_dict_preserving_dtypes(self, state_dict)
+        self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
 
     # ----------------------------------------------------------- coefficients
     @staticmethod
