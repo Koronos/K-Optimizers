@@ -94,6 +94,25 @@ def test_freeze_after_n_frees_refs() -> None:
     assert opt.get_d() == d_frozen, "frozen LR must not move"
 
 
+def test_auto_freeze_is_growth_ratio() -> None:
+    # auto_lr_freeze="auto" (the default) freezes when the discovered LR has grown
+    # _FREEZE_GROWTH× over its data-relative seed — a dimensionless, reparametrization-
+    # invariant trigger (not an absolute step count).
+    from kaon._autolr import _FREEZE_GROWTH
+    model, x, y = _tiny_problem()
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True, auto_lr_freeze="auto")
+    c = _closure(model, x, y, opt)
+    for _ in range(600):
+        opt.step(c)
+        if opt.is_frozen():
+            break
+    assert opt.is_frozen(), "auto freeze should fire once S grows ~10x over the seed"
+    t = opt._autolr
+    # frozen at ~ _FREEZE_GROWTH × seed (the growth ratio; may slightly overshoot in one step)
+    assert t.frozen_lr >= _FREEZE_GROWTH * t._seed * 0.9
+    assert t.frozen_lr <= _FREEZE_GROWTH * t._seed * 2.0
+
+
 def test_survives_harness_lr_clobber() -> None:
     # External trainers (renga-flow, kohya, the control battery) rewrite
     # group["lr"] every step. auto_lr must impose its own LR each iteration — both

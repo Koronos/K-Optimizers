@@ -212,7 +212,7 @@ class Adakaon(Optimizer):
         fused: bool = False,
         fused_tile_cap: int | None = None,
         auto_lr: bool = False,
-        auto_lr_freeze: int | None = 1000,
+        auto_lr_freeze: int | str | None = "auto",
         auto_lr_scale: float = 1.0,
         auto_lr_fuse_rel: float = 100.0,
     ) -> None:
