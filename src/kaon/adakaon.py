@@ -214,6 +214,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         auto_lr: bool = False,
         auto_lr_scale: float = 1.0,
         auto_lr_fuse_rel: float = 20.0,
+        auto_lr_d0: float | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -289,7 +290,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         # freezes back to plain Adakaon. When on, it forces group["lr"]=1.0 during
         # adaptation (the base lr is ignored) and drives the step via _step_impl.
         # Off (default) -> zero overhead, step == _step_impl.
-        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel)
+        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
         md = group["momentum_dtype"]

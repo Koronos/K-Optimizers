@@ -167,6 +167,7 @@ class Lion(AutoLRMixin, Optimizer):
         auto_lr: bool = False,
         auto_lr_scale: float = 1.0,
         auto_lr_fuse_rel: float = 20.0,
+        auto_lr_d0: float | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -203,7 +204,7 @@ class Lion(AutoLRMixin, Optimizer):
         self._foreach_stack_budget = foreach_stack_budget
         # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. When on, drives
         # the step via _step_impl at the discovered lr=S; off (default) -> step == _step_impl.
-        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel)
+        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     # ------------------------------------------------------------------- state
     @torch.no_grad()

@@ -42,8 +42,13 @@ cannot exit). The seed therefore sits DECADES below any plausible operating LR:
 scale minus a bit" seed landed 7.6× ABOVE the needed LR on a real Anima LoRA — weight
 RMS carries no information about an adapter's stability edge, which is set by the
 frozen base network and the adapter parametrization, not by the adapter's init scale).
-The climb costs only steps, not damage: DoWG gains ~1 decade per ~4 steps, so even a
-6-decade-low seed reaches the operating band in tens of steps — a free warmup.
+The climb is a **geometric ramp floor** (``S ≥ S_prev × _RAMP_GROWTH`` per update step,
+≥1 decade per ~24 steps) active until the FIRST edge contact: bare DoWG's climb is
+diffusive under real noisy gradients (measured ~250 steps/decade on a real Anima LoRA
+— useless as a warmup), so the floor supplies the pace and the edge guard supplies the
+stop — an online LR-range test, and a free warmup. ``auto_lr_d0`` optionally replaces
+the data-relative seed with an explicit starting LR; with the guard either direction
+is safe (too high → backoff walks it down; too low → the ramp climbs it fast).
 
 Stability-edge guard & freeze. A grad-norm EMA watches for instability: a spike
 (``> _SPIKE_RATIO ×`` the EMA) means the current ``S`` touched the model's stability
@@ -104,6 +109,13 @@ _EMA_BETA: float = 0.9     # grad-norm EMA horizon ~10 steps
 _EMA_WARMUP: int = 3       # steps of EMA seeding before the guard arms
 _EDGE_BAND: float = 2.0    # a repeat contact within this factor confirms the edge -> freeze
 _BACKOFF: float = 0.5      # S multiplier on each edge contact; the freeze locks at edge*_BACKOFF
+# Geometric ramp floor, active until the FIRST edge contact: S >= S_prev * _RAMP_GROWTH each
+# real update step (>=1 decade per ~24 steps). Real (noisy) gradients make the bare DoWG climb
+# DIFFUSIVE — measured ~250 steps/decade on a real Anima LoRA, useless as a warmup — while the
+# coherent-regime simulation promised ~4. The floor restores the fast climb; it is safe because
+# the edge guard is the stop (this is an online LR-range test: grow exponentially until the
+# model protests, back off, hand over to DoWG). Never re-enabled after a contact.
+_RAMP_GROWTH: float = 1.1
 
 
 class AutoLRTuner:
@@ -120,11 +132,14 @@ class AutoLRTuner:
         *,
         scale: float,
         fuse_rel: float,
+        d0: float | None = None,
     ) -> None:
         if not scale > 0.0:
             raise ValueError(f"auto_lr_scale must be > 0, got {scale}")
         if not fuse_rel > 0.0:
             raise ValueError(f"auto_lr_fuse_rel must be > 0, got {fuse_rel}")
+        if d0 is not None and not d0 > 0.0:
+            raise ValueError(f"auto_lr_d0 must be > 0 (or None for the data-relative seed), got {d0}")
         self.opt = opt
 
         # The tuner owns the LR. A leftover/prefilled base lr < 1 (e.g. renga-flow's
@@ -140,8 +155,10 @@ class AutoLRTuner:
 
         self._scale = float(scale)
         self._fuse_rel = float(fuse_rel)
+        self._d0 = float(d0) if d0 is not None else None
 
         self.S: float | None = None      # effective LR; seeded on the first step
+        self._ramp_on = True             # geometric ramp floor; off at the first edge contact
         self._seed: float | None = None  # the data-relative seed
         self._fuse: float | None = None  # absolute fuse cap; = fuse_rel * _FUSE_REF_REL * RMS(p)
         self._v = _EPS                   # DoWG distance-weighted accumulator
@@ -183,7 +200,10 @@ class AutoLRTuner:
                 sq = sq + float((pf * pf).sum())
                 cnt += pf.numel()
             rms = (sq / max(cnt, 1)) ** 0.5 if cnt else 0.0
-            self.S = max(_SEED_REL * rms, 1e-10)
+            # Explicit d0 wins over the data-relative seed. With the edge guard either
+            # direction is safe: too high -> backoff walks it down; too low -> the ramp
+            # floor climbs it fast.
+            self.S = self._d0 if self._d0 is not None else max(_SEED_REL * rms, 1e-10)
             self._seed = self.S
             self._fuse = max(self._fuse_rel * _FUSE_REF_REL * rms, self._fuse_rel * self.S)
             # x0 in the param's OWN dtype: an exact snapshot. (bf16-compressing fp32
@@ -255,7 +275,10 @@ class AutoLRTuner:
         r2 = self._rbar * self._rbar
         self._v += r2 * un2
         new_s = (r2 / math.sqrt(self._v)) * self._scale
-        if self._fuse is not None and new_s > self._fuse:  # loose safety fuse (not load-bearing)
+        if self._ramp_on:
+            # Geometric ramp floor until the first edge contact (see _RAMP_GROWTH).
+            new_s = max(new_s, s_prev * _RAMP_GROWTH)
+        if self._fuse is not None and new_s > self._fuse:
             new_s = self._fuse
         self.S = max(new_s, 1e-12)
 
@@ -275,6 +298,7 @@ class AutoLRTuner:
         isolated bad-batch spike self-corrects instead of freezing.
         """
         contact = float(self.S)  # type: ignore[arg-type]
+        self._ramp_on = False  # the range-test phase ends at the first contact, for good
         if self._edge is not None and contact <= _EDGE_BAND * self._edge:
             self.S = max(contact * _BACKOFF, 1e-12)
             self._do_freeze()
@@ -321,6 +345,7 @@ class AutoLRTuner:
             "x0": x0_list,
             "gema": self._gema,
             "edge": self._edge,
+            "ramp_on": self._ramp_on,
             "frozen": self.frozen,
             "frozen_lr": self.frozen_lr,
         }
@@ -340,6 +365,7 @@ class AutoLRTuner:
                 self._x0[params[i]] = r.to(params[i].device)
         self._gema = blob.get("gema")
         self._edge = blob.get("edge")
+        self._ramp_on = bool(blob.get("ramp_on", blob.get("edge") is None))
         self.frozen = bool(blob["frozen"])
         self.frozen_lr = blob["frozen_lr"]
 
@@ -356,10 +382,10 @@ class AutoLRMixin:
 
     _autolr: "AutoLRTuner | None"
 
-    def _init_autolr(self, auto_lr: bool, scale: float, fuse_rel: float) -> None:
+    def _init_autolr(self, auto_lr: bool, scale: float, fuse_rel: float, d0: float | None = None) -> None:
         """Call at the END of ``__init__`` (after ``super().__init__`` / param_groups exist)."""
         self._autolr = (
-            AutoLRTuner(self, scale=scale, fuse_rel=fuse_rel)  # type: ignore[arg-type]
+            AutoLRTuner(self, scale=scale, fuse_rel=fuse_rel, d0=d0)  # type: ignore[arg-type]
             if auto_lr
             else None
         )

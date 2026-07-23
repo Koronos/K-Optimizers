@@ -119,6 +119,46 @@ def test_spike_backs_off_and_self_corrects() -> None:
     assert 1.2 * s_backed < t.S, f"S must resume climbing after the false positive ({s_backed:g} -> {t.S:g})"
 
 
+def test_ramp_floor_guarantees_climb() -> None:
+    # Bare DoWG's climb is diffusive under noisy gradients (~250 steps/decade measured
+    # on a real LoRA). Until the first edge contact, the geometric ramp floor must
+    # guarantee >= _RAMP_GROWTH per update step regardless of the gradient statistics.
+    from kaon._autolr import _RAMP_GROWTH
+    model, x, y = _tiny_problem(seed=8)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    _manual_step(model, x, y, opt)
+    seed = opt._autolr._seed
+    n = 40
+    for _ in range(n):
+        _manual_step(model, x, y, opt)
+    if opt._autolr._edge is None and not opt.is_frozen():  # floor only promised pre-contact
+        floor = seed * (_RAMP_GROWTH ** n) * 0.9
+        assert opt.get_d() >= min(floor, opt._autolr._fuse), (
+            f"ramp floor must guarantee the climb ({opt.get_d():g} < {floor:g})"
+        )
+
+
+def test_ramp_floor_off_after_contact() -> None:
+    model, x, y = _tiny_problem(seed=8)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    for _ in range(20):
+        _manual_step(model, x, y, opt)
+    t = opt._autolr
+    assert t._ramp_on
+    _manual_step(model, x, y, opt, grad_factor=50.0)  # first edge contact
+    assert not t._ramp_on, "the range-test ramp must end at the first contact, for good"
+
+
+def test_d0_overrides_seed() -> None:
+    # auto_lr_d0 replaces the data-relative seed with an explicit starting LR.
+    model, x, y = _tiny_problem(seed=9)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True, auto_lr_d0=5e-4)
+    _manual_step(model, x, y, opt)
+    t = opt._autolr
+    assert t._seed == 5e-4
+    assert opt.get_d() >= 1e-4, f"S must start at ~d0, not the data-relative seed ({opt.get_d():g})"
+
+
 def test_confirmed_edge_freezes_below_edge() -> None:
     # A second contact within the edge band confirms the edge: the tuner freezes
     # ITSELF at edge*backoff (just BELOW the edge — the safe side of the overshoot
@@ -232,5 +272,6 @@ def test_state_dict_resume() -> None:
     assert opt2._autolr._t == 40
     assert opt2._autolr._gema == opt._autolr._gema, "the edge-guard EMA must round-trip"
     assert opt2._autolr._edge == opt._autolr._edge
+    assert opt2._autolr._ramp_on == opt._autolr._ramp_on, "the ramp phase must round-trip"
     opt2.step(c)  # continues without throwing
     assert opt2._autolr._t == 41
