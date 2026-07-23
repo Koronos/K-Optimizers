@@ -169,7 +169,8 @@ def test_confirmed_edge_freezes_below_edge() -> None:
     for _ in range(30):
         _manual_step(model, x, y, opt)
     t = opt._autolr
-    t._edge = t.S  # simulate a prior contact at the current level
+    t._edge = t.S       # simulate a prior contact at the current level
+    t._ramp_on = False  # (a real prior contact also ends the ramp phase)
     s_contact = t.S
     _manual_step(model, x, y, opt, grad_factor=50.0)
     assert opt.is_frozen(), "a repeat contact within the band must freeze"
@@ -201,15 +202,38 @@ def test_recovers_from_far_above() -> None:
         assert torch.isfinite(p).all(), "params must stay finite through the recovery"
 
 
-def test_nonfinite_grads_back_off_without_stepping() -> None:
-    # inf/nan grads: unambiguous contact, but stepping would poison the base state.
+def test_ramp_contact_rolls_back_to_x0() -> None:
+    # During the ramp (range-test) phase, an edge contact restores the exact x0
+    # snapshot: the overshoot leaves NO trace on the params, the spike gradient is
+    # never applied, and the grad-norm EMA keeps its healthy pre-spike baseline.
     model, x, y = _tiny_problem(seed=6)
+    orig = [p.detach().clone() for p in model.parameters()]  # == x0 (taken pre-first-update)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    for _ in range(20):
+        _manual_step(model, x, y, opt)
+    t = opt._autolr
+    assert t._ramp_on
+    s_before = t.S
+    gema_before = t._gema
+    _manual_step(model, x, y, opt, grad_factor=50.0)
+    assert t.S == s_before * 0.5, "contact must back the LR off"
+    assert not t._ramp_on
+    assert t._edge == s_before
+    for p, o in zip(model.parameters(), orig):
+        assert torch.equal(p, o), "ramp-phase contact must restore the exact x0 snapshot"
+    assert t._gema == gema_before, "the healthy pre-spike EMA must be kept (that state was restored)"
+    _manual_step(model, x, y, opt)  # and training continues normally
+
+
+def test_nonfinite_grads_roll_back_without_stepping() -> None:
+    # inf/nan grads during the ramp: same rollback path — restore x0, never step.
+    model, x, y = _tiny_problem(seed=6)
+    orig = [p.detach().clone() for p in model.parameters()]
     opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
     for _ in range(20):
         _manual_step(model, x, y, opt)
     t = opt._autolr
     s_before = t.S
-    before = [p.detach().clone() for p in model.parameters()]
     opt.zero_grad()
     loss = torch.nn.functional.mse_loss(model(x), y)
     loss.backward()
@@ -218,8 +242,8 @@ def test_nonfinite_grads_back_off_without_stepping() -> None:
             p.grad.fill_(float("inf"))
     opt.step()
     assert s_before > t.S, "non-finite grads must back the LR off"
-    for p, b in zip(model.parameters(), before):
-        assert torch.equal(p, b), "the poison gradient must not be applied"
+    for p, o in zip(model.parameters(), orig):
+        assert torch.equal(p, o), "the poison gradient must not be applied (params back at x0)"
     _manual_step(model, x, y, opt)  # and training continues normally
 
 
@@ -248,6 +272,7 @@ def test_survives_harness_lr_clobber_when_frozen() -> None:
         _manual_step(model, x, y, opt)
     t = opt._autolr
     t._edge = t.S
+    t._ramp_on = False
     _manual_step(model, x, y, opt, grad_factor=50.0)  # confirmed edge -> frozen
     assert opt.is_frozen()
     frozen = t.frozen_lr

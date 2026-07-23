@@ -224,6 +224,13 @@ class AutoLRTuner:
         if self._gema is None or self._gema <= 0.0:
             self._gema = gn
         elif self._t >= _EMA_WARMUP and gn > _SPIKE_RATIO * self._gema:
+            if self._ramp_on:
+                # Rollback path: params are restored to x0, so the spiked gradient is
+                # stale (computed at a state that no longer exists) — skip the step and
+                # keep the EMA (the healthy pre-spike baseline is still the right one).
+                self._edge_contact(params, step_after=False)
+                self._t += 1
+                return loss
             frozen_now = self._edge_contact(params, step_after=True)
             self._gema = gn  # hysteresis: the elevated aftermath must not re-trigger in a chain
             self._t += 1
@@ -298,7 +305,20 @@ class AutoLRTuner:
         isolated bad-batch spike self-corrects instead of freezing.
         """
         contact = float(self.S)  # type: ignore[arg-type]
-        self._ramp_on = False  # the range-test phase ends at the first contact, for good
+        if self._ramp_on:
+            # Range-test rollback: all pre-contact progress happened at sub-operating
+            # LRs (negligible), and x0 IS the exact pre-ramp snapshot — restore it so
+            # the overshoot leaves NO trace on the params. The base's own EMAs are not
+            # rolled back (composability boundary); the spike gradient is never applied
+            # and the contaminated EMA content decays within tens of steps.
+            self._ramp_on = False
+            self._edge = contact
+            self.S = max(contact * _BACKOFF, 1e-12)
+            for p, ref in self._x0.items():
+                p.data.copy_(ref)
+            self._rbar = 0.0
+            self._v = _EPS
+            return False
         if self._edge is not None and contact <= _EDGE_BAND * self._edge:
             self.S = max(contact * _BACKOFF, 1e-12)
             self._do_freeze()
