@@ -37,18 +37,34 @@ def _closure(model, x, y, opt):
     return c
 
 
-def _manual_step(model, x, y, opt, grad_factor: float = 1.0) -> float:
-    """One step with direct grad access (to inject spikes)."""
+def _manual_step(model, x, y, opt, grad_factor: float = 1.0, grad_fill: float | None = None) -> float:
+    """One step with direct grad access (to inject spikes or poison grads)."""
     opt.zero_grad()
     loss = torch.nn.functional.mse_loss(model(x), y)
     loss.backward()
-    if grad_factor != 1.0:
+    if grad_factor != 1.0 or grad_fill is not None:
         with torch.no_grad():
             for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.mul_(grad_factor)
+                if p.grad is None:
+                    continue
+                p.grad.fill_(grad_fill) if grad_fill is not None else p.grad.mul_(grad_factor)
     opt.step()
     return float(loss.detach())
+
+
+def _warmed_opt(seed: int, n: int = 20):
+    """A tiny problem + auto_lr Adakaon advanced n steps; returns (model, x, y, opt, tuner)."""
+    model, x, y = _tiny_problem(seed=seed)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    for _ in range(n):
+        _manual_step(model, x, y, opt)
+    return model, x, y, opt, opt._autolr
+
+
+def _arm_confirmed_edge(tuner) -> float:
+    """Simulate a prior edge contact at the current level (the next spike confirms it)."""
+    tuner._edge = tuner.S  # a real prior contact also ends the ramp phase (derived from _edge)
+    return tuner.S
 
 
 def test_off_is_plain() -> None:
@@ -100,11 +116,7 @@ def test_spike_backs_off_and_self_corrects() -> None:
     # An isolated grad spike (bad batch) = one edge contact: S halves, the DoWG
     # accumulators re-anchor, and — without a confirming second contact — S resumes
     # climbing. No freeze.
-    model, x, y = _tiny_problem(seed=3)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(30):
-        _manual_step(model, x, y, opt)
-    t = opt._autolr
+    model, x, y, opt, t = _warmed_opt(seed=3, n=30)
     s_before = t.S
     _manual_step(model, x, y, opt, grad_factor=50.0)
     assert t._edge == s_before, "the contact level must be recorded"
@@ -131,19 +143,17 @@ def test_ramp_floor_guarantees_climb() -> None:
     n = 40
     for _ in range(n):
         _manual_step(model, x, y, opt)
-    if opt._autolr._edge is None and not opt.is_frozen():  # floor only promised pre-contact
-        floor = seed * (_RAMP_GROWTH ** n) * 0.9
-        assert opt.get_d() >= min(floor, opt._autolr._fuse), (
-            f"ramp floor must guarantee the climb ({opt.get_d():g} < {floor:g})"
-        )
+    # Deterministic on this problem: no contact happens in n steps. Assert that, so the
+    # floor check below can never go vacuous (if the mechanism ever changes, fail loudly).
+    assert opt._autolr._edge is None and not opt.is_frozen()
+    floor = seed * (_RAMP_GROWTH ** n) * 0.9
+    assert opt.get_d() >= min(floor, opt._autolr._fuse), (
+        f"ramp floor must guarantee the climb ({opt.get_d():g} < {floor:g})"
+    )
 
 
 def test_ramp_floor_off_after_contact() -> None:
-    model, x, y = _tiny_problem(seed=8)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(20):
-        _manual_step(model, x, y, opt)
-    t = opt._autolr
+    model, x, y, opt, t = _warmed_opt(seed=8)
     assert t._ramp_on
     _manual_step(model, x, y, opt, grad_factor=50.0)  # first edge contact
     assert not t._ramp_on, "the range-test ramp must end at the first contact, for good"
@@ -164,14 +174,8 @@ def test_confirmed_edge_freezes_below_edge() -> None:
     # ITSELF at edge*backoff (just BELOW the edge — the safe side of the overshoot
     # cliff) and frees the reference buffers. No knob involved.
     from kaon._autolr import _BACKOFF
-    model, x, y = _tiny_problem(seed=4)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(30):
-        _manual_step(model, x, y, opt)
-    t = opt._autolr
-    t._edge = t.S       # simulate a prior contact at the current level
-    t._ramp_on = False  # (a real prior contact also ends the ramp phase)
-    s_contact = t.S
+    model, x, y, opt, t = _warmed_opt(seed=4, n=30)
+    s_contact = _arm_confirmed_edge(t)
     _manual_step(model, x, y, opt, grad_factor=50.0)
     assert opt.is_frozen(), "a repeat contact within the band must freeze"
     assert math.isclose(t.frozen_lr, s_contact * _BACKOFF, rel_tol=1e-6), (
@@ -216,7 +220,7 @@ def test_ramp_contact_rolls_back_to_x0() -> None:
     s_before = t.S
     gema_before = t._gema
     _manual_step(model, x, y, opt, grad_factor=50.0)
-    assert t.S == s_before * 0.5, "contact must back the LR off"
+    assert s_before * 0.5 == t.S, "contact must back the LR off"
     assert not t._ramp_on
     assert t._edge == s_before
     for p, o in zip(model.parameters(), orig):
@@ -234,13 +238,7 @@ def test_nonfinite_grads_roll_back_without_stepping() -> None:
         _manual_step(model, x, y, opt)
     t = opt._autolr
     s_before = t.S
-    opt.zero_grad()
-    loss = torch.nn.functional.mse_loss(model(x), y)
-    loss.backward()
-    with torch.no_grad():
-        for p in model.parameters():
-            p.grad.fill_(float("inf"))
-    opt.step()
+    _manual_step(model, x, y, opt, grad_fill=float("inf"))
     assert s_before > t.S, "non-finite grads must back the LR off"
     for p, o in zip(model.parameters(), orig):
         assert torch.equal(p, o), "the poison gradient must not be applied (params back at x0)"
@@ -257,22 +255,14 @@ def test_nan_run_is_bounded() -> None:
     t = opt._autolr
     s_before = t.S
 
-    def _nan_step():
-        opt.zero_grad()
-        torch.nn.functional.mse_loss(model(x), y).backward()
-        with torch.no_grad():
-            for p in model.parameters():
-                p.grad.fill_(float("nan"))
-        opt.step()
-
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        _nan_step()
+        _manual_step(model, x, y, opt, grad_fill=float("nan"))
         s_after_first = t.S
         assert s_after_first == s_before * 0.5, "first nan of a run = one backoff"
-        _nan_step()
-        _nan_step()
-        assert t.S == s_after_first, "repeat nans must NOT keep shrinking S"
+        _manual_step(model, x, y, opt, grad_fill=float("nan"))
+        _manual_step(model, x, y, opt, grad_fill=float("nan"))
+        assert s_after_first == t.S, "repeat nans must NOT keep shrinking S"
         assert any("non-finite" in str(wi.message) for wi in w), "a nan run must warn"
     _manual_step(model, x, y, opt)  # finite step resumes training
     assert t._nan_run == 0, "a finite gradient must reset the run"
@@ -297,13 +287,8 @@ def test_survives_harness_lr_clobber_while_adapting() -> None:
 
 
 def test_survives_harness_lr_clobber_when_frozen() -> None:
-    model, x, y = _tiny_problem(seed=7)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(30):
-        _manual_step(model, x, y, opt)
-    t = opt._autolr
-    t._edge = t.S
-    t._ramp_on = False
+    model, x, y, opt, t = _warmed_opt(seed=7, n=30)
+    _arm_confirmed_edge(t)
     _manual_step(model, x, y, opt, grad_factor=50.0)  # confirmed edge -> frozen
     assert opt.is_frozen()
     frozen = t.frozen_lr

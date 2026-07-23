@@ -76,7 +76,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from kaon._autolr import AutoLRMixin
+from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon.msam import MSAM
 
 __all__ = ["Nekaon"]
@@ -132,7 +132,7 @@ class Nekaon(AutoLRMixin, MSAM):
         low_vram_lr_ratio: float = 0.5,
         auto_lr: bool = False,
         auto_lr_scale: float = 1.0,
-        auto_lr_fuse_rel: float = 20.0,
+        auto_lr_fuse_rel: float = DEFAULT_FUSE_REL,
         auto_lr_d0: float | None = None,
         **adakaon_kwargs: Any,
     ) -> None:

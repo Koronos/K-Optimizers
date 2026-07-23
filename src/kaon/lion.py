@@ -73,7 +73,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from kaon._autolr import AutoLRMixin
+from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
@@ -166,7 +166,7 @@ class Lion(AutoLRMixin, Optimizer):
         foreach_stack_budget: int | None = None,
         auto_lr: bool = False,
         auto_lr_scale: float = 1.0,
-        auto_lr_fuse_rel: float = 20.0,
+        auto_lr_fuse_rel: float = DEFAULT_FUSE_REL,
         auto_lr_d0: float | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])

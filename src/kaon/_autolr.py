@@ -97,7 +97,11 @@ from typing import Any
 import torch
 from torch import Tensor
 
-__all__ = ["AutoLRMixin", "AutoLRTuner"]
+__all__ = ["AutoLRMixin", "AutoLRTuner", "DEFAULT_FUSE_REL"]
+
+# Default for the hosts' ``auto_lr_fuse_rel`` kwarg (single source of truth — the
+# measured recalibrations of this ceiling must not be an 8-file edit).
+DEFAULT_FUSE_REL: float = 20.0
 
 _SEED_REL: float = 1e-6   # data-relative seed = _SEED_REL * RMS(params); DECADES below any operating LR
 _FUSE_REF_REL: float = 3e-3  # fuse anchor = fuse_rel * _FUSE_REF_REL * RMS(params) (the typical operating scale)
@@ -158,7 +162,6 @@ class AutoLRTuner:
         self._d0 = float(d0) if d0 is not None else None
 
         self.S: float | None = None      # effective LR; seeded on the first step
-        self._ramp_on = True             # geometric ramp floor; off at the first edge contact
         self._seed: float | None = None  # the data-relative seed
         self._fuse: float | None = None  # absolute fuse cap; = fuse_rel * _FUSE_REF_REL * RMS(p)
         self._v = _EPS                   # DoWG distance-weighted accumulator
@@ -173,6 +176,11 @@ class AutoLRTuner:
         self.frozen_lr: float | None = None
 
     # -- introspection -----------------------------------------------------
+    @property
+    def _ramp_on(self) -> bool:
+        """Ramp (range-test) phase = no edge contact yet. Derived, never stored."""
+        return self._edge is None
+
     def get_d(self) -> float:
         """Discovered effective LR (or the frozen LR)."""
         if self.frozen:
@@ -215,7 +223,9 @@ class AutoLRTuner:
 
         # Stability-edge guard: grad-norm spike vs its EMA.
         gnorms = torch._foreach_norm([p.grad for p in params])
-        gn = float(torch.stack([n.float() for n in gnorms]).square_().sum()) ** 0.5
+        if len({n.dtype for n in gnorms}) > 1:  # rare mixed-dtype fleet; stack needs one dtype
+            gnorms = [n.float() for n in gnorms]
+        gn = float(torch.stack(gnorms).float().square_().sum()) ** 0.5
         if not math.isfinite(gn):
             # inf/nan gradient: the grads are poison — never step (stepping would spread
             # the poison into the base's own state). Only the FIRST of a consecutive run
@@ -242,6 +252,7 @@ class AutoLRTuner:
                 # Rollback path: params are restored to x0, so the spiked gradient is
                 # stale (computed at a state that no longer exists) — skip the step and
                 # keep the EMA (the healthy pre-spike baseline is still the right one).
+                # (step_after is moot here: a ramp contact can never be a freeze.)
                 self._edge_contact(params, step_after=False)
                 self._t += 1
                 return loss
@@ -319,30 +330,28 @@ class AutoLRTuner:
         isolated bad-batch spike self-corrects instead of freezing.
         """
         contact = float(self.S)  # type: ignore[arg-type]
-        if self._ramp_on:
-            # Range-test rollback: all pre-contact progress happened at sub-operating
-            # LRs (negligible), and x0 IS the exact pre-ramp snapshot — restore it so
-            # the overshoot leaves NO trace on the params. The base's own EMAs are not
-            # rolled back (composability boundary); the spike gradient is never applied
-            # and the contaminated EMA content decays within tens of steps.
-            self._ramp_on = False
-            self._edge = contact
-            self.S = max(contact * _BACKOFF, 1e-12)
-            for p, ref in self._x0.items():
-                p.data.copy_(ref)
-            self._rbar = 0.0
-            self._v = _EPS
-            return False
+        self.S = max(contact * _BACKOFF, 1e-12)
         if self._edge is not None and contact <= _EDGE_BAND * self._edge:
-            self.S = max(contact * _BACKOFF, 1e-12)
             self._do_freeze()
             if step_after:
                 self.opt._step_impl()  # type: ignore[attr-defined]
             return True
+        ramp = self._edge is None  # first-ever contact = the range-test phase ends here
         self._edge = contact
-        self.S = max(contact * _BACKOFF, 1e-12)
-        for p in params:
-            self._x0[p] = p.detach().clone()
+        # The one principled difference between the phases is the x0 handling:
+        # - ramp contact ROLLS BACK to x0 (all pre-contact progress happened at
+        #   sub-operating LRs — negligible — and x0 IS the exact pre-ramp snapshot,
+        #   so the overshoot leaves NO trace on the params; the base's own EMAs are
+        #   not rolled back — composability boundary — the spike gradient is never
+        #   applied and the contamination decays within tens of steps);
+        # - a post-ramp (drift-level) contact re-anchors x0 FORWARD to the current
+        #   params and keeps going.
+        if ramp:
+            for p, ref in self._x0.items():
+                p.data.copy_(ref)
+        else:
+            for p in params:
+                self._x0[p] = p.detach().clone()
         self._rbar = 0.0
         self._v = _EPS
         return False
@@ -378,8 +387,7 @@ class AutoLRTuner:
             "t": self._t,
             "x0": x0_list,
             "gema": self._gema,
-            "edge": self._edge,
-            "ramp_on": self._ramp_on,
+            "edge": self._edge,  # also carries the ramp phase (_ramp_on == edge is None)
             "frozen": self.frozen,
             "frozen_lr": self.frozen_lr,
         }
@@ -399,7 +407,6 @@ class AutoLRTuner:
                 self._x0[params[i]] = r.to(params[i].device)
         self._gema = blob.get("gema")
         self._edge = blob.get("edge")
-        self._ramp_on = bool(blob.get("ramp_on", blob.get("edge") is None))
         self.frozen = bool(blob["frozen"])
         self.frozen_lr = blob["frozen_lr"]
 

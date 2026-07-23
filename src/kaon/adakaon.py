@@ -52,7 +52,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
-from kaon._autolr import AutoLRMixin
+from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -213,7 +213,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         fused_tile_cap: int | None = None,
         auto_lr: bool = False,
         auto_lr_scale: float = 1.0,
-        auto_lr_fuse_rel: float = 20.0,
+        auto_lr_fuse_rel: float = DEFAULT_FUSE_REL,
         auto_lr_d0: float | None = None,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
