@@ -46,6 +46,7 @@ ktune = "kaon.tune:main"
 dev = [
     "ruff>=0.6",
     "pytest>=8.0",
+    "numpy>=1.26",  # benchmarks/proxy fingerprinting + a few tests; torch no longer pulls it in
 ]
 
 [build-system]

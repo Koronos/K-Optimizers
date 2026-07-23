@@ -363,9 +363,8 @@ class AdaPNM(AutoLRMixin, Optimizer):
         fused: bool = False,
         fused_tile_cap: int | None = None,
         auto_lr: bool = False,
-        auto_lr_freeze: int | str | None = "auto",
         auto_lr_scale: float = 1.0,
-        auto_lr_fuse_rel: float = 100.0,
+        auto_lr_fuse_rel: float = 20.0,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -431,7 +430,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
         # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
-        self._init_autolr(auto_lr, auto_lr_freeze, auto_lr_scale, auto_lr_fuse_rel)
+        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel)
 
     # ------------------------------------------------------------------- state
     @torch.no_grad()

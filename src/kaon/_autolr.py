@@ -21,27 +21,59 @@ update form — normalize-then-momentum, Adam-form, sign, orthogonalized):
     S_{t+1} = r̄_t² / √v_t                   (clamped to a LOOSE safety fuse)
 
 The estimate is intrinsically bounded (no coin-betting wealth runaway). The fuse
-(``fuse_rel × seed``, default 100×) is a safety rail, **not** load-bearing — DoWG
-discovers well below it — its only job is to stop an absurd seed from blowing up.
+(``fuse_rel × 3e-3·RMS(p)``, default ceiling ``0.06·RMS(p)``) is a LOOSE prior
+ceiling with an honest, measured role: in **sharp-edge** regimes (real adapter
+fine-tunes à la Anima — instability spikes) the edge guard governs far below it,
+and when the problem's true scale is lower still, from-below discovery governs;
+but in **mushy-edge** regimes (smooth proxy-like landscapes where over-LR degrades
+loss WITHOUT grad spikes) DoWG-with-momentum's own fixed point overshoots the loss
+optimum, no internal signal marks it (measured: grad-norm level is flat in LR;
+instantaneous-cosine and cumulative-coherence corrections both fail), and the
+ceiling is what stops the slow drift — there, it IS load-bearing by design
+(``fuse_rel=20`` measured best on both proxy configs; the old 100 let momentum
+drift to ``0.3·RMS``, te +0.011). Caveat, honestly flagged: a mushy-edge problem
+whose optimum sits far below ``0.06·RMS`` would over-shoot — no such case measured
+yet; the sharp/low cases that exist are covered by the guard/discovery.
 
-Seed & drift. A data-relative seed (``3e-3 · RMS(p)``) starts the LR *below* the
-operating scale by construction, i.e. in the sane "from-below" regime where
-distance-ratio methods discover cleanly (from above they cannot recover — but the
-data-relative seed never starts there). On a non-converging fine-tune the distance
-from ``x_0`` keeps growing, so ``S`` drifts up slowly, and freezing is *necessary*
-(never-freezing was measured to let the drift diverge on some seeds). ``auto_lr_freeze``
-locks the discovered value: ``"auto"`` (default) freezes once ``S`` has grown
-``_FREEZE_GROWTH×`` over its seed — a dimensionless, reparametrization-invariant trigger
-(an absolute step count breaks when batch/step-rate/run-length change; the held-out-loss
-plateau is broad so the exact ratio is non-critical, verified consistent across
-seeds/model-size/momentum); an ``int`` freezes after N steps; ``None`` never freezes.
-Robustification attempts that avoid the freeze entirely were measured and rejected: an
-EMA denominator *accelerates* the runaway, a growth cap is insufficient, a moving-reference
-window is unstable (collapse/explode), and no purely-internal constant-free STOP exists
-(``log S ∝ log t`` is scale-free), but the freeze POINT sits on a broad loss plateau so a
-dimensionless ratio trigger is enough.
+Seed. DoWG can only discover **from below** (from above the running-max distance
+ratchets the estimate *up* while the training destabilizes — a positive feedback it
+cannot exit). The seed therefore sits DECADES below any plausible operating LR:
+``1e-6 · RMS(p)``. This is safe by construction (the previous ``3e-3·RMS`` "operating
+scale minus a bit" seed landed 7.6× ABOVE the needed LR on a real Anima LoRA — weight
+RMS carries no information about an adapter's stability edge, which is set by the
+frozen base network and the adapter parametrization, not by the adapter's init scale).
+The climb costs only steps, not damage: DoWG gains ~1 decade per ~4 steps, so even a
+6-decade-low seed reaches the operating band in tens of steps — a free warmup.
 
-State: one per-parameter reference buffer ``x_0`` (bf16, freed at freeze) plus a
+Stability-edge guard & freeze. A grad-norm EMA watches for instability: a spike
+(``> _SPIKE_RATIO ×`` the EMA) means the current ``S`` touched the model's stability
+edge → back off (``S × _BACKOFF``), re-anchor the DoWG accumulators (``x0 := x``,
+``r̄ = 0``, ``v = ε``; the restart is self-consistent — the first post-anchor estimate
+reproduces the backed-off ``S``), and remember the contact level. The step itself is
+NOT skipped: the base update is normalized (bounded magnitude), so stepping at the
+backed-off ``S`` is safe and lets the params recover — skipping could deadlock
+(damaged params → high grads → eternal spike, no progress). The EMA resets to the
+spiked level (hysteresis: an elevated aftermath doesn't re-trigger in a chain).
+
+The freeze is **automatic and internal — there is no knob**: it fires on the
+**second contact within ``_EDGE_BAND×`` of the first** — a confirmed edge → lock at
+``edge × _BACKOFF``, just below the edge, the safe side of the measured asymmetry
+(overshoot is a cliff, undershoot is mild). An isolated spike (bad batch) never
+freezes: without a repeat contact ``S`` simply resumes climbing — the false positive
+self-corrects. This is an online LR-range-test, and it decouples the freeze from the
+seed entirely (the previous user-facing ``auto_lr_freeze`` growth-ratio trigger
+silently required the seed to land within one decade below the optimum — no
+data-relative rule achieves that across architectures — and contradicted the whole
+point of *automatic* discovery: the system now decides by itself when discovery is
+done). On a non-converging fine-tune the distance from ``x_0`` keeps growing, so
+``S`` drifts up slowly; the drift eventually meets the edge and the guard converts
+it into a freeze — never-freezing without the guard was measured to diverge on some
+seeds. Freezing (rather than adapting forever) also frees the reference buffers.
+
+State: one per-parameter reference buffer ``x_0`` (the param's own dtype — an exact
+snapshot; a bf16 copy of fp32 params was measured to inject a quantization-noise
+floor of ``~4e-3·RMS(p)`` into the first distance estimate, silently catapulting the
+decades-low seed straight back into the danger zone — freed at freeze) plus a
 few scalars. The base runs at ``lr = S`` throughout (incremental), so — unlike a
 lr=1-then-rescale wrapper — **freeze needs no momentum fold**: at freeze the base
 is already stepping at the frozen LR, so from then on ``step()`` is byte-for-byte
@@ -62,16 +94,16 @@ from torch import Tensor
 
 __all__ = ["AutoLRMixin", "AutoLRTuner"]
 
-_SEED_REL: float = 3e-3   # data-relative seed = _SEED_REL * RMS(params); below the operating LR
+_SEED_REL: float = 1e-6   # data-relative seed = _SEED_REL * RMS(params); DECADES below any operating LR
+_FUSE_REF_REL: float = 3e-3  # fuse anchor = fuse_rel * _FUSE_REF_REL * RMS(params) (the typical operating scale)
 _EPS: float = 1e-30
-# auto_lr_freeze="auto": freeze once the discovered LR has grown this many x over its
-# data-relative seed — an "order of magnitude of LR growth from a below-optimum seed"
-# brings you into the operating band. This is a DIMENSIONLESS, reparametrization-invariant
-# trigger (unlike an absolute step count, which breaks when batch size / step rate / the
-# training-length change). Non-critical: the held-out-loss plateau is broad, so any ratio in
-# ~[6, 22] lands in it (measured); 10 sits mid-plateau. Verified consistent across seeds /
-# model size / momentum, and SAFER than never-freezing (which can let the drift diverge).
-_FREEZE_GROWTH: float = 10.0
+# Stability-edge guard: a grad-norm spike > _SPIKE_RATIO × its EMA marks contact with the
+# model's stability edge (healthy batch-to-batch variation is <2×; real instability is 10–50×).
+_SPIKE_RATIO: float = 5.0
+_EMA_BETA: float = 0.9     # grad-norm EMA horizon ~10 steps
+_EMA_WARMUP: int = 3       # steps of EMA seeding before the guard arms
+_EDGE_BAND: float = 2.0    # a repeat contact within this factor confirms the edge -> freeze
+_BACKOFF: float = 0.5      # S multiplier on each edge contact; the freeze locks at edge*_BACKOFF
 
 
 class AutoLRTuner:
@@ -86,12 +118,9 @@ class AutoLRTuner:
         self,
         opt: torch.optim.Optimizer,
         *,
-        freeze: int | str | None,
         scale: float,
         fuse_rel: float,
     ) -> None:
-        if freeze != "auto" and freeze is not None and (not isinstance(freeze, int) or freeze < 1):
-            raise ValueError(f"auto_lr_freeze must be 'auto', None, or an int >= 1, got {freeze!r}")
         if not scale > 0.0:
             raise ValueError(f"auto_lr_scale must be > 0, got {scale}")
         if not fuse_rel > 0.0:
@@ -109,17 +138,18 @@ class AutoLRTuner:
                 stacklevel=3,
             )
 
-        self._freeze_at = freeze
         self._scale = float(scale)
         self._fuse_rel = float(fuse_rel)
 
         self.S: float | None = None      # effective LR; seeded on the first step
-        self._seed: float | None = None  # the data-relative seed (for the "auto" growth-ratio freeze)
-        self._fuse: float | None = None  # absolute fuse cap; = fuse_rel * seed
+        self._seed: float | None = None  # the data-relative seed
+        self._fuse: float | None = None  # absolute fuse cap; = fuse_rel * _FUSE_REF_REL * RMS(p)
         self._v = _EPS                   # DoWG distance-weighted accumulator
         self._rbar = 0.0                 # running-max distance from x0
         self._t = 0                      # adapting-step counter
         self._x0: dict[Tensor, Tensor] = {}  # per-param reference (freed at freeze)
+        self._gema: float | None = None  # grad-norm EMA (the stability-edge signal)
+        self._edge: float | None = None  # S at the last edge contact (None = no contact yet)
 
         self.frozen = False
         self.frozen_lr: float | None = None
@@ -144,7 +174,7 @@ class AutoLRTuner:
         if not params:
             return loss
 
-        # First step: data-relative seed (below the operating LR) + fuse + x0 refs.
+        # First step: decades-low data-relative seed + fuse + x0 refs.
         if self.S is None:
             sq = 0.0
             cnt = 0
@@ -153,11 +183,35 @@ class AutoLRTuner:
                 sq = sq + float((pf * pf).sum())
                 cnt += pf.numel()
             rms = (sq / max(cnt, 1)) ** 0.5 if cnt else 0.0
-            self.S = max(_SEED_REL * rms, 1e-8)
+            self.S = max(_SEED_REL * rms, 1e-10)
             self._seed = self.S
-            self._fuse = self._fuse_rel * self.S
+            self._fuse = max(self._fuse_rel * _FUSE_REF_REL * rms, self._fuse_rel * self.S)
+            # x0 in the param's OWN dtype: an exact snapshot. (bf16-compressing fp32
+            # params injects a ~4e-3·RMS(p) quantization-noise floor into the first
+            # distance estimate — measured to clobber the decades-low seed.)
             for p in params:
-                self._x0[p] = p.detach().to(torch.bfloat16).clone()
+                self._x0[p] = p.detach().clone()
+
+        # Stability-edge guard: grad-norm spike vs its EMA.
+        gnorms = torch._foreach_norm([p.grad for p in params])
+        gn = float(torch.stack([n.float() for n in gnorms]).square_().sum()) ** 0.5
+        if not math.isfinite(gn):
+            # inf/nan gradient: unambiguous edge contact, but the grads are poison —
+            # back off WITHOUT stepping (the one case a step can't help) and keep the EMA.
+            self._edge_contact(params, step_after=False)
+            self._t += 1
+            return loss
+        if self._gema is None or self._gema <= 0.0:
+            self._gema = gn
+        elif self._t >= _EMA_WARMUP and gn > _SPIKE_RATIO * self._gema:
+            frozen_now = self._edge_contact(params, step_after=True)
+            self._gema = gn  # hysteresis: the elevated aftermath must not re-trigger in a chain
+            self._t += 1
+            if frozen_now:
+                return loss
+            # fall through: step at the backed-off S with freshly re-anchored accumulators
+        else:
+            self._gema = _EMA_BETA * self._gema + (1.0 - _EMA_BETA) * gn
 
         s_prev = float(self.S)
         # Incremental step: the base applies S·u at group["lr"]=S. Forced each step
@@ -206,15 +260,34 @@ class AutoLRTuner:
         self.S = max(new_s, 1e-12)
 
         self._t += 1
-        if self._freeze_at == "auto":
-            # Dimensionless growth-ratio trigger: freeze once the LR has grown _FREEZE_GROWTH×
-            # over its (below-optimum) seed — reparametrization-invariant, no absolute step count.
-            if self.S >= _FREEZE_GROWTH * self._seed:  # type: ignore[operator]
-                self._do_freeze()
-        elif self._freeze_at is not None:  # int step count
-            if self._t >= self._freeze_at:
-                self._do_freeze()
         return loss
+
+    # -- stability-edge contact --------------------------------------------
+    def _edge_contact(self, params: list[Tensor], *, step_after: bool) -> bool:
+        """Back off from a stability-edge contact; freeze if the edge is confirmed.
+
+        Returns True if this contact froze the LR. A repeat contact within
+        ``_EDGE_BAND×`` of the recorded one confirms the edge → lock at
+        ``edge × _BACKOFF``, the safe side of the overshoot cliff. A first
+        or far-away contact records the level, backs off, and re-anchors the DoWG
+        accumulators — the restart is self-consistent (the first post-anchor
+        estimate reproduces the backed-off ``S``), so ``S`` resumes climbing and an
+        isolated bad-batch spike self-corrects instead of freezing.
+        """
+        contact = float(self.S)  # type: ignore[arg-type]
+        if self._edge is not None and contact <= _EDGE_BAND * self._edge:
+            self.S = max(contact * _BACKOFF, 1e-12)
+            self._do_freeze()
+            if step_after:
+                self.opt._step_impl()  # type: ignore[attr-defined]
+            return True
+        self._edge = contact
+        self.S = max(contact * _BACKOFF, 1e-12)
+        for p in params:
+            self._x0[p] = p.detach().clone()
+        self._rbar = 0.0
+        self._v = _EPS
+        return False
 
     # -- freeze ------------------------------------------------------------
     def _do_freeze(self) -> None:
@@ -246,6 +319,8 @@ class AutoLRTuner:
             "rbar": self._rbar,
             "t": self._t,
             "x0": x0_list,
+            "gema": self._gema,
+            "edge": self._edge,
             "frozen": self.frozen,
             "frozen_lr": self.frozen_lr,
         }
@@ -263,6 +338,8 @@ class AutoLRTuner:
         for i, r in enumerate(blob["x0"]):
             if r is not None:
                 self._x0[params[i]] = r.to(params[i].device)
+        self._gema = blob.get("gema")
+        self._edge = blob.get("edge")
         self.frozen = bool(blob["frozen"])
         self.frozen_lr = blob["frozen_lr"]
 
@@ -279,10 +356,10 @@ class AutoLRMixin:
 
     _autolr: "AutoLRTuner | None"
 
-    def _init_autolr(self, auto_lr: bool, freeze: int | str | None, scale: float, fuse_rel: float) -> None:
+    def _init_autolr(self, auto_lr: bool, scale: float, fuse_rel: float) -> None:
         """Call at the END of ``__init__`` (after ``super().__init__`` / param_groups exist)."""
         self._autolr = (
-            AutoLRTuner(self, freeze=freeze, scale=scale, fuse_rel=fuse_rel)  # type: ignore[arg-type]
+            AutoLRTuner(self, scale=scale, fuse_rel=fuse_rel)  # type: ignore[arg-type]
             if auto_lr
             else None
         )

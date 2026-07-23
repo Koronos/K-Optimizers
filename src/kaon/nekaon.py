@@ -131,9 +131,8 @@ class Nekaon(AutoLRMixin, MSAM):
         low_vram_above: int | None = None,
         low_vram_lr_ratio: float = 0.5,
         auto_lr: bool = False,
-        auto_lr_freeze: int | str | None = "auto",
         auto_lr_scale: float = 1.0,
-        auto_lr_fuse_rel: float = 100.0,
+        auto_lr_fuse_rel: float = 20.0,
         **adakaon_kwargs: Any,
     ) -> None:
         if k < 0.0:
@@ -177,7 +176,7 @@ class Nekaon(AutoLRMixin, MSAM):
                 "low-VRAM lr ratio. Use one or the other."
             )
         # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
-        self._init_autolr(auto_lr, auto_lr_freeze, auto_lr_scale, auto_lr_fuse_rel)
+        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel)
 
     # step() is the AutoLRMixin router; _step_impl is the full Nekaon step (SAM declimb ->
     # inner base -> climb) — DoWG measures the net displacement, so it composes over the lookahead.

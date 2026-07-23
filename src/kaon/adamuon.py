@@ -233,9 +233,8 @@ class AdaMuon(AutoLRMixin, Optimizer):
         foreach_stack_budget: int | None = None,
         compile: bool = False,  # noqa: A002 — public kwarg name
         auto_lr: bool = False,
-        auto_lr_freeze: int | str | None = "auto",
         auto_lr_scale: float = 1.0,
-        auto_lr_fuse_rel: float = 100.0,
+        auto_lr_fuse_rel: float = 20.0,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -285,7 +284,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
         self._codecs: dict[str, _MomentumCodec] = {}
 
         # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
-        self._init_autolr(auto_lr, auto_lr_freeze, auto_lr_scale, auto_lr_fuse_rel)
+        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel)
 
     def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
         md = group["momentum_dtype"]

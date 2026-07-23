@@ -185,9 +185,8 @@ class AdaBelief(AutoLRMixin, Optimizer):
         foreach_batch_cutoff: int = FOREACH_BATCH_CUTOFF,
         foreach_stack_budget: int | None = None,
         auto_lr: bool = False,
-        auto_lr_freeze: int | str | None = "auto",
         auto_lr_scale: float = 1.0,
-        auto_lr_fuse_rel: float = 100.0,
+        auto_lr_fuse_rel: float = 20.0,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -228,7 +227,7 @@ class AdaBelief(AutoLRMixin, Optimizer):
         self._foreach_stack_budget = foreach_stack_budget
 
         # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
-        self._init_autolr(auto_lr, auto_lr_freeze, auto_lr_scale, auto_lr_fuse_rel)
+        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel)
 
     # ------------------------------------------------------------------- state
     @torch.no_grad()

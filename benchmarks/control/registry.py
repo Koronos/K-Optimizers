@@ -74,7 +74,7 @@ OPTIMIZERS = {
     ),
     # auto_lr twin of Adakaon-nomom: SAME config + composable parameter-free LR (update-space
     # DoWG, auto_lr=True). The base lr is IGNORED (the tuner owns the scale, imposed each step),
-    # so it discovers seed-independently and freezes at the default step count; auto_lr *is* the
+    # so it discovers seed-independently and freezes itself at the stability edge; auto_lr *is* the
     # schedule-finder, so it ignores any external LR schedule (the REX-scheduled scenario just
     # runs at the discovered constant). Read on the continuity dimension.
     "Adakaon-nomom (auto_lr)": dict(
