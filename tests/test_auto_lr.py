@@ -247,6 +247,37 @@ def test_nonfinite_grads_roll_back_without_stepping() -> None:
     _manual_step(model, x, y, opt)  # and training continues normally
 
 
+def test_nan_run_is_bounded() -> None:
+    # A RUN of non-finite grads must not melt S (only the first counts as a contact)
+    # and must warn once it is clearly not an LR problem; a finite step resets the run.
+    model, x, y = _tiny_problem(seed=6)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    for _ in range(20):
+        _manual_step(model, x, y, opt)
+    t = opt._autolr
+    s_before = t.S
+
+    def _nan_step():
+        opt.zero_grad()
+        torch.nn.functional.mse_loss(model(x), y).backward()
+        with torch.no_grad():
+            for p in model.parameters():
+                p.grad.fill_(float("nan"))
+        opt.step()
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        _nan_step()
+        s_after_first = t.S
+        assert s_after_first == s_before * 0.5, "first nan of a run = one backoff"
+        _nan_step()
+        _nan_step()
+        assert t.S == s_after_first, "repeat nans must NOT keep shrinking S"
+        assert any("non-finite" in str(wi.message) for wi in w), "a nan run must warn"
+    _manual_step(model, x, y, opt)  # finite step resumes training
+    assert t._nan_run == 0, "a finite gradient must reset the run"
+
+
 def test_survives_harness_lr_clobber_while_adapting() -> None:
     # External trainers (renga-flow, kohya, the control battery) rewrite
     # group["lr"] every step. auto_lr must impose its own LR each iteration or the

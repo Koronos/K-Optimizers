@@ -167,6 +167,7 @@ class AutoLRTuner:
         self._x0: dict[Tensor, Tensor] = {}  # per-param reference (freed at freeze)
         self._gema: float | None = None  # grad-norm EMA (the stability-edge signal)
         self._edge: float | None = None  # S at the last edge contact (None = no contact yet)
+        self._nan_run = 0                # consecutive non-finite-grad steps (bounds the skip path)
 
         self.frozen = False
         self.frozen_lr: float | None = None
@@ -216,11 +217,24 @@ class AutoLRTuner:
         gnorms = torch._foreach_norm([p.grad for p in params])
         gn = float(torch.stack([n.float() for n in gnorms]).square_().sum()) ** 0.5
         if not math.isfinite(gn):
-            # inf/nan gradient: unambiguous edge contact, but the grads are poison —
-            # back off WITHOUT stepping (the one case a step can't help) and keep the EMA.
-            self._edge_contact(params, step_after=False)
+            # inf/nan gradient: the grads are poison — never step (stepping would spread
+            # the poison into the base's own state). Only the FIRST of a consecutive run
+            # counts as an edge contact (backoff/rollback); repeats skip without shrinking
+            # S further — if the grads are non-finite regardless of LR, the LR is not the
+            # problem, and melting S to 1e-12 would just stall training silently.
+            self._nan_run += 1
+            if self._nan_run == 1:
+                self._edge_contact(params, step_after=False)
+            elif self._nan_run == 3:
+                warnings.warn(
+                    "auto_lr: gradients are non-finite for 3+ consecutive steps; the LR "
+                    "has already been backed off, so this is not an LR problem — check "
+                    "the data/loss/precision. Steps are skipped while grads stay non-finite.",
+                    stacklevel=2,
+                )
             self._t += 1
             return loss
+        self._nan_run = 0
         if self._gema is None or self._gema <= 0.0:
             self._gema = gn
         elif self._t >= _EMA_WARMUP and gn > _SPIKE_RATIO * self._gema:
