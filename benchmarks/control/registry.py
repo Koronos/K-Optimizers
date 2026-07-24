@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from kaon import Adakaon, AdaMuon, AdaPNM, AdamP, Lion, Nekaon, ScheduleFree
+from kaon import Adakaon, AdamP, AdaMuon, AdaPNM, Lion, Nekaon, ScheduleFree
 
 OPTIMIZERS = {
     # --- reference baseline ---

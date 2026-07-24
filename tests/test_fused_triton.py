@@ -33,6 +33,82 @@ pytestmark = pytest.mark.skipif(
 
 DEV = "cuda"
 
+if HAS_TRITON:
+    import triton
+    import triton.language as tl
+
+    from kaon._fused_triton import (
+        factored_rc,
+        gradient_centralize,
+        requant_4bit,
+        requant_int8,
+        sr_round,
+    )
+
+    @triton.jit
+    def _int8_quant_probe(m_ptr, code_ptr, scale_ptr, R, C, BR: tl.constexpr, BC: tl.constexpr):
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        mask = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        rows = tl.arange(0, BR)
+        momentum = tl.load(m_ptr + idx, mask=mask, other=0.0)
+        requant_int8(momentum, mask, code_ptr, idx, scale_ptr, rows, R)
+
+    @triton.jit
+    def _fourbit_quant_probe(
+        m_ptr, packed_ptr, scale_ptr, R, C, Chalf, NB, BLK,
+        BR: tl.constexpr, BC: tl.constexpr,
+    ):
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        mask = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        momentum = tl.load(m_ptr + idx, mask=mask, other=0.0)
+        requant_4bit(
+            momentum, mask, idx, R, C, Chalf, packed_ptr, scale_ptr,
+            NB, BLK, BR, BC,
+        )
+
+    @triton.jit
+    def _sr_round_probe(out_ptr, val, seed, N, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        values = tl.full((BLOCK,), val, tl.float32) * 1.0
+        rounded = sr_round(values, seed, offsets)
+        tl.store(out_ptr + offsets, rounded, mask=offsets < N)
+
+    @triton.jit
+    def _gradient_centralize_probe(g_ptr, out_ptr, R, C, BR: tl.constexpr, BC: tl.constexpr):
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        mask = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        grad = tl.load(g_ptr + idx, mask=mask, other=0.0)
+        tl.store(
+            out_ptr + idx,
+            gradient_centralize(grad, mask, C.to(tl.float32)),
+            mask=mask,
+        )
+
+    @triton.jit
+    def _factored_rc_probe(
+        g_ptr, row_ptr, col_ptr, row_factor_ptr, col_factor_ptr,
+        R, C, beta2, eps1, BR: tl.constexpr, BC: tl.constexpr,
+    ):
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        rows = tl.arange(0, BR)
+        cols = tl.arange(0, BC)
+        mask = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        grad = tl.load(g_ptr + idx, mask=mask, other=0.0)
+        row_factor, col_factor = factored_rc(
+            grad, row_ptr, col_ptr, rows, cols, R, C,
+            R.to(tl.float32), C.to(tl.float32), beta2, eps1,
+        )
+        tl.store(row_factor_ptr + rows, row_factor, mask=rows < R)
+        tl.store(col_factor_ptr + cols, col_factor, mask=cols < C)
+
 
 # ----------------------------------------------------------------- helpers
 def _fused(params, **kw):
@@ -86,6 +162,81 @@ def _run_parity(shapes, dtype, mdtype, *, cautious=True, gc=True, wd=0.0, steps=
     d = max((a.detach().float() - b.detach().float()).abs().max().item() for a, b in zip(pv, pn))
     scale = max(b.detach().float().abs().max().item() for b in pn)
     return d, scale, ov
+
+
+def test_autolr_resets_rebuild_caches_and_preserve_native_parity():
+    """Two AutoLR contacts must not leave pointer arrays targeting discarded state."""
+    pv = _bag([(8, 16), (32,)], torch.float32, seed=31)
+    pn = _clone(pv)
+    cfg = dict(lr=2e-3, momentum_dtype="float32", cautious=False,
+               gradient_centralization=False)
+    fused = Adakaon(pv, fused=True, **cfg)
+    native = Adakaon(pn, **cfg)
+    gen = torch.Generator(device=DEV).manual_seed(32)
+    retired_caches = []
+    retired_state_tensors = []
+
+    for contact in range(3):
+        gs = [torch.randn(p.shape, generator=gen, device=DEV) for p in pv]
+        for p, g in zip(pv, gs, strict=True):
+            p.grad = g.clone()
+        for p, g in zip(pn, gs, strict=True):
+            p.grad = g.clone()
+        fused.step()
+        native.step()
+
+        current_caches = tuple(fused._fused_ob_caches.values()) + tuple(fused._fused_od_caches.values())
+        assert fused._fused_ob_caches and fused._fused_od_caches
+        assert all(new is not old for new in current_caches for old in retired_caches)
+        if contact == 2:
+            break
+
+        retired_caches.extend(current_caches)
+        retired_state_tensors.extend(
+            value
+            for state in fused.state.values()
+            for value in state.values()
+            if torch.is_tensor(value)
+        )
+        fused._autolr_reset_base_state()
+        native._autolr_reset_base_state()
+        assert fused._t == 0
+        assert not fused.state
+        assert not fused._fused_part
+        assert not fused._fused_ob_caches
+        assert not fused._fused_od_caches
+
+    assert all(
+        new is not old
+        for state in fused.state.values()
+        for new in state.values()
+        if torch.is_tensor(new)
+        for old in retired_state_tensors
+    )
+    for a, b in zip(pv, pn, strict=True):
+        assert torch.allclose(a, b, atol=1e-5, rtol=1e-5)
+
+
+def test_load_state_dict_invalidates_pointer_caches():
+    ps = _bag([(8, 16), (32,)], seed=33)
+    opt = Adakaon(ps, fused=True, momentum_dtype="float32")
+    for p in ps:
+        p.grad = torch.ones_like(p)
+    opt.step()
+    old_caches = tuple(opt._fused_ob_caches.values()) + tuple(opt._fused_od_caches.values())
+    assert old_caches
+
+    opt.load_state_dict(opt.state_dict())
+    assert not opt._fused_part
+    assert not opt._fused_ob_caches
+    assert not opt._fused_od_caches
+
+    for p in ps:
+        p.grad = torch.ones_like(p)
+    opt.step()
+    new_caches = tuple(opt._fused_ob_caches.values()) + tuple(opt._fused_od_caches.values())
+    assert new_caches
+    assert all(new is not old for new in new_caches for old in old_caches)
 
 
 # ----------------------------------------------------------------- host helpers
@@ -511,28 +662,14 @@ def test_int8_with_bf16_params():
 
 def test_int8_quant_primitives_match_codec():
     """The REUSABLE device primitive requant_int8 == native _quant_int8 (bit-for-bit)."""
-    import triton
-    import triton.language as tl
-
-    from kaon._fused_triton import requant_int8
     from kaon._momentum_codec import _quant_int8
 
     R, C, BR, BC = 8, 24, 8, 32
 
-    @triton.jit
-    def _probe(m_ptr, code_ptr, scale_ptr, R, C, BR: tl.constexpr, BC: tl.constexpr):
-        ri = tl.arange(0, BR)[:, None]
-        ci = tl.arange(0, BC)[None, :]
-        m2 = (ri < R) & (ci < C)
-        idx = ri * C + ci
-        rr = tl.arange(0, BR)
-        m = tl.load(m_ptr + idx, mask=m2, other=0.0)
-        requant_int8(m, m2, code_ptr, idx, scale_ptr, rr, R)
-
     m = torch.randn(R, C, device=DEV)
     code = torch.zeros(R, C, dtype=torch.int8, device=DEV)
     scale = torch.zeros(R, device=DEV)
-    _probe[(1,)](m, code, scale, R, C, BR=BR, BC=BC)
+    _int8_quant_probe[(1,)](m, code, scale, R, C, BR=BR, BC=BC)
     torch.cuda.synchronize()
     q_ref, scale_ref = _quant_int8(m)
     assert torch.equal(code, q_ref)                              # codes bit-identical
@@ -598,10 +735,6 @@ def test_4bit_converges():
 
 def test_4bit_quant_primitive_matches_codec():
     """The REUSABLE device primitive requant_4bit == native _quant_4bit (packed bytes + scale)."""
-    import triton
-    import triton.language as tl
-
-    from kaon._fused_triton import requant_4bit
     from kaon._momentum_codec import _quant_4bit
 
     R, C, BR, BC = 8, 16, 8, 16
@@ -609,19 +742,10 @@ def test_4bit_quant_primitive_matches_codec():
     Chalf, BLK = C // 2, min(128, numel)
     NB = (numel + BLK - 1) // BLK
 
-    @triton.jit
-    def _probe(m_ptr, packed_ptr, scale_ptr, R, C, Chalf, NB, BLK, BR: tl.constexpr, BC: tl.constexpr):
-        ri = tl.arange(0, BR)[:, None]
-        ci = tl.arange(0, BC)[None, :]
-        m2 = (ri < R) & (ci < C)
-        idx = ri * C + ci
-        m = tl.load(m_ptr + idx, mask=m2, other=0.0)
-        requant_4bit(m, m2, idx, R, C, Chalf, packed_ptr, scale_ptr, NB, BLK, BR, BC)
-
     m = torch.randn(R, C, device=DEV)
     packed = torch.zeros(R * Chalf, dtype=torch.uint8, device=DEV)
     scale = torch.zeros(NB, device=DEV)
-    _probe[(1,)](m, packed, scale, R, C, Chalf, NB, BLK, BR=BR, BC=BC)
+    _fourbit_quant_probe[(1,)](m, packed, scale, R, C, Chalf, NB, BLK, BR=BR, BC=BC)
     torch.cuda.synchronize()
     p_ref, s_ref, _ = _quant_4bit(m, 128)
     assert torch.equal(packed, p_ref)                          # packed bytes bit-identical
@@ -718,18 +842,6 @@ def test_grad_none_param_is_skipped():
 # ----------------------------------------------------------------- reusable device primitive
 def test_sr_round_unbiased():
     """sr_round (the reusable bf16 SR primitive) is unbiased: averaging many draws -> the value."""
-    import triton
-    import triton.language as tl
-
-    from kaon._fused_triton import sr_round
-
-    @triton.jit
-    def _probe(out_ptr, val, seed, N, BLOCK: tl.constexpr):
-        offs = tl.arange(0, BLOCK)
-        res = tl.full((BLOCK,), val, tl.float32) * 1.0
-        r = sr_round(res, seed, offs)
-        tl.store(out_ptr + offs, r, mask=offs < N)
-
     N = 4096
     # a value strictly between two bf16 representables
     lo = torch.tensor([1.0], dtype=torch.bfloat16).float().item()
@@ -739,14 +851,14 @@ def test_sr_round_unbiased():
     K = 300
     for k in range(K):
         out = torch.empty(N, device=DEV)
-        _probe[(1,)](out, val, k + 1, N, BLOCK=N)
+        _sr_round_probe[(1,)](out, val, k + 1, N, BLOCK=N)
         acc += out
     torch.cuda.synchronize()
     mean = (acc / K).mean().item()
     assert abs(mean - val) < 5e-4, f"SR mean {mean} vs {val}"
     # every draw must be one of the two bf16 neighbours of val
     out = torch.empty(N, device=DEV)
-    _probe[(1,)](out, val, 12345, N, BLOCK=N)
+    _sr_round_probe[(1,)](out, val, 12345, N, BLOCK=N)
     torch.cuda.synchronize()
     uniq = torch.unique(out.bfloat16()).numel()
     assert uniq <= 2
@@ -755,25 +867,11 @@ def test_sr_round_unbiased():
 # ----------------------------------------------------------------- reusable factored primitives
 def test_gradient_centralize_primitive():
     """gradient_centralize device helper == torch GC (subtract per-row fan-in mean)."""
-    import triton
-    import triton.language as tl
-
-    from kaon._fused_triton import gradient_centralize
-
     R, C, BR, BC = 6, 10, 8, 16
-
-    @triton.jit
-    def _probe(g_ptr, o_ptr, R, C, BR: tl.constexpr, BC: tl.constexpr):
-        ri = tl.arange(0, BR)[:, None]
-        ci = tl.arange(0, BC)[None, :]
-        m2 = (ri < R) & (ci < C)
-        idx = ri * C + ci
-        g = tl.load(g_ptr + idx, mask=m2, other=0.0)
-        tl.store(o_ptr + idx, gradient_centralize(g, m2, C.to(tl.float32)), mask=m2)
 
     g = torch.randn(R, C, device=DEV)
     o = torch.zeros(R, C, device=DEV)
-    _probe[(1,)](g, o, R, C, BR=BR, BC=BC)
+    _gradient_centralize_probe[(1,)](g, o, R, C, BR=BR, BC=BC)
     torch.cuda.synchronize()
     assert torch.allclose(o, g - g.mean(dim=1, keepdim=True), atol=1e-5)
 
@@ -781,33 +879,16 @@ def test_gradient_centralize_primitive():
 def test_factored_rc_primitive():
     """factored_rc device helper == native update_factored_state + factored_inv_sqrt_factors,
     and it updates the row/col EMA state in place."""
-    import triton
-    import triton.language as tl
-
     from kaon._factored import factored_inv_sqrt_factors, update_factored_state
-    from kaon._fused_triton import factored_rc
 
     R, C, BR, BC = 6, 10, 8, 16
-
-    @triton.jit
-    def _probe(g_ptr, rowp, colp, rfac, cfac, R, C, beta2, eps1, BR: tl.constexpr, BC: tl.constexpr):
-        ri = tl.arange(0, BR)[:, None]
-        ci = tl.arange(0, BC)[None, :]
-        rr = tl.arange(0, BR)
-        cc = tl.arange(0, BC)
-        m2 = (ri < R) & (ci < C)
-        idx = ri * C + ci
-        g = tl.load(g_ptr + idx, mask=m2, other=0.0)
-        rf, cf = factored_rc(g, rowp, colp, rr, cc, R, C, R.to(tl.float32), C.to(tl.float32), beta2, eps1)
-        tl.store(rfac + rr, rf, mask=rr < R)
-        tl.store(cfac + cc, cf, mask=cc < C)
 
     g = torch.randn(R, C, device=DEV)
     row = torch.zeros(R, device=DEV)
     col = torch.zeros(C, device=DEV)
     rfac = torch.zeros(R, device=DEV)
     cfac = torch.zeros(C, device=DEV)
-    _probe[(1,)](g, row, col, rfac, cfac, R, C, 0.999, 1e-30, BR=BR, BC=BC)
+    _factored_rc_probe[(1,)](g, row, col, rfac, cfac, R, C, 0.999, 1e-30, BR=BR, BC=BC)
     torch.cuda.synchronize()
     row_r = torch.zeros(R, device=DEV)
     col_r = torch.zeros(C, device=DEV)

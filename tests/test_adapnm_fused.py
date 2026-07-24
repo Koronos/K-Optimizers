@@ -65,6 +65,80 @@ def _run_parity(shapes, dtype, mdtype, *, cautious=True, gc=True, wd=0.0, steps=
     return d, scale, ov
 
 
+def test_autolr_resets_rebuild_caches_and_preserve_native_parity():
+    """AdaPNM resets parity counters together with state and fused pointer caches."""
+    pv = _bag([(8, 16), (32,)], torch.float32, seed=41)
+    pn = _clone(pv)
+    cfg = dict(lr=2e-3, momentum_dtype="float32", cautious=False,
+               gradient_centralization=False)
+    fused = AdaPNM(pv, fused=True, **cfg)
+    native = AdaPNM(pn, **cfg)
+    gen = torch.Generator(device=DEV).manual_seed(42)
+    retired_caches = []
+    retired_state_tensors = []
+
+    for contact in range(3):
+        gs = [torch.randn(p.shape, generator=gen, device=DEV) for p in pv]
+        for p, g in zip(pv, gs, strict=True):
+            p.grad = g.clone()
+        for p, g in zip(pn, gs, strict=True):
+            p.grad = g.clone()
+        fused.step()
+        native.step()
+
+        current_caches = tuple(fused._fused_ob_caches.values()) + tuple(fused._fused_od_caches.values())
+        assert fused._fused_ob_caches and fused._fused_od_caches
+        assert all(new is not old for new in current_caches for old in retired_caches)
+        if contact == 2:
+            break
+
+        retired_caches.extend(current_caches)
+        retired_state_tensors.extend(
+            value
+            for state in fused.state.values()
+            for value in state.values()
+            if torch.is_tensor(value)
+        )
+        fused._autolr_reset_base_state()
+        native._autolr_reset_base_state()
+        assert all(group["step"] == 0 for group in fused.param_groups)
+        assert not fused.state
+        assert not fused._fused_part
+        assert not fused._fused_ob_caches
+        assert not fused._fused_od_caches
+    assert all(
+        new is not old
+        for state in fused.state.values()
+        for new in state.values()
+        if torch.is_tensor(new)
+        for old in retired_state_tensors
+    )
+    for a, b in zip(pv, pn, strict=True):
+        assert torch.allclose(a, b, atol=1e-5, rtol=1e-5)
+
+
+def test_load_state_dict_invalidates_pointer_caches():
+    ps = _bag([(8, 16), (32,)], seed=43)
+    opt = AdaPNM(ps, fused=True, momentum_dtype="float32")
+    for p in ps:
+        p.grad = torch.ones_like(p)
+    opt.step()
+    old_caches = tuple(opt._fused_ob_caches.values()) + tuple(opt._fused_od_caches.values())
+    assert old_caches
+
+    opt.load_state_dict(opt.state_dict())
+    assert not opt._fused_part
+    assert not opt._fused_ob_caches
+    assert not opt._fused_od_caches
+
+    for p in ps:
+        p.grad = torch.ones_like(p)
+    opt.step()
+    new_caches = tuple(opt._fused_ob_caches.values()) + tuple(opt._fused_od_caches.values())
+    assert new_caches
+    assert all(new is not old for new in new_caches for old in old_caches)
+
+
 # ----------------------------------------------------------------- one-block parity
 @pytest.mark.parametrize("cautious", [True, False])
 @pytest.mark.parametrize("gc", [True, False])

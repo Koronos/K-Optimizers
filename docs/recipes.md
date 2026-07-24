@@ -140,21 +140,24 @@ shrink the rest.
 **Evidence:** **≈1.3 B/param** on the SDXL UNet shape distribution (vs reference Prodigy's four
 fp32 buffers); D trajectory unchanged. → [docs/kprodigy.md](kprodigy.md).
 
-### Parameter-free, then ~free after warmup (Mechanic, *not* Prodigy)
+### Autonomous step-size discovery (no trainer LR policy)
 
 ```python
-from kaon import Autokaon
+from kaon import Adakaon
 
-opt = Autokaon(model.parameters(), bf16_method="stochastic_rounding")
+opt = Adakaon(model.parameters(), auto_lr=True, bf16_method="stochastic_rounding")
 ```
 
-A Mechanic scalar tuner auto-discovers the LR on top of Adakaon's update; the default
-`lr_freeze="auto"` then folds the discovered LR into the base, frees the tuner's `ref` buffer,
-and runs as **byte-for-byte plain Adakaon** thereafter.
+A low-VRAM DoWG controller chooses a conservative dynamic step size directly from
+optimizer updates and gradient norms. It needs neither `report_loss()` nor a closure
+or trainer-side range test. On a stability contact it rolls back and reinitializes the
+base state; it then freezes after a confirming contact, the conservative fuse, or its
+bounded discovery budget. This is a robust starting-point mechanism, **not** a universal
+estimator of the globally optimal LR.
 
-**Evidence:** validated on a real SDXL LoRA (the data-relative scale cap generalizes — val flat
-across `scale_cap_rel` 3–12); with the default `adakaon_betas=(0.0,0.999)` the freeze handoff is
-**bit-exact**. → [docs/autokaon.md](autokaon.md).
+**Use:** `auto_lr_scale` adjusts the discovered scale only when you have a deliberate
+domain prior; `auto_lr_d0` supplies an explicit positive seed; `auto_lr_fuse_rel`
+sets the safety ceiling. → [docs/autolr.md](autolr.md).
 
 ---
 

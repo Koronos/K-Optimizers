@@ -38,7 +38,6 @@ from __future__ import annotations
 import argparse
 import glob
 import importlib
-import math
 import os
 import random
 import time
@@ -160,7 +159,7 @@ def probe(unet, recs, idxs, ati, ac, reps, seed):
 
 
 def make_optimizer(name, params, lr):
-    from kaon import AdaMuon, Adakaon
+    from kaon import Adakaon, AdaMuon
     md = {"adamuon": "bfloat16", "adamuon_int8": "int8", "adamuon_4bit": "4bit"}
     if name.startswith("adamuon"):
         return AdaMuon(params, lr=lr, betas=(0.95, 0.999), clip_threshold=1.0, ns_steps=2,
@@ -254,7 +253,8 @@ def cmd_ab(A):
         line = f"  train<= {tgt:.5f}: "
         for spec, avg in out.items():
             hit = next((p for p in avg if p[1] <= tgt), None)
-            line += f"{spec.split(':')[0]} {('%dst/%.0fs' % (hit[0], hit[3] / 1000)) if hit else 'never':>15s} | "
+            reached = f"{hit[0]}st/{hit[3] / 1000:.0f}s" if hit else "never"
+            line += f"{spec.split(':')[0]} {reached:>15s} | "
         print(line, flush=True)
 
 

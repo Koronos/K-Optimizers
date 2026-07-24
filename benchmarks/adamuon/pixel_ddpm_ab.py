@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kaon import AdaMuon, Adakaon
+from kaon import Adakaon, AdaMuon
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 DT = torch.float32
@@ -227,7 +227,7 @@ def main():
         results[spec] = (mean, ms, bp)
         tag = name + ("+cos" if cosine else "")
         print(f"  {tag:16s} lr={lr:.1e}  val={mean:.5f}  {ms:.1f}ms/step  {bp:.2f}B/param  "
-              f"seeds={['%.4f' % v for v in vals]}", flush=True)
+              f"seeds={[f'{v:.4f}' for v in vals]}", flush=True)
 
     best_spec = min(results, key=lambda s: results[s][0])
     print(f"\nBEST: {best_spec}  val={results[best_spec][0]:.5f}")

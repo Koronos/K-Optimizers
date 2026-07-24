@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.4]
+
+### Changed
+- **AutoLR is now fully autonomous.** `auto_lr=True` starts the low-VRAM DoWG
+  controller immediately and no longer uses a loss-driven range test, closure, or
+  trainer decision. `optimizer.report_loss(loss)` is a deprecated compatibility
+  no-op in this release (one warning per optimizer) and will be removed in 0.8.0.
+- AutoLR snapshots every trainable parameter from the beginning, including
+  late-gradient parameters. It uses instant spike detection plus a fixed-reference
+  log-gradient level guard: the first eight finite norms form an immutable baseline
+  and later eight-sample windows cannot move that baseline.
+- Discovery grows only before its first contact. A contact rolls parameters back,
+  clears the base state and fused caches, and restarts DoWG accumulation; a
+  comparable second contact freezes the LR. Discovery also freezes conservatively
+  at its fuse or fixed 192-step budget, recording `edge_confirmed`, `fuse_bound`,
+  or `budget_bound` in checkpoint state.
+- An explicit `auto_lr_d0` can no longer enlarge its own fuse without limit. It
+  retains at most 4× bounded compatibility headroom over the data-relative fuse;
+  higher seeds are clamped with a diagnostic, making recovery from an accidentally
+  high starting value autonomous and bounded.
+- Repeated non-finite gradients are skipped with a diagnostic after one
+  rollback/backoff, preventing unbounded LR reduction.
+
+### Fixed
+- Fused Adakaon and AdaPNM reset their state, counters, partitions, and pointer
+  caches before rebuilding buffers after an AutoLR rollback or state replacement.
+  Fused pointer arrays are never reused across a reset/load that replaces state
+  tensors.
+- AutoLR checkpoint state now serializes its fixed baseline, rolling window,
+  contacts, counter, and freeze reason. Checkpoints carrying the retired 0.7.3
+  loss-probe state load compatibly and resume with the autonomous controller.
+
+### Documentation
+- Replaced the retired `Autokaon`/Mechanic documentation with
+  [`Adakaon(auto_lr=True)`](docs/autolr.md): AutoLR is described as a conservative
+  autonomous dynamic step-size controller, not a universal optimal-LR detector.
+
 ### Added
 - **`gradient_centralization`** — a composable, **zero-state** gradient preprocessor
   (Gradient Centralization, Yong et al. 2020, arXiv:2004.01461): subtract the per-output-row
@@ -52,8 +89,8 @@ All notable changes to this project will be documented in this file.
 - **`Autokaon`** — a parameter-free learning rate on Adakaon's update via a
   [Mechanic](https://arxiv.org/abs/2306.00144) scalar tuner (an update-agnostic
   online LR tuner — **Mechanic, *not* Prodigy**), with a **freeze-to-free**
-  handoff. See [docs/autokaon.md](docs/autokaon.md) for the full design,
-  the minimal API, and the validated campaign results.
+  handoff. This historical implementation was retired in 0.7.4 in favour of
+  autonomous `auto_lr=True`.
   - Train at `lr=1.0`; the tuner discovers the effective LR (read via `get_d()`),
     keeping Adakaon's exact normalize-then-momentum update verbatim.
   - `lr_freeze` (default `"auto"`; also `int N` / `None`) ends adaptation: it folds
@@ -161,7 +198,8 @@ All notable changes to this project will be documented in this file.
 - **Renamed `Autofusion` → `Autokaon`** (follows the `Adafusion → Adakaon` rename —
   the in-house optimizers built on the kaon backend now share the `*kaon` family
   name). Class, module (`kaon.autofusion` → `kaon.autokaon`), tests, and docs
-  (`docs/autofusion.md` → `docs/autokaon.md`) renamed. No behaviour change.
+  (`docs/autofusion.md` → the then-current Autokaon documentation) renamed. No
+  behaviour change; the historical documentation was removed in 0.7.4.
 - **Renamed `Adafusion` → `Adakaon`.** The flagship optimizer is the one that most
   fully exercises the shared **kaon** backend (factored second moment + quantized
   momentum codec + stochastic rounding + foreach + cautious) — every other optimizer

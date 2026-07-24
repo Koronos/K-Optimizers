@@ -58,6 +58,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
@@ -68,7 +69,6 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
 )
-from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,

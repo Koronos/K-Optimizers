@@ -92,4 +92,5 @@ int8/4bit *codes* round-trip through fp32 losslessly).
   and the `foreach_batch_cutoff` / `foreach_stack_budget` knobs.
 - [momentum.md](momentum.md) — why int8 is the recommended cheap momentum and what
   cheaper ideas were rejected.
-- [autokaon.md](autokaon.md) — a parameter-free LR on top of this update.
+- [autolr.md](autolr.md) — autonomous step-size discovery on this update via
+  `Adakaon(auto_lr=True)`.

@@ -188,7 +188,7 @@ def test_byte_footprint_per_param():
 
 
 def test_scale_folds_value_exactly_for_quantized():
-    """``scale_`` multiplies the dequantised momentum exactly (used by Autokaon freeze)."""
+    """``scale_`` multiplies the dequantised momentum exactly for wrapper handoffs."""
     torch.manual_seed(2)
     shape = (5, 7)
     for md in ("int8", "4bit", "bfloat16", "float32"):

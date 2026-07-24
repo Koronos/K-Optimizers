@@ -67,8 +67,8 @@ our own gap+FID test (not by more lit search):
    source. And it **conflicts with MSAM** (which reuses momentum) — a real implementation tension.
 2. **Is any Muon/AdaMuon/Shampoo/SOAP variant gap-good (not just loss-good)?** No published
    gap-specific evidence (matches our in-house finding: Muon-family good-on-loss, poor-on-gap).
-3. **Schedule-free / Prodigy / Mechanic re-aimed at generalization** — not found (our Autokaon
-   freeze-to-free is already in this unexplored space).
+3. **Schedule-free / Prodigy / adaptive-LR methods re-aimed at generalization** — not found
+   (the retired Autokaon explored this space before the autonomous AutoLR controller).
 
 ## Recommended next experiment (falsification)
 

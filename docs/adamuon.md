@@ -180,13 +180,13 @@ seed, LR swept per arm, held-out val MSE). Not real SDXL/Flux — a first signal
 
 ## Follow-ups (not in v1)
 
-- Schedule-free / Prodigy parameter-free LR (kill scheduler dependence for fine
-  detail) — analogous to the `Adakaon → Autokaon` relationship.
+- Evaluate autonomous `auto_lr=True` on this optimizer for workloads where a
+  conservative dynamic step size is preferable to trainer-managed LR policy.
 
 ## See also
 
 - [muon.md](muon.md) — the simpler heavy-ball Muon hybrid this builds on.
 - [adakaon.md](adakaon.md), [kprodigy.md](kprodigy.md),
-  [autokaon.md](autokaon.md), [foreach-batching.md](foreach-batching.md),
+  [autolr.md](autolr.md), [foreach-batching.md](foreach-batching.md),
   [momentum.md](momentum.md).
 ```

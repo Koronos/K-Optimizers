@@ -85,7 +85,6 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._momentum_codec import (
-    fourbit_block_size,
     _FOURBIT_BLOCK,
     _dequant_4bit,
     _dequant_4bit_stacked,
@@ -93,6 +92,7 @@ from kaon._momentum_codec import (
     _quant_4bit_stacked,
     _quant_int8,
     _quant_int8_stacked,
+    fourbit_block_size,
     load_state_dict_preserving_dtypes,
 )
 

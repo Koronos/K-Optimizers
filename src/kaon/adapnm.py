@@ -120,6 +120,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
@@ -131,10 +132,8 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
 )
-from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
-    fourbit_block_size,
     _FOURBIT_BLOCK,
     _dequant_4bit,
     _dequant_4bit_stacked,
@@ -142,6 +141,7 @@ from kaon._momentum_codec import (
     _quant_4bit_stacked,
     _quant_int8,
     _quant_int8_stacked,
+    fourbit_block_size,
     load_state_dict_preserving_dtypes,
 )
 
@@ -432,6 +432,19 @@ class AdaPNM(AutoLRMixin, Optimizer):
 
         # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
+
+    def _invalidate_fused_caches(self) -> None:
+        """Drop every host-side cache that may retain pointers into optimizer state."""
+        self._fused_part.clear()
+        self._fused_ob_caches.clear()
+        self._fused_od_caches.clear()
+
+    def _autolr_reset_base_state(self) -> None:
+        """Reset AdaPNM's base optimizer after an AutoLR rollback/contact."""
+        self.state.clear()
+        for group in self.param_groups:
+            group["step"] = 0
+        self._invalidate_fused_caches()
 
     # ------------------------------------------------------------------- state
     @torch.no_grad()
@@ -978,6 +991,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
         tensor to how it was checkpointed.
         """
         self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
+        self._invalidate_fused_caches()
 
     # ----------------------------------------------------------- coefficients
     @staticmethod

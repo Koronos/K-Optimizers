@@ -127,10 +127,10 @@ from kaon._backend import (
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
-    fourbit_block_size,
     _FOURBIT_BLOCK,
     _quant_4bit,
     _quant_int8,
+    fourbit_block_size,
     load_state_dict_preserving_dtypes,
 )
 from kaon._stochastic_rounding import add_stochastic_

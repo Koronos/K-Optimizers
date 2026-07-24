@@ -67,6 +67,5 @@ live-reference caveat as Adakaon — `torch.save` to freeze a snapshot.)
 
 - [adakaon.md](adakaon.md) — the update engine KProdigy's pass-2 reuses.
 - [momentum.md](momentum.md) — the cheap-momentum dial shared with Adakaon.
-- [autokaon.md](autokaon.md) — the *other* parameter-free optimizer here
-  (Mechanic on Adakaon, not Prodigy), and why its update ordering converges
-  better than Prodigy's Adam-form D-adaptation.
+- [autolr.md](autolr.md) — autonomous DoWG step-size discovery available through
+  `Adakaon(auto_lr=True)` and other Kaon optimizer hosts.

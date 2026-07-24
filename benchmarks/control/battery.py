@@ -116,7 +116,7 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
                 torch.cuda.synchronize()
             t0 = time.time()
         mult = rex(it / n) if schedule == "rex" else 1.0
-        for pg, base in zip(opt.param_groups, base_lrs):
+        for pg, base in zip(opt.param_groups, base_lrs, strict=True):
             pg["lr"] = base * mult
         idx = [tr[(pos + j) % len(tr)] for j in range(bs)]; pos += bs
         opt.zero_grad()
@@ -165,7 +165,7 @@ def mean(xs):
 
 def _jsonsafe(v):
     """Coerce an optimizer hyperparameter to a JSON-able scalar/list (tuples->lists; enums/dtypes->str)."""
-    if isinstance(v, bool) or isinstance(v, (int, float, str)) or v is None:
+    if isinstance(v, (bool, int, float, str)) or v is None:
         return v
     if isinstance(v, (tuple, list)):
         return [_jsonsafe(x) for x in v]

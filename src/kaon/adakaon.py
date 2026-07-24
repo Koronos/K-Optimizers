@@ -40,6 +40,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
@@ -52,7 +53,6 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
-from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -286,11 +286,27 @@ class Adakaon(AutoLRMixin, Optimizer):
                 raise RuntimeError("Adakaon(fused=True) requires Triton (a GPU-only optional dependency)")
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
-        # Optional parameter-free LR: a Mechanic tuner that discovers the scale and
-        # freezes back to plain Adakaon. When on, it forces group["lr"]=1.0 during
-        # adaptation (the base lr is ignored) and drives the step via _step_impl.
+        # Optional autonomous DoWG step-size controller. It owns group["lr"] while
+        # adapting and drives the base update through _step_impl.
         # Off (default) -> zero overhead, step == _step_impl.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
+
+    def _invalidate_fused_caches(self) -> None:
+        """Drop every host-side cache that may retain pointers into optimizer state.
+
+        State tensors are allocated lazily by the next fused step.  The pointer
+        caches therefore must never survive a state reset or checkpoint load,
+        even when the parameter identities themselves have not changed.
+        """
+        self._fused_part.clear()
+        self._fused_ob_caches.clear()
+        self._fused_od_caches.clear()
+
+    def _autolr_reset_base_state(self) -> None:
+        """Reset Adakaon's base optimizer after an AutoLR rollback/contact."""
+        self.state.clear()
+        self._t = 0
+        self._invalidate_fused_caches()
 
     def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
         md = group["momentum_dtype"]
@@ -452,11 +468,14 @@ class Adakaon(AutoLRMixin, Optimizer):
                 native.append(p)
         if _FUSED_DISABLE:  # diagnostic routing override (see module note)
             if "one_block" in _FUSED_DISABLE:
-                native += one_block; one_block = []
+                native += one_block
+                one_block = []
             if "big" in _FUSED_DISABLE:
-                native += big; big = []
+                native += big
+                big = []
             if "one_dim" in _FUSED_DISABLE:
-                native += one_dim; one_dim = []
+                native += one_dim
+                one_dim = []
         if _PROBE_LOG_PATH:  # routing census + grad-contiguity audit (probe runs only)
             noncontig = [tuple(p.shape) for p in params if p.grad is not None and not p.grad.is_contiguous()]
             with open(_PROBE_LOG_PATH, "a") as fh:  # noqa: SIM115 — diagnostics only
@@ -660,12 +679,12 @@ class Adakaon(AutoLRMixin, Optimizer):
             if md == "int8":
                 q8, new_scale = _quant_int8_stacked(temp)            # per-row scale, [N, R, 1]
                 torch._foreach_copy_([st["m"] for st in states], list(q8.unbind(0)))
-                for st, sc in zip(states, new_scale.unbind(0)):
+                for st, sc in zip(states, new_scale.unbind(0), strict=True):
                     st["m_scale"].copy_(sc.view_as(st["m_scale"]))
             else:
                 new_packed, new_scale = _quant_4bit_stacked(temp.reshape(N, -1), states[0]["m_block"])
                 torch._foreach_copy_([st["m"] for st in states], list(new_packed.unbind(0)))
-                for st, sc in zip(states, new_scale.unbind(0)):
+                for st, sc in zip(states, new_scale.unbind(0), strict=True):
                     st["m_scale"].copy_(sc)
         inv_mean = (1.0 / (keep.float() / n).clamp_(min=1e-8)) if cautious else torch.ones(N, device=dev)
         if fused_red:
@@ -731,6 +750,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         preserving helper; the auto_lr tuner blob is peeled off first by AutoLRMixin.
         """
         self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
+        self._invalidate_fused_caches()
 
     # ----------------------------------------------------------------- foreach
 

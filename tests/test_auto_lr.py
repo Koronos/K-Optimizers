@@ -1,12 +1,8 @@
-"""Tests for the ``auto_lr`` flag — composable parameter-free LR via update-space
-DoWG (``kaon._autolr.AutoLRTuner``), on Adakaon (the first base).
+"""CPU tests for autonomous AutoLR.
 
-CPU/fp32. Validates: off == plain, LR discovery + loss reduction from the
-decades-low seed, the lr<1 ignore+warn safety, the stability-edge guard (spike
-backoff + isolated-spike self-correction + confirmed-edge automatic freeze +
-from-above recovery + nan-grad path), survival of a per-step harness lr clobber,
-and checkpoint round-trip. There is deliberately NO freeze knob: the tuner
-decides by itself when discovery is done (confirmed edge contact).
+The deterministic toy host makes detector and rollback behavior observable
+without involving a trainer or a loss signal.  One public Adakaon smoke test
+keeps the integration path covered as well.
 """
 
 from __future__ import annotations
@@ -14,454 +10,379 @@ from __future__ import annotations
 import copy
 import math
 import warnings
+from collections.abc import Iterable
 
+import pytest
 import torch
 
 from kaon import Adakaon
+from kaon._autolr import _ADAPT_MAX_STEPS, _BACKOFF, AutoLRMixin
 
 
-def _tiny_problem(seed: int = 0) -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor]:
-    torch.manual_seed(seed)
-    model = torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.Tanh(), torch.nn.Linear(16, 4))
-    x = torch.randn(32, 8)
-    y = torch.randn(32, 4)
-    return model, x, y
+class _ToyOptimizer(AutoLRMixin, torch.optim.Optimizer):
+    """Small stateful SGD host used to inspect AutoLR transactions."""
 
+    def __init__(
+        self,
+        params: Iterable[torch.Tensor],
+        *,
+        auto_lr: bool = True,
+        auto_lr_scale: float = 1.0,
+        auto_lr_fuse_rel: float = 20.0,
+        auto_lr_d0: float | None = 1e-3,
+    ) -> None:
+        super().__init__(params, {"lr": 1.0})
+        self.reset_calls = 0
+        self._init_autolr(
+            auto_lr,
+            auto_lr_scale,
+            auto_lr_fuse_rel,
+            auto_lr_d0,
+        )
 
-def _closure(model, x, y, opt):
-    def c():
-        opt.zero_grad()
-        loss = torch.nn.functional.mse_loss(model(x), y)
-        loss.backward()
-        return loss
-    return c
-
-
-def _manual_step(model, x, y, opt, grad_factor: float = 1.0, grad_fill: float | None = None) -> float:
-    """One step with direct grad access (to inject spikes or poison grads)."""
-    opt.zero_grad()
-    loss = torch.nn.functional.mse_loss(model(x), y)
-    loss.backward()
-    if grad_factor != 1.0 or grad_fill is not None:
-        with torch.no_grad():
-            for p in model.parameters():
-                if p.grad is None:
+    def _step_impl(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.grad is None:
                     continue
-                p.grad.fill_(grad_fill) if grad_fill is not None else p.grad.mul_(grad_factor)
+                state = self.state[param]
+                momentum = state.setdefault("momentum", torch.zeros_like(param))
+                momentum.mul_(0.5).add_(param.grad)
+                state["steps"] = state.get("steps", 0) + 1
+                param.add_(momentum, alpha=-float(group["lr"]))
+        return loss
+
+    def _autolr_reset_base_state(self) -> None:
+        self.reset_calls += 1
+        AutoLRMixin._autolr_reset_base_state(self)
+
+    def state_dict(self):
+        return self._autolr_state_dict(super().state_dict())
+
+    def load_state_dict(self, state_dict):
+        self._autolr_load(
+            state_dict,
+            lambda state: torch.optim.Optimizer.load_state_dict(self, state),
+        )
+
+
+def _make(
+    values: tuple[float, ...] = (1.0,),
+    **kwargs,
+) -> tuple[list[torch.nn.Parameter], _ToyOptimizer]:
+    params = [torch.nn.Parameter(torch.tensor([value], dtype=torch.float32)) for value in values]
+    return params, _ToyOptimizer(params, **kwargs)
+
+
+def _step(opt: _ToyOptimizer, grads: tuple[float | None, ...]) -> None:
+    params = [param for group in opt.param_groups for param in group["params"]]
+    assert len(params) == len(grads)
+    for param, grad in zip(params, grads):
+        param.grad = None if grad is None else torch.full_like(param, grad)
     opt.step()
-    return float(loss.detach())
 
 
-def _warmed_opt(seed: int, n: int = 20):
-    """A tiny problem + auto_lr Adakaon advanced n steps; returns (model, x, y, opt, tuner)."""
-    model, x, y = _tiny_problem(seed=seed)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(n):
-        _manual_step(model, x, y, opt)
-    return model, x, y, opt, opt._autolr
+def _first_spike(opt: _ToyOptimizer, *, healthy_steps: int = 4) -> float:
+    for _ in range(healthy_steps):
+        _step(opt, (1.0,))
+    contact = float(opt._autolr.S)
+    _step(opt, (10.0,))
+    return contact
 
 
-def _arm_confirmed_edge(tuner) -> float:
-    """Simulate a prior edge contact at the current level (the next spike confirms it)."""
-    tuner._edge = tuner.S  # a real prior contact also ends the ramp phase (derived from _edge)
-    return tuner.S
+def test_discovery_runs_without_loss_or_report_loss() -> None:
+    _, opt = _make()
+    for _ in range(12):
+        _step(opt, (1.0,))
+    assert opt._autolr._seed == pytest.approx(1e-3)
+    assert opt.get_d() > opt._autolr._seed
+    assert opt._autolr._level_base == pytest.approx([0.0] * 8)
 
 
-def _probe_drive(opt, model, x, y, loss_fn, n):
-    """Drive n probe steps, reporting a synthetic loss computed by loss_fn(rung_lr)."""
-    for _ in range(n):
-        opt.report_loss(loss_fn(opt.get_d()))
-        _manual_step(model, x, y, opt)
-        if opt.is_frozen():
-            break
+def test_report_loss_is_a_warn_once_noop() -> None:
+    params_a, opt_a = _make()
+    params_b, opt_b = _make()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for index in range(12):
+            opt_a.report_loss(float(index))
+            opt_a.report_loss(float("nan"))
+            _step(opt_a, (1.0,))
+            _step(opt_b, (1.0,))
+
+    deprecations = [item for item in caught if issubclass(item.category, DeprecationWarning)]
+    assert len(deprecations) == 1
+    assert torch.equal(params_a[0], params_b[0])
+    assert opt_a.get_d() == opt_b.get_d()
+    assert opt_a._autolr.state_blob() == opt_b._autolr.state_blob()
 
 
-def test_probe_mode_activates_on_reported_loss() -> None:
-    model, x, y = _tiny_problem(seed=10)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    opt.report_loss(0.1)
-    _manual_step(model, x, y, opt)
-    assert isinstance(opt._autolr._probe, dict), "a visible loss must select probe mode"
+def test_snapshots_parameters_that_receive_gradients_late() -> None:
+    params, opt = _make((1.0, 2.0))
+    initial_late = params[1].detach().clone()
+    _step(opt, (1.0, None))
+    assert params[1] in opt._autolr._x0
+    assert torch.equal(opt._autolr._x0[params[1]], initial_late)
+
+    for _ in range(3):
+        _step(opt, (1.0, None))
+    _step(opt, (1.0, 1.0))
+    assert not torch.equal(params[1], initial_late)
+    _step(opt, (10.0, 10.0))
+    assert torch.equal(params[1], initial_late)
 
 
-def test_no_loss_falls_back_to_continuous() -> None:
-    model, x, y = _tiny_problem(seed=10)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(4):  # mode grace window is 3 steps (report-after-step trainers lag one)
-        _manual_step(model, x, y, opt)
-    assert opt._autolr._probe is False, "no loss within the grace window -> continuous fallback"
+def test_abrupt_spike_rolls_back_parameters_and_base_state_exactly() -> None:
+    params, opt = _make()
+    initial = params[0].detach().clone()
+    contact = _first_spike(opt)
+
+    assert opt._autolr._edge == contact
+    assert opt.get_d() == pytest.approx(contact * _BACKOFF)
+    assert torch.equal(params[0], initial)
+    assert len(opt.state) == 0
+    assert opt.reset_calls == 1
+    assert opt._autolr._rbar == 0.0
+    assert opt._autolr._contacts == 1
+    assert not opt.is_frozen()
 
 
-def test_probe_finds_edge_and_freezes_below_it() -> None:
-    # Synthetic edge at 1e-4: healthy noise below, catastrophic degradation above.
-    # The probe must freeze at the last safe rung (edge/factor-ish), restore the
-    # exact initial params, and leave the base state clean.
-    from kaon._autolr import _PROBE_FACTOR
-    model, x, y = _tiny_problem(seed=11)
-    orig = [p.detach().clone() for p in model.parameters()]
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+def test_fixed_baseline_detects_gradual_growth() -> None:
+    params, opt = _make(auto_lr_d0=1e-6, auto_lr_fuse_rel=1e12)
+    initial = params[0].detach().clone()
+    for _ in range(8):
+        _step(opt, (1.0,))
+    for _ in range(7):
+        _step(opt, (3.0,))
+        assert opt._autolr._edge is None
+    _step(opt, (3.0,))
 
-    def loss_fn(lr):
-        return 0.10 + 0.01 * torch.rand(1).item() if lr <= 1e-4 else 1.2
-
-    _probe_drive(opt, model, x, y, loss_fn, 400)
-    assert opt.is_frozen(), "the probe must conclude"
-    chosen = opt.get_d()
-    assert chosen <= 1e-4, f"must not choose a degrading LR (got {chosen:g})"
-    assert chosen > 1e-4 / (_PROBE_FACTOR ** 2), f"must sit just under the edge (got {chosen:g})"
-    for p, o in zip(model.parameters(), orig):
-        assert torch.equal(p, o), "the probe must leave no trace: params back at x0"
-    assert len(opt.state) == 0 or all(not v for v in opt.state.values()), "base state starts clean"
-    _manual_step(model, x, y, opt)  # training proceeds at the frozen LR
+    assert opt._autolr._edge is not None
+    assert opt._autolr._contacts == 1
+    assert opt._autolr._level_base == pytest.approx([0.0] * 8)
+    assert opt._autolr._level_window == []
+    assert torch.equal(params[0], initial)
 
 
-def test_probe_from_above_descends() -> None:
-    # d0 lands above the edge: every early rung degrades -> the probe descends and
-    # locks the first passing rung, never ratcheting upward.
-    model, x, y = _tiny_problem(seed=12)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True, auto_lr_d0=1e-2)
+def test_second_comparable_contact_freezes_below_edge() -> None:
+    params, opt = _make()
+    initial = params[0].detach().clone()
+    edge = _first_spike(opt)
+    _step(opt, (10.0,))
 
-    def loss_fn(lr):
-        return 0.10 + 0.01 * torch.rand(1).item() if lr <= 1e-4 else float("inf")
-
-    _probe_drive(opt, model, x, y, loss_fn, 400)
     assert opt.is_frozen()
-    assert opt.get_d() <= 1e-4, f"descent must land under the edge (got {opt.get_d():g})"
+    assert opt._autolr.freeze_reason == "edge_confirmed"
+    assert opt.get_d() == pytest.approx(edge * _BACKOFF * _BACKOFF)
+    assert opt._autolr._contacts == 2
+    assert opt._autolr._x0 == {}
+    assert not torch.equal(params[0], initial), "the confirming finite step runs at the safe LR"
 
 
-def test_probe_bisection_tightens_the_bracket() -> None:
-    # After the coarse fail, log-bisection must narrow [pass, fail] down to the fine
-    # grid: the chosen LR ends within ~1.33x of the true edge, not ~3.16x.
-    from kaon._autolr import _PROBE_FACTOR_MIN
-    model, x, y = _tiny_problem(seed=14)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    edge = 1e-4
-
-    def loss_fn(lr):
-        return 0.10 + 0.01 * torch.rand(1).item() if lr <= edge else 1.2
-
-    _probe_drive(opt, model, x, y, loss_fn, 600)
-    assert opt.is_frozen()
-    chosen = opt.get_d()
-    assert chosen <= edge, f"must not choose a degrading LR (got {chosen:g})"
-    assert chosen > edge / (_PROBE_FACTOR_MIN ** 2), (
-        f"bisection must land within the fine grid of the edge (got {chosen:g} vs edge {edge:g})"
-    )
-
-
-def test_probe_confirmation_catches_slow_burn() -> None:
-    # A mild (+15%) elevation passes the coarse 8-step rung test but must FAIL the
-    # long confirmation window (SE-scaled threshold) -> the probe steps down below
-    # the soft edge instead of freezing on it.
-    model, x, y = _tiny_problem(seed=15)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    soft_edge = 1e-4
-
-    def loss_fn(lr):
-        base = 0.10 + 0.01 * torch.rand(1).item()
-        return base * 1.15 if lr > soft_edge else base
-
-    _probe_drive(opt, model, x, y, loss_fn, 900)
-    assert opt.is_frozen()
-    assert opt.get_d() <= soft_edge, (
-        f"the long window must catch the slow burn (got {opt.get_d():g} vs soft edge {soft_edge:g})"
-    )
-
-
-def test_probe_warmth_refines_the_ladder() -> None:
-    # Rising grad norms (no loss degradation) must refine the growth factor —
-    # pace only, judged by the tuner's own rung gn median vs its pooled baseline.
-    from kaon._autolr import _PROBE_FACTOR
-    model, x, y = _tiny_problem(seed=16)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(220):
-        opt.report_loss(0.10 + 0.01 * torch.rand(1).item())
-        # grads heat up once the ladder passes 1e-6 (×8 = clearly warm, no spike path)
-        _manual_step(model, x, y, opt, grad_factor=8.0 if opt.get_d() > 1e-6 else 1.0)
-        if opt.is_frozen() or (isinstance(opt._autolr._probe, dict)
-                               and opt._autolr._probe["factor"] < _PROBE_FACTOR):
-            break
-    pr = opt._autolr._probe
-    assert opt.is_frozen() or pr["factor"] < _PROBE_FACTOR, (
-        "sustained hot grad norms must refine the ladder factor"
-    )
-
-
-def test_probe_gn_vote_fails_hot_windows_despite_clean_loss() -> None:
-    # Eduardo's field observation: windows whose grad-norm median runs hot vs the
-    # pooled clean baseline are over the edge even when the loss vote is marginal.
-    # Valid in the probe (every window starts from the same x0 -> comparable), and
-    # inert where gn is flat in LR. Clean losses + x4 grads above 1e-5 must land
-    # the probe at/below that gn edge.
-    model, x, y = _tiny_problem(seed=17)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(400):
-        opt.report_loss(0.10 + 0.01 * torch.rand(1).item())  # loss NEVER degrades
-        _manual_step(model, x, y, opt, grad_factor=4.0 if opt.get_d() > 1e-5 else 1.0)
+def test_no_edge_freezes_at_fuse() -> None:
+    _, opt = _make(auto_lr_fuse_rel=1.0)
+    for _ in range(64):
+        _step(opt, (1.0,))
         if opt.is_frozen():
             break
     assert opt.is_frozen()
-    assert opt.get_d() <= 1e-5, (
-        f"the gn vote must keep the choice at/below the hot-gradient edge (got {opt.get_d():g})"
-    )
+    assert opt._autolr.freeze_reason == "fuse_bound"
+    assert opt.get_d() == pytest.approx(opt._autolr._fuse)
+    assert opt._autolr._t < _ADAPT_MAX_STEPS
 
 
-def test_probe_tops_out_at_ceiling_when_nothing_degrades() -> None:
-    # Mushy regime: no measurable in-rung degradation anywhere -> the ceiling is
-    # the honest stop (same role the fuse plays in the fallback).
-    model, x, y = _tiny_problem(seed=13)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    _probe_drive(opt, model, x, y, lambda lr: 0.10 + 0.01 * torch.rand(1).item(), 600)
-    assert opt.is_frozen(), "ladder must terminate at the ceiling"
-    assert opt.get_d() <= opt._autolr._fuse
+def test_high_d0_has_bounded_headroom_and_cannot_bypass_safety_fuse() -> None:
+    _, reference = _make(auto_lr_d0=None)
+    _step(reference, (1.0,))
+    expected_fuse = reference._autolr._fuse
+
+    _, high = _make(auto_lr_d0=10.0)
+    with pytest.warns(UserWarning, match="clamped"):
+        _step(high, (1.0,))
+    assert high._autolr._fuse == pytest.approx(4.0 * expected_fuse)
+    assert high._autolr._seed == pytest.approx(4.0 * expected_fuse)
+    assert high.get_d() == pytest.approx(4.0 * expected_fuse)
+    assert high.is_frozen()
+    assert high._autolr.freeze_reason == "fuse_bound"
 
 
-def test_off_is_plain() -> None:
-    model, x, y = _tiny_problem()
-    opt = Adakaon(model.parameters(), lr=1e-3)
+def test_no_edge_freezes_at_192_step_budget() -> None:
+    _, opt = _make(auto_lr_d0=1e-12, auto_lr_fuse_rel=1e30)
+    for _ in range(_ADAPT_MAX_STEPS):
+        _step(opt, (1.0,))
+    assert opt.is_frozen()
+    assert opt._autolr._t == _ADAPT_MAX_STEPS
+    assert opt._autolr.freeze_reason == "budget_bound"
+
+
+def test_persistent_nonfinite_gradients_back_off_once_and_skip() -> None:
+    params, opt = _make()
+    for _ in range(4):
+        _step(opt, (1.0,))
+    before = float(opt._autolr.S)
+    initial = torch.tensor([1.0])
+
+    with pytest.warns(UserWarning, match="non-finite"):
+        for _ in range(4):
+            _step(opt, (float("nan"),))
+
+    assert opt.get_d() == pytest.approx(before * _BACKOFF)
+    assert opt._autolr._contacts == 1
+    assert opt.reset_calls == 1
+    assert torch.equal(params[0], initial)
+    assert len(opt.state) == 0
+
+    _step(opt, (1.0,))
+    assert opt._autolr._nan_run == 0
+    _step(opt, (float("inf"),))
+    assert opt.get_d() == pytest.approx(before * _BACKOFF)
+    assert opt._autolr._contacts == 1, "later poison must not create an LR ratchet"
+
+
+def test_auto_lr_scale_applies_to_each_dowg_estimate_without_bypassing_fuse() -> None:
+    _, normal = _make(auto_lr_scale=1.0, auto_lr_fuse_rel=1.0)
+    _, doubled = _make(auto_lr_scale=2.0, auto_lr_fuse_rel=1.0)
+    _step(normal, (1.0,))
+    _step(doubled, (1.0,))
+    assert doubled.get_d() > normal.get_d(), "scale must affect the live DoWG estimate"
+
+    for opt in (normal, doubled):
+        for _ in range(64):
+            if opt.is_frozen():
+                break
+            _step(opt, (1.0,))
+        assert opt.is_frozen()
+        assert opt._autolr.freeze_reason == "fuse_bound"
+        assert opt.get_d() == pytest.approx(opt._autolr._fuse)
+
+
+def test_harness_lr_overwrite_cannot_change_adapting_or_frozen_lr() -> None:
+    params_a, guarded = _make()
+    params_b, reference = _make()
+    for _ in range(4):
+        guarded.param_groups[0]["lr"] = 99.0
+        _step(guarded, (1.0,))
+        _step(reference, (1.0,))
+    assert torch.equal(params_a[0], params_b[0])
+
+    _step(guarded, (10.0,))
+    _step(guarded, (10.0,))
+    assert guarded.is_frozen()
+    frozen = guarded.get_d()
+    guarded.param_groups[0]["lr"] = 99.0
+    _step(guarded, (1.0,))
+    assert guarded.param_groups[0]["lr"] == frozen
+
+
+def test_074_checkpoint_round_trip_preserves_detector_and_freeze_reason() -> None:
+    params, opt = _make(auto_lr_d0=1e-6, auto_lr_fuse_rel=1e12)
+    for _ in range(8):
+        _step(opt, (1.0,))
+    for _ in range(3):
+        _step(opt, (2.0,))
+
+    state = copy.deepcopy(opt.state_dict())
+    params2, resumed = _make(auto_lr_d0=1e-6, auto_lr_fuse_rel=1e12)
+    params2[0].data.copy_(params[0])
+    resumed.load_state_dict(state)
+    assert resumed._autolr._level_base == opt._autolr._level_base
+    assert resumed._autolr._level_window == opt._autolr._level_window
+    assert resumed._autolr._contacts == opt._autolr._contacts
+    assert resumed._autolr._t == opt._autolr._t
+
+    for _ in range(5):
+        _step(opt, (2.0,))
+        _step(resumed, (2.0,))
+    assert torch.equal(params2[0], params[0])
+    assert resumed._autolr.state_blob() == opt._autolr.state_blob()
+
+    _step(opt, (10.0,))
+    _step(resumed, (10.0,))
+    assert resumed._autolr.freeze_reason == opt._autolr.freeze_reason
+
+
+def test_073_checkpoint_load_ignores_legacy_probe_state() -> None:
+    params, opt = _make()
+    for _ in range(5):
+        _step(opt, (1.0,))
+    state = copy.deepcopy(opt.state_dict())
+    blob = state["_autolr"]
+    for key in (
+        "version",
+        "contacts",
+        "nan_run",
+        "nonfinite_backed_off",
+        "nonfinite_warned",
+        "level_base",
+        "level_window",
+        "freeze_reason",
+    ):
+        blob.pop(key)
+    blob["probe"] = {
+        "phase": "bisect",
+        "lr": 0.123,
+        "losses": [99.0],
+    }
+
+    params2, resumed = _make()
+    params2[0].data.copy_(params[0])
+    resumed.load_state_dict(state)
+    assert not hasattr(resumed._autolr, "_probe")
+    assert resumed.get_d() == resumed._autolr._seed
+    assert resumed._autolr._t == 0
+    assert torch.equal(params2[0], resumed._autolr._x0[params2[0]])
+    assert len(resumed.state) == 0
+    assert resumed.reset_calls == 1
+    assert resumed._autolr._level_base == []
+    assert resumed._autolr._level_window == []
+    _step(resumed, (1.0,))
+
+
+def test_frozen_checkpoint_reimposes_lr_on_load_and_next_step() -> None:
+    _, opt = _make()
+    _first_spike(opt)
+    _step(opt, (10.0,))
+    state = copy.deepcopy(opt.state_dict())
+
+    _, resumed = _make()
+    resumed.load_state_dict(state)
+    assert resumed.is_frozen()
+    assert resumed._autolr.freeze_reason == "edge_confirmed"
+    assert resumed.param_groups[0]["lr"] == resumed.get_d()
+    resumed.param_groups[0]["lr"] = 99.0
+    _step(resumed, (1.0,))
+    assert resumed.param_groups[0]["lr"] == resumed.get_d()
+
+
+def test_off_path_is_plain_optimizer() -> None:
+    params, opt = _make(auto_lr=False)
+    opt.param_groups[0]["lr"] = 0.1
+    _step(opt, (1.0,))
     assert opt._autolr is None
     assert not opt.is_frozen()
-    assert opt.get_d() == 1e-3
-    opt.step(_closure(model, x, y, opt))  # no crash, plain path
+    assert opt.get_d() == 0.1
+    assert params[0].item() == pytest.approx(0.9)
 
 
-def test_discovers_and_reduces_loss() -> None:
-    model, x, y = _tiny_problem()
+def test_adakaon_autonomous_cpu_smoke() -> None:
+    torch.manual_seed(7)
+    model = torch.nn.Linear(4, 2)
+    inputs = torch.randn(8, 4)
+    targets = torch.randn(8, 2)
     opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    c = _closure(model, x, y, opt)
-    with torch.no_grad():
-        start_loss = float(torch.nn.functional.mse_loss(model(x), y))
-    opt.step(c)
-    d0 = opt.get_d()  # the data-relative seed after the first step
-    for _ in range(300):
-        opt.step(c)
-    d_end = opt.get_d()
-    with torch.no_grad():
-        end_loss = float(torch.nn.functional.mse_loss(model(x), y))
-    assert d_end > 10 * d0, f"discovered LR should climb decades from the seed ({d0:g} -> {d_end:g})"
-    assert end_loss < 0.6 * start_loss, f"loss should fall ({start_loss:g} -> {end_loss:g})"
 
+    initial_d = None
+    for _ in range(12):
+        opt.zero_grad()
+        loss = torch.nn.functional.mse_loss(model(inputs), targets)
+        loss.backward()
+        opt.step()
+        if initial_d is None:
+            initial_d = opt.get_d()
 
-def test_lr_below_one_warns_and_is_ignored() -> None:
-    model, x, y = _tiny_problem()
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        opt = Adakaon(model.parameters(), lr=1e-4, betas=(0.0, 0.999), auto_lr=True)
-        c = _closure(model, x, y, opt)
-        opt.step(c)  # the tuner allocates + warns on the first real step
-        assert any("ignored" in str(wi.message) for wi in w), "a leftover lr<1 must warn"
-    with torch.no_grad():
-        start = float(torch.nn.functional.mse_loss(model(x), y))
-    for _ in range(300):
-        opt.step(c)
-    with torch.no_grad():
-        end = float(torch.nn.functional.mse_loss(model(x), y))
-    # If lr=1e-4 had been honored, the effective LR would be ~1e-4× the discovered
-    # scale and the loss would barely move. It must train normally.
-    assert end < 0.6 * start, f"lr<1 must be ignored, not shrink the LR ({start:g} -> {end:g})"
-
-
-def test_spike_backs_off_and_self_corrects() -> None:
-    # An isolated grad spike (bad batch) = one edge contact: S halves, the DoWG
-    # accumulators re-anchor, and — without a confirming second contact — S resumes
-    # climbing. No freeze.
-    model, x, y, opt, t = _warmed_opt(seed=3, n=30)
-    s_before = t.S
-    _manual_step(model, x, y, opt, grad_factor=50.0)
-    assert t._edge == s_before, "the contact level must be recorded"
-    assert not opt.is_frozen(), "a single spike must not freeze"
-    # the self-consistent restart re-derives ~the backed-off S on the contact step
-    assert s_before > t.S, f"S must back off from the contact ({s_before:g} -> {t.S:g})"
-    assert 0.2 * s_before < t.S, f"backoff should be ~x0.5, not a collapse ({s_before:g} -> {t.S:g})"
-    s_backed = t.S
-    for _ in range(60):
-        _manual_step(model, x, y, opt)
-    assert not opt.is_frozen(), "an isolated spike must self-correct, not freeze"
-    assert 1.2 * s_backed < t.S, f"S must resume climbing after the false positive ({s_backed:g} -> {t.S:g})"
-
-
-def test_ramp_floor_guarantees_climb() -> None:
-    # Bare DoWG's climb is diffusive under noisy gradients (~250 steps/decade measured
-    # on a real LoRA). Until the first edge contact, the geometric ramp floor must
-    # guarantee >= _RAMP_GROWTH per update step regardless of the gradient statistics.
-    from kaon._autolr import _RAMP_GROWTH
-    model, x, y = _tiny_problem(seed=8)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    _manual_step(model, x, y, opt)
-    seed = opt._autolr._seed
-    n = 40
-    for _ in range(n):
-        _manual_step(model, x, y, opt)
-    # Deterministic on this problem: no contact happens in n steps. Assert that, so the
-    # floor check below can never go vacuous (if the mechanism ever changes, fail loudly).
-    assert opt._autolr._edge is None and not opt.is_frozen()
-    floor = seed * (_RAMP_GROWTH ** n) * 0.9
-    assert opt.get_d() >= min(floor, opt._autolr._fuse), (
-        f"ramp floor must guarantee the climb ({opt.get_d():g} < {floor:g})"
-    )
-
-
-def test_ramp_floor_off_after_contact() -> None:
-    model, x, y, opt, t = _warmed_opt(seed=8)
-    assert t._ramp_on
-    _manual_step(model, x, y, opt, grad_factor=50.0)  # first edge contact
-    assert not t._ramp_on, "the range-test ramp must end at the first contact, for good"
-
-
-def test_d0_overrides_seed() -> None:
-    # auto_lr_d0 replaces the data-relative seed with an explicit starting LR.
-    model, x, y = _tiny_problem(seed=9)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True, auto_lr_d0=5e-4)
-    _manual_step(model, x, y, opt)
-    t = opt._autolr
-    assert t._seed == 5e-4
-    assert opt.get_d() >= 1e-4, f"S must start at ~d0, not the data-relative seed ({opt.get_d():g})"
-
-
-def test_confirmed_edge_freezes_below_edge() -> None:
-    # A second contact within the edge band confirms the edge: the tuner freezes
-    # ITSELF at edge*backoff (just BELOW the edge — the safe side of the overshoot
-    # cliff) and frees the reference buffers. No knob involved.
-    from kaon._autolr import _BACKOFF
-    model, x, y, opt, t = _warmed_opt(seed=4, n=30)
-    s_contact = _arm_confirmed_edge(t)
-    _manual_step(model, x, y, opt, grad_factor=50.0)
-    assert opt.is_frozen(), "a repeat contact within the band must freeze"
-    assert math.isclose(t.frozen_lr, s_contact * _BACKOFF, rel_tol=1e-6), (
-        f"freeze must lock just below the edge ({s_contact:g} -> {t.frozen_lr:g})"
-    )
-    assert t._x0 == {}, "the per-param reference buffers must be freed on freeze"
-    assert opt.param_groups[0]["lr"] == t.frozen_lr, "group lr folded to the frozen S"
-    d_frozen = opt.get_d()
-    _manual_step(model, x, y, opt)
-    assert opt.get_d() == d_frozen, "frozen LR must not move"
-
-
-def test_recovers_from_far_above() -> None:
-    # The Anima failure mode: the LR lands far ABOVE the stability edge. The guard
-    # must convert the blowup into backoffs — losses stay finite and the LR comes
-    # back down instead of ratcheting up with the divergence.
-    model, x, y = _tiny_problem(seed=5)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(10):
-        _manual_step(model, x, y, opt)
-    t = opt._autolr
-    t.S = 1.0  # hurl the LR far above the edge for this problem
-    losses = [_manual_step(model, x, y, opt) for _ in range(300)]
-    assert all(math.isfinite(v) for v in losses), "training must not diverge to inf/nan"
-    assert opt.get_d() < 0.1, f"the LR must come back down from far above (got {opt.get_d():g})"
-    assert losses[-1] < losses[0], "training must actually recover, not just survive"
-    for p in model.parameters():
-        assert torch.isfinite(p).all(), "params must stay finite through the recovery"
-
-
-def test_ramp_contact_rolls_back_to_x0() -> None:
-    # During the ramp (range-test) phase, an edge contact restores the exact x0
-    # snapshot: the overshoot leaves NO trace on the params, the spike gradient is
-    # never applied, and the grad-norm EMA keeps its healthy pre-spike baseline.
-    model, x, y = _tiny_problem(seed=6)
-    orig = [p.detach().clone() for p in model.parameters()]  # == x0 (taken pre-first-update)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(20):
-        _manual_step(model, x, y, opt)
-    t = opt._autolr
-    assert t._ramp_on
-    s_before = t.S
-    gema_before = t._gema
-    _manual_step(model, x, y, opt, grad_factor=50.0)
-    assert s_before * 0.5 == t.S, "contact must back the LR off"
-    assert not t._ramp_on
-    assert t._edge == s_before
-    for p, o in zip(model.parameters(), orig):
-        assert torch.equal(p, o), "ramp-phase contact must restore the exact x0 snapshot"
-    assert t._gema == gema_before, "the healthy pre-spike EMA must be kept (that state was restored)"
-    _manual_step(model, x, y, opt)  # and training continues normally
-
-
-def test_nonfinite_grads_roll_back_without_stepping() -> None:
-    # inf/nan grads during the ramp: same rollback path — restore x0, never step.
-    model, x, y = _tiny_problem(seed=6)
-    orig = [p.detach().clone() for p in model.parameters()]
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(20):
-        _manual_step(model, x, y, opt)
-    t = opt._autolr
-    s_before = t.S
-    _manual_step(model, x, y, opt, grad_fill=float("inf"))
-    assert s_before > t.S, "non-finite grads must back the LR off"
-    for p, o in zip(model.parameters(), orig):
-        assert torch.equal(p, o), "the poison gradient must not be applied (params back at x0)"
-    _manual_step(model, x, y, opt)  # and training continues normally
-
-
-def test_nan_run_is_bounded() -> None:
-    # A RUN of non-finite grads must not melt S (only the first counts as a contact)
-    # and must warn once it is clearly not an LR problem; a finite step resets the run.
-    model, x, y = _tiny_problem(seed=6)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    for _ in range(20):
-        _manual_step(model, x, y, opt)
-    t = opt._autolr
-    s_before = t.S
-
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        _manual_step(model, x, y, opt, grad_fill=float("nan"))
-        s_after_first = t.S
-        assert s_after_first == s_before * 0.5, "first nan of a run = one backoff"
-        _manual_step(model, x, y, opt, grad_fill=float("nan"))
-        _manual_step(model, x, y, opt, grad_fill=float("nan"))
-        assert s_after_first == t.S, "repeat nans must NOT keep shrinking S"
-        assert any("non-finite" in str(wi.message) for wi in w), "a nan run must warn"
-    _manual_step(model, x, y, opt)  # finite step resumes training
-    assert t._nan_run == 0, "a finite gradient must reset the run"
-
-
-def test_survives_harness_lr_clobber_while_adapting() -> None:
-    # External trainers (renga-flow, kohya, the control battery) rewrite
-    # group["lr"] every step. auto_lr must impose its own LR each iteration or the
-    # base steps at the harness's lr and diverges.
-    model, x, y = _tiny_problem(seed=7)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    c = _closure(model, x, y, opt)
-    with torch.no_grad():
-        start = float(torch.nn.functional.mse_loss(model(x), y))
-    for _ in range(300):
-        for g in opt.param_groups:      # the harness clobber, every step
-            g["lr"] = 1.0
-        opt.step(c)
-    with torch.no_grad():
-        end = float(torch.nn.functional.mse_loss(model(x), y))
-    assert end < 0.6 * start, f"must survive per-step lr clobber, not diverge ({start:g} -> {end:g})"
-
-
-def test_survives_harness_lr_clobber_when_frozen() -> None:
-    model, x, y, opt, t = _warmed_opt(seed=7, n=30)
-    _arm_confirmed_edge(t)
-    _manual_step(model, x, y, opt, grad_factor=50.0)  # confirmed edge -> frozen
-    assert opt.is_frozen()
-    frozen = t.frozen_lr
-    for g in opt.param_groups:
-        g["lr"] = 1.0                   # the harness clobber
-    _manual_step(model, x, y, opt)
-    assert opt.param_groups[0]["lr"] == frozen, "frozen LR must be re-imposed over the clobber"
-
-
-def test_state_dict_resume() -> None:
-    model, x, y = _tiny_problem(seed=5)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    c = _closure(model, x, y, opt)
-    for _ in range(40):
-        opt.step(c)
-    sd = copy.deepcopy(opt.state_dict())
-    d_at_save = opt.get_d()
-
-    opt2 = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-    opt2.load_state_dict(sd)
-    assert abs(opt2.get_d() - d_at_save) < 1e-9 * max(d_at_save, 1e-9)
-    assert opt2._autolr._t == 40
-    assert opt2._autolr._gema == opt._autolr._gema, "the edge-guard EMA must round-trip"
-    assert opt2._autolr._edge == opt._autolr._edge
-    assert opt2._autolr._ramp_on == opt._autolr._ramp_on, "the ramp phase must round-trip"
-    opt2.step(c)  # continues without throwing
-    assert opt2._autolr._t == 41
+    assert math.isfinite(opt.get_d())
+    assert opt.get_d() > initial_d

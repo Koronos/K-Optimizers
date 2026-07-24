@@ -40,13 +40,12 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   train at `lr=1.0` and the optimizer finds the effective LR itself. Matches
   reference Prodigy bit-for-bit at its defaults, then adds the kaon memory
   toolkit. → [docs/kprodigy.md](docs/kprodigy.md)
-- **`Autokaon`** — a parameter-free LR on **Adakaon's** update via a
-  [Mechanic](https://arxiv.org/abs/2306.00144) scalar tuner (Mechanic, *not*
-  Prodigy): train at `lr=1.0` and it auto-discovers the LR, keeping Adakaon's
-  exact update. Its headline is **freeze-to-free** (`lr_freeze`): after warmup it
-  folds the discovered LR into the base, frees the tuner's `ref` buffer, and
-  becomes **byte-for-byte and speed-for-speed plain Adakaon**.
-  → [docs/autokaon.md](docs/autokaon.md)
+- **`auto_lr=True`** — an autonomous, low-VRAM DoWG step-size controller available
+  on Kaon optimizers, e.g. `Adakaon(auto_lr=True)`. It observes only optimizer
+  state and gradients: no trainer callback, loss reporting, closure, or LR sweep is
+  required. It grows conservatively until a stability contact, rolls back safely,
+  then freezes to a fixed LR. The fuse is a conservative safety ceiling, not a
+  claim to identify the universal optimal LR. → [docs/autolr.md](docs/autolr.md)
 
 `Adakaon`, `AdaMuon`, and `Lion` are standard `torch.optim.Optimizer`s that work
 one-parameter-at-a-time, so they drop into per-parameter / gradient-release
@@ -110,16 +109,16 @@ opt = KProdigy(model.parameters(), lr=1.0, momentum_dtype="bfloat16")
 ```
 
 ```python
-from kaon import Autokaon
+from kaon import Adakaon
 
-# Parameter-free Adakaon: lr stays 1.0; a Mechanic tuner finds the LR. By
-# default (lr_freeze="auto") it freezes on an LR plateau, frees the tuner state,
-# and runs as pure Adakaon at the discovered LR (free thereafter). The common
-# case is just Autokaon(params, **adakaon_kwargs).
-opt = Autokaon(
+# Autonomous step-size discovery: no report_loss(), closure, or trainer policy.
+# It begins from a conservative data-relative scale, rolls back at a stability
+# contact, and freezes no later than its safety budget/fuse.
+opt = Adakaon(
     model.parameters(),
-    bf16_method="stochastic_rounding",   # adakaon_betas=(0.0, 0.999) by default
-)                                        # => bit-exact freeze
+    auto_lr=True,
+    bf16_method="stochastic_rounding",
+)
 ```
 
 ## Recipes
@@ -159,7 +158,7 @@ Adakaon(model.parameters(), lr=1e-4, betas=(0.9, 0.999), momentum_dtype="int8")
 **Parameter-free (no LR to tune):**
 
 ```python
-from kaon import KProdigy, Autokaon
+from kaon import KProdigy, Adakaon
 
 # Prodigy D-adaptation; one LR for SDXL UNet + text-encoder (each gets its own D):
 KProdigy([{"params": unet.parameters(), "lr": 1.0},
@@ -168,8 +167,8 @@ KProdigy([{"params": unet.parameters(), "lr": 1.0},
 # Parameter-free AND minimum VRAM (~1.3 B/param on the SDXL UNet):
 KProdigy(model.parameters(), lr=1.0, second_moment="factored", momentum_dtype="int8", slice_p=11)
 
-# Mechanic tuner that freezes to byte-for-byte plain Adakaon after warmup:
-Autokaon(model.parameters(), bf16_method="stochastic_rounding")
+# Autonomous DoWG step-size discovery with a conservative fuse:
+Adakaon(model.parameters(), auto_lr=True, bf16_method="stochastic_rounding")
 ```
 
 `foreach=True` (the default) batches many-small-tensor (LoRA/LoKr) steps — **318 ms → 15 ms** on
@@ -181,8 +180,8 @@ a 1434-adapter SDXL UNet. See [docs/foreach-batching.md](docs/foreach-batching.m
   benchmark that justifies it** (numbers + links + how to reproduce).
 - [docs/adakaon.md](docs/adakaon.md) — Adakaon design, validated results,
   full API.
-- [docs/autokaon.md](docs/autokaon.md) — the Mechanic LR tuner, freeze-to-free,
-  the minimal API + the one advanced knob, and the campaign results.
+- [docs/autolr.md](docs/autolr.md) — autonomous DoWG step-size discovery,
+  safety contacts, fuse, checkpointing, and API.
 - [docs/kprodigy.md](docs/kprodigy.md) — memory-efficient Prodigy design + API.
 - [docs/lion.md](docs/lion.md) — Lion (sign-momentum) design, the
   betas loss↔generalization dial, memory, and the proxy evaluation.

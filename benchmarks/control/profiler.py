@@ -84,7 +84,7 @@ def run(make, lr, *, schedule, warm, seq, seed, data, tr, te, ac, C, bs, n):
     for it, Rr in enumerate(seq):
         p = it / n
         w = (p / warm) if (warm and p < warm) else 1.0
-        for pg, base in zip(opt.param_groups, base_lrs):
+        for pg, base in zip(opt.param_groups, base_lrs, strict=True):
             pg["lr"] = base * w * sched_base(schedule, p)
         idx = [tr[(pos + j) % len(tr)] for j in range(bs)]; pos += bs
         opt.zero_grad()
