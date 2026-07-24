@@ -32,14 +32,22 @@ first step, per an /experts-meeting synthesis — 4 independent experts + web):
      loss/grads or a single 3×-baseline loss fail a window instantly.
    - BISECT: after the first fail, log-bisection of the [pass, fail] bracket
      down to ~1.33× — binary search on a monotone property, optimal per step.
-   - CONFIRM: a LONG window (32 steps) at the candidate, judged with a tighter
-     margin — catches SLOW degradation an 8-step rung cannot see (the case where
-     the hard-damage edge sits well above the quality zone). On failure it steps
-     down and re-confirms (fine steps after a tight bracket; coarse after a
-     ceiling top-out) — bounded tries — then freezes.
+   - CONFIRM: a SEQUENTIAL long test (SPRT-style) at the candidate — keeps
+     sampling until the evidence decides. Fails the moment the running median
+     crosses the SE-scaled threshold for the current n (bad candidates die in
+     ~15-80 steps); passes only by surviving ``_PROBE_CONFIRM_CAP`` samples
+     (~+19% sensitivity at Anima-like batch noise, MAD ~25% of the median —
+     a fixed 32-step window was measured to pass a burning LR by a hair: telling
+     +20-25% slow burn from that noise takes ~100 samples, which is statistics,
+     not tuning). On failure it steps down and re-confirms (fine steps after a
+     tight bracket; coarse after a ceiling top-out) — bounded tries.
    Then params restore to ``x0`` once more, base state clears, and training
-   starts byte-clean at the confirmed LR. Cost ~130-160 steps typical; the
-   seed/d0-above-the-edge case descends first (bidirectional).
+   starts byte-clean at the confirmed LR. Cost ~200-400 steps typical (bad
+   candidates cheap, the winner pays the full cap once); the d0-above-the-edge
+   case descends first (bidirectional). For quality margins BELOW what any
+   loss statistic can detect (human-preview-level burn), ``auto_lr_scale``
+   (e.g. 0.5) applies a global post-discovery multiplier — a preference, not
+   per-model calibration.
 
 2. **Continuous update-space DoWG + stability-edge guard (fallback; no loss
    visible — e.g. kohya)** — the pre-existing mechanism, unchanged, documented
@@ -169,7 +177,8 @@ _RAMP_GROWTH: float = 1.1
 # (warmth-paced), log-bisection of the [pass, fail] bracket, then a LONG confirmation
 # window at the candidate that catches slow degradation an 8-step rung cannot see.
 _PROBE_STEPS: int = 8            # measured losses per short rung
-_PROBE_CONFIRM_STEPS: int = 32   # measured losses in the confirmation window (slow-burn test)
+_PROBE_CONFIRM_MIN: int = 16     # confirmation: samples before the sequential fail test arms
+_PROBE_CONFIRM_CAP: int = 96     # confirmation: samples to PASS (sensitivity ~ +19% at Anima-like noise)
 _PROBE_FACTOR: float = 10.0 ** 0.5    # coarse ladder spacing (half-decade)
 _PROBE_FACTOR_MIN: float = 10.0 ** 0.125  # finest grid / bracket resolution (~1.33x)
 _PROBE_MARGIN: float = 0.25      # short-rung relative fail margin (fast, coarse test)
@@ -473,7 +482,20 @@ class AutoLRTuner:
             pr["losses"].append(lv)
             if bmed is not None and lv > _PROBE_ABORT * bmed:
                 fail = True  # catastrophic mid-window; no need to finish it
-        target = _PROBE_CONFIRM_STEPS if pr["phase"] == "confirm" else _PROBE_STEPS
+            elif (pr["phase"] == "confirm" and baselined
+                  and len(pr["losses"]) >= _PROBE_CONFIRM_MIN):
+                # SEQUENTIAL confirmation (SPRT-style): to tell a +20-25% slow burn
+                # from Anima-like batch noise (MAD ~25% of the median) takes ~100
+                # samples, not 32 — a fixed short window passes burning LRs by a
+                # hair (measured on a real run). So keep sampling until the evidence
+                # decides: fail the moment the running median crosses the threshold
+                # for the CURRENT n (bad candidates die in ~15-80 steps); pass only
+                # by surviving the full cap. The 4-sigma z keeps the repeated
+                # peeking honest.
+                fail = _median(pr["losses"]) > _probe_thresh(
+                    pr["base"], _PROBE_CONFIRM_MARGIN, len(pr["losses"])
+                )
+        target = _PROBE_CONFIRM_CAP if pr["phase"] == "confirm" else _PROBE_STEPS
         if not fail and len(pr["losses"]) < target:
             # mid-window: a real update at the window LR (+ grad-norm sample for warmth)
             gnorms = torch._foreach_norm([p.grad for g_ in self.opt.param_groups
