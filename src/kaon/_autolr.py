@@ -186,6 +186,12 @@ _PROBE_CONFIRM_MARGIN: float = 0.10  # confirmation relative fail margin (long, 
 _PROBE_NSIG: float = 4.0         # z on the standard error of the window median
 _PROBE_ABORT: float = 3.0        # any single loss > this × baseline median aborts the window
 _PROBE_WARM: float = 2.0         # rung grad-norm median > this × baseline gn median = "warm"
+# Grad-norm FAIL vote (probe only — valid here because every window starts from the
+# same x0, making gn medians comparable across windows, unlike the continuous regime
+# where the reference cooks along the trajectory). Measured on two real Anima runs:
+# healthy windows sit ~1.4-1.6× their own gn baseline, preview-confirmed burning LRs
+# ~2.5-3.5×. Where gn is flat in LR (mushy proxy) this vote simply never fires.
+_PROBE_GN_RATIO: float = 2.5
 _PROBE_CONFIRM_MAX: int = 8      # bounded step-downs during confirmation
 
 
@@ -495,6 +501,8 @@ class AutoLRTuner:
                 fail = _median(pr["losses"]) > _probe_thresh(
                     pr["base"], _PROBE_CONFIRM_MARGIN, len(pr["losses"])
                 )
+                if not fail and pr["gbase"] and len(pr["gns"]) >= _PROBE_CONFIRM_MIN:
+                    fail = _median(pr["gns"]) > _PROBE_GN_RATIO * _median(pr["gbase"])
         target = _PROBE_CONFIRM_CAP if pr["phase"] == "confirm" else _PROBE_STEPS
         if not fail and len(pr["losses"]) < target:
             # mid-window: a real update at the window LR (+ grad-norm sample for warmth)
@@ -521,6 +529,10 @@ class AutoLRTuner:
         if not fail and baselined:
             margin = _PROBE_CONFIRM_MARGIN if pr["phase"] == "confirm" else _PROBE_MARGIN
             fail = _median(pr["losses"]) > _probe_thresh(pr["base"], margin, len(pr["losses"]))
+        if not fail and pr["gbase"] and pr["gns"]:
+            # Grad-norm fail vote: a window whose gn median runs hot vs the pooled
+            # clean baseline is over the edge even if the loss vote is marginal.
+            fail = _median(pr["gns"]) > _PROBE_GN_RATIO * _median(pr["gbase"])
         if not fail:
             if pr["gbase"] and pr["gns"]:
                 warm = _median(pr["gns"]) > _PROBE_WARM * _median(pr["gbase"])

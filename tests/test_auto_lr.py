@@ -187,6 +187,25 @@ def test_probe_warmth_refines_the_ladder() -> None:
     )
 
 
+def test_probe_gn_vote_fails_hot_windows_despite_clean_loss() -> None:
+    # Eduardo's field observation: windows whose grad-norm median runs hot vs the
+    # pooled clean baseline are over the edge even when the loss vote is marginal.
+    # Valid in the probe (every window starts from the same x0 -> comparable), and
+    # inert where gn is flat in LR. Clean losses + x4 grads above 1e-5 must land
+    # the probe at/below that gn edge.
+    model, x, y = _tiny_problem(seed=17)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    for _ in range(400):
+        opt.report_loss(0.10 + 0.01 * torch.rand(1).item())  # loss NEVER degrades
+        _manual_step(model, x, y, opt, grad_factor=4.0 if opt.get_d() > 1e-5 else 1.0)
+        if opt.is_frozen():
+            break
+    assert opt.is_frozen()
+    assert opt.get_d() <= 1e-5, (
+        f"the gn vote must keep the choice at/below the hot-gradient edge (got {opt.get_d():g})"
+    )
+
+
 def test_probe_tops_out_at_ceiling_when_nothing_degrades() -> None:
     # Mushy regime: no measurable in-rung degradation anywhere -> the ceiling is
     # the honest stop (same role the fuse plays in the fallback).
