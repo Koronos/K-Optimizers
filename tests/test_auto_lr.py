@@ -67,6 +67,78 @@ def _arm_confirmed_edge(tuner) -> float:
     return tuner.S
 
 
+def _probe_drive(opt, model, x, y, loss_fn, n):
+    """Drive n probe steps, reporting a synthetic loss computed by loss_fn(rung_lr)."""
+    for _ in range(n):
+        opt.report_loss(loss_fn(opt.get_d()))
+        _manual_step(model, x, y, opt)
+        if opt.is_frozen():
+            break
+
+
+def test_probe_mode_activates_on_reported_loss() -> None:
+    model, x, y = _tiny_problem(seed=10)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    opt.report_loss(0.1)
+    _manual_step(model, x, y, opt)
+    assert isinstance(opt._autolr._probe, dict), "a visible loss must select probe mode"
+
+
+def test_no_loss_falls_back_to_continuous() -> None:
+    model, x, y = _tiny_problem(seed=10)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    for _ in range(4):  # mode grace window is 3 steps (report-after-step trainers lag one)
+        _manual_step(model, x, y, opt)
+    assert opt._autolr._probe is False, "no loss within the grace window -> continuous fallback"
+
+
+def test_probe_finds_edge_and_freezes_below_it() -> None:
+    # Synthetic edge at 1e-4: healthy noise below, catastrophic degradation above.
+    # The probe must freeze at the last safe rung (edge/factor-ish), restore the
+    # exact initial params, and leave the base state clean.
+    from kaon._autolr import _PROBE_FACTOR
+    model, x, y = _tiny_problem(seed=11)
+    orig = [p.detach().clone() for p in model.parameters()]
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+
+    def loss_fn(lr):
+        return 0.10 + 0.01 * torch.rand(1).item() if lr <= 1e-4 else 1.2
+
+    _probe_drive(opt, model, x, y, loss_fn, 400)
+    assert opt.is_frozen(), "the probe must conclude"
+    chosen = opt.get_d()
+    assert chosen <= 1e-4, f"must not choose a degrading LR (got {chosen:g})"
+    assert chosen > 1e-4 / (_PROBE_FACTOR ** 2), f"must sit just under the edge (got {chosen:g})"
+    for p, o in zip(model.parameters(), orig):
+        assert torch.equal(p, o), "the probe must leave no trace: params back at x0"
+    assert len(opt.state) == 0 or all(not v for v in opt.state.values()), "base state starts clean"
+    _manual_step(model, x, y, opt)  # training proceeds at the frozen LR
+
+
+def test_probe_from_above_descends() -> None:
+    # d0 lands above the edge: every early rung degrades -> the probe descends and
+    # locks the first passing rung, never ratcheting upward.
+    model, x, y = _tiny_problem(seed=12)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True, auto_lr_d0=1e-2)
+
+    def loss_fn(lr):
+        return 0.10 + 0.01 * torch.rand(1).item() if lr <= 1e-4 else float("inf")
+
+    _probe_drive(opt, model, x, y, loss_fn, 400)
+    assert opt.is_frozen()
+    assert opt.get_d() <= 1e-4, f"descent must land under the edge (got {opt.get_d():g})"
+
+
+def test_probe_tops_out_at_ceiling_when_nothing_degrades() -> None:
+    # Mushy regime: no measurable in-rung degradation anywhere -> the ceiling is
+    # the honest stop (same role the fuse plays in the fallback).
+    model, x, y = _tiny_problem(seed=13)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    _probe_drive(opt, model, x, y, lambda lr: 0.10 + 0.01 * torch.rand(1).item(), 600)
+    assert opt.is_frozen(), "ladder must terminate at the ceiling"
+    assert opt.get_d() <= opt._autolr._fuse
+
+
 def test_off_is_plain() -> None:
     model, x, y = _tiny_problem()
     opt = Adakaon(model.parameters(), lr=1e-3)

@@ -1,7 +1,40 @@
-"""``AutoLRTuner`` — composable parameter-free learning rate via **update-space
-DoWG** (Distance-over-Weighted-Gradients; Khaled, Mishchenko & Takáč, NeurIPS
-2023). Attaches to any kaon base optimizer through the ``auto_lr=True`` flag and
-discovers the LR with no per-model tuning.
+"""``AutoLRTuner`` — composable parameter-free learning rate. Attaches to any kaon
+base optimizer through the ``auto_lr=True`` flag and discovers the LR with no
+per-model tuning.
+
+**Two modes, chosen automatically by what the tuner can see** (decided at the
+first step, per an /experts-meeting synthesis — 4 independent experts + web):
+
+1. **Loss-driven range test (primary; active whenever a loss is visible** — via a
+   step closure, or the trainer calling ``optimizer.report_loss(loss)`` each step,
+   a one-line trainer change). The panel's unanimous finding: every gradient-only
+   signal family is structurally insufficient — travel-distance estimators
+   (DoWG/Prodigy/D-adaptation/Mechanic) are one-directional ratchets that cannot
+   come down from above, and gradient-MAGNITUDE guards are information-theoretically
+   blind on mushy landscapes (measured: grad-norm level flat across a full LR decade
+   on the proxy) and get "boiled-frog"-ed by gradual ramps on sharp ones (measured on
+   a real Anima run: norms 0.5→27 over 30 steps, zero spike triggers, model
+   destroyed). Loss is the one cheap, model-independent "did this step help" signal
+   — degradation at the edge is a 10-100σ event vs batch noise.
+   Mechanism (fastai lr_finder pattern, inside the optimizer, non-destructive):
+   climb an exponential LR ladder in independent RUNGS — each rung restores the
+   exact ``x0`` snapshot AND clears the base optimizer state (a clean trial), runs
+   ``_PROBE_STEPS`` real steps at the rung LR, and is judged by its MEDIAN batch
+   loss against a baseline built from the first two (sub-operating) rungs. First
+   rung that degrades (median > baseline + max(25%, 4·MAD), any non-finite, or a
+   single 3× loss) marks the edge → the previous (passed) rung's LR is chosen,
+   params restored to ``x0`` once more, base state cleared, LR frozen: training
+   then starts byte-clean at the chosen LR. Total cost ~10 rungs × 9 steps ≈ 90
+   steps, bounded, damage-free (nothing survives a bad rung). If the ladder tops
+   out at the fuse ceiling with no failure, the ceiling is chosen (mushy regimes
+   degrade too slowly to measure in-rung; the ceiling is the honest stop there).
+   If the seed/d0 already sits ABOVE the edge, the first failure with no passed
+   rung switches to descent (÷factor²) until a rung passes — bidirectional.
+
+2. **Continuous update-space DoWG + stability-edge guard (fallback; no loss
+   visible — e.g. kohya)** — the pre-existing mechanism, unchanged, documented
+   below. Known limits (measured, accepted for the fallback): discovery-from-below
+   only, magnitude guard blind on mushy edges, fuse ceiling load-bearing there.
 
 Why DoWG and not coin-betting (the previous Mechanic tuner, now purged): on
 kaon's normalize-then-momentum base the base update is ~unit-RMS (scale-invariant),
@@ -121,6 +154,20 @@ _BACKOFF: float = 0.5      # S multiplier on each edge contact; the freeze locks
 # model protests, back off, hand over to DoWG). Never re-enabled after a contact.
 _RAMP_GROWTH: float = 1.1
 
+# -- loss-driven range-test (probe) constants --------------------------------------
+_PROBE_STEPS: int = 8          # measured losses per rung (median over these judges the rung)
+_PROBE_FACTOR: float = 10.0 ** 0.5  # half-decade ladder spacing; chosen LR = edge/factor
+_PROBE_MARGIN: float = 0.25    # rung fails if median loss > baseline median × (1+margin) ...
+_PROBE_NSIG: float = 4.0       # ... or > baseline + this many robust sigmas (MAD), whichever larger
+_PROBE_ABORT: float = 3.0      # any single loss > this × baseline median aborts the rung at once
+
+
+def _median(vals: list[float]) -> float:
+    s = sorted(vals)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 else 0.5 * (s[mid - 1] + s[mid])
+
 
 class AutoLRTuner:
     """Update-space DoWG LR tuner attached to a host optimizer ``opt``.
@@ -172,8 +219,26 @@ class AutoLRTuner:
         self._edge: float | None = None  # S at the last edge contact (None = no contact yet)
         self._nan_run = 0                # consecutive non-finite-grad steps (bounds the skip path)
 
+        # Loss-driven range test. None = mode undecided (first step decides: a visible
+        # loss -> probe; none -> continuous fallback). dict = probe running. False = off.
+        self._probe: dict[str, Any] | bool | None = None
+        self._pending_loss: float | None = None
+
         self.frozen = False
         self.frozen_lr: float | None = None
+
+    # -- loss channel -------------------------------------------------------
+    def report_loss(self, loss: Any) -> None:
+        """Give the tuner this step's training loss (float or 0-dim tensor).
+
+        Call once per step BEFORE ``optimizer.step()``. Enables the loss-driven
+        range test (the primary discovery mode); without it the tuner falls back
+        to the continuous gradient-only estimator.
+        """
+        if loss is None:
+            return
+        v = float(loss.detach()) if isinstance(loss, Tensor) else float(loss)
+        self._pending_loss = v
 
     # -- introspection -----------------------------------------------------
     @property
@@ -195,6 +260,8 @@ class AutoLRTuner:
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+            if loss is not None:
+                self.report_loss(loss)  # a closure loss enables the probe like report_loss does
 
         params = [p for g in self.opt.param_groups for p in g["params"] if p.grad is not None]
         if not params:
@@ -220,6 +287,23 @@ class AutoLRTuner:
             # distance estimate — measured to clobber the decades-low seed.)
             for p in params:
                 self._x0[p] = p.detach().clone()
+
+        # Mode decision: a visible loss -> loss-driven range test (primary); none within
+        # the first few steps -> continuous gradient-only fallback. The grace window
+        # exists because trainers that report the PREVIOUS step's loss (e.g. DeepSpeed
+        # train_batch, where the loss is only known after the internal step) have
+        # nothing to report at step 0.
+        if self._probe is None:
+            if self._pending_loss is not None:
+                self._probe = {"lr": float(self.S), "losses": [], "base": [], "passed": None,
+                               "med": None, "mad": None, "descend": False, "restore": False,
+                               "skip1": False}
+            elif self._t >= 3:
+                self._probe = False
+        if isinstance(self._probe, dict):
+            return self._probe_step(loss)
+        if self._probe is False:
+            self._pending_loss = None  # continuous mode ignores late-arriving losses
 
         # Stability-edge guard: grad-norm spike vs its EMA.
         gnorms = torch._foreach_norm([p.grad for p in params])
@@ -317,6 +401,102 @@ class AutoLRTuner:
         self._t += 1
         return loss
 
+    # -- loss-driven range test (probe mode) --------------------------------
+    def _probe_step(self, loss: Any) -> Any:
+        """One step of the rung ladder. See the module docstring for the protocol.
+
+        Loss timing: the loss reported at step t was computed BEFORE this step's
+        update (forward → backward → step), so after a restore the very next
+        reported loss already reflects the restored params — no staleness. The
+        one skipped update per rung is the judgment step itself (its gradient
+        was computed at the params being discarded).
+        """
+        pr = self._probe
+        lv = self._pending_loss
+        self._pending_loss = None
+        if pr["restore"]:  # only set on mid-rung checkpoint resume: redo the rung cleanly
+            self._probe_restore()
+            pr["restore"] = False
+            pr["losses"] = []
+            pr["skip1"] = True
+            self._t += 1
+            return loss
+
+        if lv is not None and pr["skip1"]:
+            # First loss after a restore is dropped: under a report-after-step trainer
+            # (DeepSpeed train_batch) it was computed at the DISCARDED rung's params
+            # (one-step lag); under a closure it is merely the untouched-x0 loss.
+            pr["skip1"] = False
+            lv = None
+
+        finite = lv is not None and math.isfinite(lv)
+        fail = lv is not None and not finite  # non-finite loss: instant rung failure
+        if finite:
+            pr["losses"].append(lv)
+            if pr["med"] is not None and lv > _PROBE_ABORT * pr["med"]:
+                fail = True  # catastrophic mid-rung; no need to finish it
+        if not fail and len(pr["losses"]) < _PROBE_STEPS:
+            # mid-rung: a real update at the rung LR
+            self.S = pr["lr"]
+            for g in self.opt.param_groups:
+                g["lr"] = pr["lr"]
+            self.opt._step_impl()  # type: ignore[attr-defined]
+            self._t += 1
+            return loss
+
+        # Rung complete (or aborted): judge it.
+        if not fail and pr["med"] is not None:
+            med = _median(pr["losses"])
+            fail = med > pr["med"] + max(_PROBE_MARGIN * pr["med"], _PROBE_NSIG * pr["mad"])
+        if not fail and pr["med"] is None:
+            # Baseline phase: the first two rungs run at sub-operating LRs and define
+            # "healthy" (median + MAD). They cannot fail except on non-finite loss.
+            pr["base"].extend(pr["losses"])
+            if len(pr["base"]) >= 2 * _PROBE_STEPS:
+                pr["med"] = _median(pr["base"])
+                pr["mad"] = _median([abs(v - pr["med"]) for v in pr["base"]]) or (0.05 * pr["med"])
+
+        if fail:
+            if pr["passed"] is not None:
+                return self._probe_finish(pr["passed"], loss)  # edge found: keep the last safe rung
+            # Seed/d0 already above the edge: descend until a rung passes.
+            pr["descend"] = True
+            pr["lr"] = max(pr["lr"] / (_PROBE_FACTOR * _PROBE_FACTOR), 1e-12)
+        else:
+            pr["passed"] = pr["lr"]
+            if pr["descend"]:
+                return self._probe_finish(pr["lr"], loss)  # first pass after descent = just under the edge
+            nxt = pr["lr"] * _PROBE_FACTOR
+            if self._fuse is not None and nxt > self._fuse:
+                # Ladder topped out with no degradation (mushy regime): the ceiling is
+                # the honest stop — same role the fuse plays in the fallback mode.
+                return self._probe_finish(pr["lr"], loss)
+            pr["lr"] = nxt
+
+        # Start the next rung: clean trial from the exact snapshot.
+        self._probe_restore()
+        pr["losses"] = []
+        pr["skip1"] = True
+        self.S = pr["lr"]  # so get_d()/trainer logs show the ladder live
+        self._t += 1
+        return loss  # judgment step: no update (its gradient belongs to discarded params)
+
+    def _probe_restore(self) -> None:
+        """Params back to the exact x0 snapshot + base optimizer state wiped (lazy re-init)."""
+        for p, ref in self._x0.items():
+            p.data.copy_(ref)
+        self.opt.state.clear()
+
+    def _probe_finish(self, chosen: float, loss: Any) -> Any:
+        """Lock the discovered LR: restore x0, wipe base state, freeze. Training now
+        starts byte-clean at ``chosen`` — the probe leaves no trace on the model."""
+        self._probe_restore()
+        self._probe = False
+        self.S = max(chosen * self._scale, 1e-12)
+        self._do_freeze()
+        self._t += 1
+        return loss
+
     # -- stability-edge contact --------------------------------------------
     def _edge_contact(self, params: list[Tensor], *, step_after: bool) -> bool:
         """Back off from a stability-edge contact; freeze if the edge is confirmed.
@@ -388,6 +568,7 @@ class AutoLRTuner:
             "x0": x0_list,
             "gema": self._gema,
             "edge": self._edge,  # also carries the ramp phase (_ramp_on == edge is None)
+            "probe": dict(self._probe) if isinstance(self._probe, dict) else self._probe,
             "frozen": self.frozen,
             "frozen_lr": self.frozen_lr,
         }
@@ -407,6 +588,12 @@ class AutoLRTuner:
                 self._x0[params[i]] = r.to(params[i].device)
         self._gema = blob.get("gema")
         self._edge = blob.get("edge")
+        self._probe = blob.get("probe")
+        if isinstance(self._probe, dict):
+            # Mid-probe resume: the checkpoint params are mid-rung — redo the current
+            # rung from a clean restore rather than trusting a half-measured one.
+            self._probe = dict(self._probe)
+            self._probe["restore"] = True
         self.frozen = bool(blob["frozen"])
         self.frozen_lr = blob["frozen_lr"]
 
@@ -421,7 +608,7 @@ class AutoLRMixin:
     ``get_d`` / ``is_frozen``, and the checkpoint plumbing are shared here — no per-optimizer copy.
     """
 
-    _autolr: "AutoLRTuner | None"
+    _autolr: AutoLRTuner | None
 
     def _init_autolr(self, auto_lr: bool, scale: float, fuse_rel: float, d0: float | None = None) -> None:
         """Call at the END of ``__init__`` (after ``super().__init__`` / param_groups exist)."""
@@ -452,6 +639,17 @@ class AutoLRMixin:
         if self._autolr is not None:
             return self._autolr.get_d()
         return float(self.param_groups[0]["lr"])  # type: ignore[attr-defined]
+
+    def report_loss(self, loss: Any) -> None:
+        """Feed this step's training loss to ``auto_lr`` (no-op when off/frozen).
+
+        Call once per step BEFORE ``step()``. Enables the loss-driven range test —
+        the primary, model-independent discovery mode. One line in the trainer:
+        ``optimizer.report_loss(loss)`` right after computing the loss.
+        """
+        t = self._autolr
+        if t is not None and not t.frozen:
+            t.report_loss(loss)
 
     def is_frozen(self) -> bool:
         """Whether ``auto_lr`` has frozen to a fixed LR (False when auto_lr is off)."""
