@@ -16,20 +16,30 @@ first step, per an /experts-meeting synthesis — 4 independent experts + web):
    a real Anima run: norms 0.5→27 over 30 steps, zero spike triggers, model
    destroyed). Loss is the one cheap, model-independent "did this step help" signal
    — degradation at the edge is a 10-100σ event vs batch noise.
-   Mechanism (fastai lr_finder pattern, inside the optimizer, non-destructive):
-   climb an exponential LR ladder in independent RUNGS — each rung restores the
-   exact ``x0`` snapshot AND clears the base optimizer state (a clean trial), runs
-   ``_PROBE_STEPS`` real steps at the rung LR, and is judged by its MEDIAN batch
-   loss against a baseline built from the first two (sub-operating) rungs. First
-   rung that degrades (median > baseline + max(25%, 4·MAD), any non-finite, or a
-   single 3× loss) marks the edge → the previous (passed) rung's LR is chosen,
-   params restored to ``x0`` once more, base state cleared, LR frozen: training
-   then starts byte-clean at the chosen LR. Total cost ~10 rungs × 9 steps ≈ 90
-   steps, bounded, damage-free (nothing survives a bad rung). If the ladder tops
-   out at the fuse ceiling with no failure, the ceiling is chosen (mushy regimes
-   degrade too slowly to measure in-rung; the ceiling is the honest stop there).
-   If the seed/d0 already sits ABOVE the edge, the first failure with no passed
-   rung switches to descent (÷factor²) until a rung passes — bidirectional.
+   Mechanism (fastai lr_finder pattern, inside the optimizer, non-destructive,
+   ADAPTIVE coarse-to-fine): an exponential LR ladder of independent windows —
+   each restores the exact ``x0`` snapshot AND clears the base optimizer state
+   (a clean trial), runs real steps at the window LR, and is judged by its MEDIAN
+   batch loss against a POOLED baseline with an SE-of-the-median threshold
+   (statistically scaled: longer windows are automatically finer detectors, and
+   only provably-clean windows join the pool — pooling everything that merely
+   passes was measured to creep the baseline upward and erode the detector).
+   Three phases:
+   - CLIMB: coarse half-decade rungs (8 steps each); when a rung's grad-norm
+     median heats past 2× the pooled gn baseline, the growth factor refines
+     (3.16→1.78→1.33) — a PACE signal only (a wrong "warm" costs extra rungs,
+     never correctness; the loss judgments stay authoritative). Non-finite
+     loss/grads or a single 3×-baseline loss fail a window instantly.
+   - BISECT: after the first fail, log-bisection of the [pass, fail] bracket
+     down to ~1.33× — binary search on a monotone property, optimal per step.
+   - CONFIRM: a LONG window (32 steps) at the candidate, judged with a tighter
+     margin — catches SLOW degradation an 8-step rung cannot see (the case where
+     the hard-damage edge sits well above the quality zone). On failure it steps
+     down and re-confirms (fine steps after a tight bracket; coarse after a
+     ceiling top-out) — bounded tries — then freezes.
+   Then params restore to ``x0`` once more, base state clears, and training
+   starts byte-clean at the confirmed LR. Cost ~130-160 steps typical; the
+   seed/d0-above-the-edge case descends first (bidirectional).
 
 2. **Continuous update-space DoWG + stability-edge guard (fallback; no loss
    visible — e.g. kohya)** — the pre-existing mechanism, unchanged, documented
@@ -155,11 +165,19 @@ _BACKOFF: float = 0.5      # S multiplier on each edge contact; the freeze locks
 _RAMP_GROWTH: float = 1.1
 
 # -- loss-driven range-test (probe) constants --------------------------------------
-_PROBE_STEPS: int = 8          # measured losses per rung (median over these judges the rung)
-_PROBE_FACTOR: float = 10.0 ** 0.5  # half-decade ladder spacing; chosen LR = edge/factor
-_PROBE_MARGIN: float = 0.25    # rung fails if median loss > baseline median × (1+margin) ...
-_PROBE_NSIG: float = 4.0       # ... or > baseline + this many robust sigmas (MAD), whichever larger
-_PROBE_ABORT: float = 3.0      # any single loss > this × baseline median aborts the rung at once
+# Adaptive coarse-to-fine ladder: coarse growth far from the edge, refined near it
+# (warmth-paced), log-bisection of the [pass, fail] bracket, then a LONG confirmation
+# window at the candidate that catches slow degradation an 8-step rung cannot see.
+_PROBE_STEPS: int = 8            # measured losses per short rung
+_PROBE_CONFIRM_STEPS: int = 32   # measured losses in the confirmation window (slow-burn test)
+_PROBE_FACTOR: float = 10.0 ** 0.5    # coarse ladder spacing (half-decade)
+_PROBE_FACTOR_MIN: float = 10.0 ** 0.125  # finest grid / bracket resolution (~1.33x)
+_PROBE_MARGIN: float = 0.25      # short-rung relative fail margin (fast, coarse test)
+_PROBE_CONFIRM_MARGIN: float = 0.10  # confirmation relative fail margin (long, fine test)
+_PROBE_NSIG: float = 4.0         # z on the standard error of the window median
+_PROBE_ABORT: float = 3.0        # any single loss > this × baseline median aborts the window
+_PROBE_WARM: float = 2.0         # rung grad-norm median > this × baseline gn median = "warm"
+_PROBE_CONFIRM_MAX: int = 8      # bounded step-downs during confirmation
 
 
 def _median(vals: list[float]) -> float:
@@ -167,6 +185,21 @@ def _median(vals: list[float]) -> float:
     n = len(s)
     mid = n // 2
     return s[mid] if n % 2 else 0.5 * (s[mid - 1] + s[mid])
+
+
+def _probe_thresh(base: list[float], margin: float, n: int) -> float:
+    """Fail threshold for a window median of ``n`` samples vs the pooled baseline.
+
+    Statistically scaled, not calibrated: the noise term is the standard error of
+    the median (1.2533·σ/√n with σ from the MAD), so LONGER windows are
+    automatically FINER detectors, and the pooled baseline tightens the estimate
+    as the probe runs. The relative ``margin`` is a floor against hyper-sensitivity
+    once the SE becomes tiny.
+    """
+    med = _median(base)
+    mad = _median([abs(v - med) for v in base]) or 0.05 * abs(med)
+    se = 1.2533 * 1.4826 * mad / math.sqrt(max(n, 1))
+    return med + max(margin * abs(med), _PROBE_NSIG * se)
 
 
 class AutoLRTuner:
@@ -295,9 +328,11 @@ class AutoLRTuner:
         # nothing to report at step 0.
         if self._probe is None:
             if self._pending_loss is not None:
-                self._probe = {"lr": float(self.S), "losses": [], "base": [], "passed": None,
-                               "med": None, "mad": None, "descend": False, "restore": False,
-                               "skip1": False}
+                self._probe = {"phase": "climb", "lr": float(self.S),
+                               "factor": _PROBE_FACTOR, "losses": [], "gns": [],
+                               "base": [], "gbase": [], "passed": None, "fail": None,
+                               "descend": False, "tries": 0,
+                               "restore": False, "skip1": False}
             elif self._t >= 3:
                 self._probe = False
         if isinstance(self._probe, dict):
@@ -403,7 +438,7 @@ class AutoLRTuner:
 
     # -- loss-driven range test (probe mode) --------------------------------
     def _probe_step(self, loss: Any) -> Any:
-        """One step of the rung ladder. See the module docstring for the protocol.
+        """One step of the adaptive ladder. Phases: climb → bisect → confirm.
 
         Loss timing: the loss reported at step t was computed BEFORE this step's
         update (forward → backward → step), so after a restore the very next
@@ -418,6 +453,7 @@ class AutoLRTuner:
             self._probe_restore()
             pr["restore"] = False
             pr["losses"] = []
+            pr["gns"] = []
             pr["skip1"] = True
             self._t += 1
             return loss
@@ -429,14 +465,27 @@ class AutoLRTuner:
             pr["skip1"] = False
             lv = None
 
+        baselined = len(pr["base"]) >= 2 * _PROBE_STEPS
+        bmed = _median(pr["base"]) if baselined else None
         finite = lv is not None and math.isfinite(lv)
-        fail = lv is not None and not finite  # non-finite loss: instant rung failure
+        fail = lv is not None and not finite  # non-finite loss: instant window failure
         if finite:
             pr["losses"].append(lv)
-            if pr["med"] is not None and lv > _PROBE_ABORT * pr["med"]:
-                fail = True  # catastrophic mid-rung; no need to finish it
-        if not fail and len(pr["losses"]) < _PROBE_STEPS:
-            # mid-rung: a real update at the rung LR
+            if bmed is not None and lv > _PROBE_ABORT * bmed:
+                fail = True  # catastrophic mid-window; no need to finish it
+        target = _PROBE_CONFIRM_STEPS if pr["phase"] == "confirm" else _PROBE_STEPS
+        if not fail and len(pr["losses"]) < target:
+            # mid-window: a real update at the window LR (+ grad-norm sample for warmth)
+            gnorms = torch._foreach_norm([p.grad for g_ in self.opt.param_groups
+                                          for p in g_["params"] if p.grad is not None])
+            if len({n.dtype for n in gnorms}) > 1:
+                gnorms = [n.float() for n in gnorms]
+            gn = float(torch.stack(gnorms).float().square_().sum()) ** 0.5
+            if math.isfinite(gn):
+                pr["gns"].append(gn)
+            else:
+                fail = True  # non-finite gradients: the window is over the edge
+        if not fail and len(pr["losses"]) < target:
             self.S = pr["lr"]
             for g in self.opt.param_groups:
                 g["lr"] = pr["lr"]
@@ -444,38 +493,81 @@ class AutoLRTuner:
             self._t += 1
             return loss
 
-        # Rung complete (or aborted): judge it.
-        if not fail and pr["med"] is not None:
-            med = _median(pr["losses"])
-            fail = med > pr["med"] + max(_PROBE_MARGIN * pr["med"], _PROBE_NSIG * pr["mad"])
-        if not fail and pr["med"] is None:
-            # Baseline phase: the first two rungs run at sub-operating LRs and define
-            # "healthy" (median + MAD). They cannot fail except on non-finite loss.
-            pr["base"].extend(pr["losses"])
-            if len(pr["base"]) >= 2 * _PROBE_STEPS:
-                pr["med"] = _median(pr["base"])
-                pr["mad"] = _median([abs(v - pr["med"]) for v in pr["base"]]) or (0.05 * pr["med"])
+        # Window complete (or aborted): judge it against the POOLED baseline with an
+        # SE-scaled threshold (longer windows = automatically finer detection).
+        warm = False
+        if not fail and baselined:
+            margin = _PROBE_CONFIRM_MARGIN if pr["phase"] == "confirm" else _PROBE_MARGIN
+            fail = _median(pr["losses"]) > _probe_thresh(pr["base"], margin, len(pr["losses"]))
+        if not fail:
+            if pr["gbase"] and pr["gns"]:
+                warm = _median(pr["gns"]) > _PROBE_WARM * _median(pr["gbase"])
+            # Pool only windows that are PROVABLY clean (margin 0: within the pure
+            # SE band of the baseline), which is stricter than merely passing.
+            # Pooling everything that passes would let mild elevations creep the
+            # baseline upward and erode the detector (measured in tests).
+            provably_clean = (not baselined) or (
+                pr["losses"]
+                and _median(pr["losses"]) <= _probe_thresh(pr["base"], 0.0, len(pr["losses"]))
+            )
+            if not warm and provably_clean:
+                # Every such window is a draw from the same healthy regime (each starts
+                # from the same x0), so it grows the pooled baseline for free.
+                pr["base"].extend(pr["losses"])
+                pr["gbase"].extend(pr["gns"])
 
-        if fail:
-            if pr["passed"] is not None:
-                return self._probe_finish(pr["passed"], loss)  # edge found: keep the last safe rung
-            # Seed/d0 already above the edge: descend until a rung passes.
-            pr["descend"] = True
-            pr["lr"] = max(pr["lr"] / (_PROBE_FACTOR * _PROBE_FACTOR), 1e-12)
+        if pr["phase"] == "confirm":
+            if fail:
+                # Slow burn detected at the candidate: step down and re-confirm. The
+                # step size is contextual — fine (x1.33) after a tight bisected
+                # bracket, coarse (the ladder factor) after a ceiling top-out where
+                # nothing below has been measured at long horizon.
+                pr["tries"] += 1
+                if pr["tries"] >= _PROBE_CONFIRM_MAX:
+                    return self._probe_finish(pr["lr"] / pr.get("cstep", _PROBE_FACTOR_MIN), loss)
+                pr["lr"] = max(pr["lr"] / pr.get("cstep", _PROBE_FACTOR_MIN), 1e-12)
+            else:
+                return self._probe_finish(pr["lr"], loss)  # confirmed clean at long horizon
+        elif fail:
+            if pr["passed"] is None:
+                # Seed/d0 already above the edge: descend until something passes.
+                pr["descend"] = True
+                pr["fail"] = pr["lr"]
+                pr["lr"] = max(pr["lr"] / (pr["factor"] * pr["factor"]), 1e-12)
+            else:
+                pr["fail"] = pr["lr"]
+                pr["phase"] = "bisect"
+                pr["lr"] = math.sqrt(pr["passed"] * pr["fail"])  # log-midpoint of the bracket
         else:
             pr["passed"] = pr["lr"]
-            if pr["descend"]:
-                return self._probe_finish(pr["lr"], loss)  # first pass after descent = just under the edge
-            nxt = pr["lr"] * _PROBE_FACTOR
-            if self._fuse is not None and nxt > self._fuse:
-                # Ladder topped out with no degradation (mushy regime): the ceiling is
-                # the honest stop — same role the fuse plays in the fallback mode.
-                return self._probe_finish(pr["lr"], loss)
-            pr["lr"] = nxt
+            if pr["phase"] == "bisect" or pr["descend"]:
+                # A (pass, fail) bracket exists: bisect it down to the fine grid.
+                pr["phase"] = "bisect"
+                if pr["fail"] is not None and pr["fail"] / pr["passed"] > _PROBE_FACTOR_MIN * 1.05:
+                    pr["lr"] = math.sqrt(pr["passed"] * pr["fail"])
+                else:
+                    pr["phase"] = "confirm"
+                    pr["cstep"] = _PROBE_FACTOR_MIN  # tight bracket -> fine descent
+                    pr["lr"] = pr["passed"]
+            else:  # climb
+                if warm:
+                    # Grad norms are heating up: the edge is near — refine the growth
+                    # factor. Purely a PACE signal: wrong "warm" costs extra rungs,
+                    # never correctness (the loss judgments stay authoritative).
+                    pr["factor"] = max(math.sqrt(pr["factor"]), _PROBE_FACTOR_MIN)
+                nxt = pr["lr"] * pr["factor"]
+                if self._fuse is not None and nxt > self._fuse:
+                    # Ladder topped out with no degradation (mushy regime): confirm the
+                    # ceiling at long horizon — same role the fuse plays in the fallback.
+                    pr["phase"] = "confirm"
+                    pr["cstep"] = pr["factor"]  # nothing measured below -> coarse descent
+                else:
+                    pr["lr"] = nxt
 
-        # Start the next rung: clean trial from the exact snapshot.
+        # Start the next window: clean trial from the exact snapshot.
         self._probe_restore()
         pr["losses"] = []
+        pr["gns"] = []
         pr["skip1"] = True
         self.S = pr["lr"]  # so get_d()/trainer logs show the ladder live
         self._t += 1

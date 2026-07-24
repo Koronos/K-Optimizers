@@ -129,6 +129,64 @@ def test_probe_from_above_descends() -> None:
     assert opt.get_d() <= 1e-4, f"descent must land under the edge (got {opt.get_d():g})"
 
 
+def test_probe_bisection_tightens_the_bracket() -> None:
+    # After the coarse fail, log-bisection must narrow [pass, fail] down to the fine
+    # grid: the chosen LR ends within ~1.33x of the true edge, not ~3.16x.
+    from kaon._autolr import _PROBE_FACTOR_MIN
+    model, x, y = _tiny_problem(seed=14)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    edge = 1e-4
+
+    def loss_fn(lr):
+        return 0.10 + 0.01 * torch.rand(1).item() if lr <= edge else 1.2
+
+    _probe_drive(opt, model, x, y, loss_fn, 600)
+    assert opt.is_frozen()
+    chosen = opt.get_d()
+    assert chosen <= edge, f"must not choose a degrading LR (got {chosen:g})"
+    assert chosen > edge / (_PROBE_FACTOR_MIN ** 2), (
+        f"bisection must land within the fine grid of the edge (got {chosen:g} vs edge {edge:g})"
+    )
+
+
+def test_probe_confirmation_catches_slow_burn() -> None:
+    # A mild (+15%) elevation passes the coarse 8-step rung test but must FAIL the
+    # long confirmation window (SE-scaled threshold) -> the probe steps down below
+    # the soft edge instead of freezing on it.
+    model, x, y = _tiny_problem(seed=15)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    soft_edge = 1e-4
+
+    def loss_fn(lr):
+        base = 0.10 + 0.01 * torch.rand(1).item()
+        return base * 1.15 if lr > soft_edge else base
+
+    _probe_drive(opt, model, x, y, loss_fn, 900)
+    assert opt.is_frozen()
+    assert opt.get_d() <= soft_edge, (
+        f"the long window must catch the slow burn (got {opt.get_d():g} vs soft edge {soft_edge:g})"
+    )
+
+
+def test_probe_warmth_refines_the_ladder() -> None:
+    # Rising grad norms (no loss degradation) must refine the growth factor —
+    # pace only, judged by the tuner's own rung gn median vs its pooled baseline.
+    from kaon._autolr import _PROBE_FACTOR
+    model, x, y = _tiny_problem(seed=16)
+    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
+    for _ in range(220):
+        opt.report_loss(0.10 + 0.01 * torch.rand(1).item())
+        # grads heat up once the ladder passes 1e-6 (×8 = clearly warm, no spike path)
+        _manual_step(model, x, y, opt, grad_factor=8.0 if opt.get_d() > 1e-6 else 1.0)
+        if opt.is_frozen() or (isinstance(opt._autolr._probe, dict)
+                               and opt._autolr._probe["factor"] < _PROBE_FACTOR):
+            break
+    pr = opt._autolr._probe
+    assert opt.is_frozen() or pr["factor"] < _PROBE_FACTOR, (
+        "sustained hot grad norms must refine the ladder factor"
+    )
+
+
 def test_probe_tops_out_at_ceiling_when_nothing_degrades() -> None:
     # Mushy regime: no measurable in-rung degradation anywhere -> the ceiling is
     # the honest stop (same role the fuse plays in the fallback).
