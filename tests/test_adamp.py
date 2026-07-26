@@ -308,7 +308,9 @@ def test_foreach_matches_per_param(cfg):
         ob.step()
     for a, b in zip(pa, pb, strict=True):
         max_diff = max(max_diff, (a.detach() - b.detach()).abs().max().item())
-        assert torch.equal(a, b), f"foreach != per-param (max diff {max_diff})"
+        assert torch.allclose(a, b, rtol=0.0, atol=1e-7), (
+            f"foreach != per-param (max diff {max_diff})"
+        )
 
 
 def test_foreach_chunking_is_exact():

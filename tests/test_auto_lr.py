@@ -1,9 +1,4 @@
-"""CPU tests for autonomous AutoLR.
-
-The deterministic toy host makes detector and rollback behavior observable
-without involving a trainer or a loss signal.  One public Adakaon smoke test
-keeps the integration path covered as well.
-"""
+"""CPU tests for continuous Mechanic AutoLR."""
 
 from __future__ import annotations
 
@@ -15,13 +10,10 @@ from collections.abc import Iterable
 import pytest
 import torch
 
-from kaon import Adakaon
-from kaon._autolr import _ADAPT_MAX_STEPS, _BACKOFF, AutoLRMixin
+from kaon import Adakaon, AutoLRMixin, Lion, Nekaon
 
 
 class _ToyOptimizer(AutoLRMixin, torch.optim.Optimizer):
-    """Small stateful SGD host used to inspect AutoLR transactions."""
-
     def __init__(
         self,
         params: Iterable[torch.Tensor],
@@ -29,16 +21,10 @@ class _ToyOptimizer(AutoLRMixin, torch.optim.Optimizer):
         auto_lr: bool = True,
         auto_lr_scale: float = 1.0,
         auto_lr_fuse_rel: float = 20.0,
-        auto_lr_d0: float | None = 1e-3,
+        auto_lr_d0: float | None = None,
     ) -> None:
         super().__init__(params, {"lr": 1.0})
-        self.reset_calls = 0
-        self._init_autolr(
-            auto_lr,
-            auto_lr_scale,
-            auto_lr_fuse_rel,
-            auto_lr_d0,
-        )
+        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     def _step_impl(self, closure=None):
         loss = None
@@ -56,316 +42,267 @@ class _ToyOptimizer(AutoLRMixin, torch.optim.Optimizer):
                 param.add_(momentum, alpha=-float(group["lr"]))
         return loss
 
-    def _autolr_reset_base_state(self) -> None:
-        self.reset_calls += 1
-        AutoLRMixin._autolr_reset_base_state(self)
-
-    def state_dict(self):
-        return self._autolr_state_dict(super().state_dict())
-
-    def load_state_dict(self, state_dict):
-        self._autolr_load(
-            state_dict,
-            lambda state: torch.optim.Optimizer.load_state_dict(self, state),
-        )
-
-
-def _make(
-    values: tuple[float, ...] = (1.0,),
-    **kwargs,
-) -> tuple[list[torch.nn.Parameter], _ToyOptimizer]:
+def _make(values=(1.0,), **kwargs):
     params = [torch.nn.Parameter(torch.tensor([value], dtype=torch.float32)) for value in values]
     return params, _ToyOptimizer(params, **kwargs)
 
 
-def _step(opt: _ToyOptimizer, grads: tuple[float | None, ...]) -> None:
-    params = [param for group in opt.param_groups for param in group["params"]]
-    assert len(params) == len(grads)
-    for param, grad in zip(params, grads):
+def _step(opt: _ToyOptimizer, grads) -> None:
+    params = [p for group in opt.param_groups for p in group["params"]]
+    for param, grad in zip(params, grads, strict=True):
         param.grad = None if grad is None else torch.full_like(param, grad)
     opt.step()
 
 
-def _first_spike(opt: _ToyOptimizer, *, healthy_steps: int = 4) -> float:
-    for _ in range(healthy_steps):
-        _step(opt, (1.0,))
-    contact = float(opt._autolr.S)
-    _step(opt, (10.0,))
-    return contact
+def _assert_tuners_equal(left, right) -> None:
+    assert left.get_d() == right.get_d()
+    for name in ("_r", "_m", "_v", "_s"):
+        assert getattr(left._autolr, name) == getattr(right._autolr, name)
+    assert left._autolr._t == right._autolr._t
+    assert left._autolr._last_h == right._autolr._last_h
+    for lp, rp in zip(left._autolr._params(), right._autolr._params(), strict=True):
+        assert torch.equal(left._autolr._x0[lp], right._autolr._x0[rp])
+        assert torch.equal(left._autolr._delta[lp], right._autolr._delta[rp])
 
 
-def test_discovery_runs_without_loss_or_report_loss() -> None:
-    _, opt = _make()
-    for _ in range(12):
-        _step(opt, (1.0,))
-    assert opt._autolr._seed == pytest.approx(1e-3)
-    assert opt.get_d() > opt._autolr._seed
-    assert opt._autolr._level_base == pytest.approx([0.0] * 8)
-
-
-def test_report_loss_is_a_warn_once_noop() -> None:
-    params_a, opt_a = _make()
-    params_b, opt_b = _make()
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        for index in range(12):
-            opt_a.report_loss(float(index))
-            opt_a.report_loss(float("nan"))
-            _step(opt_a, (1.0,))
-            _step(opt_b, (1.0,))
-
-    deprecations = [item for item in caught if issubclass(item.category, DeprecationWarning)]
-    assert len(deprecations) == 1
-    assert torch.equal(params_a[0], params_b[0])
-    assert opt_a.get_d() == opt_b.get_d()
-    assert opt_a._autolr.state_blob() == opt_b._autolr.state_blob()
-
-
-def test_snapshots_parameters_that_receive_gradients_late() -> None:
-    params, opt = _make((1.0, 2.0))
-    initial_late = params[1].detach().clone()
-    _step(opt, (1.0, None))
-    assert params[1] in opt._autolr._x0
-    assert torch.equal(opt._autolr._x0[params[1]], initial_late)
-
-    for _ in range(3):
-        _step(opt, (1.0, None))
-    _step(opt, (1.0, 1.0))
-    assert not torch.equal(params[1], initial_late)
-    _step(opt, (10.0, 10.0))
-    assert torch.equal(params[1], initial_late)
-
-
-def test_abrupt_spike_rolls_back_parameters_and_base_state_exactly() -> None:
+def test_first_step_is_seed_scaled_unit_update() -> None:
     params, opt = _make()
-    initial = params[0].detach().clone()
-    contact = _first_spike(opt)
+    _step(opt, (1.0,))
+    assert 1.0 - params[0].item() == pytest.approx(1e-6, rel=0.05)
+    assert opt.get_d() == pytest.approx(1e-6)
+    assert opt.param_groups[0]["lr"] == opt.get_d()
 
-    assert opt._autolr._edge == contact
-    assert opt.get_d() == pytest.approx(contact * _BACKOFF)
-    assert torch.equal(params[0], initial)
-    assert len(opt.state) == 0
-    assert opt.reset_calls == 1
-    assert opt._autolr._rbar == 0.0
-    assert opt._autolr._contacts == 1
+
+@pytest.mark.parametrize(
+    ("optimizer_cls", "betas", "extra"),
+    [
+        (Adakaon, (0.9, 0.999), {}),
+        (Nekaon, (0.5, 0.999), {"k": 1.5}),
+        (Lion, (0.9, 0.99), {}),
+    ],
+)
+def test_first_autolr_update_matches_same_fixed_lr_with_cautious_weight_decay(
+    optimizer_cls, betas, extra
+) -> None:
+    torch.manual_seed(11)
+    auto_param = torch.nn.Parameter(torch.randn(8, 8))
+    fixed_param = torch.nn.Parameter(auto_param.detach().clone())
+    shared = {
+        "betas": betas,
+        "weight_decay": 0.1,
+        "cautious": True,
+        "gradient_centralization": True,
+        "momentum_dtype": "float32",
+        "foreach": False,
+        **extra,
+    }
+    auto = optimizer_cls([auto_param], lr=1.0, auto_lr=True, **shared)
+    fixed = optimizer_cls([fixed_param], lr=auto.get_d(), auto_lr=False, **shared)
+    grad = torch.randn_like(auto_param)
+    auto_param.grad = grad.clone()
+    fixed_param.grad = grad.clone()
+    auto.step()
+    fixed.step()
+    for optimizer in (auto, fixed):
+        eval_fn = getattr(optimizer, "eval", None)
+        if eval_fn is not None:
+            eval_fn()
+    torch.testing.assert_close(auto_param, fixed_param, rtol=0.0, atol=0.0)
+
+
+def test_continuous_feedback_grows_without_freeze_or_horizon() -> None:
+    _, opt = _make()
+    initial = opt.get_d()
+    for _ in range(300):
+        _step(opt, (1.0,))
+    assert opt.get_d() > initial
+    assert opt._autolr._t == 300
+    assert not opt.is_frozen()
+    assert opt._autolr.freeze_reason is None
+
+
+def test_auto_lr_scale_is_explicit_multiplier() -> None:
+    _, normal = _make(auto_lr_scale=1.0)
+    _, triple = _make(auto_lr_scale=3.0)
+    assert triple.get_d() == pytest.approx(3.0 * normal.get_d())
+    _step(normal, (1.0,))
+    _step(triple, (1.0,))
+    assert triple.get_d() == pytest.approx(3.0 * normal.get_d())
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"auto_lr_scale": float("inf")},
+        {"auto_lr_scale": float("nan")},
+        {"auto_lr_fuse_rel": float("inf")},
+        {"auto_lr_d0": float("inf")},
+    ],
+)
+def test_constructor_rejects_nonfinite_compatibility_values(kwargs) -> None:
+    with pytest.raises(ValueError, match="finite and > 0"):
+        _make(**kwargs)
+
+
+def test_d0_extremes_warn_and_produce_identical_trajectories() -> None:
+    with pytest.warns(UserWarning, match="deprecated and ignored"):
+        params_low, low = _make(auto_lr_d0=1e-30)
+    with pytest.warns(UserWarning, match="deprecated and ignored"):
+        params_high, high = _make(auto_lr_d0=1e6)
+    for grad in (1.0, 0.5, -0.25, 0.75, 0.2):
+        _step(low, (grad,))
+        _step(high, (grad,))
+    assert torch.equal(params_low[0], params_high[0])
+    _assert_tuners_equal(low, high)
+
+
+def test_fuse_rel_is_accepted_but_does_not_freeze_or_cap() -> None:
+    _, opt = _make(auto_lr_fuse_rel=1e-9)
+    for _ in range(40):
+        _step(opt, (1.0,))
+    assert opt.get_d() > 1e-6
     assert not opt.is_frozen()
 
 
-def test_fixed_baseline_detects_gradual_growth() -> None:
-    params, opt = _make(auto_lr_d0=1e-6, auto_lr_fuse_rel=1e12)
-    initial = params[0].detach().clone()
-    for _ in range(8):
-        _step(opt, (1.0,))
-    for _ in range(7):
-        _step(opt, (3.0,))
-        assert opt._autolr._edge is None
-    _step(opt, (3.0,))
-
-    assert opt._autolr._edge is not None
-    assert opt._autolr._contacts == 1
-    assert opt._autolr._level_base == pytest.approx([0.0] * 8)
-    assert opt._autolr._level_window == []
-    assert torch.equal(params[0], initial)
-
-
-def test_second_comparable_contact_freezes_below_edge() -> None:
-    params, opt = _make()
-    initial = params[0].detach().clone()
-    edge = _first_spike(opt)
-    _step(opt, (10.0,))
-
-    assert opt.is_frozen()
-    assert opt._autolr.freeze_reason == "edge_confirmed"
-    assert opt.get_d() == pytest.approx(edge * _BACKOFF * _BACKOFF)
-    assert opt._autolr._contacts == 2
-    assert opt._autolr._x0 == {}
-    assert not torch.equal(params[0], initial), "the confirming finite step runs at the safe LR"
-
-
-def test_no_edge_freezes_at_fuse() -> None:
-    _, opt = _make(auto_lr_fuse_rel=1.0)
-    for _ in range(64):
-        _step(opt, (1.0,))
-        if opt.is_frozen():
-            break
-    assert opt.is_frozen()
-    assert opt._autolr.freeze_reason == "fuse_bound"
-    assert opt.get_d() == pytest.approx(opt._autolr._fuse)
-    assert opt._autolr._t < _ADAPT_MAX_STEPS
-
-
-def test_high_d0_has_bounded_headroom_and_cannot_bypass_safety_fuse() -> None:
-    _, reference = _make(auto_lr_d0=None)
-    _step(reference, (1.0,))
-    expected_fuse = reference._autolr._fuse
-
-    _, high = _make(auto_lr_d0=10.0)
-    with pytest.warns(UserWarning, match="clamped"):
-        _step(high, (1.0,))
-    assert high._autolr._fuse == pytest.approx(4.0 * expected_fuse)
-    assert high._autolr._seed == pytest.approx(4.0 * expected_fuse)
-    assert high.get_d() == pytest.approx(4.0 * expected_fuse)
-    assert high.is_frozen()
-    assert high._autolr.freeze_reason == "fuse_bound"
-
-
-def test_no_edge_freezes_at_192_step_budget() -> None:
-    _, opt = _make(auto_lr_d0=1e-12, auto_lr_fuse_rel=1e30)
-    for _ in range(_ADAPT_MAX_STEPS):
-        _step(opt, (1.0,))
-    assert opt.is_frozen()
-    assert opt._autolr._t == _ADAPT_MAX_STEPS
-    assert opt._autolr.freeze_reason == "budget_bound"
-
-
-def test_persistent_nonfinite_gradients_back_off_once_and_skip() -> None:
-    params, opt = _make()
-    for _ in range(4):
-        _step(opt, (1.0,))
-    before = float(opt._autolr.S)
-    initial = torch.tensor([1.0])
-
-    with pytest.warns(UserWarning, match="non-finite"):
-        for _ in range(4):
-            _step(opt, (float("nan"),))
-
-    assert opt.get_d() == pytest.approx(before * _BACKOFF)
-    assert opt._autolr._contacts == 1
-    assert opt.reset_calls == 1
-    assert torch.equal(params[0], initial)
-    assert len(opt.state) == 0
-
-    _step(opt, (1.0,))
-    assert opt._autolr._nan_run == 0
-    _step(opt, (float("inf"),))
-    assert opt.get_d() == pytest.approx(before * _BACKOFF)
-    assert opt._autolr._contacts == 1, "later poison must not create an LR ratchet"
-
-
-def test_auto_lr_scale_applies_to_each_dowg_estimate_without_bypassing_fuse() -> None:
-    _, normal = _make(auto_lr_scale=1.0, auto_lr_fuse_rel=1.0)
-    _, doubled = _make(auto_lr_scale=2.0, auto_lr_fuse_rel=1.0)
-    _step(normal, (1.0,))
-    _step(doubled, (1.0,))
-    assert doubled.get_d() > normal.get_d(), "scale must affect the live DoWG estimate"
-
-    for opt in (normal, doubled):
-        for _ in range(64):
-            if opt.is_frozen():
-                break
-            _step(opt, (1.0,))
-        assert opt.is_frozen()
-        assert opt._autolr.freeze_reason == "fuse_bound"
-        assert opt.get_d() == pytest.approx(opt._autolr._fuse)
-
-
-def test_harness_lr_overwrite_cannot_change_adapting_or_frozen_lr() -> None:
-    params_a, guarded = _make()
-    params_b, reference = _make()
-    for _ in range(4):
-        guarded.param_groups[0]["lr"] = 99.0
-        _step(guarded, (1.0,))
-        _step(reference, (1.0,))
+def test_report_loss_is_warn_once_and_trajectory_noop() -> None:
+    params_a, a = _make()
+    params_b, b = _make()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(8):
+            a.report_loss(99.0)
+            a.report_loss(float("nan"))
+            _step(a, (1.0,))
+            _step(b, (1.0,))
+    assert sum(issubclass(w.category, DeprecationWarning) for w in caught) == 1
     assert torch.equal(params_a[0], params_b[0])
-
-    _step(guarded, (10.0,))
-    _step(guarded, (10.0,))
-    assert guarded.is_frozen()
-    frozen = guarded.get_d()
-    guarded.param_groups[0]["lr"] = 99.0
-    _step(guarded, (1.0,))
-    assert guarded.param_groups[0]["lr"] == frozen
+    _assert_tuners_equal(a, b)
 
 
-def test_074_checkpoint_round_trip_preserves_detector_and_freeze_reason() -> None:
-    params, opt = _make(auto_lr_d0=1e-6, auto_lr_fuse_rel=1e12)
-    for _ in range(8):
-        _step(opt, (1.0,))
-    for _ in range(3):
-        _step(opt, (2.0,))
-
-    state = copy.deepcopy(opt.state_dict())
-    params2, resumed = _make(auto_lr_d0=1e-6, auto_lr_fuse_rel=1e12)
-    params2[0].data.copy_(params[0])
-    resumed.load_state_dict(state)
-    assert resumed._autolr._level_base == opt._autolr._level_base
-    assert resumed._autolr._level_window == opt._autolr._level_window
-    assert resumed._autolr._contacts == opt._autolr._contacts
-    assert resumed._autolr._t == opt._autolr._t
-
-    for _ in range(5):
-        _step(opt, (2.0,))
-        _step(resumed, (2.0,))
-    assert torch.equal(params2[0], params[0])
-    assert resumed._autolr.state_blob() == opt._autolr.state_blob()
-
-    _step(opt, (10.0,))
-    _step(resumed, (10.0,))
-    assert resumed._autolr.freeze_reason == opt._autolr.freeze_reason
+def test_anchor_includes_parameter_receiving_gradient_late() -> None:
+    params, opt = _make((1.0, 2.0))
+    _step(opt, (1.0, None))
+    assert torch.equal(opt._autolr._x0[params[1]], torch.tensor([2.0]))
+    _step(opt, (1.0, 1.0))
+    assert params[1].item() < 2.0
 
 
-def test_073_checkpoint_load_ignores_legacy_probe_state() -> None:
+def test_nonfinite_gradients_skip_without_touching_live_or_base_state() -> None:
     params, opt = _make()
-    for _ in range(5):
+    for _ in range(4):
         _step(opt, (1.0,))
-    state = copy.deepcopy(opt.state_dict())
-    blob = state["_autolr"]
-    for key in (
-        "version",
-        "contacts",
-        "nan_run",
-        "nonfinite_backed_off",
-        "nonfinite_warned",
-        "level_base",
-        "level_window",
-        "freeze_reason",
-    ):
-        blob.pop(key)
-    blob["probe"] = {
-        "phase": "bisect",
-        "lr": 0.123,
-        "losses": [99.0],
-    }
+    before_param = params[0].detach().clone()
+    before_momentum = opt.state[params[0]]["momentum"].clone()
+    before_scale = opt.get_d()
+    before_t = opt._autolr._t
+    with pytest.warns(UserWarning, match="non-finite"):
+        _step(opt, (float("nan"),))
+    _step(opt, (float("inf"),))
+    assert torch.equal(params[0], before_param)
+    assert torch.equal(opt.state[params[0]]["momentum"], before_momentum)
+    assert opt.get_d() == before_scale
+    assert opt._autolr._t == before_t
+    assert opt._autolr._nonfinite_steps == 2
 
+
+def test_harness_lr_overwrite_is_ignored() -> None:
+    params_a, a = _make()
+    params_b, b = _make()
+    for _ in range(6):
+        a.param_groups[0]["lr"] = 99.0
+        _step(a, (1.0,))
+        _step(b, (1.0,))
+    assert torch.equal(params_a[0], params_b[0])
+    _assert_tuners_equal(a, b)
+
+
+def test_checkpoint_round_trip_resumes_exactly() -> None:
+    params, opt = _make()
+    for grad in (1.0, 0.5, -0.25, 0.75):
+        _step(opt, (grad,))
+    state = copy.deepcopy(opt.state_dict())
     params2, resumed = _make()
     params2[0].data.copy_(params[0])
     resumed.load_state_dict(state)
-    assert not hasattr(resumed._autolr, "_probe")
-    assert resumed.get_d() == resumed._autolr._seed
-    assert resumed._autolr._t == 0
-    assert torch.equal(params2[0], resumed._autolr._x0[params2[0]])
-    assert len(resumed.state) == 0
-    assert resumed.reset_calls == 1
-    assert resumed._autolr._level_base == []
-    assert resumed._autolr._level_window == []
-    _step(resumed, (1.0,))
+    _assert_tuners_equal(opt, resumed)
+
+    for grad in (0.2, -0.4, 1.1):
+        _step(opt, (grad,))
+        _step(resumed, (grad,))
+    assert torch.equal(params[0], params2[0])
+    _assert_tuners_equal(opt, resumed)
 
 
-def test_frozen_checkpoint_reimposes_lr_on_load_and_next_step() -> None:
+def test_old_dowg_checkpoint_fails_closed() -> None:
     _, opt = _make()
-    _first_spike(opt)
-    _step(opt, (10.0,))
-    state = copy.deepcopy(opt.state_dict())
-
+    state = opt.state_dict()
+    state["_autolr"] = {"version": 2, "S": 1e-3, "x0": []}
     _, resumed = _make()
-    resumed.load_state_dict(state)
-    assert resumed.is_frozen()
-    assert resumed._autolr.freeze_reason == "edge_confirmed"
-    assert resumed.param_groups[0]["lr"] == resumed.get_d()
-    resumed.param_groups[0]["lr"] = 99.0
-    _step(resumed, (1.0,))
-    assert resumed.param_groups[0]["lr"] == resumed.get_d()
+    with pytest.raises(ValueError, match="retired probe/DoWG"):
+        resumed.load_state_dict(state)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("scale", float("nan"), "invalid scale"),
+        ("v", [-1.0] * 6, "negative v"),
+        ("s", [0.0] * 6, "invalid s"),
+    ],
+)
+def test_corrupt_mechanic_scalar_checkpoint_fails_closed(field, value, match) -> None:
+    _, opt = _make()
+    _step(opt, (1.0,))
+    state = copy.deepcopy(opt.state_dict())
+    state["_autolr"][field] = value
+    _, resumed = _make()
+    with pytest.raises(ValueError, match=match):
+        resumed.load_state_dict(state)
+
+
+def test_corrupt_mechanic_trajectory_checkpoint_fails_closed() -> None:
+    _, opt = _make()
+    _step(opt, (1.0,))
+    state = copy.deepcopy(opt.state_dict())
+    state["_autolr"]["delta"][0].fill_(float("nan"))
+    _, resumed = _make()
+    with pytest.raises(ValueError, match="non-finite tensors"):
+        resumed.load_state_dict(state)
+
+
+def test_checkpoint_rejects_overflowed_applied_scale() -> None:
+    _, opt = _make()
+    state = copy.deepcopy(opt.state_dict())
+    state["_autolr"]["scale"] = 1e308
+    state["_autolr"]["s"] = [1.0] * 6
+    _, resumed = _make()
+    with pytest.raises(ValueError, match="invalid applied scale"):
+        resumed.load_state_dict(state)
+
+
+def test_oversized_tensor_uses_unstacked_memory_path(monkeypatch) -> None:
+    param = torch.nn.Parameter(torch.zeros(2_000_001))
+    opt = _ToyOptimizer([param])
+    original_stack = torch.stack
+
+    def guarded_stack(tensors, *args, **kwargs):
+        values = list(tensors)
+        assert not any(value.numel() > 2_000_000 for value in values)
+        return original_stack(values, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "stack", guarded_stack)
+    param.grad = torch.ones_like(param)
+    opt.step()
+    assert torch.isfinite(param).all()
 
 
 def test_off_path_is_plain_optimizer() -> None:
     params, opt = _make(auto_lr=False)
     opt.param_groups[0]["lr"] = 0.1
     _step(opt, (1.0,))
-    assert opt._autolr is None
-    assert not opt.is_frozen()
-    assert opt.get_d() == 0.1
     assert params[0].item() == pytest.approx(0.9)
+    assert opt.get_d() == 0.1
+    assert not opt.is_frozen()
 
 
 def test_adakaon_autonomous_cpu_smoke() -> None:
@@ -373,16 +310,38 @@ def test_adakaon_autonomous_cpu_smoke() -> None:
     model = torch.nn.Linear(4, 2)
     inputs = torch.randn(8, 4)
     targets = torch.randn(8, 2)
-    opt = Adakaon(model.parameters(), betas=(0.0, 0.999), auto_lr=True)
-
-    initial_d = None
-    for _ in range(12):
+    opt = Adakaon(
+        model.parameters(),
+        betas=(0.0, 0.999),
+        auto_lr=True,
+    )
+    initial = opt.get_d()
+    for _ in range(20):
         opt.zero_grad()
-        loss = torch.nn.functional.mse_loss(model(inputs), targets)
-        loss.backward()
+        torch.nn.functional.mse_loss(model(inputs), targets).backward()
         opt.step()
-        if initial_d is None:
-            initial_d = opt.get_d()
-
     assert math.isfinite(opt.get_d())
-    assert opt.get_d() > initial_d
+    assert opt.get_d() > initial
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+
+
+def test_adakaon_bf16_safe_seed_does_not_quantize_feedback_to_zero() -> None:
+    param = torch.ones(8, 8, dtype=torch.bfloat16, requires_grad=True)
+    opt = Adakaon(
+        [param],
+        lr=1.0,
+        betas=(0.9, 0.999),
+        weight_decay=0.0,
+        momentum_dtype="bfloat16",
+        bf16_method="stochastic_rounding",
+        cautious=False,
+        gradient_centralization=False,
+        foreach=False,
+        auto_lr=True,
+    )
+    for _ in range(64):
+        param.grad = torch.ones_like(param)
+        opt.step()
+    assert opt.get_d() > 1e-6
+    assert opt._autolr._last_h != 0.0
+    assert any(bool(delta.abs().max() > 0) for delta in opt._autolr._delta.values())

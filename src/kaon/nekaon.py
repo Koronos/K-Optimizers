@@ -176,11 +176,11 @@ class Nekaon(AutoLRMixin, MSAM):
                 "discovered LR on all groups each step, which would clobber the per-group "
                 "low-VRAM lr ratio. Use one or the other."
             )
-        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
+        # Composable continuous Mechanic LR via AutoLRMixin. off -> zero overhead.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     # step() is the AutoLRMixin router; _step_impl is the full Nekaon step (SAM declimb ->
-    # inner base -> climb) — DoWG measures the net displacement, so it composes over the lookahead.
+    # inner base -> climb). MSAM's hooks expose the true iterate to Mechanic.
     def _step_impl(self, closure: Any = None) -> Any:
         return MSAM.step(self, closure)  # explicit: super() would hit AutoLRMixin.step (the router)
 

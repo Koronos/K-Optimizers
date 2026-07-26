@@ -202,7 +202,7 @@ class Lion(AutoLRMixin, Optimizer):
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
-        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. When on, drives
+        # Composable continuous Mechanic LR via AutoLRMixin. When on, drives
         # the step via _step_impl at the discovered lr=S; off (default) -> step == _step_impl.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
@@ -317,7 +317,7 @@ class Lion(AutoLRMixin, Optimizer):
                 s["m_scale"].copy_(sc)
 
     # -------------------------------------------------------------------- step
-    # step() is the AutoLRMixin router (drives the DoWG tuner when auto_lr is on, else
+    # step() is the AutoLRMixin router (drives Mechanic when auto_lr is on, else
     # _step_impl; re-imposes the frozen LR each step vs a harness clobber).
     @torch.no_grad()
     def _step_impl(self, closure: Any = None) -> Any:

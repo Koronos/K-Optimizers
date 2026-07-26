@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.5]
+
+### Changed
+- Replaced the bounded DoWG probe behind `auto_lr=True` with continuous Mechanic:
+  six discounted bettors, an explicitly stored anchored trajectory, no loss callback, geometric
+  ramp, contact detector, fuse, freeze, or step horizon.
+- `auto_lr_d0` is deprecated and ignored; low and high legacy values now produce
+  identical safe-start trajectories. `auto_lr_fuse_rel` remains accepted for
+  source compatibility but no longer caps the continuous controller.
+- Mechanic keeps one native-dtype parameter anchor and one persistent fp32
+  normalized trajectory (~6 B/trainable parameter for bf16 weights). Bounded
+  shape batches accelerate small tensors, while oversized tensors use an unstacked
+  path to avoid multiplying full-tensor temporaries. The explicit trajectory prevents
+  a safe sub-ULP seed from stalling on bf16 weights.
+- Nekaon/MSAM now expose an internal true/virtual/live protocol so their lookahead
+  is removed before Mechanic measurement and reapplied with the exact selected
+  scale. Native and fused/Triton paths share the same lifecycle.
+
+### Fixed
+- Scalar overflow and non-finite reconstruction fail closed without returning
+  corrupted parameters. Non-finite gradients skip the base optimizer and warn once.
+- AutoLR checkpoints serialize all bettor state, anchors, fp32 trajectories, and
+  the fused MSAM stochastic-rounding seed through the public mixin contract.
+  Nekaon reconstructs its live view before the first resumed forward/backward;
+  incompatible 0.7.4 DoWG checkpoints fail explicitly.
+
+### Validation
+- Added paired multi-seed fixed-LR comparisons for Adakaon, Nekaon, and Lion,
+  plus quantized checkpoint tests, bf16 stochastic-rounding/Kahan coverage, and
+  native-Windows CUDA/Triton true/live tests.
+- Added 5,000-step, three-seed stability runs for each AutoLR optimizer and an
+  explicit fixed-LR update-equivalence gate with cautious updates and weight decay.
+
 ## [0.7.4]
 
 ### Changed

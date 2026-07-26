@@ -233,7 +233,7 @@ class AdamP(AutoLRMixin, Optimizer):
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
 
-        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
+        # Composable parameter-free LR (continuous Mechanic) via AutoLRMixin. off -> zero overhead.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     # ------------------------------------------------------------------- state

@@ -1,15 +1,10 @@
-"""Autonomous, composable learning-rate discovery for Kaon optimizers.
+"""Continuous, trainer-independent Mechanic step-size adaptation for Kaon.
 
-``AutoLRTuner`` measures updates in the base optimizer's own update space and
-runs a continuous DoWG estimate.  A geometric ramp accelerates discovery until
-the first stability contact.  Contacts are detected from gradients alone by an
-instantaneous EMA spike guard and a fixed-reference, windowed level guard.  No
-loss, closure result, scheduler, or trainer decision participates in discovery.
-
-The tuner owns the effective learning rate while adapting.  It freezes after a
-confirmed stability edge, when it reaches its conservative fuse, or after 192
-adapting steps.  Its only persistent tensor cost is one exact parameter snapshot,
-which is released at freeze.
+The controller treats the host optimizer as a *unit-update oracle*.  Its six
+exponentially-discounted bettors continuously rescale the anchored trajectory;
+there is no range-test phase, freeze, horizon, loss signal, or trainer decision.
+Hosts with a live parameter view (MSAM/Nekaon) expose three private lifecycle
+hooks so the anchor always follows the true iterate rather than the lookahead.
 """
 
 from __future__ import annotations
@@ -23,51 +18,17 @@ from torch import Tensor
 
 __all__ = ["AutoLRMixin", "AutoLRTuner", "DEFAULT_FUSE_REL"]
 
-# Default for the hosts' ``auto_lr_fuse_rel`` kwarg.
 DEFAULT_FUSE_REL: float = 20.0
 
-_SEED_REL: float = 1e-6
-_FUSE_REF_REL: float = 3e-3
-_EPS: float = 1e-30
-
-# Instantaneous stability guard.
-_SPIKE_RATIO: float = 5.0
-_EMA_BETA: float = 0.9
-_EMA_WARMUP: int = 3
-
-# Contact policy.
-_EDGE_BAND: float = 2.0
-_BACKOFF: float = 0.5
-
-# Discovery ramp, active only before the first contact.
-_RAMP_GROWTH: float = 1.1
-
-# Fixed-reference level guard.  The baseline never follows the trajectory, so a
-# gradual increase cannot "cook" the detector as it can a moving EMA.
-_LEVEL_BASE_STEPS: int = 8
-_LEVEL_WINDOW: int = 8
-_LEVEL_RATIO: float = 2.5
-_LEVEL_NMAD: float = 4.0
-
-_ADAPT_MAX_STEPS: int = 192
-_D0_FUSE_HEADROOM: float = 4.0
-
-
-def _median(vals: list[float]) -> float:
-    ordered = sorted(vals)
-    middle = len(ordered) // 2
-    if len(ordered) % 2:
-        return ordered[middle]
-    return 0.5 * (ordered[middle - 1] + ordered[middle])
+_BETAS = tuple(1.0 - 0.1**k for k in range(1, 7))
+_EPS = 1e-8
+_S_INIT = 1e-6
+_STATE_VERSION = 3
+_REDUCTION_CHUNK_ELEMENTS = 2_000_000
 
 
 class AutoLRTuner:
-    """Update-space DoWG tuner attached to a Kaon optimizer host.
-
-    The host exposes ``param_groups``, ``state``, ``_step_impl()`` and the
-    internal ``_autolr_reset_base_state()`` hook supplied by :class:`AutoLRMixin`.
-    Fused hosts override the reset hook to invalidate pointer caches as well.
-    """
+    """Mechanic controller attached directly to a Kaon optimizer host."""
 
     def __init__(
         self,
@@ -77,19 +38,14 @@ class AutoLRTuner:
         fuse_rel: float,
         d0: float | None = None,
     ) -> None:
-        if not scale > 0.0:
-            raise ValueError(f"auto_lr_scale must be > 0, got {scale}")
-        if not fuse_rel > 0.0:
-            raise ValueError(f"auto_lr_fuse_rel must be > 0, got {fuse_rel}")
-        if d0 is not None and not d0 > 0.0:
-            raise ValueError(
-                "auto_lr_d0 must be > 0 (or None for the data-relative seed), "
-                f"got {d0}"
-            )
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError(f"auto_lr_scale must be finite and > 0, got {scale}")
+        if not math.isfinite(fuse_rel) or fuse_rel <= 0.0:
+            raise ValueError(f"auto_lr_fuse_rel must be finite and > 0, got {fuse_rel}")
+        if d0 is not None and (not math.isfinite(d0) or d0 <= 0.0):
+            raise ValueError(f"auto_lr_d0 must be finite and > 0 or None, got {d0}")
         self.opt = opt
 
-        # The tuner owns group["lr"].  A trainer default such as 1e-4 must not
-        # silently scale the autonomous result.
         small = [float(group["lr"]) for group in opt.param_groups if group["lr"] < 1.0]
         if small:
             warnings.warn(
@@ -100,386 +56,378 @@ class AutoLRTuner:
             )
 
         self._scale = float(scale)
+        # Retained in state/API for source compatibility. Mechanic has no fuse.
         self._fuse_rel = float(fuse_rel)
         self._d0 = float(d0) if d0 is not None else None
+        if self._d0 is not None:
+            warnings.warn(
+                "auto_lr_d0 is deprecated and ignored by continuous Mechanic; "
+                "the safe seed is fixed. Use auto_lr_scale only when an explicit "
+                "global multiplier is intended.",
+                stacklevel=3,
+            )
+        # A user-provided d0 must never turn the safe-start controller into an
+        # accidentally high-LR controller. This seed is an algorithm invariant.
+        self._seed = _S_INIT
 
-        self.S: float | None = None
-        self._seed: float | None = None
-        self._fuse: float | None = None
-        self._v = _EPS
-        self._rbar = 0.0
-        self._t = 0
+        self._r = [0.0] * len(_BETAS)
+        self._m = [0.0] * len(_BETAS)
+        self._v = [0.0] * len(_BETAS)
+        self._s = [self._seed / len(_BETAS)] * len(_BETAS)
         self._x0: dict[Tensor, Tensor] = {}
-
-        self._gema: float | None = None
-        self._edge: float | None = None
-        self._contacts = 0
-        self._nan_run = 0
-        self._nonfinite_backed_off = False
+        # The ideal normalized trajectory must not be inferred back from bf16
+        # weights: a safe 1e-6 seed is usually below one bf16 ULP.  Keeping it in
+        # fp32 lets the controller receive feedback even while the materialized
+        # model weights temporarily round back to their anchor.
+        self._delta: dict[Tensor, Tensor] = {}
+        self._t = 0
+        self._last_h = 0.0
+        self._nonfinite_steps = 0
         self._nonfinite_warned = False
-        self._level_base: list[float] = []
-        self._level_window: list[float] = []
         self._report_loss_warned = False
 
+        # Compatibility attributes: continuous Mechanic never freezes.
         self.frozen = False
         self.frozen_lr: float | None = None
         self.freeze_reason: str | None = None
+        self.S = self._applied_scale()
+        self._set_group_lr(self.S)
 
-    # -- compatibility -----------------------------------------------------
+    def _params(self) -> list[Tensor]:
+        return [p for group in self.opt.param_groups for p in group["params"] if p.requires_grad]
+
+    def _applied_scale(self) -> float:
+        return self._scale * float(sum(self._s))
+
+    def _set_group_lr(self, value: float) -> None:
+        for group in self.opt.param_groups:
+            group["lr"] = value
+
+    def _host_hook(self, name: str, *args: Any) -> None:
+        hook = getattr(self.opt, name, None)
+        if hook is not None:
+            hook(*args)
+
     def report_loss(self, loss: Any) -> None:
-        """Deprecated compatibility no-op; AutoLR no longer consumes loss."""
+        """Deprecated compatibility no-op; Mechanic never consumes loss."""
         del loss
         if not self._report_loss_warned:
             warnings.warn(
-                "optimizer.report_loss() is deprecated and ignored: auto_lr is fully "
-                "autonomous as of kaon 0.7.4.",
+                "optimizer.report_loss() is deprecated and ignored: auto_lr is fully autonomous.",
                 DeprecationWarning,
                 stacklevel=3,
             )
             self._report_loss_warned = True
 
-    # -- introspection -----------------------------------------------------
-    @property
-    def _ramp_on(self) -> bool:
-        return self._edge is None
-
     def get_d(self) -> float:
-        if self.frozen:
-            return float(self.frozen_lr)  # type: ignore[arg-type]
-        return float(self.S) if self.S is not None else 0.0
-
-    # -- discovery ---------------------------------------------------------
-    def _initialize(self) -> None:
-        """Seed the tuner and snapshot every currently trainable parameter."""
-        trainable = [
-            p
-            for group in self.opt.param_groups
-            for p in group["params"]
-            if p.requires_grad
-        ]
-        sq = 0.0
-        count = 0
-        for param in trainable:
-            param_f = param.detach().float()
-            sq += float((param_f * param_f).sum())
-            count += param_f.numel()
-        rms = math.sqrt(sq / max(count, 1)) if count else 0.0
-
-        requested = self._d0 if self._d0 is not None else max(_SEED_REL * rms, 1e-10)
-        # d0 may retain a small amount of compatibility headroom, but it cannot
-        # inflate its own ceiling without bound.  The old ``fuse_rel * d0`` rule
-        # made the protection disappear exactly when it was needed most (and
-        # could freeze a damaged run at 20*d0).
-        base_fuse = max(self._fuse_rel * _FUSE_REF_REL * rms, 1e-12)
-        requested_fuse = max(base_fuse, self._fuse_rel * requested)
-        self._fuse = min(requested_fuse, _D0_FUSE_HEADROOM * base_fuse)
-        self.S = min(requested, self._fuse)
-        self._seed = self.S
-        if self._d0 is not None and requested > self._fuse:
-            warnings.warn(
-                f"auto_lr_d0={requested:g} exceeds the autonomous safety fuse "
-                f"({self._fuse:g}) and was clamped to it.",
-                stacklevel=3,
-            )
-        self._x0 = {param: param.detach().clone() for param in trainable}
+        return float(self.S)
 
     @staticmethod
-    def _global_norm(tensors: list[Tensor]) -> float:
-        norms = torch._foreach_norm(tensors)
-        if len({norm.dtype for norm in norms}) > 1:
-            norms = [norm.float() for norm in norms]
-        return math.sqrt(float(torch.stack(norms).float().square_().sum()))
-
-    def _level_is_hot(self, grad_norm: float) -> bool:
-        """Detect a sustained shift from the first eight finite grad norms."""
-        log_norm = math.log(max(grad_norm, _EPS))
-        if len(self._level_base) < _LEVEL_BASE_STEPS:
-            self._level_base.append(log_norm)
-            return False
-
-        self._level_window.append(log_norm)
-        if len(self._level_window) > _LEVEL_WINDOW:
-            del self._level_window[0]
-        if len(self._level_window) < _LEVEL_WINDOW:
-            return False
-
-        baseline = _median(self._level_base)
-        raw_mad = _median([abs(value - baseline) for value in self._level_base])
-        robust_mad = 1.4826 * raw_mad
-        threshold = baseline + max(
-            math.log(_LEVEL_RATIO),
-            _LEVEL_NMAD * robust_mad,
+    def _all_finite(tensors: list[Tensor]) -> bool:
+        """Check many tensors with multi-tensor kernels and one sync per device."""
+        by_device_dtype: dict[tuple[torch.device, torch.dtype], list[Tensor]] = {}
+        for tensor in tensors:
+            by_device_dtype.setdefault((tensor.device, tensor.dtype), []).append(tensor)
+        norms_by_device: dict[torch.device, list[Tensor]] = {}
+        for (device, _dtype), items in by_device_dtype.items():
+            norms = torch._foreach_norm(items)
+            norms_by_device.setdefault(device, []).extend(norms)
+        return all(
+            bool(torch.isfinite(torch.stack(norms)).all())
+            for norms in norms_by_device.values()
         )
-        return _median(self._level_window) > threshold
 
-    def _complete_adapting_step(self) -> None:
-        """Advance the hard budget and freeze at a terminal autonomous bound."""
-        self._t += 1
-        if self.frozen:
-            return
-        if self._fuse is not None and self.S is not None and self._fuse * (1 - 1e-12) <= self.S:
-            self.S = self._fuse
-            self._do_freeze("fuse_bound")
-        elif self._t >= _ADAPT_MAX_STEPS:
-            self._do_freeze("budget_bound")
+    @staticmethod
+    def _feedback_sum(params: list[Tensor], delta: dict[Tensor, Tensor]) -> float:
+        """Compute global <gradient, trajectory> in shape buckets."""
+        by_device: dict[torch.device, list[Tensor]] = {}
+        active = [p for p in params if p.grad is not None]
+        for chunk in AutoLRTuner._shape_batches(active):
+            if len(chunk) == 1 and chunk[0].numel() > _REDUCTION_CHUNK_ELEMENTS:
+                p = chunk[0]
+                term = torch.vdot(p.grad.detach().float().reshape(-1), delta[p].reshape(-1))
+                by_device.setdefault(p.device, []).append(term)
+                continue
+            gradients = torch.stack([p.grad.detach() for p in chunk]).float()
+            trajectory = torch.stack([delta[p] for p in chunk])
+            by_device.setdefault(chunk[0].device, []).append(
+                torch.vdot(gradients.reshape(-1), trajectory.reshape(-1))
+            )
+        return sum(float(torch.stack(terms).sum()) for terms in by_device.values())
+
+    @staticmethod
+    def _shape_batches(params: list[Tensor]) -> list[list[Tensor]]:
+        buckets: dict[tuple[torch.device, torch.dtype, tuple[int, ...]], list[Tensor]] = {}
+        for p in params:
+            key = (p.device, p.dtype, tuple(p.shape))
+            buckets.setdefault(key, []).append(p)
+        result: list[list[Tensor]] = []
+        for (_device, _dtype, shape), bucket in buckets.items():
+            per_tensor = max(math.prod(shape), 1)
+            chunk_size = max(_REDUCTION_CHUNK_ELEMENTS // per_tensor, 1)
+            result.extend(
+                bucket[start : start + chunk_size]
+                for start in range(0, len(bucket), chunk_size)
+            )
+        return result
+
+    def _materialize(
+        self, params: list[Tensor], delta: dict[Tensor, Tensor], scale: float
+    ) -> None:
+        for batch in self._shape_batches(params):
+            if len(batch) == 1 and batch[0].numel() > _REDUCTION_CHUNK_ELEMENTS:
+                p = batch[0]
+                value = delta[p].clone().mul_(-scale).add_(self._x0[p])
+                p.copy_(value.to(dtype=p.dtype))
+                continue
+            anchors = torch.stack([self._x0[p] for p in batch])
+            values = torch.stack([delta[p] for p in batch])
+            values.mul_(-scale).add_(anchors)
+            values = values.to(dtype=batch[0].dtype)
+            torch._foreach_copy_([p.data for p in batch], list(values.unbind(0)))
+
+    def _warn_nonfinite(self) -> None:
+        if not self._nonfinite_warned:
+            warnings.warn(
+                "auto_lr: non-finite gradients were skipped without advancing the "
+                "optimizer or Mechanic state.",
+                stacklevel=3,
+            )
+            self._nonfinite_warned = True
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
-        """Take one autonomous adapting step."""
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
-        params = [
-            p
-            for group in self.opt.param_groups
-            for p in group["params"]
-            if p.grad is not None
-        ]
-        if not params:
+        params = self._params()
+        active = [p for p in params if p.grad is not None]
+        if not active:
+            return loss
+        # Check before declimbing a live MSAM/Nekaon view: a skipped poisoned
+        # step must leave that view and every state tensor exactly untouched.
+        if not self._all_finite([p.grad for p in active]):
+            self._nonfinite_steps += 1
+            self._warn_nonfinite()
             return loss
 
-        if self.S is None:
-            self._initialize()
+        scale_prev = self._applied_scale()
+        self._host_hook("_autolr_prepare_true")
+        if not self._x0:
+            self._x0 = {p: p.detach().clone() for p in params}
+            self._delta = {p: torch.zeros_like(p, dtype=torch.float32) for p in params}
 
-        grad_norm = self._global_norm([p.grad for p in params])
-        if not math.isfinite(grad_norm):
-            # A persistent poison source is not repaired by repeatedly shrinking LR.
-            # Roll back/back off once per consecutive run and skip every poisoned step.
-            self._nan_run += 1
-            if not self._nonfinite_backed_off:
-                self._nonfinite_backoff()
-            elif not self._nonfinite_warned:
-                warnings.warn(
-                    "auto_lr: gradients are non-finite again; the LR has already been "
-                    "backed off once, so this is not treated as another LR contact. Check "
-                    "the data, loss, and precision; steps are skipped until gradients "
-                    "become finite.",
-                    stacklevel=2,
-                )
-                self._nonfinite_warned = True
-            self._complete_adapting_step()
+        h = self._feedback_sum(params, self._delta)
+        if not math.isfinite(h):
+            self._nonfinite_steps += 1
+            self._warn_nonfinite()
+            self._host_hook("_autolr_restore_live", scale_prev)
             return loss
-        self._nan_run = 0
 
-        level_hot = self._level_is_hot(grad_norm)
-        spike = (
-            self._gema is not None
-            and self._gema > 0.0
-            and self._t >= _EMA_WARMUP
-            and grad_norm > _SPIKE_RATIO * self._gema
-        )
-        if self._gema is None or self._gema <= 0.0:
-            self._gema = grad_norm
-        elif level_hot or spike:
-            if self._ramp_on:
-                # The gradient belongs to the pre-rollback parameters, so it cannot
-                # safely be applied after restoring x0 and resetting base state.
-                self._edge_contact(step_after=False)
-                self._complete_adapting_step()
-                return loss
+        # Materialize the controller's ideal true iterate before asking the base
+        # optimizer for a unit update.  This also normalizes any bf16 round-trip
+        # noise introduced while removing an MSAM/Nekaon live climb.
+        self._materialize(params, self._delta, scale_prev)
 
-            frozen_now = self._edge_contact(step_after=True)
-            self._gema = grad_norm
-            self._complete_adapting_step()
-            if frozen_now:
-                return loss
-            # A non-confirming contact re-anchors DoWG and then applies this finite
-            # gradient at the backed-off LR.
-        else:
-            self._gema = _EMA_BETA * self._gema + (1.0 - _EMA_BETA) * grad_norm
-
-        s_prev = float(self.S)
-        for group in self.opt.param_groups:
-            group["lr"] = s_prev
-
-        previous = [
-            p.detach().float() if p.dtype != torch.float32 else p.detach().clone()
-            for p in params
-        ]
+        self._set_group_lr(1.0)
         self.opt._step_impl()  # type: ignore[attr-defined]
+        # A live-view host now carries a newly-created *unit-scale* climb. Remove
+        # it before reading the virtual optimizer's true output.
+        self._host_hook("_autolr_after_virtual_step")
 
-        current = [p.detach().float() for p in params]
-        delta = torch._foreach_sub(current, previous)
-        update_norm_sq = float(torch.stack(torch._foreach_norm(delta)).square_().sum())
-        update_norm_sq /= s_prev * s_prev + _EPS
+        if not self._all_finite(params):
+            self._materialize(params, self._delta, scale_prev)
+            self._set_group_lr(scale_prev)
+            raise FloatingPointError(
+                "base optimizer produced non-finite parameters during the unit update; "
+                "parameters were restored, but optimizer state advanced"
+            )
 
-        if update_norm_sq <= 0.0:
-            self._complete_adapting_step()
-            return loss
+        old_m = self._m
+        clipped_h = [min(max(h, -m), m) for m in old_m]
+        new_m = [max(beta * m, abs(h) + _EPS) for beta, m in zip(_BETAS, old_m, strict=True)]
+        new_v = [
+            beta * beta * v + h * h
+            for beta, v in zip(_BETAS, self._v, strict=True)
+        ]
+        new_r = [
+            beta * r + h_clip * s
+            for beta, r, h_clip, s in zip(
+                _BETAS, self._r, clipped_h, self._s, strict=True
+            )
+        ]
+        candidate = [
+            ((self._seed / len(_BETAS)) * m + max(r, 0.0)) / (math.sqrt(v) + _EPS)
+            for m, r, v in zip(new_m, new_r, new_v, strict=True)
+        ]
+        if not all(math.isfinite(value) and value >= 0.0 for value in candidate):
+            self._materialize(params, self._delta, scale_prev)
+            self._set_group_lr(scale_prev)
+            raise FloatingPointError("Mechanic produced a non-finite scale; optimizer state advanced")
 
-        # Distance is global over all snapshotted trainable parameters, including
-        # ones without a gradient on this particular step.
-        tracked = list(self._x0)
-        displacement = torch._foreach_sub(
-            [p.detach().float() for p in tracked],
-            [self._x0[p].float() for p in tracked],
-        )
-        distance = self._global_norm(displacement)
-        self._rbar = max(self._rbar, distance)
-        radius_sq = self._rbar * self._rbar
-        self._v += radius_sq * update_norm_sq
+        new_scale = self._scale * float(sum(candidate))
+        new_delta: dict[Tensor, Tensor] = {}
+        for batch in self._shape_batches(params):
+            if len(batch) == 1 and batch[0].numel() > _REDUCTION_CHUNK_ELEMENTS:
+                p = batch[0]
+                trajectories = self._delta[p].clone()
+                old_representable = (
+                    self._delta[p].clone().mul_(-scale_prev).add_(self._x0[p]).to(dtype=p.dtype)
+                )
+                trajectories.add_(old_representable).sub_(p.detach())
+                new_delta[p] = trajectories
+                continue
+            anchors = torch.stack([self._x0[p] for p in batch])
+            trajectories = torch.stack([self._delta[p] for p in batch])
+            old_representable = trajectories.mul(-scale_prev).add_(anchors).to(dtype=batch[0].dtype)
+            current = torch.stack([p.detach() for p in batch])
+            trajectories.add_(old_representable).sub_(current)
+            new_delta.update(zip(batch, trajectories.unbind(0), strict=True))
 
-        new_s = (radius_sq / math.sqrt(self._v)) * self._scale
-        if self._ramp_on:
-            new_s = max(new_s, s_prev * _RAMP_GROWTH)
-        if self._fuse is not None:
-            new_s = min(new_s, self._fuse)
-        self.S = max(new_s, 1e-12)
+        self._materialize(params, new_delta, new_scale)
 
-        self._complete_adapting_step()
+        if not self._all_finite(params):
+            self._materialize(params, self._delta, scale_prev)
+            self._set_group_lr(scale_prev)
+            raise FloatingPointError(
+                "Mechanic reconstruction produced non-finite parameters; parameters were "
+                "restored, but optimizer state advanced"
+            )
+
+        self._m, self._v, self._r, self._s = new_m, new_v, new_r, candidate
+        self._delta = new_delta
+        self.S = new_scale
+
+        self._last_h = h
+        self._t += 1
+        self._set_group_lr(self.S)
+        # Rebuild the live lookahead from the refreshed unit-direction momentum,
+        # scaled by the exact Mechanic value used for the true reconstruction.
+        self._host_hook("_autolr_restore_live", self.S)
         return loss
 
-    # -- contacts and freeze ----------------------------------------------
-    def _nonfinite_backoff(self) -> None:
-        """Perform the single lifetime rollback allowed for poisoned gradients."""
-        contact = float(self.S)  # type: ignore[arg-type]
-        self.S = max(contact * _BACKOFF, 1e-12)
-        self._contacts += 1
-        self._nonfinite_backed_off = True
-        if self._edge is None:
-            self._edge = contact
-        self._level_window.clear()
-        for param, reference in self._x0.items():
-            param.copy_(reference)
-        self.opt._autolr_reset_base_state()  # type: ignore[attr-defined]
-        self._rbar = 0.0
-        self._v = _EPS
-
-    def _edge_contact(self, *, step_after: bool) -> bool:
-        """Back off at a stability contact and freeze on a comparable repeat."""
-        contact = float(self.S)  # type: ignore[arg-type]
-        self.S = max(contact * _BACKOFF, 1e-12)
-        self._contacts += 1
-        comparable = (
-            self._edge is not None
-            and self._edge / _EDGE_BAND <= contact <= self._edge * _EDGE_BAND
-        )
-        if comparable:
-            self._do_freeze("edge_confirmed")
-            if step_after:
-                self.opt._step_impl()  # type: ignore[attr-defined]
-            return True
-
-        first_contact = self._edge is None
-        self._edge = contact
-        self._level_window.clear()
-
-        if first_contact:
-            # The exploratory trajectory is discarded exactly, together with every
-            # piece of base state or fused pointer metadata derived from it.
-            for param, reference in self._x0.items():
-                param.copy_(reference)
-            self.opt._autolr_reset_base_state()  # type: ignore[attr-defined]
-        else:
-            # A non-comparable later contact starts a new local DoWG epoch without
-            # allocating another reference copy.
-            for param in self._x0:
-                self._x0[param].copy_(param)
-
-        self._rbar = 0.0
-        self._v = _EPS
-        return False
-
-    def _do_freeze(self, reason: str) -> None:
-        """Lock the effective LR and release the parameter reference buffers."""
-        self.frozen_lr = float(self.S) if self.S is not None else 0.0
-        for group in self.opt.param_groups:
-            group["lr"] = self.frozen_lr
-        self._x0.clear()
-        self.freeze_reason = reason
-        self.frozen = True
-
-    # -- checkpointing -----------------------------------------------------
     def state_blob(self) -> dict[str, Any]:
-        """Return tuner state with references stored in stable parameter order."""
-        params = [p for group in self.opt.param_groups for p in group["params"]]
-        index = {param: i for i, param in enumerate(params)}
-        x0_list: list[Tensor | None] = [None] * len(params)
-        for param, reference in self._x0.items():
-            x0_list[index[param]] = reference.detach().clone()
+        params = self._params()
         return {
-            "version": 2,
-            "S": self.S,
+            "version": _STATE_VERSION,
+            "algorithm": "mechanic",
+            "scale": self._scale,
+            "fuse_rel": self._fuse_rel,
+            "d0": self._d0,
             "seed": self._seed,
-            "fuse": self._fuse,
-            "v": self._v,
-            "rbar": self._rbar,
+            "r": list(self._r),
+            "m": list(self._m),
+            "v": list(self._v),
+            "s": list(self._s),
+            "x0": [self._x0[p].detach().clone() if p in self._x0 else None for p in params],
+            "delta": [
+                self._delta[p].detach().clone() if p in self._delta else None for p in params
+            ],
             "t": self._t,
-            "x0": x0_list,
-            "gema": self._gema,
-            "edge": self._edge,
-            "contacts": self._contacts,
-            "nan_run": self._nan_run,
-            "nonfinite_backed_off": self._nonfinite_backed_off,
+            "last_h": self._last_h,
+            "nonfinite_steps": self._nonfinite_steps,
             "nonfinite_warned": self._nonfinite_warned,
-            "level_base": list(self._level_base),
-            "level_window": list(self._level_window),
-            "frozen": self.frozen,
-            "frozen_lr": self.frozen_lr,
-            "freeze_reason": self.freeze_reason,
         }
 
     def load_blob(self, blob: dict[str, Any]) -> None:
-        """Restore 0.7.4 state or migrate a 0.7.3 blob.
+        version = int(blob.get("version", 0))
+        if version != _STATE_VERSION or blob.get("algorithm") != "mechanic":
+            raise ValueError(
+                "AutoLR checkpoint uses the retired probe/DoWG controller and cannot be "
+                "safely migrated to continuous Mechanic; restart AutoLR from an unadapted checkpoint"
+            )
+        params = self._params()
+        saved_x0 = blob.get("x0")
+        if not isinstance(saved_x0, list) or len(saved_x0) != len(params):
+            raise ValueError("AutoLR Mechanic checkpoint parameter topology differs")
+        saved_delta = blob.get("delta")
+        if not isinstance(saved_delta, list) or len(saved_delta) != len(params):
+            raise ValueError("AutoLR Mechanic checkpoint trajectory topology differs")
+        for name in ("r", "m", "v", "s"):
+            values = blob.get(name)
+            if not isinstance(values, list) or len(values) != len(_BETAS):
+                raise ValueError(f"AutoLR Mechanic checkpoint has invalid {name!r} state")
+            if not all(math.isfinite(float(value)) for value in values):
+                raise ValueError(f"AutoLR Mechanic checkpoint has non-finite {name!r} state")
 
-        The obsolete 0.7.3 ``probe`` member is intentionally ignored.  All fields
-        shared with continuous DoWG remain usable, while new detector state starts
-        empty when it is absent.
-        """
-        params = [p for group in self.opt.param_groups for p in group["params"]]
-        self.S = blob.get("S")
-        self._seed = blob.get("seed")
-        self._fuse = blob.get("fuse")
-        self._v = float(blob.get("v", _EPS))
-        self._rbar = float(blob.get("rbar", 0.0))
-        self._t = int(blob.get("t", 0))
-        self._x0 = {}
-        for index, reference in enumerate(blob.get("x0", [])):
-            if reference is not None and index < len(params):
-                self._x0[params[index]] = reference.to(
-                    device=params[index].device,
-                    dtype=params[index].dtype,
-                )
-        self._gema = blob.get("gema")
-        self._edge = blob.get("edge")
-        self._contacts = int(blob.get("contacts", 1 if self._edge is not None else 0))
-        self._nan_run = int(blob.get("nan_run", 0))
-        self._nonfinite_backed_off = bool(blob.get("nonfinite_backed_off", False))
+        scale = float(blob["scale"])
+        fuse_rel = float(blob.get("fuse_rel", self._fuse_rel))
+        d0 = blob.get("d0")
+        d0 = None if d0 is None else float(d0)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("AutoLR Mechanic checkpoint has invalid scale")
+        if not math.isfinite(fuse_rel) or fuse_rel <= 0.0:
+            raise ValueError("AutoLR Mechanic checkpoint has invalid fuse compatibility value")
+        if d0 is not None and (not math.isfinite(d0) or d0 <= 0.0):
+            raise ValueError("AutoLR Mechanic checkpoint has invalid d0 compatibility value")
+        if any(float(value) < 0.0 for value in blob["m"]):
+            raise ValueError("AutoLR Mechanic checkpoint has negative m state")
+        if any(float(value) < 0.0 for value in blob["v"]):
+            raise ValueError("AutoLR Mechanic checkpoint has negative v state")
+        if (
+            any(float(value) < 0.0 for value in blob["s"])
+            or sum(float(value) for value in blob["s"]) <= 0.0
+        ):
+            raise ValueError("AutoLR Mechanic checkpoint has invalid s state")
+        applied_scale = scale * sum(float(value) for value in blob["s"])
+        if not math.isfinite(applied_scale) or applied_scale <= 0.0:
+            raise ValueError("AutoLR Mechanic checkpoint has invalid applied scale")
+
+        step = int(blob.get("t", 0))
+        last_h = float(blob.get("last_h", 0.0))
+        nonfinite_steps = int(blob.get("nonfinite_steps", 0))
+        if step < 0 or nonfinite_steps < 0 or not math.isfinite(last_h):
+            raise ValueError("AutoLR Mechanic checkpoint has invalid counters/feedback")
+
+        for p, anchor, trajectory in zip(params, saved_x0, saved_delta, strict=True):
+            if (anchor is None) != (trajectory is None):
+                raise ValueError("AutoLR Mechanic checkpoint anchor/trajectory state differs")
+            if anchor is None:
+                if step > 0:
+                    raise ValueError("AutoLR Mechanic checkpoint is missing an active trajectory")
+                continue
+            if not torch.is_tensor(anchor) or not torch.is_tensor(trajectory):
+                raise ValueError("AutoLR Mechanic checkpoint trajectory entries must be tensors")
+            if anchor.shape != p.shape or trajectory.shape != p.shape:
+                raise ValueError("AutoLR Mechanic checkpoint tensor topology differs")
+            if not bool(torch.isfinite(anchor).all()) or not bool(torch.isfinite(trajectory).all()):
+                raise ValueError("AutoLR Mechanic checkpoint contains non-finite tensors")
+
+        saved_seed = float(blob.get("seed", _S_INIT))
+        if saved_seed != _S_INIT:
+            raise ValueError("AutoLR Mechanic checkpoint has an unsafe/noncanonical seed")
+        self._scale = scale
+        self._fuse_rel = fuse_rel
+        self._d0 = d0
+        self._seed = _S_INIT
+        self._r = [float(value) for value in blob["r"]]
+        self._m = [float(value) for value in blob["m"]]
+        self._v = [float(value) for value in blob["v"]]
+        self._s = [float(value) for value in blob["s"]]
+        self._x0 = {
+            p: value.to(device=p.device, dtype=p.dtype).clone()
+            for p, value in zip(params, saved_x0, strict=True)
+            if value is not None
+        }
+        self._delta = {
+            p: value.to(device=p.device, dtype=torch.float32).clone()
+            for p, value in zip(params, saved_delta, strict=True)
+            if value is not None
+        }
+        if self._x0.keys() != self._delta.keys():
+            raise ValueError("AutoLR Mechanic checkpoint anchor/trajectory state differs")
+        self._t = step
+        self._last_h = last_h
+        self._nonfinite_steps = nonfinite_steps
         self._nonfinite_warned = bool(blob.get("nonfinite_warned", False))
-        self._level_base = [float(value) for value in blob.get("level_base", [])]
-        self._level_window = [float(value) for value in blob.get("level_window", [])]
-        self.frozen = bool(blob.get("frozen", False))
-        self.frozen_lr = blob.get("frozen_lr")
-        self.freeze_reason = blob.get("freeze_reason")
-        if isinstance(blob.get("probe"), dict) and not self.frozen:
-            # A 0.7.3 loss-probe checkpoint may contain parameters and optimizer
-            # moments from a half-finished ladder rung.  Discard that trial and
-            # restart autonomous discovery from its exact pre-probe snapshot.
-            with torch.no_grad():
-                for param, reference in self._x0.items():
-                    param.copy_(reference)
-            self.opt._autolr_reset_base_state()  # type: ignore[attr-defined]
-            self.S = self._seed if self._seed is not None else self.S
-            self._v = _EPS
-            self._rbar = 0.0
-            self._t = 0
-            self._gema = None
-            self._edge = None
-            self._contacts = 0
-            self._nan_run = 0
-            self._nonfinite_backed_off = False
-            self._nonfinite_warned = False
-            self._level_base = []
-            self._level_window = []
-        if self.frozen:
-            for group in self.opt.param_groups:
-                group["lr"] = self.frozen_lr
+        self.S = self._applied_scale()
+        self._set_group_lr(self.S)
 
 
 class AutoLRMixin:
-    """Attach autonomous AutoLR to a Kaon optimizer with shared plumbing."""
+    """Attach continuous Mechanic AutoLR to a Kaon optimizer."""
 
     _autolr: AutoLRTuner | None
 
@@ -498,19 +446,15 @@ class AutoLRMixin:
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
-        tuner = self._autolr
-        if tuner is not None:
-            if not tuner.frozen:
-                return tuner.step(closure)
-            for group in self.param_groups:  # type: ignore[attr-defined]
-                group["lr"] = tuner.frozen_lr
+        if self._autolr is not None:
+            return self._autolr.step(closure)
         return self._step_impl(closure)
 
     def _step_impl(self, closure: Any = None) -> Any:
         raise NotImplementedError("optimizer using AutoLRMixin must provide _step_impl")
 
     def _autolr_reset_base_state(self) -> None:
-        """Reset base state after rollback; fused hosts also invalidate caches."""
+        """Legacy host hook retained for external subclasses; Mechanic does not rollback."""
         self.state.clear()  # type: ignore[attr-defined]
 
     def get_d(self) -> float:
@@ -519,12 +463,19 @@ class AutoLRMixin:
         return float(self.param_groups[0]["lr"])  # type: ignore[attr-defined]
 
     def report_loss(self, loss: Any) -> None:
-        """Deprecated compatibility no-op when AutoLR is enabled."""
         if self._autolr is not None:
             self._autolr.report_loss(loss)
 
     def is_frozen(self) -> bool:
-        return self._autolr is not None and self._autolr.frozen
+        return False
+
+    def state_dict(self) -> dict[str, Any]:
+        """Serialize both the host optimizer and autonomous controller state."""
+        return self._autolr_state_dict(super().state_dict())  # type: ignore[misc]
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore both the host optimizer and autonomous controller state."""
+        self._autolr_load(state_dict, super().load_state_dict)  # type: ignore[misc]
 
     def _autolr_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         if self._autolr is not None:
@@ -537,3 +488,6 @@ class AutoLRMixin:
         inner_load(copied)
         if self._autolr is not None and blob is not None:
             self._autolr.load_blob(blob)
+        after_load = getattr(self, "_autolr_after_load", None)
+        if after_load is not None:
+            after_load()

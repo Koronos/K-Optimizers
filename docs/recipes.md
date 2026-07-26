@@ -148,16 +148,18 @@ from kaon import Adakaon
 opt = Adakaon(model.parameters(), auto_lr=True, bf16_method="stochastic_rounding")
 ```
 
-A low-VRAM DoWG controller chooses a conservative dynamic step size directly from
-optimizer updates and gradient norms. It needs neither `report_loss()` nor a closure
-or trainer-side range test. On a stability contact it rolls back and reinitializes the
-base state; it then freezes after a confirming contact, the conservative fuse, or its
-bounded discovery budget. This is a robust starting-point mechanism, **not** a universal
-estimator of the globally optimal LR.
+A Mechanic controller continuously adapts the step size from an explicitly stored
+anchored parameter trajectory and gradients. It needs neither `report_loss()` nor a closure,
+trainer-side range test, scheduler, contact detector, or fixed discovery budget.
+This is an autonomous optimizer mechanism, **not** a universal estimator of the
+globally optimal LR.
 
-**Use:** `auto_lr_scale` adjusts the discovered scale only when you have a deliberate
-domain prior; `auto_lr_d0` supplies an explicit positive seed; `auto_lr_fuse_rel`
-sets the safety ceiling. → [docs/autolr.md](autolr.md).
+The bf16-safe trajectory costs about 6 B per trainable parameter (native-dtype
+anchor + fp32 displacement), plus one temporary fp32 trajectory during `step()`.
+
+**Use:** leave all AutoLR controls at their defaults. `auto_lr_scale` remains an
+explicit multiplier; legacy `auto_lr_d0` is ignored and `auto_lr_fuse_rel` is kept
+only for source compatibility. → [docs/autolr.md](autolr.md).
 
 ---
 

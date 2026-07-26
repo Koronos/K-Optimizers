@@ -430,7 +430,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
                 raise RuntimeError("AdaPNM(fused=True) requires Triton (a GPU-only optional dependency)")
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
-        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
+        # Composable parameter-free LR (continuous Mechanic) via AutoLRMixin. off -> zero overhead.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     def _invalidate_fused_caches(self) -> None:

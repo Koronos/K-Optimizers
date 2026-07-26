@@ -284,7 +284,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
         # One momentum codec per dtype string (stateless beyond the dtype).
         self._codecs: dict[str, _MomentumCodec] = {}
 
-        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
+        # Composable parameter-free LR (continuous Mechanic) via AutoLRMixin. off -> zero overhead.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     def _codec(self, group: dict[str, Any]) -> _MomentumCodec:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import os
+import shutil
 
 import pytest
 import torch
@@ -242,6 +244,8 @@ def test_invalid_args_rejected(kwargs, match):
 def test_compile_step_matches_eager():
     """``compile=True`` produces a numerically equivalent update and stays finite."""
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if dev == "cpu" and os.name == "nt" and shutil.which("cl") is None:
+        pytest.skip("torch.compile CPU on Windows requires the MSVC cl compiler")
     torch.manual_seed(0)
     ps0 = [torch.randn(16, 24, device=dev) for _ in range(3)]
     gs = [torch.randn(16, 24, device=dev) * 0.1 for _ in range(3)]

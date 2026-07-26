@@ -40,12 +40,13 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   train at `lr=1.0` and the optimizer finds the effective LR itself. Matches
   reference Prodigy bit-for-bit at its defaults, then adds the kaon memory
   toolkit. → [docs/kprodigy.md](docs/kprodigy.md)
-- **`auto_lr=True`** — an autonomous, low-VRAM DoWG step-size controller available
+- **`auto_lr=True`** — an autonomous Mechanic step-size controller available
   on Kaon optimizers, e.g. `Adakaon(auto_lr=True)`. It observes only optimizer
   state and gradients: no trainer callback, loss reporting, closure, or LR sweep is
-  required. It grows conservatively until a stability contact, rolls back safely,
-  then freezes to a fixed LR. The fuse is a conservative safety ceiling, not a
-  claim to identify the universal optimal LR. → [docs/autolr.md](docs/autolr.md)
+  required. Six discounted bettors continuously adapt an anchored trajectory with
+  no probe horizon, contact detector, or trainer decision. Its exact bf16-safe
+  trajectory costs ~6 B per trainable parameter; see the memory contract.
+  → [docs/autolr.md](docs/autolr.md)
 
 `Adakaon`, `AdaMuon`, and `Lion` are standard `torch.optim.Optimizer`s that work
 one-parameter-at-a-time, so they drop into per-parameter / gradient-release
@@ -112,8 +113,7 @@ opt = KProdigy(model.parameters(), lr=1.0, momentum_dtype="bfloat16")
 from kaon import Adakaon
 
 # Autonomous step-size discovery: no report_loss(), closure, or trainer policy.
-# It begins from a conservative data-relative scale, rolls back at a stability
-# contact, and freezes no later than its safety budget/fuse.
+# It begins from a fixed low seed and adapts continuously without a probe horizon.
 opt = Adakaon(
     model.parameters(),
     auto_lr=True,
@@ -167,7 +167,7 @@ KProdigy([{"params": unet.parameters(), "lr": 1.0},
 # Parameter-free AND minimum VRAM (~1.3 B/param on the SDXL UNet):
 KProdigy(model.parameters(), lr=1.0, second_moment="factored", momentum_dtype="int8", slice_p=11)
 
-# Autonomous DoWG step-size discovery with a conservative fuse:
+# Autonomous continuous Mechanic step-size adaptation:
 Adakaon(model.parameters(), auto_lr=True, bf16_method="stochastic_rounding")
 ```
 
@@ -180,8 +180,8 @@ a 1434-adapter SDXL UNet. See [docs/foreach-batching.md](docs/foreach-batching.m
   benchmark that justifies it** (numbers + links + how to reproduce).
 - [docs/adakaon.md](docs/adakaon.md) — Adakaon design, validated results,
   full API.
-- [docs/autolr.md](docs/autolr.md) — autonomous DoWG step-size discovery,
-  safety contacts, fuse, checkpointing, and API.
+- [docs/autolr.md](docs/autolr.md) — continuous Mechanic adaptation,
+  Nekaon true/live composition, checkpointing, and API.
 - [docs/kprodigy.md](docs/kprodigy.md) — memory-efficient Prodigy design + API.
 - [docs/lion.md](docs/lion.md) — Lion (sign-momentum) design, the
   betas loss↔generalization dial, memory, and the proxy evaluation.

@@ -286,7 +286,7 @@ class Adakaon(AutoLRMixin, Optimizer):
                 raise RuntimeError("Adakaon(fused=True) requires Triton (a GPU-only optional dependency)")
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
-        # Optional autonomous DoWG step-size controller. It owns group["lr"] while
+        # Optional continuous Mechanic step-size controller. It owns group["lr"] while
         # adapting and drives the base update through _step_impl.
         # Off (default) -> zero overhead, step == _step_impl.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
@@ -334,7 +334,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         if is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
 
-    # step() is the AutoLRMixin router (drives the DoWG tuner when auto_lr is on, else
+    # step() is the AutoLRMixin router (drives Mechanic when auto_lr is on, else
     # calls _step_impl); it also re-imposes the frozen LR each step vs a harness clobber.
     @torch.no_grad()
     def _step_impl(self, closure: Any = None) -> Any:
@@ -739,7 +739,9 @@ class Adakaon(AutoLRMixin, Optimizer):
 
     def state_dict(self) -> dict[str, Any]:
         """Base state + the auto_lr tuner blob (via AutoLRMixin) when auto_lr is on."""
-        return self._autolr_state_dict(super().state_dict())
+        state_dict = self._autolr_state_dict(super().state_dict())
+        state_dict["_adakaon_meta"] = {"fused_step": self._t}
+        return state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized first moment's stored dtype.
@@ -749,7 +751,13 @@ class Adakaon(AutoLRMixin, Optimizer):
         on resume — losing the memory the codec was chosen to save. Delegate to the
         preserving helper; the auto_lr tuner blob is peeled off first by AutoLRMixin.
         """
-        self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
+        copied = dict(state_dict)
+        meta = copied.pop("_adakaon_meta", {})
+        fused_step = int(meta.get("fused_step", 0))
+        if fused_step < 0:
+            raise ValueError("Adakaon checkpoint has an invalid fused step counter")
+        self._autolr_load(copied, lambda sd: load_state_dict_preserving_dtypes(self, sd))
+        self._t = fused_step
         self._invalidate_fused_caches()
 
     # ----------------------------------------------------------------- foreach

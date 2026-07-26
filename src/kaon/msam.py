@@ -129,6 +129,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._axpy_cache: dict[str, Any] | None = None  # Triton 4bit fast-path pointer arrays
         self._axpy_seed = 0                             # SR seed counter for the fused axpy
         self._eclamp: dict[int, float] = {}             # per-group climb bound, frozen per cycle
+        self._e_scale = 1.0                             # exact scale frozen with the live climb
 
     # ------------------------------------------------------------- perturbation
     def _momentum_owner(self) -> Any:
@@ -199,7 +200,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         return 0.0 if sq is None else float(sq.sqrt())
 
     @torch.no_grad()
-    def _apply(self, sign: float) -> None:
+    def _apply(self, sign: float, scale: float | None = None) -> None:
         """Add ``sign * rho * m / ||m||`` to every weight (bf16-correct write), bucketed.
 
         ``norm="global"`` uses the cached cross-param norm (one radius for the net);
@@ -210,18 +211,25 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         the dominant perturbation cost at 4 bits; ``_axpy_4bit_batched`` does dequant +
         bf16-SR axpy in ONE launch per bucket (measured ~4.4 ms/step -> sub-ms on the
         C=128 proxy). Ineligible params (non-contiguous, exotic dtype) fall back here."""
-        leftover = self._apply_fused_4bit(sign) if self.norm == "none" else None
+        if sign > 0.0 and scale is not None:
+            self._e_scale = float(scale)
+        applied_scale = self._e_scale if scale is None else float(scale)
+        leftover = (
+            self._apply_fused_4bit(sign, applied_scale)
+            if self.norm == "none"
+            else None
+        )
         for plist, states, md, shape, group in (self._buckets() if leftover is None else leftover):
             m = CodecBuffer.read_stacked(states, "m", md, shape)  # [N, *shape] fp32
             n = m.shape[0]
             if self.norm == "global":
-                m.mul_(sign * self.rho / (self._mnorm + self.eps))
+                m.mul_(sign * self.rho * applied_scale / (self._mnorm + self.eps))
             elif self.norm == "tensor":  # per-tensor radius: rho * m_i / ||m_i|| per slice
                 norms = (m * m).reshape(n, -1).sum(dim=1).sqrt_()  # no .norm(): dot SIGFPEs here
-                scales = (sign * self.rho) / (norms + self.eps)
+                scales = (sign * self.rho * applied_scale) / (norms + self.eps)
                 m.mul_(scales.view(n, *([1] * (m.ndim - 1))))
             else:  # "none": raw momentum — rho is a lookahead in OPTIMIZER-STEP units
-                m.mul_(sign * self.rho)
+                m.mul_(sign * self.rho * applied_scale)
                 bound = self._climb_bound(group, sign)
                 # NaN passes through clamp(): a non-finite momentum coordinate (e.g. a
                 # 0*inf from a blown 4-bit block scale) must contribute ZERO climb, never
@@ -235,7 +243,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                     add_stochastic_(p.data, m_i, alpha=1.0)
 
     @torch.no_grad()
-    def _apply_fused_4bit(self, sign: float):
+    def _apply_fused_4bit(self, sign: float, scale: float):
         """Triton fast path for the ``norm="none"`` 4-bit perturbation.
 
         Returns the list of torch-path leftover buckets, or ``None`` if Triton is
@@ -264,7 +272,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 leftover[(shape, md, id(group))] = (plist, states, md, shape, group)
         ids = tuple(id(st["m"]) for _k, (_lp, ls, _g) in sorted(eligible.items(), key=lambda kv: kv[0][0]) for st in ls)
         cache = self._axpy_cache
-        if cache is None or cache["ids"] != ids:
+        if cache is None or cache["ids"] != ids or cache["scale"] != scale:
             buckets = []
             for (n, dtype, block, _gid), (plist, states, group) in eligible.items():
                 dev = plist[0].device
@@ -279,9 +287,9 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                     # swaps must subtract the SAME clamped e even if a scheduler moved lr.
                     bound=self._climb_bound(group, sign),
                 ))
-            cache = self._axpy_cache = {"ids": ids, "buckets": buckets}
+            cache = self._axpy_cache = {"ids": ids, "scale": scale, "buckets": buckets}
         self._axpy_seed += 1
-        alpha = sign * self.rho
+        alpha = sign * self.rho * scale
         for bk in cache["buckets"]:
             ft._axpy_4bit_batched[(bk["N"] * bk["K"],)](
                 bk["p_addr"], bk["pk_addr"], bk["sc_addr"], alpha, bk["bound"], bk["n"], bk["K"],
@@ -308,7 +316,45 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             self.inner.train()
         if not self._train_mode and self._has_e:
             self._apply(+1.0)
+        elif not self._train_mode:
+            # A checkpoint is saved in eval/true view and cannot serialize an
+            # already-applied climb. Rebuild it from the restored momentum.
+            # Nekaon+AutoLR must use the restored Mechanic scale, while plain
+            # MSAM keeps its normal unit scale.
+            tuner = getattr(self, "_autolr", None)
+            scale = tuner.get_d() if tuner is not None else 1.0
+            self._autolr_restore_live(scale)
         self._train_mode = True
+
+    # --------------------------------------------------------- AutoLR live view
+    def _autolr_prepare_true(self) -> None:
+        """Remove the exact previous live climb before Mechanic reads its anchor."""
+        if self._has_e:
+            self._apply(-1.0)
+            self._has_e = False
+        self._eclamp.clear()
+        self._axpy_cache = None
+
+    def _autolr_after_virtual_step(self) -> None:
+        """Remove the unit-scale climb created by the virtual inner step."""
+        if self._has_e:
+            self._apply(-1.0)
+            self._has_e = False
+        self._eclamp.clear()
+        self._axpy_cache = None
+
+    def _autolr_restore_live(self, scale: float) -> None:
+        """Rebuild the live view with the exact scale used for the true iterate."""
+        if self.rho == 0.0:
+            return
+        if self.norm == "global":
+            self._mnorm = self._global_mnorm()
+            climb = self._mnorm > 0.0
+        else:
+            climb = bool(self._momentum_params())
+        if climb:
+            self._apply(+1.0, scale=scale)
+            self._has_e = True
 
     # ------------------------------------------------------------------- probe
     @torch.no_grad()
@@ -399,23 +445,47 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             else:  # tensor/none scale per slice inside _apply (zero-m slices no-op)
                 climb = bool(self._momentum_params())
             if climb:
-                self._apply(+1.0)
+                self._apply(+1.0, scale=1.0)
                 self._has_e = True
         if _PROBE_LOG:
             self._probe("CLIMB")
         return loss
 
     # -------------------------------------------------------------- state_dict
+    def state_dict(self) -> dict[str, Any]:
+        state_dict = super().state_dict()
+        state_dict["_msam_meta"] = {"axpy_seed": self._axpy_seed}
+        return state_dict
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore the inner base optimizer (dtype-preserving — every kaon optimizer's own
         ``load_state_dict`` already delegates to the preserving helper; a wrapped wrapper
         restores its own buffers too). MSAM itself keeps no persistent per-param state
         (the perturbation is recomputed from momentum). Checkpoints must be saved in eval
         mode (unperturbed weights)."""
-        self._load_wrapped(state_dict, lambda inner, sd: inner.load_state_dict(sd))
+        copied = dict(state_dict)
+        meta = copied.pop("_msam_meta", {})
+        axpy_seed = int(meta.get("axpy_seed", 0))
+        if axpy_seed < 0:
+            raise ValueError("MSAM checkpoint has an invalid fused stochastic-rounding seed")
+        self._load_wrapped(copied, lambda inner, sd: inner.load_state_dict(sd))
         self.base_optimizer = self.inner
-        self._train_mode = True
+        # Checkpoints are required to contain the eval/true weights. Stay in
+        # that view after loading so the caller's normal train() transition can
+        # reconstruct the live perturbation before the first forward pass.
+        self._train_mode = False
         self._has_e = False
         self._mnorm = 0.0
         self._eclamp.clear()
         self._axpy_cache = None
+        self._axpy_seed = axpy_seed
+        self._e_scale = 1.0
+        # Plain MSAM has all information needed now. Nekaon+AutoLR waits until
+        # its controller blob has restored the exact scale, then the mixin calls
+        # _autolr_after_load below.
+        if getattr(self, "_autolr", None) is None:
+            self.train()
+
+    def _autolr_after_load(self) -> None:
+        """Restore the live view after the mixin has loaded the exact controller scale."""
+        self.train()
