@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.6]
+
 ### Safety
 - Quarantined `auto_lr=True` after real-training and proxy failures showed that
   gradient/trajectory-only controllers can silently overshoot a workload's safe
