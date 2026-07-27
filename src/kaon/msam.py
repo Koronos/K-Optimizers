@@ -319,32 +319,11 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         elif not self._train_mode:
             # A checkpoint is saved in eval/true view and cannot serialize an
             # already-applied climb. Rebuild it from the restored momentum.
-            # Nekaon+AutoLR must use the restored Mechanic scale, while plain
-            # MSAM keeps its normal unit scale.
-            tuner = getattr(self, "_autolr", None)
-            scale = tuner.get_d() if tuner is not None else 1.0
-            self._autolr_restore_live(scale)
+            self._restore_live_view()
         self._train_mode = True
 
-    # --------------------------------------------------------- AutoLR live view
-    def _autolr_prepare_true(self) -> None:
-        """Remove the exact previous live climb before Mechanic reads its anchor."""
-        if self._has_e:
-            self._apply(-1.0)
-            self._has_e = False
-        self._eclamp.clear()
-        self._axpy_cache = None
-
-    def _autolr_after_virtual_step(self) -> None:
-        """Remove the unit-scale climb created by the virtual inner step."""
-        if self._has_e:
-            self._apply(-1.0)
-            self._has_e = False
-        self._eclamp.clear()
-        self._axpy_cache = None
-
-    def _autolr_restore_live(self, scale: float) -> None:
-        """Rebuild the live view with the exact scale used for the true iterate."""
+    def _restore_live_view(self) -> None:
+        """Rebuild the ordinary unit-scale live view after loading a checkpoint."""
         if self.rho == 0.0:
             return
         if self.norm == "global":
@@ -353,7 +332,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         else:
             climb = bool(self._momentum_params())
         if climb:
-            self._apply(+1.0, scale=scale)
+            self._apply(+1.0, scale=1.0)
             self._has_e = True
 
     # ------------------------------------------------------------------- probe
@@ -480,12 +459,4 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._axpy_cache = None
         self._axpy_seed = axpy_seed
         self._e_scale = 1.0
-        # Plain MSAM has all information needed now. Nekaon+AutoLR waits until
-        # its controller blob has restored the exact scale, then the mixin calls
-        # _autolr_after_load below.
-        if getattr(self, "_autolr", None) is None:
-            self.train()
-
-    def _autolr_after_load(self) -> None:
-        """Restore the live view after the mixin has loaded the exact controller scale."""
         self.train()

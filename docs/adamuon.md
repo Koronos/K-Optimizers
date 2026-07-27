@@ -180,13 +180,13 @@ seed, LR swept per arm, held-out val MSE). Not real SDXL/Flux — a first signal
 
 ## Follow-ups (not in v1)
 
-- Evaluate autonomous `auto_lr=True` on this optimizer for workloads where a
-  conservative dynamic step size is preferable to trainer-managed LR policy.
+- Revisit automatic step-size control only after a model-agnostic safety signal
+  is validated on real fine-tuning workloads; the current AutoLR is quarantined.
 
 ## See also
 
 - [muon.md](muon.md) — the simpler heavy-ball Muon hybrid this builds on.
 - [adakaon.md](adakaon.md), [kprodigy.md](kprodigy.md),
-  [autolr.md](autolr.md), [foreach-batching.md](foreach-batching.md),
+  [foreach-batching.md](foreach-batching.md),
   [momentum.md](momentum.md).
 ```

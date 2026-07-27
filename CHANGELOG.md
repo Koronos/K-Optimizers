@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Safety
+- Quarantined `auto_lr=True` after real-training and proxy failures showed that
+  gradient/trajectory-only controllers can silently overshoot a workload's safe
+  learning rate. Enabling it now raises before the first optimizer step.
+- Retained the constructor arguments temporarily for a clear migration error.
+  `auto_lr=False` has no extra state or step overhead, and legacy checkpoints
+  load their base optimizer state while discarding the retired AutoLR blob.
+- Moved the DoWG, range-test, Mechanic, LR-servo, MoMo/AdamG and NGN-MDv1
+  investigations to `docs/EXPERIMENTS_GRAVEYARD.md`; none is advertised as a
+  production learning-rate solution.
+
 ## [0.7.5]
 
 ### Changed

@@ -122,8 +122,6 @@ def train(make, lr, *, schedule, seq, seed, data, tr, te, ac, channels, bs, n, c
         opt.zero_grad()
         loss = H.batch_loss(net, data[Rr], torch.tensor(idx, device=DEV), ac, g)
         loss.backward()
-        if hasattr(opt, "report_loss"):
-            opt.report_loss(loss)  # kaon auto_lr: mirrors renga — enables the loss-driven probe
         opt.step()
         if it >= warm:
             timed += 1

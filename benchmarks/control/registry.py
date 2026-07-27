@@ -72,16 +72,6 @@ OPTIMIZERS = {
         lr=6e-4, lr_const=1.2e-3, family="in-house",
         blurb="factored Adam, no momentum (minimum VRAM, regularizing)",
     ),
-    # auto_lr twin of Adakaon-nomom: SAME config + composable parameter-free LR (update-space
-    # DoWG, auto_lr=True). The base lr is IGNORED (the tuner owns the scale, imposed each step),
-    # so it discovers seed-independently and freezes itself at the stability edge; auto_lr *is* the
-    # schedule-finder, so it ignores any external LR schedule (the REX-scheduled scenario just
-    # runs at the discovered constant). Read on the continuity dimension.
-    "Adakaon-nomom (auto_lr)": dict(
-        make=lambda p, lr: Adakaon(p, betas=(0.0, 0.999), cautious=False, momentum_dtype="bfloat16", auto_lr=True),
-        lr=6e-4, lr_const=1.2e-3, family="in-house",
-        blurb="Adakaon-nomom + auto_lr (update-space DoWG) — discovers the LR itself, no tuning",
-    ),
     "Adakaon-bf16": dict(
         make=lambda p, lr: Adakaon(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16"),
         lr=1.2e-3, lr_const=1.2e-3, family="in-house",

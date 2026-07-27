@@ -164,8 +164,8 @@ def _run_parity(shapes, dtype, mdtype, *, cautious=True, gc=True, wd=0.0, steps=
     return d, scale, ov
 
 
-def test_autolr_resets_rebuild_caches_and_preserve_native_parity():
-    """Two AutoLR contacts must not leave pointer arrays targeting discarded state."""
+def test_internal_resets_rebuild_caches_and_preserve_native_parity():
+    """Internal state resets must not retain pointer arrays to discarded state."""
     pv = _bag([(8, 16), (32,)], torch.float32, seed=31)
     pn = _clone(pv)
     cfg = dict(lr=2e-3, momentum_dtype="float32", cautious=False,

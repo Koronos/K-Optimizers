@@ -40,13 +40,10 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   train at `lr=1.0` and the optimizer finds the effective LR itself. Matches
   reference Prodigy bit-for-bit at its defaults, then adds the kaon memory
   toolkit. → [docs/kprodigy.md](docs/kprodigy.md)
-- **`auto_lr=True`** — an autonomous Mechanic step-size controller available
-  on Kaon optimizers, e.g. `Adakaon(auto_lr=True)`. It observes only optimizer
-  state and gradients: no trainer callback, loss reporting, closure, or LR sweep is
-  required. Six discounted bettors continuously adapt an anchored trajectory with
-  no probe horizon, contact detector, or trainer decision. Its exact bf16-safe
-  trajectory costs ~6 B per trainable parameter; see the memory contract.
-  → [docs/autolr.md](docs/autolr.md)
+- **AutoLR is quarantined.** `auto_lr=True` now fails before training because the
+  experimental controllers could silently overshoot the safe LR. Use an explicit
+  `lr`; the measurements and rejected designs remain in the
+  [experiments graveyard](docs/EXPERIMENTS_GRAVEYARD.md).
 
 `Adakaon`, `AdaMuon`, and `Lion` are standard `torch.optim.Optimizer`s that work
 one-parameter-at-a-time, so they drop into per-parameter / gradient-release
@@ -109,18 +106,6 @@ from kaon import KProdigy
 opt = KProdigy(model.parameters(), lr=1.0, momentum_dtype="bfloat16")
 ```
 
-```python
-from kaon import Adakaon
-
-# Autonomous step-size discovery: no report_loss(), closure, or trainer policy.
-# It begins from a fixed low seed and adapts continuously without a probe horizon.
-opt = Adakaon(
-    model.parameters(),
-    auto_lr=True,
-    bf16_method="stochastic_rounding",
-)
-```
-
 ## Recipes
 
 Each line below is a **complete call** — paste it, swap in your `model.parameters()`, and
@@ -158,7 +143,7 @@ Adakaon(model.parameters(), lr=1e-4, betas=(0.9, 0.999), momentum_dtype="int8")
 **Parameter-free (no LR to tune):**
 
 ```python
-from kaon import KProdigy, Adakaon
+from kaon import KProdigy
 
 # Prodigy D-adaptation; one LR for SDXL UNet + text-encoder (each gets its own D):
 KProdigy([{"params": unet.parameters(), "lr": 1.0},
@@ -167,8 +152,6 @@ KProdigy([{"params": unet.parameters(), "lr": 1.0},
 # Parameter-free AND minimum VRAM (~1.3 B/param on the SDXL UNet):
 KProdigy(model.parameters(), lr=1.0, second_moment="factored", momentum_dtype="int8", slice_p=11)
 
-# Autonomous continuous Mechanic step-size adaptation:
-Adakaon(model.parameters(), auto_lr=True, bf16_method="stochastic_rounding")
 ```
 
 `foreach=True` (the default) batches many-small-tensor (LoRA/LoKr) steps — **318 ms → 15 ms** on
@@ -180,8 +163,7 @@ a 1434-adapter SDXL UNet. See [docs/foreach-batching.md](docs/foreach-batching.m
   benchmark that justifies it** (numbers + links + how to reproduce).
 - [docs/adakaon.md](docs/adakaon.md) — Adakaon design, validated results,
   full API.
-- [docs/autolr.md](docs/autolr.md) — continuous Mechanic adaptation,
-  Nekaon true/live composition, checkpointing, and API.
+- [docs/autolr.md](docs/autolr.md) — AutoLR quarantine and migration guidance.
 - [docs/kprodigy.md](docs/kprodigy.md) — memory-efficient Prodigy design + API.
 - [docs/lion.md](docs/lion.md) — Lion (sign-momentum) design, the
   betas loss↔generalization dial, memory, and the proxy evaluation.

@@ -140,26 +140,11 @@ shrink the rest.
 **Evidence:** **≈1.3 B/param** on the SDXL UNet shape distribution (vs reference Prodigy's four
 fp32 buffers); D trajectory unchanged. → [docs/kprodigy.md](kprodigy.md).
 
-### Autonomous step-size discovery (no trainer LR policy)
+### Automatic step-size discovery
 
-```python
-from kaon import Adakaon
-
-opt = Adakaon(model.parameters(), auto_lr=True, bf16_method="stochastic_rounding")
-```
-
-A Mechanic controller continuously adapts the step size from an explicitly stored
-anchored parameter trajectory and gradients. It needs neither `report_loss()` nor a closure,
-trainer-side range test, scheduler, contact detector, or fixed discovery budget.
-This is an autonomous optimizer mechanism, **not** a universal estimator of the
-globally optimal LR.
-
-The bf16-safe trajectory costs about 6 B per trainable parameter (native-dtype
-anchor + fp32 displacement), plus one temporary fp32 trajectory during `step()`.
-
-**Use:** leave all AutoLR controls at their defaults. `auto_lr_scale` remains an
-explicit multiplier; legacy `auto_lr_d0` is ignored and `auto_lr_fuse_rel` is kept
-only for source compatibility. → [docs/autolr.md](autolr.md).
+The shared `auto_lr=True` experiment is quarantined because it could silently
+overshoot and damage real fine-tuning runs. Use an explicit LR and see
+[autolr.md](autolr.md) for migration details.
 
 ---
 

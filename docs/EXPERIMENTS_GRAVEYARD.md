@@ -15,6 +15,42 @@
 
 Legend: ⛔ REJECTED (measured, no win) · ↩ SUPERSEDED (renamed/absorbed) · ⏸ PARKED (built or measured, pending decision/merge)
 
+## ⛔ QUARANTINED — automatic learning-rate campaign (2026-07-27)
+
+- **Shared `auto_lr=True` add-on (DoWG → loss range test → bounded DoWG → continuous
+  Mechanic)** — **removed from production use after a real destructive failure.** The
+  gradient-only ramp crossed the useful LR region gradually and burned an Anima/LoRA
+  run around step 100; moving baselines were cooked by the same trajectory they were
+  meant to police. Fixed-reference windows, rollback, contacts, a 192-step bound and
+  fuses made the mechanism more complicated without producing a model-agnostic safety
+  boundary. The later continuous Mechanic controller removed the arbitrary horizon and
+  survived broad synthetic sweeps, but required an exact anchor plus fp32 trajectory
+  (~6 B/trainable bf16 parameter) and did not consistently match tuned Adakaon/Nekaon.
+  **Production status:** `auto_lr=True` now raises during construction, before the first
+  step. `auto_lr=False` is unchanged. Legacy checkpoints discard only `_autolr` state.
+  Recoverable history: releases 0.5.0–0.7.5, `origin/worktree-auto-lr-mixin`, and commits
+  `32fcd22`, `e6a496f`, `08456e1`.
+- **Momentum LR servo / “adjuster”** — bounded multiplicative corrections from alignment
+  and momentum telemetry were safer than full discovery but did not produce consistent
+  quality gains across Adakaon, Nekaon and Lion. A small LR still remained small; noisy
+  signals could move an already-good LR away from its optimum. Branch:
+  `codex/lr-servo-momentum`.
+- **MoMo, AdamG and Mechanic add-on variants** — loss-aware or scale-adaptive addons were
+  implemented and exercised on the proxy, but either required trainer loss plumbing,
+  carried extra state, or failed to improve the loss/generalization frontier reliably.
+  Branch: `codex/autolr-momo-prototype`; benchmark and test artifacts remain in that
+  worktree rather than the production package.
+- **NGN-MDv1** — exact loss-aware reference was stable over a broad high-`c` range and
+  protected against overshoot, but could not grow from a too-low `c`. On the 32×32 UNet
+  proxy (128 steps, 3 seeds), best test loss was **0.21185** vs Nekaon **0.20843** and
+  Adakaon **0.19825**, while its reference state cost **8 B/parameter**. It is a useful
+  high-side stabilizer, not autonomous LR discovery. Branch: `codex/ngnm-prototype`.
+- **KProdigy as the answer to AutoLR** — Prodigy's one-way D-adaptation was robust when
+  started in its intended regime but did not solve arbitrary-scale discovery: too-low
+  seeds adapt slowly and the algorithm cannot safely infer a universal upper edge.
+  KProdigy remains available as a standalone explicitly selected optimizer; it is no
+  longer presented as validation of the shared AutoLR concept.
+
 > The candidates-v2 **winners were promoted to `main`** in commit `1879645` ("Promote 6 verified
 > candidate optimizers + wrapper mixins"): **AdaBelief, ScheduleFree, ADOPT, AdamP, Lookahead, SAM**.
 > Those are NOT in this graveyard — see "Already on main" at the bottom. Only the candidates that

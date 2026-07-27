@@ -1,79 +1,35 @@
-# AutoLR — continuous autonomous step size
+# AutoLR — quarantined
 
-`auto_lr=True` enables Kaon's built-in Mechanic controller on optimizers that use
-the shared AutoLR mixin, including Adakaon, Nekaon, Lion, and AdaPNM.
+`auto_lr=True` is disabled and raises `RuntimeError` during optimizer construction,
+before parameters or optimizer state can be modified.
+
+Kaon's DoWG, loss-range-test and continuous Mechanic implementations all passed
+useful synthetic checks, but none established a model-agnostic safety boundary.
+In real fine-tuning, the gradient-only controller could increase the LR gradually
+past the useful region and damage the model around step 100. Mechanic removed the
+fixed discovery horizon, but added roughly 6 bytes per trainable bf16 parameter
+and still did not reliably outperform a good fixed LR. A controller with a rare
+silent destructive failure is not an acceptable production feature.
+
+Use an explicit LR:
 
 ```python
-from kaon import Nekaon
+from kaon import Adakaon
 
-optimizer = Nekaon(model.parameters(), auto_lr=True)
+optimizer = Adakaon(model.parameters(), lr=1e-4)
 ```
 
-The trainer does not participate: there is no loss callback, closure requirement,
-LR sweep, scheduler, candidate list, or step budget. The optimizer starts from a
-fixed absolute low seed and continuously adapts one global step size from gradients and its
-anchored parameter trajectory using six discounted Mechanic bettors.
+The old arguments remain temporarily in optimizer signatures so existing
+configuration files receive an actionable error instead of silently changing
+behavior. `auto_lr=False` is the normal zero-overhead path.
 
-Unlike the retired 0.7.4 DoWG probe, the controller has no geometric ramp, contact
-detector, rollback phase, fuse, or arbitrary 192-step horizon. It remains adaptive;
-on the tested nonlinear proxies its scale settles near the useful fixed-LR region
-and can still respond if the training regime changes.
+Legacy checkpoints containing `_autolr` still load: Kaon discards only that
+retired controller blob and restores the base optimizer state. Resume with an
+explicit LR appropriate for the workload.
 
-## Memory and optimizer composition
-
-The persistent tensor overhead is one native-dtype anchor plus one fp32 normalized
-trajectory for every trainable parameter (about 6 B/parameter for bf16 weights, or
-8 B/parameter for fp32 weights). Steps use bounded working buffers for shape-compatible
-small tensors. A tensor larger than the internal batching budget takes an unstacked path,
-so batching never creates several full-size stacked copies of a large weight. The explicit
-fp32 trajectory is required for correctness:
-the safe `1e-6` seed is below one bf16 ULP for many weights, so reading displacement
-back from the materialized model would silently pin the controller at its seed.
-
-This cost applies only to parameters owned by the optimizer (for example, adapter
-weights in LoRA/LoKr), but it makes AutoLR inappropriate when its extra trajectory
-does not fit the training VRAM budget.
-
-Nekaon and MSAM keep a live lookahead view between steps. Their internal protocol
-removes the previous lookahead before Mechanic measures the true iterate, removes
-the virtual unit-scale lookahead after the base step, reconstructs the scaled true
-iterate, and reapplies a lookahead with exactly that same scale. This protocol is
-covered on native and fused/Triton paths.
-
-## Compatibility controls
-
-- `auto_lr=True` enables continuous Mechanic.
-- `auto_lr_scale` is an optional explicit multiplier; leave it at `1.0` for the
-  autonomous path.
-- `auto_lr_d0` is deprecated and ignored. High and low values produce the same
-  trajectory, so an old configuration cannot accidentally start hot.
-- `auto_lr_fuse_rel` is accepted for source compatibility but no longer caps or
-  freezes the controller.
-
-`optimizer.get_d()` returns the effective step size. `optimizer.is_frozen()` is
-always false because Mechanic is continuous.
-
-`optimizer.report_loss(loss)` remains a deprecated warning-once no-op and will be
-removed in 0.8.0.
-
-The controller assumes one replicated optimizer trajectory. Ordinary data-parallel
-training is compatible when gradients and parameters are synchronized before `step()`.
-Sharded optimizer/parameter schemes that give each rank only part of the global
-gradient-trajectory inner product need an explicit collective reduction and are not
-currently supported by AutoLR.
-
-## Checkpoints
-
-The public `AutoLRMixin.state_dict()` contract stores the anchor, fp32 trajectory, and all
-six bettor accumulators alongside the host optimizer state; custom hosts that override
-serialization must delegate through the mixin.
-A 0.7.5 Mechanic checkpoint resumes exactly, including Nekaon's first live
-forward/backward after returning from the required eval-view checkpoint. Checkpoints
-made by the retired 0.7.4 DoWG controller
-fail closed instead of guessing a migration between different algorithms; resume
-from an unadapted model checkpoint when switching controller generations.
-
-AutoLR is still an optimizer, not an oracle. No gradient-only method can identify a
-finite optimum on an unbounded linear objective. Release validation therefore uses
-paired nonlinear multi-seed batteries and real low-resolution training smokes,
-rather than a fixed number of discovery steps.
+The implementations and benchmark evidence remain recoverable from Git history
+and the research branches listed in
+[EXPERIMENTS_GRAVEYARD.md](EXPERIMENTS_GRAVEYARD.md). AutoLR should not return to
+production until a new design survives multi-seed proxy tests and real low-resolution
+fine-tuning, including deliberately low and high seeds, without a load-bearing
+step horizon, hidden LR range, or irreversible parameter damage.

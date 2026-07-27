@@ -79,7 +79,7 @@ diffusion specifically vs only LLMs? interaction with bf16 + LoRA?
   with the above.
 - **Schedule-free & parameter-free LR (Defazio schedule-free, Prodigy, AutoLR).**
   Kill the LR/scheduler babysitting — but re-tune their target toward generalization, not just
-  fast convergence (our autonomous `auto_lr=True` controller freezes to plain base operation).
+  fast convergence. Automatic LR controllers remain quarantined until they meet the same bar.
 - **Diffusion-specific loss/timestep handling baked into the optimizer or training:** min-SNR /
   sigmoid / soft-min-SNR weighting, mid-SNR emphasis (where the gap lives), immiscible/optimal-
   transport noise pairing, REPA-style representation alignment — do these reduce the gap?

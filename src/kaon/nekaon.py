@@ -170,17 +170,10 @@ class Nekaon(AutoLRMixin, MSAM):
             **adakaon_kwargs,
         )
         self.k = float(k)
-        if auto_lr and low_vram_above is not None:
-            raise ValueError(
-                "Nekaon(auto_lr=True) is incompatible with low_vram_above: auto_lr forces one "
-                "discovered LR on all groups each step, which would clobber the per-group "
-                "low-VRAM lr ratio. Use one or the other."
-            )
-        # Composable continuous Mechanic LR via AutoLRMixin. off -> zero overhead.
+        # Retired AutoLR compatibility gate. True fails before the first step.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
-    # step() is the AutoLRMixin router; _step_impl is the full Nekaon step (SAM declimb ->
-    # inner base -> climb). MSAM's hooks expose the true iterate to Mechanic.
+    # AutoLRMixin is now a pass-through compatibility router when disabled.
     def _step_impl(self, closure: Any = None) -> Any:
         return MSAM.step(self, closure)  # explicit: super() would hit AutoLRMixin.step (the router)
 
