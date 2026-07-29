@@ -94,21 +94,21 @@ training (the continuity scenario), where it keeps (rather than loses) its gener
   | int8 | 0.0806 | +0.0064 | 1.04 |
   | bfloat16 | 0.0806 | +0.0056 | 2.03 |
 * **Step time:** two extra perturbation passes per step; no extra forward/backward, no
-  global sync — and at the default 4-bit they run through a dedicated Triton kernel
-  (`_axpy_4bit_batched`: dequant + bf16-SR axpy in ONE launch per bucket; parity vs the
-  torch path 6e-8, measured perturbation cost 4.4 → 0.6 ms on the C=128 proxy). **Pass
+  global sync — and at the default 4-bit they run through the shared Triton momentum
+  kernel (`_axpy_momentum_batched`: dequant + bf16-SR axpy in one launch per bucket).
+  **Pass
   `fused=True` on GPU** to also run the inner Adakaon through its Triton kernels (same
-  math + state — parity ≤2.4e-7):
+  math + state). Large/conv 4-bit state now updates directly in-kernel with no fp32
+  momentum-sized temporary:
 
-  | regime (battery) | Nekaon (4bit) | Nekaon-fused (4bit) |
+  | regime (RTX 3000 Ada, cautious + GC) | Nekaon native (4bit) | Nekaon fused (4bit) |
   |---|---|---|
-  | 512-tiny-tensor LoRA bag | 7.73 ms | **1.48 ms** |
-  | C=128 UNet step | 18.0 ms | **15.8 ms** |
+  | 512-tiny-tensor LoRA bag | 52.77 ms | **0.63 ms** |
+  | large 512×512 bag | 42.74 ms | **5.39 ms** |
+  | large convolution bag | 27.38 ms | **3.83 ms** |
 
-  (For scale: Adakaon-bf16 measures ~14.3/3.9 ms in the same tables at 3.6× the memory.)
-  The remaining 4-bit residue is the inner native conv-path codec (quant/requant) —
-  unexercised further because on a real DiT step (GEMM-bound) the optimizer is <1% of
-  the iteration — vs SAM's +100%.
+  Standard 64/128-element 4-bit blocks take the direct route. Non-aligned custom
+  blocks retain the compatible fallback rather than silently changing codec semantics.
 
 ## Stability — the per-element climb bound
 

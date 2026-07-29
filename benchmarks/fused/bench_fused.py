@@ -89,9 +89,9 @@ def step_ms(opt: torch.optim.Optimizer, reps: int, warmup: int) -> float:
     return ts[len(ts) // 2]
 
 
-def build(cls, params, *, fused: bool, big_batched: bool | None):
+def build(cls, params, *, fused: bool, big_batched: bool | None, beta1: float = 0.9):
     """Construct an optimizer in the campaign's real config (cautious+gc+wd+bf16 momentum)."""
-    opt = cls(params, lr=1e-3, weight_decay=0.01, cautious=True,
+    opt = cls(params, lr=1e-3, betas=(beta1, 0.999), weight_decay=0.01, cautious=True,
               gradient_centralization=True, momentum_dtype="bfloat16", fused=fused)
     if fused and big_batched is not None and hasattr(opt, "_fused_big_batched"):
         opt._fused_big_batched = big_batched
@@ -113,6 +113,7 @@ def main() -> None:
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
     ap.add_argument("--reps", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument("--beta1", type=float, default=0.9)
     ap.add_argument("--force", action="store_true", help="run even if the GPU looks busy")
     A = ap.parse_args()
 
@@ -136,11 +137,11 @@ def main() -> None:
         cls = classes[name]
         for regime in regimes:
             # fresh bag per config so state alloc cost isn't shared/warmed across configs
-            nat = step_ms(build(cls, make_bag(regime, dtype), fused=False, big_batched=None),
+            nat = step_ms(build(cls, make_bag(regime, dtype), fused=False, big_batched=None, beta1=A.beta1),
                           A.reps, A.warmup)
-            fus = step_ms(build(cls, make_bag(regime, dtype), fused=True, big_batched=True),
+            fus = step_ms(build(cls, make_bag(regime, dtype), fused=True, big_batched=True, beta1=A.beta1),
                           A.reps, A.warmup)
-            o_nb = build(cls, make_bag(regime, dtype), fused=True, big_batched=False)
+            o_nb = build(cls, make_bag(regime, dtype), fused=True, big_batched=False, beta1=A.beta1)
             nobat = step_ms(o_nb, A.reps, A.warmup) if hasattr(o_nb, "_fused_big_batched") else float("nan")
             r1 = nat / fus if fus else float("nan")
             r2 = (nobat / fus) if (fus and nobat == nobat) else float("nan")

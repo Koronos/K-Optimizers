@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.7]
+
+### Performance
+- Expanded Adakaon's Triton backend across the full fine-tuning shape mix:
+  quantized 1-D state, convolutions, large matrices, and the momentum-free
+  `beta1=0` path now remain fused instead of falling back to Python/foreach.
+- Replaced large-tensor 4-bit dequantize/EMA/requantize temporaries with aligned
+  in-kernel block processing. Standard 64/128-element blocks allocate no
+  momentum-sized fp32 temporary; non-aligned custom blocks retain the compatible
+  fallback.
+- Cached large-tensor reduction buffers, pointer arrays and Nekaon/MSAM momentum
+  dispatch plans, while preserving invalidation on reset, load and late gradients.
+- Generalized Nekaon/MSAM's fused perturbation to fp32, bf16, int8 and 4-bit
+  momentum, avoiding per-parameter stochastic-rounding and dequantization calls.
+
+### Fixed
+- Kept int8/4-bit momentum buffer identities stable across requantization so
+  fused pointer caches cannot retain stale addresses.
+- Separated Triton buckets by parameter dtype; mixed fp32/bf16 parameter groups
+  no longer share an incompatible compile-time pointer interpretation.
+- Made odd-length 4-bit storage a tested framework contract: `ceil(n/2)` bytes,
+  correct final low nibble, and a canonical zero unused high nibble across native,
+  stacked and Triton implementations.
+
+### Validation
+- Added native/fused parity for Adakaon and Nekaon across bf16/int8/4-bit,
+  momentum-free steps, late gradients, convs and large/odd shapes.
+- Added a dedicated odd-length 4-bit contract battery spanning lengths 1–1025,
+  block sizes 1/7/64/128, individual/stacked codecs and 1-D/2-D/3-D EMA state.
+
 ## [0.7.6]
 
 ### Safety

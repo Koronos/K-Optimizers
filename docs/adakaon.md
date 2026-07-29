@@ -53,8 +53,16 @@ Adakaon(
     foreach=True,                       # multi-tensor batching (foreach-batching.md)
     foreach_batch_cutoff=2_000_000,     # weights bigger than this loop instead of stacking
     foreach_stack_budget=None,          # chunk memory cap (None = adaptive to free VRAM)
+    fused=False,                        # Triton GPU backend (recommended for CUDA fine-tuning)
 )
 ```
+
+With `fused=True`, fp32/bf16 parameters remain fused across LoRA matrices,
+biases/norms, convolutions and large full-finetune tensors. Standard 4-bit
+momentum blocks (64/128 elements) dequantize, update and requantize inside the
+chunked Triton kernel without allocating a momentum-sized fp32 temporary;
+non-aligned custom block sizes retain the compatible native-codec fallback.
+Odd element counts are supported by the shared nibble-storage contract.
 
 `Adakaon` is a standard `torch.optim.Optimizer` that works one parameter at a
 time, so it drops into per-parameter / gradient-release training loops unchanged.

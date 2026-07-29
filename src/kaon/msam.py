@@ -130,6 +130,15 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._axpy_seed = 0                             # SR seed counter for the fused axpy
         self._eclamp: dict[int, float] = {}             # per-group climb bound, frozen per cycle
         self._e_scale = 1.0                             # exact scale frozen with the live climb
+        # Param groups and state dictionaries are stable between checkpoint loads.
+        # Cache the momentum census/buckets so Nekaon's two perturbation passes do
+        # not rescan and regroup hundreds of adapters every step.  A late-gradient
+        # parameter changes owner-state size and invalidates the cache lazily.
+        self._momentum_cache_key: tuple[Any, ...] | None = None
+        self._momentum_cache: list[tuple[Tensor, dict[str, Any], str, dict[str, Any]]] = []
+        self._bucket_cache: list[
+            tuple[list[Tensor], list[dict[str, Any]], str, tuple[int, ...], dict[str, Any]]
+        ] | None = None
 
     # ------------------------------------------------------------- perturbation
     def _momentum_owner(self) -> Any:
@@ -143,15 +152,27 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
 
     def _momentum_params(self) -> list[tuple[Tensor, dict[str, Any], str, dict[str, Any]]]:
         """Every (param, inner_state, momentum_dtype, group) that has a momentum buffer."""
+        owner = self._momentum_owner()
+        owner_state = owner.state
+        key = (
+            id(owner_state),
+            len(owner_state),
+            tuple(len(group["params"]) for group in self.param_groups),
+        )
+        if key == self._momentum_cache_key:
+            return self._momentum_cache
         out = []
-        owner_state = self._momentum_owner().state
         for group in self.param_groups:
             md = group["momentum_dtype"]
             for p in group["params"]:
                 st = owner_state.get(p)
                 if st and "m" in st:
                     out.append((p, st, md, group))
-        return out
+        self._momentum_cache_key = key
+        self._momentum_cache = out
+        self._bucket_cache = None
+        self._axpy_cache = None
+        return self._momentum_cache
 
     def _buckets(self) -> list[tuple[list[Tensor], list[dict[str, Any]], str, tuple[int, ...], dict[str, Any]]]:
         """Group the momentum-carrying params by (shape, dtype, momentum_dtype, group) so
@@ -159,13 +180,20 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         (the per-param dequant x2 per step made the 512-tiny-tensor LoRA regime ~10x
         slower). Buckets never mix param groups: the per-element climb bound is a
         per-group quantity (it reads the group's lr / clip_threshold)."""
+        momentum = self._momentum_params()
+        if self._bucket_cache is not None:
+            return self._bucket_cache
         by_key: dict[tuple[Any, ...], tuple[list[Tensor], list[dict[str, Any]], dict[str, Any]]] = {}
-        for p, st, md, group in self._momentum_params():
+        for p, st, md, group in momentum:
             key = (tuple(p.shape), p.dtype, md, id(group))
             plist, states, _g = by_key.setdefault(key, ([], [], group))
             plist.append(p)
             states.append(st)
-        return [(plist, states, key[2], key[0], g) for key, (plist, states, g) in by_key.items()]
+        self._bucket_cache = [
+            (plist, states, key[2], key[0], g)
+            for key, (plist, states, g) in by_key.items()
+        ]
+        return self._bucket_cache
 
     def _climb_bound(self, group: dict[str, Any], sign: float) -> float:
         """Per-element cap on the climb: ``|e_i| <= |rho| * clip_threshold * lr``.
@@ -215,7 +243,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             self._e_scale = float(scale)
         applied_scale = self._e_scale if scale is None else float(scale)
         leftover = (
-            self._apply_fused_4bit(sign, applied_scale)
+            self._apply_fused(sign, applied_scale)
             if self.norm == "none"
             else None
         )
@@ -243,59 +271,85 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                     add_stochastic_(p.data, m_i, alpha=1.0)
 
     @torch.no_grad()
-    def _apply_fused_4bit(self, sign: float, scale: float):
-        """Triton fast path for the ``norm="none"`` 4-bit perturbation.
+    def _apply_fused(self, sign: float, scale: float):
+        """Triton fast path for a ``norm="none"`` momentum perturbation.
 
         Returns the list of torch-path leftover buckets, or ``None`` if Triton is
-        unavailable (caller then runs the full torch path). The packed/scale buffers are
-        REPLACED by every requant, so the pointer arrays are rebuilt whenever the buffer
-        ids change (they stay valid across one climb -> removal/eval/train cycle)."""
+        unavailable (caller then runs the full torch path). Momentum buffers are
+        requantized in place, so pointer arrays remain valid until state is reset."""
         try:
             import kaon._fused_triton as ft
             if not ft.HAS_TRITON:
                 return None
         except Exception:  # noqa: BLE001 — optional dependency; torch path is always correct
             return None
-        eligible: dict[tuple[int, Any, int, int], tuple[list[Tensor], list[dict[str, Any]], dict[str, Any]]] = {}
+        # Momentum storage has stable identity for the lifetime of optimizer
+        # state (all codecs requantize in place).  Reuse the complete dispatch
+        # plan until _momentum_params observes a state-size change or load resets
+        # the cache; this removes two O(parameter-count) pointer scans per step.
+        self._momentum_params()  # O(1) cache-key check; catches late-gradient state growth
+        cache = self._axpy_cache
+        if cache is not None and cache["scale"] == scale:
+            self._launch_fused(cache, sign, scale, ft)
+            return cache["leftover"]
+        eligible: dict[tuple[Any, ...], tuple[list[Tensor], list[dict[str, Any]], dict[str, Any]]] = {}
         leftover: dict[tuple[Any, ...], tuple[list[Tensor], list[dict[str, Any]], str, tuple[int, ...], dict[str, Any]]] = {}
         for plist, states, md, shape, group in self._buckets():
-            ok = md == "4bit" and all(
+            ok = md in ("float32", "bfloat16", "int8", "4bit") and all(
                 p.is_cuda and p.data.is_contiguous() and p.dtype in (torch.float32, torch.bfloat16)
                 for p in plist
             )
             if ok:
-                key = (plist[0].numel(), plist[0].dtype, states[0]["m_block"], id(group))
+                block = states[0].get("m_block", 1)
+                row_width = plist[0].numel() // plist[0].shape[0] if plist[0].ndim >= 2 else plist[0].numel()
+                key = (
+                    plist[0].numel(), plist[0].dtype, md, block, row_width, id(group)
+                )
                 lp, ls, _g = eligible.setdefault(key, ([], [], group))
                 lp.extend(plist)
                 ls.extend(states)
             else:
                 leftover[(shape, md, id(group))] = (plist, states, md, shape, group)
-        ids = tuple(id(st["m"]) for _k, (_lp, ls, _g) in sorted(eligible.items(), key=lambda kv: kv[0][0]) for st in ls)
-        cache = self._axpy_cache
-        if cache is None or cache["ids"] != ids or cache["scale"] != scale:
-            buckets = []
-            for (n, dtype, block, _gid), (plist, states, group) in eligible.items():
-                dev = plist[0].device
-                buckets.append(dict(
-                    p_addr=ft.ptr_array(plist, dev),
-                    pk_addr=ft.ptr_array([st["m"] for st in states], dev),
-                    sc_addr=ft.ptr_array([st["m_scale"] for st in states], dev),
-                    n=n, K=(n + 1023) // 1024, N=len(plist), block=block,
-                    lowp=dtype == torch.bfloat16,
-                    # frozen at climb time (cache rebuilds exactly once per climb — requant
-                    # replaces the m buffers, changing the ids): the removal/eval/train
-                    # swaps must subtract the SAME clamped e even if a scheduler moved lr.
-                    bound=self._climb_bound(group, sign),
-                ))
-            cache = self._axpy_cache = {"ids": ids, "scale": scale, "buckets": buckets}
+        buckets = []
+        for (n, dtype, md, block, row_width, _gid), (plist, states, group) in eligible.items():
+            dev = plist[0].device
+            mom = {
+                "float32": ft.MOM_FP32,
+                "bfloat16": ft.MOM_BF16,
+                "int8": ft.MOM_INT8,
+                "4bit": ft.MOM_4BIT,
+            }[md]
+            m_addr = ft.ptr_array([st["m"] for st in states], dev)
+            buckets.append(dict(
+                p_addr=ft.ptr_array(plist, dev),
+                m_addr=m_addr,
+                sc_addr=(
+                    ft.ptr_array([st["m_scale"] for st in states], dev)
+                    if md in ("int8", "4bit") else m_addr
+                ),
+                n=n, K=(n + 1023) // 1024, N=len(plist), block=block,
+                row_width=row_width, mom=mom, lowp=dtype == torch.bfloat16,
+                group=group,
+            ))
+        cache = self._axpy_cache = {
+            "scale": scale,
+            "buckets": buckets,
+            "leftover": list(leftover.values()),
+        }
+        self._launch_fused(cache, sign, scale, ft)
+        return cache["leftover"]
+
+    def _launch_fused(self, cache: dict[str, Any], sign: float, scale: float, ft: Any) -> None:
+        """Launch a cached fused perturbation plan."""
         self._axpy_seed += 1
         alpha = sign * self.rho * scale
         for bk in cache["buckets"]:
-            ft._axpy_4bit_batched[(bk["N"] * bk["K"],)](
-                bk["p_addr"], bk["pk_addr"], bk["sc_addr"], alpha, bk["bound"], bk["n"], bk["K"],
-                self._axpy_seed, FBLOCK=bk["block"], LOWP=bk["lowp"], SR=bk["lowp"], BLOCK=1024,
+            ft._axpy_momentum_batched[(bk["N"] * bk["K"],)](
+                bk["p_addr"], bk["m_addr"], bk["sc_addr"], alpha,
+                self._climb_bound(bk["group"], sign), bk["n"], bk["K"], bk["row_width"],
+                self._axpy_seed, MOM=bk["mom"], FBLOCK=bk["block"],
+                LOWP=bk["lowp"], SR=bk["lowp"], BLOCK=1024,
             )
-        return list(leftover.values())
 
     # --------------------------------------------------------------- train/eval
     @torch.no_grad()
@@ -459,4 +513,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._axpy_cache = None
         self._axpy_seed = axpy_seed
         self._e_scale = 1.0
+        self._momentum_cache_key = None
+        self._momentum_cache = []
+        self._bucket_cache = None
         self.train()

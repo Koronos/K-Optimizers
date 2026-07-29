@@ -304,7 +304,9 @@ class _Int8Codec(_MomentumCodec):
         m = state["m"].float() * state["m_scale"]                    # dequant
         m.lerp_(update, 1.0 - beta1)
         delta = m.clone()
-        state["m"], state["m_scale"] = _quant_int8(m)                # requant
+        q, scale = _quant_int8(m)                                    # requant
+        state["m"].copy_(q)
+        state["m_scale"].copy_(scale.reshape_as(state["m_scale"]))
         return delta
 
     def ema_stacked(
@@ -367,7 +369,8 @@ class _FourBitCodec(_MomentumCodec):
         m.lerp_(update, 1.0 - beta1)
         delta = m.clone()
         packed, scale, _ = _quant_4bit(m, bs)                        # requant
-        state["m"], state["m_scale"] = packed, scale
+        state["m"].copy_(packed)
+        state["m_scale"].copy_(scale)
         return delta
 
     def ema_stacked(

@@ -786,9 +786,9 @@ class AdaPNM(AutoLRMixin, Optimizer):
                 centralize_grads_(big)
             self._native_dispatch(big, group)
             return
-        by_shape: dict[tuple[int, int], list[Tensor]] = {}
+        by_shape: dict[tuple[tuple[int, ...], Any], list[Tensor]] = {}
         for p in big:
-            by_shape.setdefault(tuple(p.shape), []).append(p)
+            by_shape.setdefault((tuple(p.shape), p.dtype), []).append(p)
         for plist in by_shape.values():
             if len(plist) >= 2:
                 self._chunked_step_batched(plist, group, ft, c, pos_pref, neg_pref)
