@@ -118,10 +118,14 @@ class CodecBuffer:
         if dtype in ("bfloat16", "float32"):
             state[key].copy_(value_fp32.reshape(state[key].shape))
         elif dtype == "int8":
-            state[key], state[f"{key}_scale"] = _quant_int8(value_fp32.reshape(state[key].shape))
+            # In place: pointer caches over these buffers must never dangle (see adakaon requant).
+            q, sc = _quant_int8(value_fp32.reshape(state[key].shape))
+            state[key].copy_(q)
+            state[f"{key}_scale"].copy_(sc.reshape(state[f"{key}_scale"].shape))
         else:  # 4bit
             packed, scale, _ = _quant_4bit(value_fp32, state[f"{key}_block"])
-            state[key], state[f"{key}_scale"] = packed, scale
+            state[key].copy_(packed)
+            state[f"{key}_scale"].copy_(scale)
 
     @staticmethod
     def read_stacked(
@@ -159,7 +163,8 @@ class CodecBuffer:
             q, new_scale = _quant_int8_stacked(value_fp32.reshape(n, row, rest))
             torch._foreach_copy_([s[key].reshape(row, rest) for s in states], list(q.unbind(0)))
             for s, sc in zip(states, new_scale.unbind(0), strict=True):
-                s[f"{key}_scale"] = sc.reshape(row, 1) if len(shape) >= 2 else sc.reshape(1)
+                # In place (not reassignment): pointer caches reference these scale tensors.
+                s[f"{key}_scale"].copy_(sc.reshape(s[f"{key}_scale"].shape))
         else:  # 4bit
             bs = states[0][f"{key}_block"]
             new_packed, new_scale = _quant_4bit_stacked(value_fp32.reshape(n, per), bs)

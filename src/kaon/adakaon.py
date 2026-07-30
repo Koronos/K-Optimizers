@@ -584,10 +584,17 @@ class Adakaon(AutoLRMixin, Optimizer):
         ft._chunked_mom[grid](gf, mf, pf, r, c, keep, C, n, inv_rms_lr, lr * wd, b1,
                               CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
         if quant:
+            # Requant IN PLACE: cached pointer tables (MSAM's fused axpy plan, batched-step
+            # plans) hold raw data_ptrs into these buffers — replacing the tensors leaves the
+            # tables dangling (illegal memory access once the old block is empty_cache()d).
             if md == "int8":
-                st["m"], st["m_scale"] = _quant_int8(m_fp32)
+                q, sc = _quant_int8(m_fp32)
+                st["m"].copy_(q.reshape(st["m"].shape))
+                st["m_scale"].copy_(sc.reshape(st["m_scale"].shape))
             else:
-                st["m"], st["m_scale"], _ = _quant_4bit(m_fp32.reshape(-1), st["m_block"])
+                packed, sc, _ = _quant_4bit(m_fp32.reshape(-1), st["m_block"])
+                st["m"].copy_(packed)
+                st["m_scale"].copy_(sc)
         inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
         ft._chunked_apply[grid](gf, mf, pf, n, inv_mean, lr * wd, self._t,
                                 CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024)
