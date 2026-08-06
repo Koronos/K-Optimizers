@@ -4,6 +4,54 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.9]
+
+### Changed
+- **Breaking.** `MSAM.load_state_dict` now raises when the checkpoint was saved in
+  train mode. Such a checkpoint stores weights that already carry the lookahead
+  perturbation, and a fresh optimizer cannot know to remove it, so resuming baked one
+  perturbation into the weights per resume (measured `k * lr * clip_threshold`, e.g.
+  1.5e-4 at `k=1.5, lr=1e-4`) with nothing in the state dict to detect it. `state_dict`
+  now records `train_mode`; checkpoints written before this release load unchanged.
+  Call `optimizer.eval()` before saving, as the docs already required.
+- The MSAM/Nekaon climb round trip writes low-precision weights with
+  **round-to-nearest instead of stochastic rounding**, on both the torch and Triton
+  paths. Stochastic rounding exists so an *accumulating* update below the weight's ulp
+  is not lost; the climb accumulates nothing (applied at the end of a step, removed at
+  the start of the next), so two independent SR draws do not cancel and the weights
+  random-walk. Measured on bf16: 19% relative L2 drift after 4000 climb/removal cycles,
+  growing as sqrt(N), against exactly zero on fp32. Round-to-nearest makes the pair land
+  back on the same stored value: measured drift exactly zero, while the climb is still
+  applied wherever bf16 can represent it (0.95x of the fp32 perturbation at `lr=1e-4`).
+  Affected MSAM in all three `norm` modes and therefore Nekaon; Lookahead and SAM were
+  never affected because they restore an exact weight snapshot instead of recomputing
+  the perturbation.
+
+### Added
+- Inert-lookahead warning. The climb can be too small to do anything in two distinct
+  ways: below half a low-precision ulp (unrepresentable), or representable but so small
+  that the gradient at the perturbed point is indistinguishable from the true one.
+  Measured on a real MLP with fp32 weights, `|dw|/|w| = 2.3e-5` moved the gradient by
+  0.018% while `3.7e-3` moved it by 2.1%, so the mechanism is reported inert below
+  ~1e-4 relative displacement. Fires once, after the condition has held for 50
+  consecutive climbs so an LR warmup does not trip it. At `lr <= 1e-6` with the default
+  `k=1.5` this means Nekaon has been equivalent to Adakaon plus rounding noise, which
+  was previously silent.
+
+### Fixed
+- The fused perturbation plan now validates its cached **weight** pointers. 0.7.8 made
+  every momentum writer requantize in place so `m`/`m_scale` pointers cannot dangle, but
+  nothing pinned a weight's storage: an external EMA, a `.to()` or an FSDP reshard
+  rebinds `p.data` and left `p_addr` addressing freed memory, with the plan's
+  invalidation key unable to observe it.
+
+### Validation
+- `tests/test_msam_climb_precision.py`: 20 tests over the round-trip contract (every
+  momentum codec, every `norm` mode, torch and Triton paths), a guard that the fix does
+  not simply stop perturbing, the warning's fire/quiet conditions including the warmup
+  window, checkpoint rejection with backward compatibility, and pointer invalidation.
+  15 of them fail without this release.
+
 ## [0.7.7]
 
 ### Performance

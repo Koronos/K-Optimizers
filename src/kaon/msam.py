@@ -38,14 +38,24 @@ measurement, exactly like Lookahead / Schedule-Free. Always checkpoint in eval m
 checkpoint saved in train mode stores perturbed weights, and a fresh MSAM cannot know to
 remove that perturbation on resume.
 
-bf16 note. The climb/restore round-trip is two stochastic-rounding writes on bf16
-weights (unbiased, but not bit-exact); on fp32 weights the round-trip is exact to
-floating-point addition. SAM avoids this with a full weight snapshot per step; MSAM
-deliberately trades that snapshot away for zero memory.
+bf16 note. The climb/restore round-trip uses **round-to-nearest, not stochastic
+rounding** — deliberately. SR exists so an *accumulating* update smaller than the
+weight's ulp is not lost; the climb accumulates nothing (it is applied and removed one
+step later), so its rounding error has no signal to preserve, only a random walk to
+contribute. Two independent SR draws do not cancel: measured 19% relative L2 drift after
+4000 climb/removal cycles on bf16 weights, growing as sqrt(N) (fp32 weights: exactly
+zero, the round trip is exact to floating-point addition). Round-to-nearest makes the
++e/-e pair land back on the same bf16 value whenever the residual is under half an ulp —
+measured drift exactly zero. The cost is that a climb below half an ulp is not applied at
+all; see the inert-lookahead warning in :meth:`_warn_if_inert`, which fires in exactly
+that regime. SAM and Lookahead sidestep all of this by keeping an exact weight snapshot;
+MSAM deliberately trades that snapshot away for zero memory, which is what makes the
+removal a *recompute* rather than a *copy*.
 """
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable
 from typing import Any
 
@@ -53,7 +63,6 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from kaon._stochastic_rounding import add_stochastic_
 from kaon._wrappers import CodecBuffer, WrapsInnerOptimizer
 
 __all__ = ["MSAM"]
@@ -139,6 +148,9 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._bucket_cache: list[
             tuple[list[Tensor], list[dict[str, Any]], str, tuple[int, ...], dict[str, Any]]
         ] | None = None
+        self._inert_streak = 0                          # consecutive climbs too small to do anything
+        self._inert_checks = 0                          # bounded: the check reads weights
+        self._inert_warned = False
 
     # ------------------------------------------------------------- perturbation
     def _momentum_owner(self) -> Any:
@@ -216,6 +228,67 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             self._eclamp[gid] = abs(self.rho) * group.get("clip_threshold", 1.0) * group["lr"]
         return self._eclamp[gid]
 
+    # Below this relative displacement the perturbed gradient is measurably the same as
+    # the true one: on a real MLP with fp32 weights (so representation is not the limit),
+    # |dw|/|w| = 2.3e-5 moved the gradient by 1.8e-4 (0.018%), while |dw|/|w| = 3.7e-3
+    # moved it by 2.1%. A climb under ~1e-4 relative samples nothing and is pure cost.
+    _INERT_REL = 1e-4
+    # Warn only after the condition has held this many consecutive climbs, so an LR
+    # warmup (which legitimately starts near zero) does not trip it.
+    _INERT_PATIENCE = 50
+    # ...and stop looking after this many climbs either way: the check reads weights, so
+    # leaving it armed for the whole run would cost bandwidth every step forever.
+    _INERT_MAX_CHECKS = 4 * _INERT_PATIENCE
+    # Weight magnitude is read from at most this many params per group — a mean over a
+    # handful of tensors is a fine scale estimate and keeps the check off the hot path.
+    _INERT_SAMPLE = 8
+
+    @torch.no_grad()
+    def _warn_if_inert(self) -> None:
+        """Warn once when the climb is too small to perturb anything.
+
+        Two regimes, both silent before this: the displacement can be under half a
+        low-precision ulp (unrepresentable — round-to-nearest drops it, stochastic
+        rounding would turn it into noise), or representable but so small that the
+        gradient at the perturbed point is indistinguishable from the true one. Either
+        way the mechanism is inert and ``rho``/``k`` is only costing time."""
+        if self._inert_warned or self.rho == 0.0 or self._inert_checks >= self._INERT_MAX_CHECKS:
+            return
+        self._inert_checks += 1
+        msg = None
+        for group in self.param_groups:
+            params = [p for p in group["params"] if p.numel()][: self._INERT_SAMPLE]
+            if not params:
+                continue
+            e = abs(self.rho) * group["lr"] * group.get("clip_threshold", 1.0)
+            w = float(torch.stack([p.detach().abs().mean().float() for p in params]).mean())
+            if w == 0.0:
+                continue
+            dtype = params[0].dtype
+            half_ulp = 0.5 * torch.finfo(dtype).eps * w
+            if dtype != torch.float32 and e < half_ulp:
+                msg = (
+                    f"{type(self).__name__}: the lookahead displacement (<= {e:.2e}) is below "
+                    f"half a {dtype} ulp ({half_ulp:.2e}), so it cannot move the weights at all. "
+                    f"Use fp32 weights for these parameters, or set rho/k=0 to drop the cost."
+                )
+            elif e / w < self._INERT_REL:
+                msg = (
+                    f"{type(self).__name__}: the lookahead displaces the weights by only "
+                    f"{e / w:.1e} relative (lr={group['lr']:.2e}); below ~{self._INERT_REL:.0e} the "
+                    f"perturbed gradient is indistinguishable from the true one, so the mechanism "
+                    f"is inert. Raise lr or rho/k, or set rho/k=0 to drop the cost."
+                )
+            if msg is not None:
+                break
+        if msg is None:
+            self._inert_streak = 0
+            return
+        self._inert_streak += 1
+        if self._inert_streak >= self._INERT_PATIENCE:
+            self._inert_warned = True
+            warnings.warn(msg, stacklevel=3)
+
     @torch.no_grad()
     def _global_mnorm(self) -> float:
         """Global L2 norm over all momenta, via ``(m*m).sum()`` (``torch.dot`` is avoided
@@ -266,9 +339,9 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 m.clamp_(-bound, bound)  # per-element stability cap (see _climb_bound)
             if plist[0].dtype == torch.float32:
                 torch._foreach_add_([p.data for p in plist], list(m.unbind(0)))
-            else:  # low-precision weights: stochastic-rounding write per slice
+            else:  # low-precision weights: round-to-nearest, deliberately NOT stochastic
                 for p, m_i in zip(plist, m.unbind(0), strict=True):
-                    add_stochastic_(p.data, m_i, alpha=1.0)
+                    p.data.copy_((p.data.float() + m_i).to(p.dtype))
 
     @torch.no_grad()
     def _apply_fused(self, sign: float, scale: float):
@@ -289,7 +362,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         # the cache; this removes two O(parameter-count) pointer scans per step.
         self._momentum_params()  # O(1) cache-key check; catches late-gradient state growth
         cache = self._axpy_cache
-        if cache is not None and cache["scale"] == scale:
+        if cache is not None and cache["scale"] == scale and self._plan_addrs_valid(cache):
             self._launch_fused(cache, sign, scale, ft)
             return cache["leftover"]
         eligible: dict[tuple[Any, ...], tuple[list[Tensor], list[dict[str, Any]], dict[str, Any]]] = {}
@@ -322,6 +395,12 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             m_addr = ft.ptr_array([st["m"] for st in states], dev)
             buckets.append(dict(
                 p_addr=ft.ptr_array(plist, dev),
+                # Momentum buffers are requantized in place, but nothing pins a WEIGHT's
+                # storage: an external EMA, a .to() or an FSDP reshard rebinds p.data and
+                # leaves p_addr pointing at freed memory. Witness the first param of each
+                # bucket (a reallocation moves the whole model, not one tensor) so the plan
+                # is rebuilt instead of writing to a dangling address.
+                p_witness=plist[0], p_witness_addr=plist[0].data_ptr(),
                 m_addr=m_addr,
                 sc_addr=(
                     ft.ptr_array([st["m_scale"] for st in states], dev)
@@ -339,6 +418,13 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._launch_fused(cache, sign, scale, ft)
         return cache["leftover"]
 
+    @staticmethod
+    def _plan_addrs_valid(cache: dict[str, Any]) -> bool:
+        """True while every cached weight pointer still addresses its parameter."""
+        return all(
+            bk["p_witness"].data_ptr() == bk["p_witness_addr"] for bk in cache["buckets"]
+        )
+
     def _launch_fused(self, cache: dict[str, Any], sign: float, scale: float, ft: Any) -> None:
         """Launch a cached fused perturbation plan."""
         self._axpy_seed += 1
@@ -348,7 +434,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 bk["p_addr"], bk["m_addr"], bk["sc_addr"], alpha,
                 self._climb_bound(bk["group"], sign), bk["n"], bk["K"], bk["row_width"],
                 self._axpy_seed, MOM=bk["mom"], FBLOCK=bk["block"],
-                LOWP=bk["lowp"], SR=bk["lowp"], BLOCK=1024,
+                # SR=False: round-to-nearest, matching the torch path. See the bf16 note.
+                LOWP=bk["lowp"], SR=False, BLOCK=1024,
             )
 
     # --------------------------------------------------------------- train/eval
@@ -478,6 +565,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             else:  # tensor/none scale per slice inside _apply (zero-m slices no-op)
                 climb = bool(self._momentum_params())
             if climb:
+                self._warn_if_inert()
                 self._apply(+1.0, scale=1.0)
                 self._has_e = True
         if _PROBE_LOG:
@@ -487,7 +575,13 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
     # -------------------------------------------------------------- state_dict
     def state_dict(self) -> dict[str, Any]:
         state_dict = super().state_dict()
-        state_dict["_msam_meta"] = {"axpy_seed": self._axpy_seed}
+        state_dict["_msam_meta"] = {
+            "axpy_seed": self._axpy_seed,
+            # Recorded so a checkpoint taken in train mode (weights carrying the climb,
+            # which cannot be reconstructed on resume) fails loudly instead of silently
+            # baking one perturbation into the weights per resume.
+            "train_mode": self._train_mode,
+        }
         return state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -501,6 +595,13 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         axpy_seed = int(meta.get("axpy_seed", 0))
         if axpy_seed < 0:
             raise ValueError("MSAM checkpoint has an invalid fused stochastic-rounding seed")
+        if meta.get("train_mode", False):
+            raise ValueError(
+                "MSAM checkpoint was saved in train mode: the stored weights carry the "
+                "lookahead perturbation, and a fresh optimizer cannot know to remove it — "
+                "resuming would bake one perturbation into the weights per resume. Call "
+                "optimizer.eval() before saving the checkpoint."
+            )
         self._load_wrapped(copied, lambda inner, sd: inner.load_state_dict(sd))
         self.base_optimizer = self.inner
         # Checkpoints are required to contain the eval/true weights. Stay in
