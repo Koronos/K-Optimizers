@@ -46,6 +46,7 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
+    flat_view,
     foreach_budget,
     is_low_precision,
     rms,
@@ -123,6 +124,144 @@ _STACK_BYTES_PER_ELEM = 48
 # plateau. See docs/foreach-batching.md.
 
 
+def _identity(t: Tensor) -> Tensor:
+    """``mat`` for buckets whose effective layout *is* the tensor (no view needed)."""
+    return t
+
+
+# Unbound, so the per-step staleness guard is a C-level ``map()`` instead of a genexpr.
+_DATA_PTR = Tensor.data_ptr
+
+
+class _ForeachChunk:
+    """Cached derived views for ONE stacked chunk of the native foreach path.
+
+    Rebuilding these lists every step is what made a bag of 0-D scalars slow: with 448
+    params the non-factored bucket calls :func:`~kaon._backend.flat_view` ~5x per param per
+    step (the ``v`` stack, the codec's ``mat`` callback, the weight-decay stack, the final
+    subtract) and every one of those calls on a 0-D tensor materializes a fresh
+    ``aten::view`` TensorImpl. They are all pure functions of tensors the optimizer
+    **already owns** — the params and their ``self.state`` buffers — so caching them pins
+    no memory at all.
+
+    Gradient views are deliberately **not** cached: a retained view of ``p.grad`` keeps the
+    previous step's gradient storage alive (``set_to_none=True`` allocates a fresh grad
+    every backward), which would add a whole gradient set to peak memory — an unacceptable
+    trade for an optimizer whose entire pitch is memory. :meth:`grad_stack` avoids them a
+    different way instead: ``torch.stack`` always writes a contiguous output, so stacking
+    the **raw** grads and reshaping the *stack* once is element-for-element the same buffer
+    as stacking N per-param reshapes — one ``view`` per step instead of N. That covers every
+    bucket whose params share an ``ndim`` (all convs, all 1-D, all 0-D); only a bucket that
+    genuinely mixes 0-D with shape-``(1,)`` params still builds per-param views.
+
+    Staleness is the caller's job (:meth:`Adakaon._foreach_plan`): the plan is rebuilt when
+    the group's param identities or ``p.data`` pointers change, and dropped outright by
+    :meth:`Adakaon._invalidate_fused_caches` (state reset / checkpoint load) and by any step
+    that falls back to the per-parameter path.
+    """
+
+    __slots__ = ("cols", "eff", "grad_reshape", "grad_uniform", "length", "mat", "plist",
+                 "pviews", "rows", "states", "view", "vs")
+
+    def __init__(
+        self,
+        plist: list[Tensor],
+        states: list[dict[str, Any]],
+        group: dict[str, Any],
+        eff: tuple[int, int] | None,
+        matrixize: bool,
+        length: int,
+        cached: bool = True,
+    ) -> None:
+        self.plist, self.states, self.eff, self.length = plist, states, eff, length
+        n = len(plist)
+        # ``grad_uniform``: the bucket's grads all share an ndim, so they stack raw and the
+        # STACK gets reshaped (``grad_reshape``, ``None`` when it is already [N, *eff]).
+        self.grad_uniform = cached
+        self.grad_reshape: tuple[int, ...] | None = None
+        if eff is not None:                                   # factored bucket
+            R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
+            self.view = (lambda t: t.view(R, C)) if matrixize else _identity
+            self.rows = [s["row"] for s in states]
+            self.cols = [s["col"] for s in states]
+            self.vs = None
+            if matrixize:                                     # conv [N,O,I,kh,kw] -> [N,R,C]
+                self.grad_reshape = (n, R, C)
+        else:                                                 # non-factored bucket
+            self.rows = self.cols = None
+            ndims = {p.ndim for p in plist}
+            self.view = _identity if ndims == {1} else flat_view
+            self.grad_uniform = cached and len(ndims) == 1
+            if ndims == {0}:                                  # 0-D bag: [N] -> [N, 1]
+                self.grad_reshape = (n, 1)
+            self.vs = [self.view(s["v"]) for s in states]
+        self.pviews = [self.view(p.data) for p in plist]
+        # The codec calls ``mat(state["m"])`` once (float) or twice (int8) per param per
+        # step; when that call would build a view, an identity-keyed lookup of prebuilt
+        # views is cheaper. Only then — ``Tensor.__hash__`` is a Python-level call in
+        # torch, so a dict hit is *more* expensive than ``_identity`` when there is no view
+        # to save. 4bit is excluded too: its ``m`` is a packed byte string, not a momentum
+        # in the effective layout (``view`` would raise), and its codec never calls ``mat``.
+        self.mat = self.view
+        if (cached and self.view is not _identity and group["betas"][0] > 0
+                and group["momentum_dtype"] != "4bit"):
+            self.mat = {s["m"]: self.view(s["m"]) for s in states}.__getitem__
+
+    # ponytail: known ceiling. Profiling a 448x 0-D bag after this cache shows the residue is
+    # three ``stack`` + three ``unbind`` per step (~1344 ``aten::select``). Only ONE of each
+    # pair lives here (the ``v`` stack and its write-back); the other two are inside
+    # ``_momentum_codec.ema_stacked`` and ``_backend.subtract_batched_``, which this change is
+    # scoped out of. Persistent ``cat(out=)`` scratch buffers with cached unbind slices would
+    # therefore buy only the local pair (~10% of the remaining step) while pinning a stacked
+    # fp32 buffer per bucket for the process's lifetime — a bad trade for an optimizer whose
+    # pitch is memory, and it would feed back into the free-VRAM-adaptive chunk budget.
+    # Removing the other two needs the codec to hand back a reusable buffer: follow-up work.
+    def grad_stack(self) -> Tensor:
+        """This step's stacked fp32 gradient ``[N, *eff]``. Never cached — see the class
+        docstring; the reshape-the-stack trick keeps it to one ``view`` per bucket."""
+        if self.grad_uniform:
+            g = torch.stack([p.grad for p in self.plist])
+            if self.grad_reshape is not None:
+                g = g.view(self.grad_reshape)
+            return g.float()
+        view = self.view
+        return torch.stack([view(p.grad) for p in self.plist]).float()
+
+
+class _ForeachPlan:
+    """One param group's foreach bucketing plus the per-chunk view caches.
+
+    ``buckets`` preserves the order the uncached code stepped in (factored buckets first,
+    then non-factored, each in first-seen param order). ``chunks`` is that bucketing split
+    by the current memory budget; the split is re-derived only when a bucket's chunk length
+    actually changes, because the adaptive VRAM budget wobbles every step while
+    ``budget // length`` almost never does.
+
+    ``cached=False`` (the ``_foreach_cache_enabled`` A/B switch) makes every chunk rebuild
+    its lists per param per step exactly as the pre-cache code did, so the two arms differ
+    only in this optimization and nothing else.
+    """
+
+    __slots__ = ("buckets", "chunks", "ids", "ptrs", "steps")
+
+    def __init__(self, ids: tuple, ptrs: tuple, buckets: list[tuple]) -> None:
+        self.ids, self.ptrs, self.buckets = ids, ptrs, buckets
+        self.chunks: list[_ForeachChunk] | None = None
+        self.steps: tuple[int, ...] = ()
+
+    def rechunk(self, budget: int, group: dict[str, Any],
+                cached: bool = True) -> list[_ForeachChunk]:
+        steps = tuple(max(1, budget // size) for size, *_ in self.buckets)
+        if self.chunks is not None and steps == self.steps:
+            return self.chunks
+        self.steps = steps
+        self.chunks = [
+            _ForeachChunk(plist[i:i + n], states[i:i + n], group, eff, matrixize, length, cached)
+            for n, (_size, plist, states, eff, matrixize, length) in zip(steps, self.buckets, strict=True)
+            for i in range(0, len(plist), n)
+        ]
+        return self.chunks
+
 
 class Adakaon(AutoLRMixin, Optimizer):
     """Conv-aware factored optimizer with optional bf16 momentum.
@@ -163,11 +302,12 @@ class Adakaon(AutoLRMixin, Optimizer):
             2-D tensors) *and* full fine-tunes (thousands of weights incl. all the
             1-D biases/norms). Params are bucketed by shape and each bucket steps
             as a few stacked kernels: ``ndim >= 2`` factored ``[N, R, C]``, ``ndim
-            == 1`` non-factored ``[N, L]``. Matches the per-parameter path
-            numerically (stochastic-rounding draws differ, unbiased either way);
-            int8 momentum is also batched (per-row absmax dequant/EMA/requant on
-            the stacked layout), as is 4bit (per-block absmax, packed nibbles). The
-            rest (0-D scalars, kahan, fp16+SR,
+            <= 1`` non-factored ``[N, L]`` (0-D scalars — e.g. LyCORIS
+            ``use_scalar`` gates — ride that bucket as length-1 rows). Matches the
+            per-parameter path numerically (stochastic-rounding draws differ,
+            unbiased either way); int8 momentum is also batched (per-row absmax
+            dequant/EMA/requant on the stacked layout), as is 4bit (per-block
+            absmax, packed nibbles). The rest (kahan, fp16+SR,
             non-contiguous matrixized convs, single-param groups) transparently
             falls back to it. Set ``False`` to force the per-parameter path.
         foreach_batch_cutoff: per-tensor element count above which a weight is
@@ -280,10 +420,18 @@ class Adakaon(AutoLRMixin, Optimizer):
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
         self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPointerCache (1-D)
         self._fused_big_caches: dict[tuple[int, tuple[int, ...], Any], Any] = {}
+        # Native foreach path: group id -> _ForeachPlan (bucketing + per-chunk views). Set
+        # ``_foreach_cache_enabled = False`` to rebuild every step — the A/B switch the
+        # cache's speedup is measured with; it is numerically a no-op either way.
+        self._foreach_plans: dict[int, _ForeachPlan] = {}
+        self._foreach_cache_enabled = True
         if self._fused:
             from kaon._fused_triton import HAS_TRITON, TILE_CAP
             if not HAS_TRITON:
                 raise RuntimeError("Adakaon(fused=True) requires Triton (a GPU-only optional dependency)")
+            # 2-D one_block/chunked crossover ONLY. The non-factored (ndim<=1) ceiling is
+            # ft.TILE_CAP_1D and is deliberately not tunable from here: a 1-D tensor over its
+            # cap falls to native rather than to a better kernel, so the two are independent.
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
         # Optional continuous Mechanic step-size controller. It owns group["lr"] while
@@ -292,16 +440,20 @@ class Adakaon(AutoLRMixin, Optimizer):
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     def _invalidate_fused_caches(self) -> None:
-        """Drop every host-side cache that may retain pointers into optimizer state.
+        """Drop every host-side cache that may retain pointers or views into optimizer state.
 
-        State tensors are allocated lazily by the next fused step.  The pointer
-        caches therefore must never survive a state reset or checkpoint load,
-        even when the parameter identities themselves have not changed.
+        State tensors are allocated lazily by the next step.  The fused pointer caches and
+        the native foreach view caches therefore must never survive a state reset or
+        checkpoint load, even when the parameter identities themselves have not changed:
+        ``load_state_dict`` *replaces* ``state["v"]`` / ``state["m"]`` (the dtype-preserving
+        loader casts them back), so anything still holding the old buffers would keep
+        stepping a detached copy of the state.
         """
         self._fused_part.clear()
         self._fused_ob_caches.clear()
         self._fused_od_caches.clear()
         self._fused_big_caches.clear()
+        self._foreach_plans.clear()
 
     def _autolr_reset_base_state(self) -> None:
         """Reset Adakaon's base optimizer after an AutoLR rollback/contact."""
@@ -376,12 +528,16 @@ class Adakaon(AutoLRMixin, Optimizer):
                 self._step_foreach(fast, group, chunk_budget)
                 for p in slow:
                     self._step_one_param(p, group)
-            else:
-                for p in params:
-                    self._step_one_param(p, group)
-        else:
-            for p in params:
-                self._step_one_param(p, group)
+                return
+        # Per-parameter fallback for the whole group: drop any cached plan for it. The
+        # shared codecs requant IN PLACE since 4d980ee (``state["m"].copy_(q)``), so this
+        # is no longer load-bearing for int8/4bit the way it was — but a group that steps
+        # per-param has no use for a plan anyway, and dropping it keeps the invariant
+        # "a cached plan only ever describes a group the foreach path actually stepped".
+        # The ids/ptrs guard cannot see a fallback: the param set is unchanged.
+        self._foreach_plans.pop(id(group), None)
+        for p in params:
+            self._step_one_param(p, group)
 
     # ----------------------------------------------------------------- fused (Triton) step
     @torch.no_grad()
@@ -463,7 +619,19 @@ class Adakaon(AutoLRMixin, Optimizer):
                 one_block.append(p)
             elif two_d and ft.next_pow2_tile(*ft.eff_2d(p))[0] * ft.next_pow2_tile(*ft.eff_2d(p))[1] > cap:
                 big.append(p)
-            elif bf_ok and ft.fused_1d_eligible(p, cap):
+            elif bf_ok and (
+                # No cap argument on purpose: 1-D is bounded by ft.TILE_CAP_1D, not by the 2-D
+                # ``cap``. Above the 2-D cap a tensor goes to the chunked kernel; above the 1-D
+                # cap it goes to NATIVE (there is no chunked 1-D route), so the two ceilings
+                # answer different questions and moved apart in 0.7.10.
+                ft.fused_1d_eligible(p)
+                # 0-D scalars (LyCORIS use_scalar gates) ride the 1-D kernel as
+                # length-1 tensors: it works on base pointers + element counts,
+                # never on shapes, so a valid pointer with numel()==1 is enough.
+                # Per-param dispatch for them is ~22 launches/scalar/step (CPU
+                # launch-bound); the kernel is one launch for the whole bag.
+                or (p.ndim == 0 and p.is_cuda and p.dtype in (torch.float32, torch.bfloat16))
+            ):
                 one_dim.append(p)
             else:
                 native.append(p)
@@ -515,8 +683,9 @@ class Adakaon(AutoLRMixin, Optimizer):
             )
 
     def _fused_one_dim(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
-        """One-block non-factored kernel over the eligible 1-D weights (biases / norm scales). GC is a
-        no-op on 1-D (``centralize_grads_`` skips ndim<2), so it never enters this path."""
+        """One-block non-factored kernel over the eligible ``ndim <= 1`` weights (biases / norm
+        scales, plus 0-D scalars as length-1 tensors). GC is a no-op on ndim<2 (``centralize_grads_``
+        skips them), so it never enters this path."""
         for p in plist:
             st = self.state[p]
             if not st:
@@ -613,7 +782,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]  # noqa: N806 — conv -> matrixized
         n = R * C
         states = [self.state[p] for p in plist]
-        g = torch.stack([p.grad.float().reshape(R, C) for p in plist])     # [N, R, C]
+        g = torch.stack([p.grad.reshape(R, C) for p in plist]).float()     # [N, R, C]
         if group["gradient_centralization"]:
             g.sub_(g.mean(dim=-1, keepdim=True))                          # GC on the fp32 copy
         gsq = g * g                                                       # raw (eps1 goes on the means)
@@ -858,14 +1027,16 @@ class Adakaon(AutoLRMixin, Optimizer):
         """Per-parameter shapes/dtypes the batched fast path can stack.
 
         Both branches are covered: ``ndim >= 2`` uses the factored bucket, ``ndim
-        == 1`` (biases/norms — the bulk of a full fine-tune) uses the non-factored
-        bucket. Only 0-D scalars and the awkward dtype/contiguity cases fall back.
+        <= 1`` (biases/norms — the bulk of a full fine-tune — plus 0-D scalars,
+        which ride the non-factored bucket as length-1 rows) uses the
+        non-factored bucket. Only the awkward dtype/contiguity cases fall back:
+        a bag of 0-D scalars on the per-param path is ~22 CUDA launches *per
+        scalar per step* (pure CPU dispatch, measured ~592x slower than the same
+        params as shape ``(1,)``), which is exactly what batching exists to fix.
 
         ``cutoff`` is the effective per-tensor size limit (performance threshold,
         possibly lowered by the memory budget) — bigger weights loop.
         """
-        if p.ndim == 0:                          # 0-D scalars -> per-param path
-            return False
         if p.numel() > cutoff:
             # Compute/bandwidth-bound: the per-tensor launch overhead is noise for
             # it, so looping is as fast and skips the stack/copy traffic.
@@ -881,26 +1052,20 @@ class Adakaon(AutoLRMixin, Optimizer):
             return p.data.is_contiguous() and p.grad.is_contiguous()
         return True
 
-    @torch.no_grad()
-    def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
-        """Batched step for many params at once.
-
-        Params are bucketed so each bucket can be stacked into a single tensor and
-        stepped with a handful of kernels — element-for-element the same math as
-        :meth:`_step_one_param`:
+    def _foreach_buckets(self, params: list[Tensor], group: dict[str, Any]) -> list[tuple]:
+        """Bucket ``params`` so each bucket stacks into one tensor, and init their state.
 
         * ``ndim >= 2`` -> factored bucket, keyed by effective 2-D shape ``[N, R, C]``.
-        * ``ndim == 1`` (biases/norms) -> non-factored bucket, keyed by length ``[N, L]``.
-        """
-        beta1, beta2 = group["betas"]
-        eps1, _eps2 = group["eps"]
-        lr, clip = group["lr"], group["clip_threshold"]
-        wd = group["weight_decay"]
-        cautious, bf16_method = group["cautious"], group["bf16_method"]
-        codec = self._codec(group)
+        * ``ndim <= 1`` (biases/norms, 0-D scalars) -> non-factored bucket, keyed
+          by element count ``[N, L]`` (a 0-D scalar is a length-1 row, sharing the
+          ``L == 1`` bucket with shape-``(1,)`` params).
 
-        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+        Returns ``(chunk_size, plist, states, eff, matrixize, length)`` per bucket —
+        factored buckets first, then non-factored, each in first-seen param order (the
+        order the pre-cache code stepped them in).
+        """
+        factored: dict[tuple[Any, ...], tuple[list, list]] = {}
+        flat: dict[tuple[Any, ...], tuple[list, list]] = {}
         for p in params:
             state = self.state[p]
             if not state:
@@ -909,31 +1074,61 @@ class Adakaon(AutoLRMixin, Optimizer):
             if g.ndim >= 2:
                 matrixize = g.ndim > 2  # conv kernels always reshape to 2-D before factoring
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:  # ndim == 1
-                flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
+                bucket = factored.setdefault((eff, p.dtype, matrixize), ([], []))
+            else:  # ndim <= 1 — 0-D scalars ride as length 1 (g.numel() == g.shape[0] for 1-D)
+                bucket = flat.setdefault((g.numel(), p.dtype), ([], []))
+            bucket[0].append(p)
+            bucket[1].append(state)
+        buckets = [(max(eff[0] * eff[1], 1), pl, st, eff, matrixize, 0)
+                   for (eff, _dtype, matrixize), (pl, st) in factored.items()]
+        buckets += [(max(length, 1), pl, st, None, False, length)
+                    for (length, _dtype), (pl, st) in flat.items()]
+        return buckets
 
-        for (eff, _dtype, matrixize), plist in factored_buckets.items():
-            step = max(1, budget // max(eff[0] * eff[1], 1))
-            for i in range(0, len(plist), step):
-                self._factored_bucket(
-                    plist[i:i + step], eff, matrixize,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
-                )
-        for (length, _dtype), plist in flat_buckets.items():
-            step = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), step):
-                self._nonfactored_bucket(
-                    plist[i:i + step], length,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
-                )
+    def _foreach_plan(self, params: list[Tensor], group: dict[str, Any],
+                      budget: int) -> list[_ForeachChunk]:
+        """This step's chunks for ``group``, from the cached plan when it is still valid.
+
+        The plan is rebuilt when the param set changes (``id`` per param) or when any
+        ``p.data`` is rebound to different storage (``data_ptr`` per param) — a dtype or
+        device change necessarily moves the pointer, so one guard covers re-bucketing too.
+        Everything else that can invalidate it is event-driven: see
+        :meth:`_invalidate_fused_caches` and the per-parameter fallback in
+        :meth:`_native_dispatch`.
+        """
+        gid = id(group)
+        cached = self._foreach_cache_enabled
+        ids = tuple(map(id, params))
+        ptrs = tuple(map(_DATA_PTR, params))
+        plan = self._foreach_plans.get(gid) if cached else None
+        if plan is None or plan.ids != ids or plan.ptrs != ptrs:
+            plan = _ForeachPlan(ids, ptrs, self._foreach_buckets(params, group))
+            if cached:
+                self._foreach_plans[gid] = plan
+        return plan.rechunk(budget, group, cached)
+
+    @torch.no_grad()
+    def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
+        """Batched step for many params at once.
+
+        Each bucket is stacked into a single tensor and stepped with a handful of kernels —
+        element-for-element the same math as :meth:`_step_one_param`. The bucketing and
+        every view it derives come from the cached :class:`_ForeachPlan`.
+        """
+        beta1, beta2 = group["betas"]
+        eps1, _eps2 = group["eps"]
+        lr, clip = group["lr"], group["clip_threshold"]
+        wd = group["weight_decay"]
+        cautious, bf16_method = group["cautious"], group["bf16_method"]
+        codec = self._codec(group)
+        for chunk in self._foreach_plan(params, group, budget):
+            bucket = self._factored_bucket if chunk.eff is not None else self._nonfactored_bucket
+            bucket(chunk, beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec)
 
     @torch.no_grad()
     def _factored_bucket(
         self,
-        plist: list[Tensor],
-        eff: tuple[int, int],
-        matrixize: bool,
+        chunk: _ForeachChunk,
         beta1: float,
         beta2: float,
         eps1: float,
@@ -944,16 +1139,11 @@ class Adakaon(AutoLRMixin, Optimizer):
         bf16_method: str,
         codec: _MomentumCodec,
     ) -> None:
-        R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
-        N = len(plist)  # noqa: N806
+        R, C = chunk.eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
+        N = len(chunk.plist)  # noqa: N806
+        rows, cols = chunk.rows, chunk.cols
 
-        def mat(t: Tensor) -> Tensor:
-            return t.view(R, C) if matrixize else t
-
-        rows = [self.state[p]["row"] for p in plist]
-        cols = [self.state[p]["col"] for p in plist]
-
-        grad = torch.stack([mat(p.grad).float() for p in plist])          # [N, R, C]
+        grad = chunk.grad_stack()                                         # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -981,26 +1171,24 @@ class Adakaon(AutoLRMixin, Optimizer):
         if beta1 > 0:
             # The codec owns every dtype's dequant → fp32 EMA → requant detail; this
             # block is identical for fp32/bf16/int8/4bit (and to _step_one_param).
-            states = [self.state[p] for p in plist]
-            delta = codec.ema_stacked(states, update, mat, (R, C), beta1)  # [N, R, C]
+            delta = codec.ema_stacked(chunk.states, update, chunk.mat, (R, C), beta1)  # [N, R, C]
         else:
             delta = update
 
         if wd != 0:
-            p_fp32 = torch.stack([mat(p.data).float() for p in plist])
+            p_fp32 = torch.stack(chunk.pviews).float()
             delta = delta.add_(p_fp32, alpha=lr * wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
         # Subtract delta from the (matrixized) weights, batched.
-        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
+        subtract_batched_(chunk.pviews, delta, bf16_method)
 
     @torch.no_grad()
     def _nonfactored_bucket(
         self,
-        plist: list[Tensor],
-        length: int,
+        chunk: _ForeachChunk,
         beta1: float,
         beta2: float,
         eps1: float,
@@ -1011,17 +1199,27 @@ class Adakaon(AutoLRMixin, Optimizer):
         bf16_method: str,
         codec: _MomentumCodec,
     ) -> None:
-        """Non-factored update (full per-coordinate second moment) for 1-D params.
+        """Non-factored update (full per-coordinate second moment) for ``ndim <= 1`` params.
 
         The bulk of a full fine-tune is biases and norm weights. Their update is
         the plain Adam-style ``grad / sqrt(v)`` — no row/col factoring — so a
         bucket of equal-length 1-D tensors stacks to ``[N, L]`` and steps as a few
         kernels. Mirrors the ``not factored`` branch of :meth:`_step_one_param`.
-        """
-        N = len(plist)  # noqa: N806 — matrix dim (stacked tensor is [N, L])
-        vs = [self.state[p]["v"] for p in plist]                          # each [L], fp32
 
-        grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
+        0-D scalars (LyCORIS ``use_scalar`` gates and friends) join the ``L == 1``
+        bucket as length-1 **views** of the same storage (:func:`flat_view`): stacking,
+        the codec's write-back and the final subtract all go through the views, so
+        the persisted state keeps its original 0-D shape (checkpoint-compatible
+        with the per-param path). For ``L == 1`` the RMS clip
+        ``|update| / sqrt(1)`` equals the per-param ``rms()`` of a scalar, and the
+        cautious mask's per-slice mean is the scalar mask itself — element-for-
+        element the same math as :meth:`_step_one_param`.
+        """
+        N = len(chunk.plist)  # noqa: N806 — matrix dim (stacked tensor is [N, L])
+        length = chunk.length
+        vs = chunk.vs                                                     # each [L], fp32
+
+        grad = chunk.grad_stack()                                         # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
         # Second-moment EMA weight (fixed beta2).
@@ -1039,22 +1237,22 @@ class Adakaon(AutoLRMixin, Optimizer):
         update.mul_(lr)
 
         if beta1 > 0:
-            # Same codec entry point as the factored bucket; mat is identity here and
-            # the effective per-param shape is the 1-D length (so int8 reduces the
-            # whole L axis to one scalar scale, 4bit blocks over L).
-            states = [self.state[p] for p in plist]
-            delta = codec.ema_stacked(states, update, lambda t: t, (length,), beta1)  # [N, L]
+            # Same codec entry point as the factored bucket; mat flattens a 0-D
+            # ``m`` to its length-1 view (identity on 1-D) and the effective
+            # per-param shape is the 1-D length (so int8 reduces the whole L axis
+            # to one scalar scale, 4bit blocks over L).
+            delta = codec.ema_stacked(chunk.states, update, chunk.mat, (length,), beta1)  # [N, L]
         else:
             delta = update
 
         if wd != 0:
-            p_fp32 = torch.stack([p.data.float() for p in plist])
+            p_fp32 = torch.stack(chunk.pviews).float()
             delta = delta.add_(p_fp32, alpha=lr * wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([p.data for p in plist], delta, bf16_method)
+        subtract_batched_(chunk.pviews, delta, bf16_method)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:

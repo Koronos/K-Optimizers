@@ -446,3 +446,160 @@ def test_sparse_grad_rejected():
     p.grad = torch.randn(4).to_sparse()
     with pytest.raises(RuntimeError):
         opt.step()
+
+
+# ============================================================ 0-D scalar params
+# LyCORIS ``use_scalar`` gates (and friends) are 0-D weights. They used to be gated
+# out of the foreach path and stepped one-by-one, which is ~20 CUDA launches per
+# scalar per step; they now ride the non-factored ``L == 1`` bucket as length-1
+# views. These tests pin the three things that can silently break: the routing, the
+# element-for-element parity with the per-param path, and the state layout (so a
+# checkpoint crosses between the two paths).
+def _scalar_shapes() -> list[tuple[int, ...]]:
+    """0-D scalars plus shape-``(1,)`` bucket-mates.
+
+    Every entry has ``numel() == 1``, so the whole bag lands in the same
+    non-factored bucket — 0-D as length-1 views, ``(1,)`` as-is — which is exactly
+    the mixed stacking the batched path has to get right.
+    """
+    return [(), (), (), (1,), (1,)]
+
+
+def _scalar_bag(shapes, seed: int = 11) -> list[torch.nn.Parameter]:
+    g = torch.Generator().manual_seed(seed)
+    return [torch.nn.Parameter(torch.randn(s, generator=g) * 0.05) for s in shapes]
+
+
+def _scalar_parity(cfg, shapes=None, steps: int = 10, seed: int = 11, grad_seed: int = 7):
+    """Drive one bag of params and one grad sequence through both paths.
+
+    Returns ``(pa, pb, oa, ob)`` — ``a`` is ``foreach=True``, ``b`` is ``foreach=False``.
+    """
+    pa = _scalar_bag(_scalar_shapes() if shapes is None else shapes, seed)
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
+    oa = ScheduleFree(pa, foreach=True, **cfg)
+    ob = ScheduleFree(pb, foreach=False, **cfg)
+    gg = torch.Generator().manual_seed(grad_seed)
+    for _ in range(steps):
+        for a, b in zip(pa, pb, strict=True):
+            grad = torch.randn(a.shape, generator=gg) * 0.02
+            a.grad, b.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+    return pa, pb, oa, ob
+
+
+_SCALAR_CFGS = [
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'float32'},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'bfloat16'},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'int8'},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': '4bit'},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'float32', 'weight_decay': 0.02},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'int8', 'weight_decay': 0.02},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': '4bit', 'weight_decay': 0.02},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'float32', 'inner_momentum': 0.9},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'int8', 'inner_momentum': 0.9, 'weight_decay': 0.02},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'float32', 'warmup_steps': 3},
+    {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'float32', 'cautious': False},
+]
+
+
+@pytest.mark.parametrize("cfg", _SCALAR_CFGS)
+def test_foreach_scalar_0d_matches_per_param(cfg):
+    """0-D scalars through the batched bucket are element-for-element equal to the
+    per-parameter path (fp32 weights, so stochastic rounding is not in play).
+
+    For a length-1 slice every per-slice reduction the batched code does must
+    degenerate to the per-param scalar one (the RMS clip's ``norm/sqrt(1)``, the
+    cautious mask's mean over one element, the int8 absmax over one element) — this
+    test is the proof of that, not an assumption.
+    """
+    pa, pb, oa, _ob = _scalar_parity(cfg)
+    for a, b in zip(pa, pb, strict=True):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+    # State keeps the per-param layout: a 0-D param keeps 0-D buffers (checkpoint compat).
+    for a in pa:
+        if a.ndim == 0:
+            assert oa.state[a]["v"].shape == a.shape
+
+
+def test_foreach_scalar_0d_takes_batched_path(monkeypatch):
+    """0-D scalars must actually ride the batched bucket, not silently fall back to
+    the per-param loop (the LyCORIS use_scalar pathology this guards against)."""
+    looped = []
+    orig = ScheduleFree._step_one_param
+
+    def spy(self, p, *args, **kwargs):
+        looped.append(p)
+        return orig(self, p, *args, **kwargs)
+
+    monkeypatch.setattr(ScheduleFree, "_step_one_param", spy)
+    params = _scalar_bag(_scalar_shapes())
+    opt = ScheduleFree(params, foreach=True, lr=0.0025, betas=(0.9, 0.999))
+    gg = torch.Generator().manual_seed(3)
+    for _ in range(3):
+        for p in params:
+            p.grad = torch.randn(p.shape, generator=gg) * 0.02
+        opt.step()
+    assert not looped, f"{len(looped)} params fell back to the per-param loop"
+
+
+def test_foreach_scalar_0d_mixed_with_other_shapes():
+    """0-D scalars mixed with 1-D / 2-D / conv params: the scalars stay bit-exact vs
+    the per-param path and the other buckets keep their existing contract (the file's
+    own parity tests own the exact claim for those; here they get a 1e-7 bound so this
+    test is not hostage to value-dependent last-ulp drift)."""
+    shapes = [(), (), (1,), (40,), (40,), (8, 16), (8, 16), (4, 4, 3, 3)]
+    pa, pb, _oa, _ob = _scalar_parity({'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'float32'}, shapes=shapes, steps=8, seed=3, grad_seed=5)
+    for a, b in zip(pa, pb, strict=True):
+        if a.numel() == 1:
+            torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=1e-7)
+
+
+def test_scalar_0d_checkpoint_roundtrip_across_paths():
+    """A checkpoint saved mid-training by one path resumes bit-exactly on the other:
+    the 0-D state layout is identical on both, in both directions."""
+    cfg = {'lr': 0.0025, 'betas': (0.9, 0.999), 'momentum_dtype': 'int8', 'weight_decay': 0.02}
+    for save_foreach, load_foreach in [(True, False), (False, True)]:
+        pa = _scalar_bag(_scalar_shapes(), seed=29)
+        oa = ScheduleFree(pa, foreach=save_foreach, **cfg)
+        gg = torch.Generator().manual_seed(31)
+        grads = [[torch.randn(p.shape, generator=gg) * 0.02 for p in pa] for _ in range(8)]
+        for step in range(4):
+            for p, gr in zip(pa, grads[step], strict=True):
+                p.grad = gr.clone()
+            oa.step()
+        buf = io.BytesIO()
+        torch.save({"opt": oa.state_dict(), "params": [p.detach().clone() for p in pa]}, buf)
+        buf.seek(0)
+        ckpt = torch.load(buf, weights_only=False)
+        pb = [torch.nn.Parameter(t.clone()) for t in ckpt["params"]]
+        ob = ScheduleFree(pb, foreach=load_foreach, **cfg)
+        ob.load_state_dict(ckpt["opt"])
+        for step in range(4, 8):
+            for plist, opt in ((pa, oa), (pb, ob)):
+                for p, gr in zip(plist, grads[step], strict=True):
+                    p.grad = gr.clone()
+                opt.step()
+        for a, b in zip(pa, pb, strict=True):
+            torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+def test_scalar_0d_train_eval_roundtrip():
+    """train()/eval() swap the 0-D weights to the averaged x-iterate and back, and the
+    swap is the same on both paths (the y<->x views are per-param but read the batched
+    path's ``z``)."""
+    pa, pb, oa, ob = _scalar_parity(dict(lr=2.5e-3, betas=(0.9, 0.999), momentum_dtype="float32"))
+    for o in (oa, ob):
+        o.eval()
+    for a, b in zip(pa, pb, strict=True):
+        assert a.ndim == b.ndim
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+    y_a = [p.detach().clone() for p in pa]
+    for o in (oa, ob):
+        o.train()
+    for a, b, y in zip(pa, pb, y_a, strict=True):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+        assert not torch.equal(a.detach(), y)  # eval view really differed from train view

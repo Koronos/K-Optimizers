@@ -62,6 +62,7 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
+    flat_view,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
@@ -549,8 +550,8 @@ class KProdigy(Optimizer):
                 records[i][1].flatten()[::slice_p] for i in idxs
             ])                                                            # [B, L]
             sliced_p = torch.stack([
-                records[i][0].detach().float().flatten()[::slice_p] for i in idxs
-            ])                                                            # [B, L]
+                records[i][0].detach().flatten()[::slice_p] for i in idxs
+            ]).float()                                                    # [B, L]
             p0 = torch.stack([records[i][2]["p0"].expand_as(sliced_p[0]) for i in idxs])
             # numerator partials: <g, p0 - p> per param (tail reduction is
             # bit-identical to a per-tensor .sum()).
@@ -634,9 +635,16 @@ class KProdigy(Optimizer):
                 # a per dim-0 row scale for ndim>=2 (reduce trailing dims), a single
                 # scalar for ndim<=1 (reduce the whole row). The stacked layout is
                 # [B, *shape]; reduce all dims after B except dim-0-row.
+                #
+                # 0-D params go through flat_view so the stack is [B, 1] and the
+                # ndim<=1 branch below applies verbatim: without it the stack would
+                # be [B] with NO axis to reduce and the [B, 1] scale would broadcast
+                # to [B, B] (a hard RuntimeError on any 0-D + int8 bag). flat_view is
+                # the identity for ndim>=1, so every other shape is untouched.
                 target = d * (1 - beta1)
-                ndim = records[idxs[0]][0].ndim
-                m_stack = torch.stack([s["m"] for s in states]).float()  # [B, *shape]
+                ndim = max(records[idxs[0]][0].ndim, 1)
+                ms = [flat_view(s["m"]) for s in states]
+                m_stack = torch.stack(ms).float()                        # [B, *shape]
                 # Broadcast each per-param scale ([R,1...] or scalar) under the
                 # leading batch dim.
                 if ndim >= 2:
@@ -648,11 +656,11 @@ class KProdigy(Optimizer):
                         [s["m_scale"].reshape(1) for s in states]
                     ).reshape(len(states), 1)                            # [B, 1]
                 m_stack.mul_(scales)
-                m_stack.mul_(beta1).add_(grads, alpha=target)
+                m_stack.mul_(beta1).add_(grads.reshape(m_stack.shape), alpha=target)
                 absmax = m_stack.abs().amax(dim=reduce_dims, keepdim=True).clamp_(min=1e-12)
                 new_scale = absmax / 127.0
                 q = (m_stack / new_scale).round_().clamp_(-127, 127).to(torch.int8)
-                torch._foreach_copy_([s["m"] for s in states], list(q.unbind(0)))
+                torch._foreach_copy_(ms, list(q.unbind(0)))
                 for s, sc in zip(states, new_scale.unbind(0), strict=True):
                     s["m_scale"].copy_(sc.reshape(s["m_scale"].shape))
             else:  # 4bit — shared codec stacked lerp (bit-identical to ema_one)
@@ -740,8 +748,9 @@ class KProdigy(Optimizer):
         return group["bf16_method"] != "kahan"
 
     def _param_foreach_eligible(self, p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
-        if p.ndim == 0:
-            return False
+        # 0-D scalars are NOT excluded: they ride the non-factored bucket as
+        # length-1 rows (see kaon._backend.flat_view). Only the per-tensor size cap
+        # and the awkward dtype/contiguity cases fall back to the per-param loop.
         if p.numel() > cutoff:
             return False
         if (
@@ -859,8 +868,8 @@ class KProdigy(Optimizer):
                 matrixize = g.ndim > 2 and group["factor_conv_as_matrix"]
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
                 factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:
-                flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
+            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
+                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
 
         for (eff, _dt, matrixize), plist in factored_buckets.items():
             step = max(1, budget // max(eff[0] * eff[1], 1))
@@ -883,7 +892,7 @@ class KProdigy(Optimizer):
         if group["betas"][0] > 0:
             states = [self.state[p] for p in plist]
             return self._codec(group).dequant_stacked(states, mat, eff)
-        return torch.stack([mat(p.grad).float() for p in plist])
+        return torch.stack([mat(p.grad) for p in plist]).float()
 
     @torch.no_grad()
     def _factored_bucket(
@@ -900,7 +909,7 @@ class KProdigy(Optimizer):
         def mat(t: Tensor) -> Tensor:
             return t.view(R, C) if matrixize else t
 
-        grad = torch.stack([mat(p.grad).float() for p in plist])              # [N, R, C]
+        grad = torch.stack([mat(p.grad) for p in plist]).float()              # [N, R, C]
         rows = torch.stack([self.state[p]["row"] for p in plist])            # [N, R]
         cols = torch.stack([self.state[p]["col"] for p in plist])            # [N, C]
 
@@ -912,7 +921,7 @@ class KProdigy(Optimizer):
         delta = numer.mul_(inv_denom).mul_(dlr)
 
         if decay != 0 and decouple:
-            p_fp32 = torch.stack([mat(p.data).float() for p in plist])
+            p_fp32 = torch.stack([mat(p.data) for p in plist]).float()
             delta = delta.add_(p_fp32, alpha=decay * dlr)
 
         if cautious:
@@ -931,7 +940,7 @@ class KProdigy(Optimizer):
         cautious = group["cautious"]
         bf16_method = group["bf16_method"]
 
-        grad = torch.stack([p.grad.float() for p in plist])                  # [N, *shape]
+        grad = torch.stack([p.grad for p in plist]).float()                  # [N, *shape]
         v = torch.stack([self.state[p]["v"] for p in plist])
         denom = v.sqrt().clamp_(min=d * eps)
 
@@ -939,7 +948,7 @@ class KProdigy(Optimizer):
         delta = numer.div_(denom).mul_(dlr)
 
         if decay != 0 and decouple:
-            p_fp32 = torch.stack([p.data.float() for p in plist])
+            p_fp32 = torch.stack([p.data for p in plist]).float()
             delta = delta.add_(p_fp32, alpha=decay * dlr)
 
         if cautious:
@@ -951,8 +960,9 @@ class KProdigy(Optimizer):
     def _flat_full_bucket(
         self, plist: list[Tensor], length: int, group: dict[str, Any], d: float, dlr: float
     ) -> None:
-        """Batched update for 1-D params under factored second_moment (they use the
-        full ``v`` fallback). Same math as :meth:`_full_bucket` for a [N, L] stack."""
+        """Batched update for ``ndim <= 1`` params under factored second_moment (they use
+        the full ``v`` fallback; 0-D scalars ride as length 1). Same math as
+        :meth:`_full_bucket` for a [N, L] stack."""
         self._full_bucket(plist, (length,), group, d, dlr)
 
     # -- weight update -----------------------------------------------------

@@ -80,11 +80,11 @@ def step_ms(opt: torch.optim.Optimizer, reps: int, warmup: int) -> float:
     for _ in range(reps):
         if DEV == "cuda":
             torch.cuda.synchronize()
-        t0 = time.time()
+        t0 = time.perf_counter()
         opt.step()
         if DEV == "cuda":
             torch.cuda.synchronize()
-        ts.append((time.time() - t0) * 1000.0)
+        ts.append((time.perf_counter() - t0) * 1000.0)
     ts.sort()
     return ts[len(ts) // 2]
 

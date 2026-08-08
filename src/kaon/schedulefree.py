@@ -121,6 +121,7 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
+    flat_view,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
@@ -509,7 +510,10 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
 
     @staticmethod
     def _param_foreach_eligible(p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
-        if p.ndim == 0 or p.numel() > cutoff:
+        # 0-D scalars are NOT excluded: they ride the non-factored bucket as
+        # length-1 rows (see kaon._backend.flat_view). Only the per-tensor size cap
+        # and the awkward dtype/contiguity cases fall back to the per-param loop.
+        if p.numel() > cutoff:
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"
@@ -539,8 +543,8 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
                 matrixize = g.ndim > 2
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
                 factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:
-                flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
+            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
+                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
 
         for (eff, _dtype, matrixize), plist in factored_buckets.items():
             stepn = max(1, budget // max(eff[0] * eff[1], 1))
@@ -568,7 +572,7 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         rows = [s["row"] for s in states]
         cols = [s["col"] for s in states]
 
-        grad = torch.stack([mat(p.grad).float() for p in plist])          # [N, R, C]
+        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -589,7 +593,7 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         d = self._normalized_d_stacked(states, md, grad, inv_denom, (R, C), c)     # [N, R, C]
 
         if wd != 0:
-            d.add_(torch.stack([mat(p.data).float() for p in plist]), alpha=wd)    # at y
+            d.add_(torch.stack([mat(p.data) for p in plist]).float(), alpha=wd)    # at y
 
         if cautious:
             d = cautious_batched_(d, grad)
@@ -607,14 +611,21 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         self, plist: list[Tensor], length: int, md: str,
         c: dict[str, float], group: dict[str, Any],
     ) -> None:
+        """Non-factored (full per-coordinate ``v``) update for ``ndim <= 1`` params.
+
+        0-D scalars share the ``L == 1`` bucket with shape-``(1,)`` params as length-1
+        **views** (:func:`~kaon._backend.flat_view`) of the same storage, so ``v``, the
+        ``z`` / ``exp_avg`` codec write-backs and the y write all reach the original
+        0-D tensors and the persisted state keeps its per-param shape.
+        """
         eps1 = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
 
         states = [self.state[p] for p in plist]
-        vs = [s["v"] for s in states]
+        vs = [flat_view(s["v"]) for s in states]
 
-        grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
+        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
         v = torch.stack(vs)
 
         v.mul_(c["beta2"]).addcmul_(grad, grad, value=1.0 - c["beta2"])
@@ -626,13 +637,13 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         d = self._normalized_d_stacked(states, md, grad, inv_denom, (length,), c)  # [N, L]
 
         if wd != 0:
-            d.add_(torch.stack([p.data.float() for p in plist]), alpha=wd)
+            d.add_(torch.stack([flat_view(p.data) for p in plist]).float(), alpha=wd)
 
         if cautious:
             d = cautious_batched_(d, grad)
 
         z = self._dequant_full_stacked(states, "z", md, (length,))
-        ys = [p.data for p in plist]
+        ys = [flat_view(p.data) for p in plist]
         self._lerp_then_add_batched(ys, z, d, c["ckp1"], c["y_d_coef"], bf16_method)
         z.sub_(d, alpha=c["lr_t"])
         self._store_full_stacked(states, "z", md, z)
@@ -651,7 +662,7 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         """
         # y_new = (1-ckp1)*y + ckp1*z + y_d_coef*d ; y_new = y - delta
         # => delta = ckp1*(y - z) - y_d_coef*d
-        ystack = torch.stack([yv.float() for yv in yviews])
+        ystack = torch.stack(yviews).float()
         delta = ystack.sub_(z).mul_(ckp1).sub_(d, alpha=y_d_coef)
         subtract_batched_(yviews, delta, bf16_method)
 

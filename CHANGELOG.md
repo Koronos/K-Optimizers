@@ -4,6 +4,82 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.10]
+
+### Performance
+- **0-D scalars are batched** in all nine foreach optimizers (Adakaon, AdaBelief, AdamP,
+  AdaMuon, AdaPNM, ADOPT, KProdigy, Lion, ScheduleFree). A bag of 0-D parameters —
+  LyCORIS `use_scalar` gates and friends — was excluded from the batched path outright
+  and stepped one at a time, ~22 CUDA launches per scalar per step of pure CPU dispatch.
+  They now ride the non-factored bucket as length-1 **views** (`_backend.flat_view`),
+  sharing the `L == 1` bucket with real shape-`(1,)` params; for Adakaon they also reach
+  the Triton 1-D kernel, which is shape-free (base pointer + element count) and needs
+  nothing but `numel() == 1`. Measured on 448 scalars, bf16 momentum: native
+  330.0 -> 6.4 ms/step (51x), fused 305.9 -> 0.45 ms/step (684x). The persisted state
+  keeps its 0-D shape, so checkpoints stay interchangeable with the per-parameter path
+  in both directions.
+- Removed the per-parameter cast anti-pattern from every batched stacking site (33
+  sites). `torch.stack([x.float() for x in xs])` launches one widening kernel per
+  parameter; `torch.stack(xs).float()` launches one per bucket. Numerically identical
+  (bf16 -> fp32 is exact widening), and it was 901 of the 949 CUDA launches in a
+  non-factored Adakaon bucket step.
+- **`TILE_CAP` 131072 -> 8192**, with the 1-D ceiling split out into a new
+  `TILE_CAP_1D` (131072, i.e. unchanged behaviour for 1-D). `TILE_CAP` is the 2-D
+  one-block/chunked crossover, and 0.7.7's chunked-kernel rewrite moved it down by 16x —
+  the old value dates from when the alternative was the native foreach path. Re-measured
+  on the current kernels (min of 60 A/B-interleaved reps, fp32 and bf16 params, N=50 and
+  N=200 bags, all four configs agreeing): one_block wins to 8192 (1.1-2.5x), chunked
+  wins from 16384 (1.0-1.9x) and 32768 (1.5-1.8x). End to end, 200x (256,256) steps
+  10.18 -> 2.26 ms in fp32 (4.5x) and 10.87 -> 1.55 ms in bf16 (7.0x); a mixed 2-D bag
+  8.46 -> 1.93 ms (4.4x); bags already below the cap are unchanged within noise. The
+  crossover is an occupancy effect (tensors-per-CTA against SM count), so it is GPU
+  dependent and stays overridable per optimizer with `fused_tile_cap=`.
+- **The 2-D and 1-D caps are now separate constants**, because they answer different
+  questions. Over the 2-D cap a tensor goes to the **chunked** kernel, which is faster —
+  that cap is an occupancy crossover and wants to be low. Over the 1-D cap there is no
+  chunked route and the tensor falls to the **native** path, which is slower — that cap
+  is a one-program capability bound. Sharing one constant would have turned the 2-D win
+  into a 2.0-2.2x regression for 1-D tensors of length 16384, a reachable shape (a
+  14336-wide FFN's norm weight pads to 16384 lanes). `fused_tile_cap=` keeps its name
+  and now means the 2-D crossover only; it no longer moves the 1-D ceiling.
+- Adakaon caches the native foreach path's bucketing and derived views per param group
+  (`_ForeachPlan` / `_ForeachChunk`). The cached objects are views of tensors the
+  optimizer already owns, so nothing extra is pinned; gradient views are deliberately
+  **not** cached, since a retained `p.grad` view would hold the previous step's gradient
+  storage alive and add a whole gradient set to peak memory. Invalidated by param-set
+  change, `p.data` rebind, `load_state_dict`, `_autolr_reset_base_state`,
+  `add_param_group`, and a budget-driven re-chunk. `_foreach_cache_enabled = False`
+  restores the uncached behaviour for A/B measurement; it is numerically a no-op.
+- Combined effect on a realistic full-fine-tune-with-LyCORIS bag (200x (256,256) + 100x
+  (512,) + 128 scalars, bf16): native 122.1 -> 14.7 ms/step, fused 118.9 -> 2.26 ms/step.
+
+### Fixed
+- int8 `m_scale` layout in the batched requant of AdaBelief, AdamP, AdaPNM and Lion.
+  `_store_stacked` hardcoded the scale to `(row, 1)` for `ndim >= 2` and `(1,)`
+  otherwise, which is not what the per-parameter `_quant_int8` produces for anything
+  that is not exactly 2-D: a conv's scale is `(R, 1, 1, 1)` and a 0-D param's is a
+  scalar. A parameter stepped once by the foreach path could then never be stepped
+  per-parameter again — the stored scale mis-broadcast against the momentum and raised,
+  a hard error rather than a silent skew. Both paths now go through the shared
+  `int8_scale_shape`.
+- KProdigy's int8 pass-1 momentum update raised on any bag mixing 0-D params with int8
+  momentum: the stack had no axis to reduce and the `[B, 1]` scale broadcast to
+  `[B, B]`. The stack now goes through `flat_view`, which is the identity above 0-D.
+
+### Validation
+- ~200 new tests: batched-vs-per-param parity and cross-path checkpoint round trips for
+  0-D params in each of the nine optimizers, fused routing and parity for 0-D under
+  every momentum dtype (including int8/4bit and `beta1=0`, which the 1-D kernel has
+  carried since 0.7.7), the six foreach-cache invalidation paths, the `TILE_CAP` route
+  flip, and `tests/test_stacked_cast.py`, which counts `aten::_to_copy` kernels raised
+  at `torch.stack` sites through a dispatch mode and fails if they scale with bucket
+  size. Suite: 858 passed, 1 skipped, against 655 passed on 0.7.9.
+- The cap split is pinned by two dedicated tests, because the failure it prevents is a
+  silent perf regression that no correctness assertion would catch: one on the
+  predicates (at the same 16384 padded lanes, a 1-D tensor is eligible for the fused 1-D
+  kernel while a 2-D tensor is not) and one end to end (a bag of 16384-long 1-D params
+  lands in `one_dim`, not `native`).
+
 ## [0.7.9]
 
 ### Changed

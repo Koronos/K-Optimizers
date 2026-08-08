@@ -103,6 +103,7 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
+    flat_view,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
@@ -331,7 +332,10 @@ class ADOPT(AutoLRMixin, Optimizer):
 
     @staticmethod
     def _param_foreach_eligible(p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
-        if p.ndim == 0 or p.numel() > cutoff:
+        # 0-D scalars are NOT excluded: they ride the non-factored bucket as
+        # length-1 rows (see kaon._backend.flat_view). Only the per-tensor size cap
+        # and the awkward dtype/contiguity cases fall back to the per-param loop.
+        if p.numel() > cutoff:
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"
@@ -345,7 +349,10 @@ class ADOPT(AutoLRMixin, Optimizer):
 
     @torch.no_grad()
     def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
-        """Batched step. Factored (ndim>=2) and non-factored (ndim==1) buckets, by shape."""
+        """Batched step. Factored (ndim>=2) and non-factored (ndim<=1) buckets, by shape.
+
+        0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
+        with real shape-(1,) params."""
         c = self._coeffs(group)
 
         factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
@@ -359,8 +366,8 @@ class ADOPT(AutoLRMixin, Optimizer):
                 matrixize = g.ndim > 2
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
                 factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:
-                flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
+            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
+                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
 
         for (eff, _dtype, matrixize), plist in factored_buckets.items():
             stepn = max(1, budget // max(eff[0] * eff[1], 1))
@@ -391,7 +398,7 @@ class ADOPT(AutoLRMixin, Optimizer):
         rows = [s["row"] for s in states]
         cols = [s["col"] for s in states]
 
-        grad = torch.stack([mat(p.grad).float() for p in plist])          # [N, R, C]
+        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -439,13 +446,20 @@ class ADOPT(AutoLRMixin, Optimizer):
         c: dict[str, float],
         group: dict[str, Any],
     ) -> None:
+        """Non-factored (full per-coordinate ``v``) update for ``ndim <= 1`` params.
+
+        0-D scalars share the ``L == 1`` bucket with shape-``(1,)`` params as length-1
+        **views** (:func:`~kaon._backend.flat_view`) of the same storage, so the
+        step-0 ``v = g_0^2`` init, the lagged v write-back, the codec write-back and
+        the weight subtract all reach the original 0-D tensors.
+        """
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
 
         states = [self.state[p] for p in plist]
-        vs = [s["v"] for s in states]
+        vs = [flat_view(s["v"]) for s in states]
 
-        grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
+        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
         if c["ostep"] == 0:
@@ -453,7 +467,7 @@ class ADOPT(AutoLRMixin, Optimizer):
             return
 
         if wd != 0:
-            torch._foreach_mul_([p.data for p in plist], 1.0 - group["lr"] * wd)
+            torch._foreach_mul_([flat_view(p.data) for p in plist], 1.0 - group["lr"] * wd)
 
         # normalize by the PRE-update v: denom = max(sqrt(v), eps).
         denom = v.sqrt().clamp_(min=c["eps"])
@@ -461,12 +475,12 @@ class ADOPT(AutoLRMixin, Optimizer):
         if c["clip"] is not None:
             normed.clamp_(-c["clip"], c["clip"])
 
-        m = self._codec.ema_stacked(states, normed, lambda t: t, (length,), c["beta1"])  # [N, L]
+        m = self._codec.ema_stacked(states, normed, flat_view, (length,), c["beta1"])  # [N, L]
         delta = m.mul_(c["lr"])
 
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_([p.data for p in plist], delta, bf16_method)
+        subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method)
 
         # fold g_t into v AFTER use.
         v.mul_(c["beta2"]).addcmul_(grad, grad, value=1.0 - c["beta2"])

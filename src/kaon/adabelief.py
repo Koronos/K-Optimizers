@@ -97,6 +97,7 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
+    flat_view,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
@@ -112,6 +113,7 @@ from kaon._momentum_codec import (
     _quant_int8,
     _quant_int8_stacked,
     fourbit_block_size,
+    int8_scale_shape,
     load_state_dict_preserving_dtypes,
 )
 
@@ -352,8 +354,13 @@ class AdaBelief(AutoLRMixin, Optimizer):
             torch._foreach_copy_(
                 [s["m"].reshape(row, rest) for s in states], list(q.unbind(0))
             )
+            # Store the scale in the layout `_quant_int8` (the per-param requant)
+            # produces, so the two paths stay interchangeable. Hardcoding (row, 1)
+            # here reshaped a conv's (R,1,1,1) scale to (R,1) and a 0-D param's ()
+            # scale to (1,); the next per-param step on that state then raised on
+            # the mismatched broadcast.
             for s, sc in zip(states, new_scale.unbind(0), strict=True):  # sc: [R, 1]
-                s["m_scale"] = sc.reshape(row, 1) if len(shape) >= 2 else sc.reshape(1)
+                s["m_scale"] = sc.reshape(int8_scale_shape(s["m"]))
         else:  # 4bit
             bs = states[0]["m_block"]
             new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs)
@@ -437,7 +444,10 @@ class AdaBelief(AutoLRMixin, Optimizer):
 
     @staticmethod
     def _param_foreach_eligible(p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
-        if p.ndim == 0 or p.numel() > cutoff:
+        # 0-D scalars are NOT excluded: they ride the non-factored bucket as
+        # length-1 rows (see kaon._backend.flat_view). Only the per-tensor size cap
+        # and the awkward dtype/contiguity cases fall back to the per-param loop.
+        if p.numel() > cutoff:
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"
@@ -452,7 +462,10 @@ class AdaBelief(AutoLRMixin, Optimizer):
 
     @torch.no_grad()
     def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
-        """Batched step. Factored (ndim>=2) and non-factored (ndim==1) buckets, by shape."""
+        """Batched step. Factored (ndim>=2) and non-factored (ndim<=1) buckets, by shape.
+
+        0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
+        with real shape-(1,) params."""
         c = self._coeffs(group)
         md = group["momentum_dtype"]
 
@@ -467,8 +480,8 @@ class AdaBelief(AutoLRMixin, Optimizer):
                 matrixize = g.ndim > 2
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
                 factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:
-                flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
+            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
+                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
 
         for (eff, _dtype, matrixize), plist in factored_buckets.items():
             stepn = max(1, budget // max(eff[0] * eff[1], 1))
@@ -501,7 +514,7 @@ class AdaBelief(AutoLRMixin, Optimizer):
         rows = [s["row"] for s in states]
         cols = [s["col"] for s in states]
 
-        grad = torch.stack([mat(p.grad).float() for p in plist])          # [N, R, C]
+        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -547,18 +560,27 @@ class AdaBelief(AutoLRMixin, Optimizer):
         c: dict[str, float],
         group: dict[str, Any],
     ) -> None:
+        """Non-factored (full per-coordinate ``s``) update for ``ndim <= 1`` params.
+
+        0-D scalars share the ``L == 1`` bucket with shape-``(1,)`` params as length-1
+        **views** (:func:`~kaon._backend.flat_view`) of the same storage, so the state
+        write-backs and the weight subtract reach the original 0-D tensors and the
+        persisted state keeps its per-param shape. The cautious mask's per-slice mean
+        over one element is the scalar mask itself, so the math is element-for-element
+        :meth:`_step_one_param`'s.
+        """
         eps = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
 
         states = [self.state[p] for p in plist]
-        ss = [s["s"] for s in states]
+        ss = [flat_view(s["s"]) for s in states]
 
-        grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
+        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
         s = torch.stack(ss)                                               # [N, L]
 
         if wd != 0:
-            self._apply_decoupled_wd_batched(plist, lambda t: t, group["lr"] * wd)
+            self._apply_decoupled_wd_batched(plist, flat_view, group["lr"] * wd)
 
         # First-moment EMA before the residual second moment.
         m = self._dequant_stacked(states, md, (length,))                  # [N, L]
@@ -577,7 +599,7 @@ class AdaBelief(AutoLRMixin, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([p.data for p in plist], delta, bf16_method)
+        subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method)
 
     @torch.no_grad()
     def _apply_decoupled_wd_batched(self, plist: list[Tensor], mat: Any, factor: float) -> None:

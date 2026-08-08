@@ -17,13 +17,17 @@ the whole update (EMA + reconstruction + RMS clip + momentum + weight decay +
 cautious + stochastic rounding) as a handful of batched kernels:
 
 - `ndim >= 2` → factored bucket `[N, R, C]`
-- `ndim == 1` (biases/norms, the bulk of a full fine-tune) → non-factored `[N, L]`
+- `ndim <= 1` (biases/norms, the bulk of a full fine-tune, plus 0-D scalars such
+  as LyCORIS `use_scalar` gates, which ride the bucket as length-1 rows) →
+  non-factored `[N, L]`
 
 It is **element-for-element equal** to the per-parameter path (bit-exact on CPU,
 ~1e-8 on CUDA from reduction order; stochastic-rounding draws legitimately differ,
-unbiased either way). Anything it doesn't cover — 0-D scalars, `momentum_dtype=
-"int8"`, `bf16_method="kahan"`, fp16+SR, non-contiguous matrixized convs,
-single-param (gradient-release) optimizers — transparently falls back to the loop.
+unbiased either way); `momentum_dtype="int8"` is also batched (per-row absmax
+dequant/EMA/requant on the stacked layout), as is `"4bit"` (per-block absmax,
+packed nibbles). Anything it doesn't cover — `bf16_method="kahan"`, fp16+SR,
+non-contiguous matrixized convs, single-param (gradient-release) optimizers —
+transparently falls back to the loop.
 
 ### Measured
 
@@ -36,6 +40,23 @@ single-param (gradient-release) optimizers — transparently falls back to the l
 foreach is a large win for adapters (many tiny tensors, launch-bound) and a modest
 one for full fine-tunes (dominated by large bandwidth-bound weights — there is less
 launch overhead to remove there).
+
+0-D scalars are the extreme of the launch-bound regime, and until 0.7.10 they were
+excluded from batching entirely. Adakaon on 448 bare scalars with bf16 momentum
+(`benchmarks/fused/bench_scalar0d.py`, median of 50 reps, RTX 3000 Ada Laptop):
+
+| regime | native before | native after | fused before | fused after |
+|---|---|---|---|---|
+| 448 × `()` scalars | 330.0 ms | **6.4 ms** | 305.9 ms | **0.45 ms** |
+| 448 × `(1,)` (control) | 20.1 ms | 4.9 ms | 0.51 ms | 0.27 ms |
+| mixed 2-D + 1-D + 0-D | 122.1 ms | 14.7 ms | 118.9 ms | 2.26 ms |
+
+The `(1,)` control is the point: a shape-`(1,)` param and a 0-D param are the same
+amount of work, and the gap between them was pure per-tensor dispatch. They now share
+the `L == 1` bucket, so the two rows track each other. The `after` column also carries
+the two other changes in that release (one widening cast per bucket instead of one per
+param, and the cached bucketing/view plan), which is why the `(1,)` control improved
+too.
 
 ## The two knobs (deliberately decoupled)
 

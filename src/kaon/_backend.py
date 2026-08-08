@@ -4,6 +4,7 @@ One implementation each — so a fix or a perf change lands everywhere at once �
 cross-cutting pieces that used to be copy-pasted into each optimizer:
 
 * the low-precision dtype check,
+* the 0-D -> length-1 view used by every non-factored foreach bucket,
 * the bf16-correct weight write (``p -= delta``), per-param and batched (foreach),
 * cautious masking (Liang et al. 2024), per-param and batched.
 
@@ -28,6 +29,7 @@ __all__ = [
     "cautious_batched_",
     "cautious_one_",
     "centralize_grads_",
+    "flat_view",
     "foreach_budget",
     "is_low_precision",
     "rms",
@@ -45,6 +47,28 @@ def is_low_precision(t: Tensor) -> bool:
 def rms(t: Tensor) -> Tensor:
     """Root-mean-square of ``t`` (Adafactor-style update normalizer)."""
     return t.norm(2) / math.sqrt(max(t.numel(), 1))
+
+
+def flat_view(t: Tensor) -> Tensor:
+    """0-D scalar -> length-1 **view**; anything else returned untouched.
+
+    The single place every optimizer's non-factored foreach bucket goes through to
+    admit 0-D params (LyCORIS ``use_scalar`` gates and friends). A bag of scalars on
+    the per-parameter path costs ~20 CUDA launches *per scalar per step* — pure CPU
+    dispatch, measured ~6x the wall time of the same params shaped ``(1,)`` — which is
+    exactly what foreach batching exists to remove. Bucketing them by ``numel()``
+    drops them into the ``L == 1`` non-factored bucket alongside real shape-``(1,)``
+    params, and the whole update (grad stack, state stack, codec write-back, weight
+    subtract) then flows through length-1 rows.
+
+    It must be a *view*, not a reshape-copy: the bucket writes state and weights back
+    through it, so those writes have to reach the original 0-D storage and leave the
+    persisted state at its per-param shape (checkpoints stay compatible across paths).
+    For ``L == 1`` the batched per-slice reductions degenerate to the per-param scalar
+    ones — ``norm(dim=1)/sqrt(1) == rms(x)``, and a one-element mask's mean is the mask
+    — so the batched and per-param paths stay element-for-element identical.
+    """
+    return t.view(1) if t.ndim == 0 else t
 
 
 # ----------------------------- foreach budget -----------------------------

@@ -93,6 +93,7 @@ from kaon._momentum_codec import (
     _quant_int8,
     _quant_int8_stacked,
     fourbit_block_size,
+    int8_scale_shape,
     load_state_dict_preserving_dtypes,
 )
 
@@ -306,9 +307,13 @@ class Lion(AutoLRMixin, Optimizer):
             torch._foreach_copy_(
                 [s["m"].reshape(row, rest) for s in states], list(q.unbind(0))
             )
-            # Per-param scale is shaped (R, 1) (ndim>=2) or (1,) (ndim==1, scalar).
+            # Store the scale in the layout `_quant_int8` (the per-param requant)
+            # produces, so the two paths stay interchangeable. Hardcoding (row, 1)
+            # here reshaped a conv's (R,1,1,1) scale to (R,1) and a 0-D param's ()
+            # scale to (1,); the next per-param step on that state then raised on
+            # the mismatched broadcast.
             for s, sc in zip(states, new_scale.unbind(0), strict=True):  # sc: [R, 1]
-                s["m_scale"] = sc.reshape(row, 1) if len(shape) >= 2 else sc.reshape(1)
+                s["m_scale"] = sc.reshape(int8_scale_shape(s["m"]))
         else:  # 4bit
             bs = states[0]["m_block"]
             new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs)
@@ -369,7 +374,10 @@ class Lion(AutoLRMixin, Optimizer):
 
     @staticmethod
     def _param_foreach_eligible(p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
-        if p.ndim == 0 or p.numel() > cutoff:
+        # 0-D scalars are NOT excluded: they ride the non-factored bucket as
+        # length-1 rows (see kaon._backend.flat_view). Only the per-tensor size cap
+        # and the awkward dtype/contiguity cases fall back to the per-param loop.
+        if p.numel() > cutoff:
             return False
         # fp16+SR is unsupported (raises) -> route to the per-param path.
         return not (
@@ -429,7 +437,7 @@ class Lion(AutoLRMixin, Optimizer):
     ) -> None:
         n = len(plist)
         states = [self.state[p] for p in plist]
-        grad = torch.stack([p.grad.reshape(length).float() for p in plist])  # [N, L]
+        grad = torch.stack([p.grad.reshape(length) for p in plist]).float()  # [N, L]
         m = self._dequant_stacked(states, md, shape).reshape(n, length)      # [N, L] fp32
 
         # Lion direction: sign of the beta1-interpolated momentum.
@@ -441,7 +449,7 @@ class Lion(AutoLRMixin, Optimizer):
         self._store_stacked(states, md, m.reshape((n, *shape)))
 
         if wd != 0:
-            p_fp32 = torch.stack([p.data.reshape(length).float() for p in plist])
+            p_fp32 = torch.stack([p.data.reshape(length) for p in plist]).float()
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:

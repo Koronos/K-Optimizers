@@ -20,6 +20,7 @@ from kaon import Adakaon, Nekaon
 from kaon._fused_triton import (
     HAS_TRITON,
     TILE_CAP,
+    TILE_CAP_1D,
     fused_1d_eligible,
     fused_eligible,
     next_pow2_tile,
@@ -134,7 +135,8 @@ def _buckets(opt):
 
 def _bag(shapes, dtype=torch.float32, seed=0):
     g = torch.Generator(device=DEV).manual_seed(seed)
-    return [torch.randn(*s, generator=g, device=DEV, dtype=dtype).requires_grad_(True) for s in shapes]
+    # tuple-form randn (identical draws to the *s varargs form) so 0-D shapes `()` work too
+    return [torch.randn(s, generator=g, device=DEV, dtype=dtype).requires_grad_(True) for s in shapes]
 
 
 def _clone(ps):
@@ -155,7 +157,7 @@ def _run_parity(
     on = Adakaon(pn, **cfg)
     gen = torch.Generator(device=DEV).manual_seed(7)
     for _ in range(steps):
-        gs = [torch.randn(*p.shape, generator=gen, device=DEV, dtype=dtype) for p in pv]
+        gs = [torch.randn(tuple(p.shape), generator=gen, device=DEV, dtype=dtype) for p in pv]
         for p, g in zip(pv, gs):
             p.grad = g.clone()
         for p, g in zip(pn, gs):
@@ -273,11 +275,13 @@ def test_load_state_dict_invalidates_pointer_caches():
 
 # ----------------------------------------------------------------- host helpers
 def test_eligibility_predicate():
-    assert TILE_CAP == 1 << 17                                       # measured crossover (131072)
+    assert TILE_CAP == 1 << 13                        # measured one_block/chunked crossover (8192)
     assert fused_eligible(torch.zeros(8, 16, device=DEV))            # tiny 2-D
     assert fused_eligible(torch.zeros(16, 320, device=DEV))          # low-rank LoRA
     assert fused_eligible(torch.zeros(16, 320, device=DEV, dtype=torch.bfloat16))
-    assert fused_eligible(torch.zeros(128, 1024, device=DEV))        # 131072 lanes == cap (medium)
+    assert fused_eligible(torch.zeros(64, 128, device=DEV))          # 8192 lanes == cap (medium)
+    assert not fused_eligible(torch.zeros(128, 128, device=DEV))     # 16384 lanes -> chunked wins
+    assert not fused_eligible(torch.zeros(256, 256, device=DEV))     # 65536 lanes -> chunked wins 4.5x
     assert not fused_eligible(torch.zeros(128, device=DEV))          # 1-D
     assert fused_eligible(torch.zeros(8, 8, 3, 3, device=DEV))       # conv ndim>2 -> matrixized (8,72)
     assert not fused_eligible(torch.zeros(8, 8, 256, 256, device=DEV))  # conv too big for one block
@@ -319,10 +323,18 @@ def test_fp32_parity_lora_shapes():
 
 
 def test_fp32_parity_medium_tiles_near_cap():
-    # tiles up to the raised cap (131072 lanes) fuse and stay exact vs native (measured 1.2-1.4x faster)
-    d, _, ov = _run_parity([(128, 1024), (256, 512)], torch.float32, "float32")
+    # tiles right at the cap (8192 lanes) still take the one-block kernel (measured 1.1-1.3x over
+    # chunked there) and stay exact vs native
+    d, _, ov = _run_parity([(64, 128), (128, 64)], torch.float32, "float32")
     assert d < 1e-5, f"max|Δp|={d:.2e}"
-    assert len(_parts(ov)[0]) == 2                                 # both fused at the new cap
+    assert len(_parts(ov)[0]) == 2                                 # both one-block at the cap
+
+
+def test_fp32_parity_just_above_cap_routes_chunked():
+    # one lane-doubling past the cap (16384) flips to the chunked path; same math
+    d, _, ov = _run_parity([(128, 128), (128, 128)], torch.float32, "float32")
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+    assert len(_parts(ov)[0]) == 0 and len(_parts(ov)[1]) == 2
 
 
 # ----------------------------------------------------------------- chunked (big-tensor) path
@@ -460,10 +472,35 @@ def test_big_batched_matches_native_foreach_toggle():
 # Many tiny 1-D tensors are the launch-bound regime (like the 2-D LoRA bag); the fused 1-D kernel owns
 # one per program. All momentum codecs are updated inside the same kernel.
 def test_one_dim_eligibility_predicate():
+    assert TILE_CAP_1D == 1 << 17                     # 1-D one-program bound (131072), not the 2-D cap
     assert fused_1d_eligible(torch.zeros(1024, device=DEV))
     assert fused_1d_eligible(torch.zeros(2048, device=DEV, dtype=torch.bfloat16))
     assert not fused_1d_eligible(torch.zeros(8, 16, device=DEV))             # 2-D -> not the 1-D path
-    assert not fused_1d_eligible(torch.zeros(TILE_CAP * 2, device=DEV))      # too big for one block
+    assert fused_1d_eligible(torch.zeros(TILE_CAP_1D, device=DEV))           # exactly at the 1-D cap
+    assert not fused_1d_eligible(torch.zeros(TILE_CAP_1D * 2, device=DEV))   # too big for one block
+
+
+def test_one_dim_cap_is_independent_of_the_two_dim_crossover():
+    """The 2-D cap is an occupancy crossover (over it, the CHUNKED kernel is faster); the 1-D cap
+    is a one-program capability bound (over it there is only NATIVE, which is slower). Coupling
+    them cost 2x on 1-D tensors of 16384 lanes, so the asymmetry is pinned here: at the SAME
+    16384 padded lanes a 1-D tensor must stay fused while a 2-D tensor must go chunked."""
+    assert TILE_CAP < TILE_CAP_1D
+    lanes = 1 << 14
+    assert fused_1d_eligible(torch.zeros(lanes, device=DEV))                 # 1-D 16384 -> fused
+    assert not fused_eligible(torch.zeros(128, 128, device=DEV))             # 2-D 16384 -> chunked
+    # and the 2-D knob must not drag the 1-D ceiling down with it
+    assert fused_1d_eligible(torch.zeros(lanes, device=DEV), TILE_CAP_1D)
+
+
+def test_one_dim_above_two_dim_cap_still_routes_fused():
+    """End-to-end counterpart of the predicate asymmetry: a bag of 16384-long 1-D params is
+    2x faster fused than native, so it must land in ``one_dim`` even though the same padded
+    lane count sends a 2-D weight to the chunked path."""
+    d, _, ov = _run_parity([(1 << 14,)] * 3, torch.float32, "float32")
+    ob, big, od, nat = _parts(ov)
+    assert len(od) == 3 and len(nat) == 0 and len(big) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
 
 
 def test_one_dim_routes_and_parity_fp32():
@@ -592,6 +629,109 @@ def test_nekaon_fused_cache_admits_late_gradient():
     assert sum(bk["N"] for bk in ov._axpy_cache["buckets"]) == 2
     d = max((a - b).abs().max().item() for a, b in zip(pv, pn, strict=True))
     assert d < 2e-3, f"late-gradient fused/native max|Δp|={d:.2e}"
+
+
+def test_one_dim_mixed_dtype_buckets_split():
+    """fp32 and bf16 1-D params of the SAME length must land in SEPARATE kernel
+    buckets: `lowp` (the kernel's pointer type) is per-bucket, so a shared bucket
+    would read half the bag through the wrong pointer type."""
+    cfg = dict(lr=2e-3, betas=(0.9, 0.999), momentum_dtype="float32")
+    pv = _bag([(512,)] * 2, torch.float32, seed=3) + _bag([(512,)] * 2, torch.bfloat16, seed=4)
+    pn = _clone(pv)
+    ov = _fused(pv, **cfg)
+    on = Adakaon(pn, **cfg)
+    gen = torch.Generator(device=DEV).manual_seed(9)
+    for _ in range(6):
+        for p, q in zip(pv, pn):
+            g = torch.randn(tuple(p.shape), generator=gen, device=DEV, dtype=p.dtype)
+            p.grad, q.grad = g.clone(), g.clone()
+        ov.step()
+        on.step()
+    torch.cuda.synchronize()
+    buckets = [bk for cache in ov._fused_od_caches.values() for bk in cache.buckets]
+    assert len(buckets) == 2, f"expected fp32/bf16 split, got {len(buckets)} bucket(s)"
+    for a, b in zip(pv, pn):
+        rel = (a.detach().float() - b.detach().float()).abs().max().item()
+        scale = max(b.detach().float().abs().max().item(), 1e-3)
+        assert rel / scale < 5e-2, f"dtype={a.dtype} rel={rel/scale:.2e}"
+
+
+# ------------------------------------------------- 0-D scalars (LyCORIS use_scalar gates)
+# A 0-D param has a valid base pointer and numel()==1, which is all the shape-free 1-D kernel
+# needs — it rides the one_dim path as a length-1 tensor. Per-param dispatch for a bag of
+# scalars is ~22 CUDA launches per scalar per step (measured 592x slower than shape-(1,)).
+def test_zero_dim_routes_to_one_dim_and_parity_fp32():
+    d, _, ov = _run_parity([()] * 6, torch.float32, "float32")
+    ob, big, od, nat = _parts(ov)
+    assert len(od) == 6 and len(ob) == 0 and len(big) == 0 and len(nat) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_zero_dim_mixed_with_1d_and_2d():
+    # the real LoKr layout: adapter matrices + per-module 0-D scalar gates
+    d, _, ov = _run_parity([(8, 16), (16, 16), (), (), (1,), (256,)], torch.float32, "float32")
+    ob, big, od, nat = _parts(ov)
+    assert len(ob) == 2 and len(od) == 4 and len(nat) == 0
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+@pytest.mark.parametrize("cautious", [True, False])
+def test_zero_dim_features(cautious):
+    d, _, _ = _run_parity([()] * 4, torch.float32, "float32", cautious=cautious, wd=0.05)
+    assert d < 1e-5, f"cautious={cautious} max|Δp|={d:.2e}"
+
+
+def test_zero_dim_bf16_momentum():
+    d, scale, _ = _run_parity([()] * 4, torch.float32, "bfloat16")
+    assert d / scale < 5e-3, f"rel={d/scale:.2e}"
+
+
+def test_zero_dim_bf16_params_sr():
+    d, scale, _ = _run_parity([()] * 4, torch.bfloat16, "bfloat16")
+    assert d / scale < 5e-2, f"rel={d/scale:.2e}"
+
+
+@pytest.mark.parametrize("mdtype", ["int8", "4bit"])
+def test_zero_dim_quant_routes_to_one_dim(mdtype):
+    # The 1-D kernel carries int8/4bit momentum (scalar scale / one 2-lane nibble block),
+    # so a 0-D scalar rides it under quant momentum exactly like a shape-(1,) param does.
+    d, scale, ov = _run_parity([()] * 4, torch.float32, mdtype)
+    ob, big, od, nat = _parts(ov)
+    assert len(od) == 4 and len(nat) == 0
+    assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
+
+
+@pytest.mark.parametrize("mdtype", ["int8", "4bit"])
+def test_zero_dim_quant_buckets_apart_from_one_dim(mdtype):
+    # A 0-D scalar and a shape-(1,) param share BL == next_pow2(numel); the mixed bag must
+    # still match native, and the 2-D weight must stay on its own (one-block) route.
+    d, scale, ov = _run_parity([(), (), (1,), (256,), (8, 16)], torch.float32, mdtype)
+    ob, big, od, nat = _parts(ov)
+    assert len(ob) == 1 and len(od) == 4 and len(nat) == 0
+    assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
+
+
+def test_zero_dim_no_momentum_routes_to_one_dim():
+    # beta1==0 (no ``m``) is a supported 1-D kernel mode — it reuses ``v_addr`` as a
+    # harmless valid pointer — so the scalars stay on the fused route and stay bit-exact.
+    cfg = dict(lr=2e-3, betas=(0.0, 0.999), cautious=False, momentum_dtype="float32",
+               weight_decay=0.0, gradient_centralization=True)
+    pv = _bag([()] * 4, torch.float32, seed=2)
+    pn = _clone(pv)
+    ov = _fused(pv, **cfg)
+    on = Adakaon(pn, foreach=False, **cfg)
+    gen = torch.Generator(device=DEV).manual_seed(7)
+    for _ in range(6):
+        for p, q in zip(pv, pn):
+            g = torch.randn((), generator=gen, device=DEV)
+            p.grad, q.grad = g.clone(), g.clone()
+        ov.step()
+        on.step()
+    torch.cuda.synchronize()
+    ob_, big, od, nat = _parts(ov)
+    assert len(od) == 4 and len(nat) == 0
+    for a, b in zip(pv, pn):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
 
 
 # ------------------------------------------------- conv (ndim>2) matrixized to (out, in*kh*kw)

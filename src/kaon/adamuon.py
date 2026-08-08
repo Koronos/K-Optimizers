@@ -63,6 +63,7 @@ from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
     centralize_grads_,
+    flat_view,
     foreach_budget,
     is_low_precision,
     rms,
@@ -376,8 +377,9 @@ class AdaMuon(AutoLRMixin, Optimizer):
 
     @staticmethod
     def _param_foreach_eligible(p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
-        if p.ndim == 0:
-            return False
+        # 0-D scalars are NOT excluded: they ride the non-factored bucket as
+        # length-1 rows (see kaon._backend.flat_view). Only the per-tensor size cap
+        # and the awkward dtype/contiguity cases fall back to the per-param loop.
         if p.numel() > cutoff:
             return False
         if (
@@ -413,8 +415,8 @@ class AdaMuon(AutoLRMixin, Optimizer):
                 matrixize = g.ndim > 2
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
                 factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:
-                flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
+            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
+                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
 
         for (eff, _dtype, matrixize), plist in factored_buckets.items():
             step = max(1, budget // max(eff[0] * eff[1], 1))
@@ -457,7 +459,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
         rows = [self.state[p]["row"] for p in plist]
         cols = [self.state[p]["col"] for p in plist]
 
-        grad = torch.stack([mat(p.grad).float() for p in plist])          # [N, R, C]
+        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
 
         # 1. First moment of the RAW gradient (codec owns dequant→EMA→requant).
         if beta1 > 0:
@@ -492,7 +494,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
         delta = update
 
         if wd != 0:
-            p_fp32 = torch.stack([mat(p.data).float() for p in plist])
+            p_fp32 = torch.stack([mat(p.data) for p in plist]).float()
             delta = delta.add_(p_fp32, alpha=lr * wd)
 
         if cautious:
@@ -515,16 +517,23 @@ class AdaMuon(AutoLRMixin, Optimizer):
         bf16_method: str,
         codec: _MomentumCodec,
     ) -> None:
-        """Non-factored Adam-style update for 1-D params (biases, norm scales).
+        """Non-factored Adam-style update for ``ndim <= 1`` params (biases, norm
+        scales, plus 0-D scalars as length-1 rows).
 
         Not orthogonalized (Newton-Schulz needs a matrix). RMS-normalized to the
         same ``0.2·lr`` target as the 2-D path so a single ``lr`` is consistent
         across the model.
+
+        0-D scalars join the ``L == 1`` bucket as length-1 **views**
+        (:func:`~kaon._backend.flat_view`) of the same storage, so ``v``, the codec
+        write-back and the weight subtract all reach the original 0-D tensors. At
+        ``L == 1`` the per-slice ``norm(dim=1)/sqrt(1)`` is exactly the per-param
+        ``rms()`` of a scalar, so the clip is the same op the per-param path applies.
         """
         N = len(plist)  # noqa: N806
-        vs = [self.state[p]["v"] for p in plist]                          # each [L], fp32
+        vs = [flat_view(self.state[p]["v"]) for p in plist]               # each [L], fp32
 
-        grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
+        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
         omb = 1.0 - beta2
@@ -541,18 +550,18 @@ class AdaMuon(AutoLRMixin, Optimizer):
 
         if beta1 > 0:
             states = [self.state[p] for p in plist]
-            delta = codec.ema_stacked(states, update, lambda t: t, (length,), beta1)  # [N, L]
+            delta = codec.ema_stacked(states, update, flat_view, (length,), beta1)  # [N, L]
         else:
             delta = update
 
         if wd != 0:
-            p_fp32 = torch.stack([p.data.float() for p in plist])
+            p_fp32 = torch.stack([flat_view(p.data) for p in plist]).float()
             delta = delta.add_(p_fp32, alpha=lr * wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([p.data for p in plist], delta, bf16_method)
+        subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:

@@ -48,6 +48,7 @@ __all__ = [
     "_quant_4bit_stacked",
     "_dequant_4bit_stacked",
     "fourbit_block_size",
+    "int8_scale_shape",
 ]
 
 MomentumDtype = ("bfloat16", "float32", "int8", "4bit")
@@ -81,6 +82,25 @@ def _quant_int8(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     scale = absmax / _INT8_ABSMAX
     q = (m_fp32 / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP).to(torch.int8)
     return q, scale
+
+
+def int8_scale_shape(m: Tensor) -> tuple[int, ...]:
+    """Shape :func:`_quant_int8` gives the scale of a momentum buffer shaped like ``m``.
+
+    The batched requant reduces a *matrixized* ``[N, R, rest]`` view, so it has to
+    reshape each per-param scale back into this layout before storing it. Hardcoding
+    ``(R, 1)`` there is wrong for anything that is not exactly 2-D: a conv's scale is
+    ``(R, 1, 1, 1)`` and a 0-D param's is a scalar, and a param stepped once by the
+    foreach path could then never be stepped per-param again (the stored scale
+    mis-broadcasts against the momentum — a hard error, not a silent skew).
+
+    Mirrors :func:`_quant_int8`'s ``keepdim`` reduction exactly: ``ndim >= 2`` keeps
+    the dim-0 row axis with ones elsewhere; 1-D reduces over an empty dim tuple to
+    ``(1,)``; 0-D stays a scalar.
+    """
+    if m.ndim >= 2:
+        return (m.shape[0],) + (1,) * (m.ndim - 1)
+    return (1,) * m.ndim
 
 
 def _quant_int8_stacked(m_fp32: Tensor) -> tuple[Tensor, Tensor]:

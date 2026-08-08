@@ -182,7 +182,7 @@ def test_checkpoints_written_before_the_marker_still_load():
 def test_fused_plan_detects_a_relocated_weight():
     """An external EMA / .to() / reshard rebinds p.data; the cached pointer table must
     not keep writing to the old address."""
-    p = ((torch.randn(128, 128, device="cuda") * 0.02)).requires_grad_(True)
+    p = (torch.randn(128, 128, device="cuda") * 0.02).requires_grad_(True)
     opt = _nekaon([p], momentum_dtype="4bit")
     _spin(opt, [p])
     assert opt._axpy_cache is not None

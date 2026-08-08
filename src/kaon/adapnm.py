@@ -126,6 +126,7 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
+    flat_view,
     foreach_budget,
     is_low_precision,
     rms,
@@ -142,6 +143,7 @@ from kaon._momentum_codec import (
     _quant_int8,
     _quant_int8_stacked,
     fourbit_block_size,
+    int8_scale_shape,
     load_state_dict_preserving_dtypes,
 )
 
@@ -428,6 +430,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
             from kaon._fused_triton import HAS_TRITON, TILE_CAP
             if not HAS_TRITON:
                 raise RuntimeError("AdaPNM(fused=True) requires Triton (a GPU-only optional dependency)")
+            # 2-D one_block/chunked crossover ONLY; the ndim<=1 ceiling is ft.TILE_CAP_1D.
             self._fused_tile_cap = TILE_CAP if fused_tile_cap is None else fused_tile_cap
 
         # Composable parameter-free LR (continuous Mechanic) via AutoLRMixin. off -> zero overhead.
@@ -575,8 +578,13 @@ class AdaPNM(AutoLRMixin, Optimizer):
             torch._foreach_copy_(
                 [s[prefix].reshape(row, rest) for s in states], list(q.unbind(0))
             )
+            # Store the scale in the layout `_quant_int8` (the per-param requant)
+            # produces, so the two paths stay interchangeable. Hardcoding (row, 1)
+            # here reshaped a conv's (R,1,1,1) scale to (R,1) and a 0-D param's ()
+            # scale to (1,); the next per-param step on that state then raised on
+            # the mismatched broadcast.
             for s, sc in zip(states, new_scale.unbind(0), strict=True):  # sc: [R, 1]
-                s[f"{prefix}_scale"] = sc.reshape(row, 1) if len(shape) >= 2 else sc.reshape(1)
+                s[f"{prefix}_scale"] = sc.reshape(int8_scale_shape(s[prefix]))
         else:  # 4bit
             bs = states[0][f"{prefix}_block"]
             new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs)
@@ -700,7 +708,9 @@ class AdaPNM(AutoLRMixin, Optimizer):
                 one_block.append(p)
             elif big_ok:
                 big.append(p)
-            elif bf_ok and float_mom and no_ams and ft.fused_1d_eligible(p, cap):
+            # No cap argument: 1-D is bounded by ft.TILE_CAP_1D, not the 2-D crossover ``cap``
+            # (above the 1-D cap a tensor falls to native, not to the chunked kernel).
+            elif bf_ok and float_mom and no_ams and ft.fused_1d_eligible(p):
                 one_dim.append(p)
             else:
                 native.append(p)
@@ -850,7 +860,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
         b2, eps1 = group["betas"][1], group["eps"]
         states = [self.state[p] for p in plist]
         R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]    # noqa: N806 — conv -> matrixized
-        g = torch.stack([p.grad.float().reshape(R, C) for p in plist])     # [N, R, C]
+        g = torch.stack([p.grad.reshape(R, C) for p in plist]).float()     # [N, R, C]
         if group["gradient_centralization"]:
             g.sub_(g.mean(dim=-1, keepdim=True))
         gsq = g * g
@@ -1022,7 +1032,10 @@ class AdaPNM(AutoLRMixin, Optimizer):
 
     @staticmethod
     def _param_foreach_eligible(p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
-        if p.ndim == 0 or p.numel() > cutoff:
+        # 0-D scalars are NOT excluded: they ride the non-factored bucket as
+        # length-1 rows (see kaon._backend.flat_view). Only the per-tensor size cap
+        # and the awkward dtype/contiguity cases fall back to the per-param loop.
+        if p.numel() > cutoff:
             return False
         if (
             group["bf16_method"] == "stochastic_rounding"
@@ -1037,7 +1050,10 @@ class AdaPNM(AutoLRMixin, Optimizer):
 
     @torch.no_grad()
     def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
-        """Batched step. Factored (ndim>=2) and non-factored (ndim==1) buckets, by shape."""
+        """Batched step. Factored (ndim>=2) and non-factored (ndim<=1) buckets, by shape.
+
+        0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
+        with real shape-(1,) params."""
         c = self._coeffs(group)
         md = group["momentum_dtype"]
         pos, neg = self._pos_neg_prefixes(group["step"])
@@ -1053,8 +1069,8 @@ class AdaPNM(AutoLRMixin, Optimizer):
                 matrixize = g.ndim > 2
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
                 factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:
-                flat_buckets.setdefault((g.shape[0], p.dtype), []).append(p)
+            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
+                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
 
         for (eff, _dtype, matrixize), plist in factored_buckets.items():
             stepn = max(1, budget // max(eff[0] * eff[1], 1))
@@ -1089,7 +1105,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
         rows = [s["row"] for s in states]
         cols = [s["col"] for s in states]
 
-        grad = torch.stack([mat(p.grad).float() for p in plist])          # [N, R, C]
+        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -1133,19 +1149,27 @@ class AdaPNM(AutoLRMixin, Optimizer):
         c: dict[str, float],
         group: dict[str, Any],
     ) -> None:
+        """Non-factored (full per-coordinate ``v``) update for ``ndim <= 1`` params.
+
+        0-D scalars share the ``L == 1`` bucket with shape-``(1,)`` params as length-1
+        **views** (:func:`~kaon._backend.flat_view`) of the same storage, so ``v`` /
+        ``max_v``, both momenta and the weight subtract reach the original 0-D
+        tensors. At ``L == 1`` the batched RMS clip ``norm(dim=1)/sqrt(1)`` is the
+        per-param ``rms()`` of a scalar, so the clip matches :meth:`_step_one_param`.
+        """
         eps1 = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         ams_bound = group["ams_bound"]
 
         states = [self.state[p] for p in plist]
-        vs = [s["v"] for s in states]
+        vs = [flat_view(s["v"]) for s in states]
 
-        grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
+        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
         if wd != 0:
-            self._apply_decoupled_wd_batched(plist, lambda t: t, group["lr"] * wd)
+            self._apply_decoupled_wd_batched(plist, flat_view, group["lr"] * wd)
 
         # Full per-coordinate second moment (1-D). eps here goes on the denominator
         # (kozistr), NOT folded into grad^2; eps1==eps for the 1-D path.
@@ -1153,7 +1177,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
         if ams_bound:
-            max_vs = [s["max_v"] for s in states]
+            max_vs = [flat_view(s["max_v"]) for s in states]
             max_v = torch.stack(max_vs)
             torch.maximum(max_v, v, out=max_v)
             torch._foreach_copy_(max_vs, list(max_v.unbind(0)))
@@ -1169,7 +1193,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([p.data for p in plist], delta, bf16_method)
+        subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method)
 
     def _pn_stacked(
         self,

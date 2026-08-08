@@ -60,15 +60,61 @@ except ImportError:  # pragma: no cover - exercised only on triton-less installs
     tl = None
     _HAS_TRITON = False
 
-__all__ = ["fused_eligible", "fused_1d_eligible", "eff_2d", "warps_for", "next_pow2_tile", "TILE_CAP", "HAS_TRITON"]
+__all__ = ["fused_eligible", "fused_1d_eligible", "eff_2d", "warps_for", "next_pow2_tile", "TILE_CAP",
+           "TILE_CAP_1D", "HAS_TRITON"]
 
 HAS_TRITON = _HAS_TRITON
-# Largest padded tile a single program owns. Measured crossover (RTX 4080, fp32): the one-block
-# kernel beats native up to ~131072 lanes (2.7x @ 65K, 1.2-1.4x @ 131K) and loses past ~262144
-# (register spill; >=1M lanes won't even compile). 131072 is the measured sweet spot; this cap is
-# also the boundary between the single-program route and the batched chunked multi-block route used
-# for truly-large tensors (full-FT matrices).
-TILE_CAP = 1 << 17  # 131072 padded lanes
+# Largest padded tile a single program owns — i.e. the ONE_BLOCK vs CHUNKED crossover.
+#
+# One program == one tensor, so a bag of N tensors is N CTAs no matter how big each one is: past a
+# few thousand lanes the tile needs many warps and the whole tensor is serialized inside a single
+# CTA, leaving most of the GPU idle (200 tensors = 200 fat CTAs over 36 SMs). The batched chunked
+# path splits the same work into N * ceil(n/BLOCK) CTAs and fills the machine instead. The cap was
+# 131072 from an era when the alternative was the NATIVE foreach path; 0.7.7 rewrote the chunked
+# kernel and moved the crossover down by 16x.
+#
+# Re-measured on 0.7.7+ kernels (RTX 3000 Ada Laptop, 36 SMs; min of 60 A/B-interleaved reps,
+# cautious+GC+wd, bf16 momentum). Ratios are the worse-arm/better-arm over N=50 and N=200 bags of
+# same-shape tensors, fp32 and bf16 params (all four configs agree on the crossover):
+#     lanes    winner              margin
+#      1024    one_block           2.1-2.5x
+#      4096    one_block           1.5-2.1x
+#      8192    one_block           1.1-1.3x
+#     16384    chunked             1.0-1.9x
+#     32768    chunked             1.5-1.8x
+# End-to-end, cap 131072 -> 8192: 200x (256,256) steps 10.18 -> 2.26 ms fp32 (4.5x) and
+# 10.87 -> 1.55 ms bf16 (7.0x); a mixed 2-D bag (50x each of (64,64)...(256,512)) 8.46 -> 1.93 ms
+# (4.4x); bags already below the cap (200x (64,64)) are unchanged within noise.
+#
+# The crossover is an occupancy effect (tensors-per-CTA vs SM count), so the optimum is GPU
+# dependent — a part with many more SMs may tolerate a higher cap. It is not hard-coded into the
+# routing: ``Adakaon(fused_tile_cap=...)`` / ``AdaPNM(fused_tile_cap=...)`` override this default
+# per optimizer. That kwarg means *this* number — the 2-D one_block/chunked crossover — and does
+# NOT move the 1-D ceiling below (see :data:`TILE_CAP_1D`).
+TILE_CAP = 1 << 13  # 8192 padded lanes
+
+# Largest padded block the NON-FACTORED (ndim <= 1) one-block kernel accepts.
+#
+# Deliberately a separate constant from :data:`TILE_CAP`, because the two answer different
+# questions. For 2-D, exceeding the cap means "hand this to the chunked kernel", which fills the
+# machine better — so the cap is an occupancy crossover and wants to be low. For 1-D there is NO
+# chunked route: exceeding the cap drops the tensor to the NATIVE foreach path. So this cap is the
+# one-program capability bound (how big a block a single program can still own profitably), and
+# lowering it past the point where native catches up is a pure loss.
+#
+# Coupling them is what made 0.7.10's TILE_CAP 131072 -> 8192 a 2.0-2.2x REGRESSION for 1-D tensors
+# of length 16384 — a reachable shape (a 14336-wide FFN's norm weight pads to 16384). Measured
+# fused-1D vs native, same harness as above:
+#     length     fp32                    bf16
+#      16384     fused  2.03x faster     fused  2.16x faster
+#      32768     native 1.06x faster     fused  1.17x faster
+#      65536     native 1.50x faster     native 1.22x faster
+#     131072     native 1.23x faster     fused  1.06x faster
+# 131072 keeps the pre-0.7.10 1-D behaviour exactly (zero regression, which is the point of the
+# split). The data does suggest the true 1-D crossover is nearer 32768 — 65536 favours native by
+# 1.2-1.5x — so there is a further win available here, but tightening it is a separate measurement
+# with its own regression risk and is intentionally not bundled with the 2-D change.
+TILE_CAP_1D = 1 << 17  # 131072 padded lanes
 DEV = "cuda"
 
 # Momentum storage kinds (passed to the kernel as a constexpr so the unused branches compile away).
@@ -139,13 +185,17 @@ def fused_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP) -> bool:
     return tile_cap >= BR * BC
 
 
-def fused_1d_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP) -> bool:
+def fused_1d_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP_1D) -> bool:
     """Does ONE Triton block own this 1-D tensor? (1-D, contiguous, fp32/bf16, fits a block.)
 
     The non-factored (full per-coordinate ``v``) Adam step for biases / norm scales. Same
     one-block-per-tensor pointer-array idea as the 2-D path, so a bag of many tiny 1-D tensors
     (the launch-bound regime) steps in one launch instead of a torch-foreach stack. Quant momentum
-    (int8/4bit) uses the scalar/per-block form of the same codecs inside the 1-D kernel."""
+    (int8/4bit) uses the scalar/per-block form of the same codecs inside the 1-D kernel.
+
+    Note the default is :data:`TILE_CAP_1D`, **not** the 2-D :data:`TILE_CAP`: falling off this
+    cap means dropping to the native foreach path, not to the chunked kernel, so the two bounds
+    are unrelated. Callers pass no cap — ``fused_tile_cap=`` tunes the 2-D crossover only."""
     if p.ndim != 1 or not p.is_cuda or not p.is_contiguous():
         return False
     if p.dtype not in (torch.float32, torch.bfloat16):
@@ -1628,11 +1678,14 @@ class AdaPnmCache:
 
 
 class OneDimPointerCache:
-    """Per-tensor pointer arrays for the non-factored 1-D path, bucketed by padded block ``BL`` =
-    ``next_pow2(L)`` (one launch per distinct block size). Holds ``g/p/m/v`` base-address arrays + the
-    true lengths ``Ls`` (for masking). Quantized momentum additionally caches its scale pointer and
-    4-bit block size; ``beta1==0`` (no ``m``) reuses ``v_addr`` as a harmless valid pointer. Same plumbing as
-    :class:`PointerArrayCache` (grad pointers refreshed on realloc)."""
+    """Per-tensor pointer arrays for the non-factored ``ndim <= 1`` path, bucketed by (padded block
+    ``BL`` = ``next_pow2(numel)``, momentum kind, 4-bit block, param dtype) — one launch per distinct
+    bucket. Holds ``g/p/m/v`` base-address arrays + the true element counts ``Ls`` (for masking). The
+    kernel is shape-free (base pointer + count), so a 0-D scalar rides as ``numel() == 1`` — for 1-D
+    tensors ``numel() == shape[0]``, so this is the same bucketing as before. Quantized momentum
+    additionally caches its scale pointer and 4-bit block size; ``beta1==0`` (no ``m``) reuses
+    ``v_addr`` as a harmless valid pointer. Same plumbing as :class:`PointerArrayCache` (grad
+    pointers refreshed on realloc)."""
 
     def __init__(self, plist, state_of):
         self.ids = tuple(id(p) for p in plist)
@@ -1647,7 +1700,7 @@ class OneDimPointerCache:
                    else MOM_BF16 if mdtype == torch.bfloat16 else MOM_FP32)
             block = st.get("m_block", 1)
             # 4-bit packing requires a pair of lanes even for a scalar parameter.
-            bl = max(2 if mom == MOM_4BIT else 1, triton.next_power_of_2(p.shape[0]))
+            bl = max(2 if mom == MOM_4BIT else 1, triton.next_power_of_2(max(p.numel(), 1)))
             groups.setdefault((bl, mom, block, p.dtype), []).append(p)
         self.buckets = []
         for (BL, mom, block, _dtype), bl in groups.items():  # noqa: N806
@@ -1661,7 +1714,7 @@ class OneDimPointerCache:
                 plist=bl, BL=BL, mom=mom, momentum=momentum, block=block,
                 p_addr=i64([p.data_ptr() for p in bl]),
                 m_addr=m_addr, mscale_addr=mscale_addr, v_addr=v_addr,
-                Ls=i32([p.shape[0] for p in bl]),
+                Ls=i32([p.numel() for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
                 grad_ptrs=tuple(p.grad.data_ptr() for p in bl),

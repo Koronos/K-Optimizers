@@ -202,7 +202,7 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
             buckets.setdefault((tuple(p.shape), p.dtype), []).append(p)
         for (shape, _dtype), plist in buckets.items():
             states = [self.state[p] for p in plist]
-            theta = torch.stack([p.detach().float() for p in plist])        # [N, *shape]
+            theta = torch.stack([p.detach() for p in plist]).float()        # [N, *shape]
             phi = CodecBuffer.read_stacked(states, "phi", md, shape)        # [N, *shape]
             phi.lerp_(theta, alpha)
             CodecBuffer.write_stacked(states, "phi", md, phi)
