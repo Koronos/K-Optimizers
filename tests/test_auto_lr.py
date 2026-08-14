@@ -15,7 +15,7 @@ from collections.abc import Iterable
 import pytest
 import torch
 
-from kaon import Adakaon
+from kaon import Adakaon, Nekaon
 from kaon._autolr import _ADAPT_MAX_STEPS, _BACKOFF, AutoLRMixin
 
 
@@ -386,3 +386,31 @@ def test_adakaon_autonomous_cpu_smoke() -> None:
 
     assert math.isfinite(opt.get_d())
     assert opt.get_d() > initial_d
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="0.7.4 DoWG freezes at its RMS fuse under clipped/constant gradients",
+)
+def test_nekaon_074_constant_gradient_does_not_burn_model_by_step_100() -> None:
+    """Direct Nekaon reproduction of the reported step~100 AutoLR failure."""
+    param = torch.nn.Parameter(torch.full((4, 4), 0.02))
+    initial = param.detach().clone()
+    opt = Nekaon(
+        [param],
+        lr=1.0,
+        k=1.5,
+        betas=(0.5, 0.999),
+        weight_decay=0.0,
+        momentum_dtype="float32",
+        cautious=False,
+        gradient_centralization=False,
+        foreach=False,
+        auto_lr=True,
+    )
+    for _ in range(100):
+        param.grad = torch.ones_like(param)
+        opt.step()
+    opt.eval()
+    displacement_rms = float((param.detach() - initial).square().mean().sqrt())
+    assert displacement_rms <= 2.0 * float(initial.square().mean().sqrt())

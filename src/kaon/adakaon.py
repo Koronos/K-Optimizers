@@ -33,7 +33,7 @@ it drops into per-parameter / gradient-release training loops unchanged.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, Literal
 
 import torch
@@ -70,6 +70,7 @@ from kaon._momentum_codec import (
     _unpack_nibbles,
     load_state_dict_preserving_dtypes,
 )
+from kaon._telemetry import AdakaonStepTelemetry, _AdakaonTelemetryAccumulator
 
 __all__ = ["Adakaon"]
 
@@ -276,10 +277,19 @@ class Adakaon(AutoLRMixin, Optimizer):
         # array, no [N,R,C] stack, GC in-kernel). Default False until the A/B confirms a win. See
         # _chunked_reductions_fused and docs/FUSED_REDUCTIONS_DESIGN.md.
         self._fused_reductions = True
+        # Native/foreach momentum stores an LR-independent direction. Wrappers
+        # such as MSAM/Nekaon use this marker to convert it back to step units.
+        self._momentum_is_unscaled = True
         self._t = 0
         self._fused_part: dict[int, tuple] = {}          # group id -> cached (ids, one_block, big, one_dim, native)
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
         self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPointerCache (1-D)
+        # Passive research instrumentation.  The disabled path performs no
+        # reductions and retains no additional per-parameter tensors.
+        self._step_telemetry_hook: Callable[[AdakaonStepTelemetry], None] | None = None
+        self._telemetry_step = 0
+        self._telemetry_prev_direction: dict[Tensor, Tensor] = {}
+        self._telemetry_seen_params: set[Tensor] = set()
         if self._fused:
             from kaon._fused_triton import HAS_TRITON, TILE_CAP
             if not HAS_TRITON:
@@ -290,6 +300,23 @@ class Adakaon(AutoLRMixin, Optimizer):
         # adapting and drives the base update through _step_impl.
         # Off (default) -> zero overhead, step == _step_impl.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
+
+    def _set_step_telemetry_hook(
+        self,
+        hook: Callable[[AdakaonStepTelemetry], None] | None,
+    ) -> None:
+        """Install passive native/foreach telemetry (internal research API).
+
+        Replacing or removing the hook starts a fresh lagged-observation epoch.
+        Fused kernels do not expose the LR-independent direction yet and fail
+        closed rather than reporting telemetry with different units.
+        """
+        if hook is not None and self._fused:
+            raise NotImplementedError("Adakaon step telemetry is not implemented for fused=True")
+        self._step_telemetry_hook = hook
+        self._telemetry_step = 0
+        self._telemetry_prev_direction.clear()
+        self._telemetry_seen_params.clear()
 
     def _invalidate_fused_caches(self) -> None:
         """Drop every host-side cache that may retain pointers into optimizer state.
@@ -314,6 +341,106 @@ class Adakaon(AutoLRMixin, Optimizer):
         if codec is None:
             codec = self._codecs[md] = _make_codec(md)
         return codec
+
+    def _telemetry_prev_one(
+        self,
+        p: Tensor,
+        state: dict[str, Any],
+        like: Tensor,
+        group: dict[str, Any],
+    ) -> tuple[Tensor, int]:
+        """Read the lagged learned direction without allocating persistent state.
+
+        Momentum already is the previous pre-cautious direction.  With beta1=0
+        there is no such buffer, so the opt-in telemetry path retains its own
+        exact direction copy; the ordinary optimizer path remains allocation-free.
+        """
+        seen = p in self._telemetry_seen_params
+        if group["betas"][0] > 0:
+            return self._codec(group).dequant_one(state, like), like.numel() if seen else 0
+        previous = self._telemetry_prev_direction.get(p)
+        if previous is None:
+            return torch.zeros_like(like, dtype=torch.float32), 0
+        return previous.reshape_as(like), like.numel()
+
+    def _telemetry_prev_stacked(
+        self,
+        plist: list[Tensor],
+        states: list[dict[str, Any]],
+        mat: Any,
+        eff: tuple[int, ...],
+        group: dict[str, Any],
+    ) -> tuple[Tensor, int]:
+        seen_numel = sum(p.numel() for p in plist if p in self._telemetry_seen_params)
+        if group["betas"][0] > 0:
+            return self._codec(group).dequant_stacked(states, mat, eff), seen_numel
+        previous = [
+            self._telemetry_prev_direction.get(p, torch.zeros_like(p, dtype=torch.float32))
+            for p in plist
+        ]
+        return torch.stack([mat(value) for value in previous]), seen_numel
+
+    def _telemetry_observe_one(
+        self,
+        telemetry: _AdakaonTelemetryAccumulator,
+        p: Tensor,
+        grad: Tensor,
+        learned_direction: Tensor,
+        prev_direction: Tensor,
+        previous_numel: int,
+        group: dict[str, Any],
+    ) -> None:
+        direction = (
+            cautious_one_(learned_direction.clone(), grad)
+            if group["cautious"]
+            else learned_direction
+        )
+        wd = group["weight_decay"]
+        decay = p.data.float().mul(wd) if wd != 0 else None
+        telemetry.observe(
+            grad,
+            direction,
+            prev_direction,
+            decay,
+            previous_numel=previous_numel,
+        )
+        if group["betas"][0] == 0:
+            self._telemetry_prev_direction[p] = direction.detach().clone().reshape_as(p)
+        self._telemetry_seen_params.add(p)
+
+    def _telemetry_observe_stacked(
+        self,
+        telemetry: _AdakaonTelemetryAccumulator,
+        plist: list[Tensor],
+        grad: Tensor,
+        learned_direction: Tensor,
+        prev_direction: Tensor,
+        previous_numel: int,
+        mat: Any,
+        group: dict[str, Any],
+    ) -> None:
+        direction = (
+            cautious_batched_(learned_direction.clone(), grad)
+            if group["cautious"]
+            else learned_direction
+        )
+        wd = group["weight_decay"]
+        decay = (
+            torch.stack([mat(p.data).float() for p in plist]).mul_(wd)
+            if wd != 0
+            else None
+        )
+        telemetry.observe(
+            grad,
+            direction,
+            prev_direction,
+            decay,
+            previous_numel=previous_numel,
+        )
+        if group["betas"][0] == 0:
+            for p, value in zip(plist, direction.unbind(0), strict=True):
+                self._telemetry_prev_direction[p] = value.detach().clone().reshape_as(p)
+        self._telemetry_seen_params.update(plist)
 
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
@@ -344,6 +471,11 @@ class Adakaon(AutoLRMixin, Optimizer):
                 loss = closure()
         if self._fused:
             return self._fused_step(loss)
+        hook = self._step_telemetry_hook
+        telemetry = None
+        if hook is not None:
+            self._telemetry_step += 1
+            telemetry = _AdakaonTelemetryAccumulator(self._telemetry_step)
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None]
             for p in params:
@@ -351,11 +483,18 @@ class Adakaon(AutoLRMixin, Optimizer):
                     raise RuntimeError("Adakaon does not support sparse gradients")
             if group["gradient_centralization"]:
                 centralize_grads_(params)
-            self._native_dispatch(params, group)
+            self._native_dispatch(params, group, telemetry)
+        if hook is not None and telemetry is not None:
+            hook(telemetry.finish())
         return loss
 
     @torch.no_grad()
-    def _native_dispatch(self, params: list[Tensor], group: dict[str, Any]) -> None:
+    def _native_dispatch(
+        self,
+        params: list[Tensor],
+        group: dict[str, Any],
+        telemetry: _AdakaonTelemetryAccumulator | None = None,
+    ) -> None:
         """The native (non-fused) step over ``params`` — foreach batching where eligible, else
         per-param. Gradient Centralization is the caller's responsibility (done per-subset)."""
         if not params:
@@ -372,15 +511,15 @@ class Adakaon(AutoLRMixin, Optimizer):
             for p in params:
                 (fast if self._param_foreach_eligible(p, group, cutoff) else slow).append(p)
             if len(fast) >= 2:
-                self._step_foreach(fast, group, chunk_budget)
+                self._step_foreach(fast, group, chunk_budget, telemetry)
                 for p in slow:
-                    self._step_one_param(p, group)
+                    self._step_one_param(p, group, telemetry)
             else:
                 for p in params:
-                    self._step_one_param(p, group)
+                    self._step_one_param(p, group, telemetry)
         else:
             for p in params:
-                self._step_one_param(p, group)
+                self._step_one_param(p, group, telemetry)
 
     # ----------------------------------------------------------------- fused (Triton) step
     @torch.no_grad()
@@ -791,7 +930,13 @@ class Adakaon(AutoLRMixin, Optimizer):
         return True
 
     @torch.no_grad()
-    def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
+    def _step_foreach(
+        self,
+        params: list[Tensor],
+        group: dict[str, Any],
+        budget: int,
+        telemetry: _AdakaonTelemetryAccumulator | None = None,
+    ) -> None:
         """Batched step for many params at once.
 
         Params are bucketed so each bucket can be stacked into a single tensor and
@@ -828,6 +973,7 @@ class Adakaon(AutoLRMixin, Optimizer):
                 self._factored_bucket(
                     plist[i:i + step], eff, matrixize,
                     beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
+                    group, telemetry,
                 )
         for (length, _dtype), plist in flat_buckets.items():
             step = max(1, budget // max(length, 1))
@@ -835,6 +981,7 @@ class Adakaon(AutoLRMixin, Optimizer):
                 self._nonfactored_bucket(
                     plist[i:i + step], length,
                     beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
+                    group, telemetry,
                 )
 
     @torch.no_grad()
@@ -852,6 +999,8 @@ class Adakaon(AutoLRMixin, Optimizer):
         cautious: bool,
         bf16_method: str,
         codec: _MomentumCodec,
+        group: dict[str, Any],
+        telemetry: _AdakaonTelemetryAccumulator | None,
     ) -> None:
         R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
         N = len(plist)  # noqa: N806
@@ -863,6 +1012,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         cols = [self.state[p]["col"] for p in plist]
 
         grad = torch.stack([mat(p.grad).float() for p in plist])          # [N, R, C]
+        telemetry_grad = grad.clone() if telemetry is not None else None
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -879,28 +1029,48 @@ class Adakaon(AutoLRMixin, Optimizer):
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
-        # Reconstruct 1/sqrt(v_hat) = r_factor * c_factor, then clip and scale.
+        # Reconstruct 1/sqrt(v_hat) = r_factor * c_factor, then clip.  Momentum
+        # is kept in direction units; applying lr after its EMA makes a changing
+        # lr control the current step instead of being baked into its history.
         r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
         c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
         update = grad.mul(r_factor).mul_(c_factor)                                 # [N, R, C]
         rms = update.reshape(N, -1).norm(2, dim=1) / math.sqrt(R * C)              # per-slice RMS
         update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1, 1))
-        update.mul_(lr)
+        prev_direction = None
+        previous_numel = 0
+        states = [self.state[p] for p in plist]
+        if telemetry is not None:
+            prev_direction, previous_numel = self._telemetry_prev_stacked(
+                plist, states, mat, (R, C), group
+            )
+        # The codec owns every dtype's dequant → fp32 EMA → requant detail; this
+        # is identical for fp32/bf16/int8/4bit (and to _step_one_param).
+        delta = codec.ema_stacked(states, update, mat, (R, C), beta1) if beta1 > 0 else update
 
-        if beta1 > 0:
-            # The codec owns every dtype's dequant → fp32 EMA → requant detail; this
-            # block is identical for fp32/bf16/int8/4bit (and to _step_one_param).
-            states = [self.state[p] for p in plist]
-            delta = codec.ema_stacked(states, update, mat, (R, C), beta1)  # [N, R, C]
-        else:
-            delta = update
+        if telemetry is not None:
+            self._telemetry_observe_stacked(
+                telemetry,
+                plist,
+                telemetry_grad,
+                delta,
+                prev_direction,
+                previous_numel,
+                mat,
+                group,
+            )
 
         if wd != 0:
             p_fp32 = torch.stack([mat(p.data).float() for p in plist])
-            delta = delta.add_(p_fp32, alpha=lr * wd)
+            delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
+
+        # Scale each parameter slice like the per-parameter path.  Besides
+        # avoiding an extra stacked allocation, this keeps quantized-codec CPU
+        # rounding aligned with ``_step_one_param``.
+        torch._foreach_mul_(list(delta.unbind(0)), lr)
 
         # Subtract delta from the (matrixized) weights, batched.
         subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
@@ -919,6 +1089,8 @@ class Adakaon(AutoLRMixin, Optimizer):
         cautious: bool,
         bf16_method: str,
         codec: _MomentumCodec,
+        group: dict[str, Any],
+        telemetry: _AdakaonTelemetryAccumulator | None,
     ) -> None:
         """Non-factored update (full per-coordinate second moment) for 1-D params.
 
@@ -931,6 +1103,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         vs = [self.state[p]["v"] for p in plist]                          # each [L], fp32
 
         grad = torch.stack([p.grad.float() for p in plist])               # [N, L]
+        telemetry_grad = grad.clone() if telemetry is not None else None
         v = torch.stack(vs)                                               # [N, L]
 
         # Second-moment EMA weight (fixed beta2).
@@ -945,28 +1118,51 @@ class Adakaon(AutoLRMixin, Optimizer):
         update = grad.mul(v.rsqrt())                                      # [N, L]
         rms = update.norm(2, dim=1) / math.sqrt(length)                   # per-slice RMS
         update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1))
-        update.mul_(lr)
-
+        prev_direction = None
+        previous_numel = 0
+        states = [self.state[p] for p in plist]
+        if telemetry is not None:
+            prev_direction, previous_numel = self._telemetry_prev_stacked(
+                plist, states, lambda t: t, (length,), group
+            )
         if beta1 > 0:
             # Same codec entry point as the factored bucket; mat is identity here and
             # the effective per-param shape is the 1-D length (so int8 reduces the
             # whole L axis to one scalar scale, 4bit blocks over L).
-            states = [self.state[p] for p in plist]
             delta = codec.ema_stacked(states, update, lambda t: t, (length,), beta1)  # [N, L]
         else:
             delta = update
 
+        if telemetry is not None:
+            self._telemetry_observe_stacked(
+                telemetry,
+                plist,
+                telemetry_grad,
+                delta,
+                prev_direction,
+                previous_numel,
+                lambda t: t,
+                group,
+            )
+
         if wd != 0:
             p_fp32 = torch.stack([p.data.float() for p in plist])
-            delta = delta.add_(p_fp32, alpha=lr * wd)
+            delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
+        torch._foreach_mul_(list(delta.unbind(0)), lr)
+
         subtract_batched_([p.data for p in plist], delta, bf16_method)
 
     @torch.no_grad()
-    def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
+    def _step_one_param(
+        self,
+        p: Tensor,
+        group: dict[str, Any],
+        telemetry: _AdakaonTelemetryAccumulator | None = None,
+    ) -> None:
         beta1, beta2 = group["betas"]
         eps1, _eps2 = group["eps"]
         lr, clip = group["lr"], group["clip_threshold"]
@@ -978,6 +1174,7 @@ class Adakaon(AutoLRMixin, Optimizer):
             self._init_state(p, state, group)
 
         grad_fp32 = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
+        telemetry_grad = grad_fp32.clone() if telemetry is not None else None
         ndim = grad_fp32.ndim
         factored = ndim >= 2
 
@@ -999,17 +1196,37 @@ class Adakaon(AutoLRMixin, Optimizer):
 
         if clip > 0:
             update.div_((rms(update) / clip).clamp_(min=1.0))
-        update.mul_(lr)
+        prev_direction = None
+        previous_numel = 0
+        if telemetry is not None:
+            prev_direction, previous_numel = self._telemetry_prev_one(
+                p, state, update, group
+            )
 
         # Single codec call owns dequant → fp32 EMA → requant for every dtype.
+        # The stored momentum is an unscaled direction; lr is applied to the
+        # complete (momentum + weight-decay) direction below.
         delta = self._codec(group).ema_one(state, update, beta1) if beta1 > 0 else update
+
+        if telemetry is not None:
+            self._telemetry_observe_one(
+                telemetry,
+                p,
+                telemetry_grad,
+                delta,
+                prev_direction,
+                previous_numel,
+                group,
+            )
 
         if wd != 0:
             p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
-            delta = delta.add_(p_fp32, alpha=lr * wd)
+            delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_one_(delta, grad_fp32)
+
+        delta.mul_(lr)
 
         subtract_one_(p, delta, state, bf16_method)
 

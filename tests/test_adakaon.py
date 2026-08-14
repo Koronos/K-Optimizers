@@ -92,6 +92,102 @@ def test_cautious_runs():
     opt.step()  # must not raise
 
 
+@pytest.mark.parametrize("weight_decay,cautious", [(0.0, False), (0.07, False), (0.07, True)])
+def test_unscaled_momentum_preserves_constant_lr_legacy_update(weight_decay, cautious):
+    """Moving lr outside momentum is algebraically the old update at constant lr."""
+    lr = 3e-3
+    beta1, beta2 = 0.8, 0.95
+    initial = torch.tensor([0.4, -0.3, 0.2, -0.1], dtype=torch.float32)
+    param = torch.nn.Parameter(initial.clone())
+    reference = initial.clone()
+    opt = Adakaon(
+        [param],
+        lr=lr,
+        betas=(beta1, beta2),
+        eps=(1e-12, 1e-3),
+        weight_decay=weight_decay,
+        clip_threshold=0.7,
+        momentum_dtype="float32",
+        cautious=cautious,
+        gradient_centralization=False,
+        foreach=False,
+    )
+    legacy_v = torch.zeros_like(reference)
+    legacy_m = torch.zeros_like(reference)  # old state: stored in step (lr-scaled) units
+    gradients = [
+        torch.tensor([0.3, -0.2, -0.1, 0.4]),
+        torch.tensor([-0.1, -0.4, 0.2, 0.3]),
+        torch.tensor([0.5, 0.1, -0.3, -0.2]),
+    ]
+
+    for grad in gradients:
+        param.grad = grad.clone()
+        opt.step()
+
+        # Replay the pre-refactor 1-D fp32 path in its original operation order.
+        grad_work = grad.clone()
+        grad_sq = grad_work * grad_work
+        grad_sq.add_(1e-12)
+        legacy_v.lerp_(grad_sq, 1.0 - beta2)
+        update = grad_work.mul(legacy_v.rsqrt())
+        update.div_((update.norm() / math.sqrt(update.numel()) / 0.7).clamp_(min=1.0))
+        update.mul_(lr)
+        legacy_m.mul_(beta1).add_(update, alpha=1.0 - beta1)
+        delta = legacy_m.clone()
+        if weight_decay:
+            delta.add_(reference, alpha=lr * weight_decay)
+        if cautious:
+            mask = (delta * grad_work > 0).to(delta.dtype)
+            delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
+        reference.sub_(delta)
+
+    torch.testing.assert_close(param.detach(), reference, rtol=2e-6, atol=2e-8)
+    torch.testing.assert_close(opt.state[param]["m"], legacy_m / lr, rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_momentum_direction_is_independent_of_lr_history(foreach):
+    """Different earlier LRs must not contaminate a later step at the same LR."""
+    shapes = [(4, 3), (4, 3), (7,), (7,)]
+    generator = torch.Generator().manual_seed(29)
+    params_a = [torch.nn.Parameter(torch.randn(shape, generator=generator)) for shape in shapes]
+    params_b = [torch.nn.Parameter(param.detach().clone()) for param in params_a]
+    common = dict(
+        betas=(0.85, 0.97),
+        momentum_dtype="float32",
+        cautious=False,
+        gradient_centralization=False,
+        foreach=foreach,
+    )
+    opt_a = Adakaon(params_a, lr=1e-5, **common)
+    opt_b = Adakaon(params_b, lr=2e-1, **common)
+
+    grads_1 = [torch.randn(shape, generator=generator) for shape in shapes]
+    for pa, pb, grad in zip(params_a, params_b, grads_1, strict=True):
+        pa.grad = grad.clone()
+        pb.grad = grad.clone()
+    opt_a.step()
+    opt_b.step()
+    for pa, pb in zip(params_a, params_b, strict=True):
+        torch.testing.assert_close(opt_a.state[pa]["m"], opt_b.state[pb]["m"], rtol=0, atol=0)
+
+    # Re-anchor parameters and use the same current LR. Equal direction state must
+    # now produce exactly the same update despite the different first-step LRs.
+    for pa, pb in zip(params_a, params_b, strict=True):
+        pb.data.copy_(pa.data)
+    opt_a.param_groups[0]["lr"] = 2e-2
+    opt_b.param_groups[0]["lr"] = 2e-2
+    grads_2 = [torch.randn(shape, generator=generator) for shape in shapes]
+    for pa, pb, grad in zip(params_a, params_b, grads_2, strict=True):
+        pa.grad = grad.clone()
+        pb.grad = grad.clone()
+    opt_a.step()
+    opt_b.step()
+
+    for pa, pb in zip(params_a, params_b, strict=True):
+        torch.testing.assert_close(pa, pb, rtol=0, atol=0)
+
+
 def _parity_params():
     """A mix that exercises every fast-path branch (factored, conv, and 1-D).
 
@@ -125,10 +221,12 @@ def _parity_params():
     ],
 )
 def test_foreach_matches_per_param(cfg):
-    """foreach=True is element-for-element equal to the per-parameter path.
+    """foreach=True is numerically equal to the per-parameter path.
 
     fp32 params keep stochastic rounding a no-op, so the only difference between
-    the two code paths would be a real bug. Bit-exact on CPU.
+    the two code paths would be a real bug. Quantized momentum can differ by one
+    fp32 ULP because its per-slice and stacked scale arithmetic use different
+    kernels now that LR is applied after dequantization.
     """
     pa = _parity_params()
     pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
@@ -141,8 +239,13 @@ def test_foreach_matches_per_param(cfg):
             a.grad, b.grad = grad.clone(), grad.clone()
         oa.step()
         ob.step()
+    quantized = cfg.get("momentum_dtype") in ("int8", "4bit")
     for a, b in zip(pa, pb, strict=False):
-        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            a.detach(), b.detach(),
+            rtol=2e-7 if quantized else 0,
+            atol=5e-9 if quantized else 0,
+        )
 
 
 def test_foreach_chunking_is_exact():
@@ -201,7 +304,7 @@ def test_foreach_4bit_chunking_is_exact():
         oa.step()
         ob.step()
     for a, b in zip(pa, pb, strict=False):
-        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=2e-7, atol=5e-9)
 
 
 def test_4bit_pack_roundtrip():

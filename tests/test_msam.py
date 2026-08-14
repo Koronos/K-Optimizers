@@ -150,7 +150,7 @@ def test_codec_momenta_climb_norm():
 
 
 def test_none_norm_is_step_scaled():
-    """norm='none': the climb is exactly rho * m (raw momentum, step-unit lookahead),
+    """norm='none': the climb is exactly rho * lr * m_direction,
     capped per element at |rho| * clip_threshold * lr (the stability bound)."""
     rho = -1.5
     pa = _params()
@@ -162,7 +162,7 @@ def test_none_norm_is_step_scaled():
     opt.eval()
     bound = abs(rho) * 1.0 * KW["lr"]
     for w, p in zip(live, pa, strict=True):
-        expected = (rho * mom[p]).clamp(-bound, bound)
+        expected = (rho * KW["lr"] * mom[p]).clamp(-bound, bound)
         # atol 1e-6: (w - p) reconstructs e through an fp32 add at |p|~1, whose
         # cancellation error (~ulp(|p|)) sits just above 1e-7. Round-trip exactness is
         # asserted separately with torch.equal below.

@@ -76,13 +76,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
+from kaon._autolr import DEFAULT_FUSE_REL
 from kaon.msam import MSAM
 
 __all__ = ["Nekaon"]
 
 
-class Nekaon(AutoLRMixin, MSAM):
+class Nekaon(MSAM):
     """Adakaon + k-step negative momentum-lookahead (zero-cost flat-minima bias).
 
     Args:
@@ -140,6 +140,12 @@ class Nekaon(AutoLRMixin, MSAM):
             raise ValueError(f"k must be >= 0 (lookahead steps), got {k}")
         if betas[0] <= 0.0:
             raise ValueError("Nekaon requires betas[0] > 0 (the lookahead rides the momentum)")
+        if adakaon_kwargs.get("fused", False):
+            raise NotImplementedError(
+                "Nekaon fused is temporarily disabled on the adaptive-scale prototype branch: "
+                "the Triton kernels still store LR-scaled momentum and must be migrated to "
+                "the same LR-independent direction units as native/foreach first."
+            )
         if low_vram_above is not None:
             if low_vram_above < 0:
                 raise ValueError(f"low_vram_above must be >= 0, got {low_vram_above}")
@@ -167,6 +173,10 @@ class Nekaon(AutoLRMixin, MSAM):
             betas=betas,
             weight_decay=weight_decay,
             momentum_dtype=momentum_dtype,
+            auto_lr=auto_lr,
+            auto_lr_scale=auto_lr_scale,
+            auto_lr_fuse_rel=auto_lr_fuse_rel,
+            auto_lr_d0=auto_lr_d0,
             **adakaon_kwargs,
         )
         self.k = float(k)
@@ -176,16 +186,14 @@ class Nekaon(AutoLRMixin, MSAM):
                 "discovered LR on all groups each step, which would clobber the per-group "
                 "low-VRAM lr ratio. Use one or the other."
             )
-        # Composable parameter-free LR (update-space DoWG) via AutoLRMixin. off -> zero overhead.
-        self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
+    # Adaptive-scale addons belong to the inner optimizer core.  MSAM owns only
+    # declimb/climb lifecycle and forwards introspection/telemetry without making
+    # any LR decision itself.
+    def get_d(self) -> float:
+        return self.inner.get_d()
 
-    # step() is the AutoLRMixin router; _step_impl is the full Nekaon step (SAM declimb ->
-    # inner base -> climb) — DoWG measures the net displacement, so it composes over the lookahead.
-    def _step_impl(self, closure: Any = None) -> Any:
-        return MSAM.step(self, closure)  # explicit: super() would hit AutoLRMixin.step (the router)
+    def report_loss(self, loss: Any) -> None:
+        self.inner.report_loss(loss)
 
-    def state_dict(self) -> dict[str, Any]:
-        return self._autolr_state_dict(super().state_dict())
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self._autolr_load(state_dict, lambda sd: MSAM.load_state_dict(self, sd))
+    def is_frozen(self) -> bool:
+        return self.inner.is_frozen()

@@ -129,6 +129,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._axpy_cache: dict[str, Any] | None = None  # Triton 4bit fast-path pointer arrays
         self._axpy_seed = 0                             # SR seed counter for the fused axpy
         self._eclamp: dict[int, float] = {}             # per-group climb bound, frozen per cycle
+        self._estep_scale: dict[int, float] = {}        # direction -> step units, frozen per cycle
 
     # ------------------------------------------------------------- perturbation
     def _momentum_owner(self) -> Any:
@@ -187,6 +188,18 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             self._eclamp[gid] = abs(self.rho) * group.get("clip_threshold", 1.0) * group["lr"]
         return self._eclamp[gid]
 
+    def _climb_step_scale(self, group: dict[str, Any], sign: float) -> float:
+        """Convert stored momentum direction to step units, frozen per climb."""
+        gid = id(group)
+        if sign > 0 and gid not in self._estep_scale:
+            owner = self._momentum_owner()
+            self._estep_scale[gid] = (
+                float(group["lr"])
+                if getattr(owner, "_momentum_is_unscaled", False)
+                else 1.0
+            )
+        return self._estep_scale[gid]
+
     @torch.no_grad()
     def _global_mnorm(self) -> float:
         """Global L2 norm over all momenta, via ``(m*m).sum()`` (``torch.dot`` is avoided
@@ -220,8 +233,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 norms = (m * m).reshape(n, -1).sum(dim=1).sqrt_()  # no .norm(): dot SIGFPEs here
                 scales = (sign * self.rho) / (norms + self.eps)
                 m.mul_(scales.view(n, *([1] * (m.ndim - 1))))
-            else:  # "none": raw momentum — rho is a lookahead in OPTIMIZER-STEP units
-                m.mul_(sign * self.rho)
+            else:  # "none": raw direction converted to optimizer-step units
+                m.mul_(sign * self.rho * self._climb_step_scale(group, sign))
                 bound = self._climb_bound(group, sign)
                 # NaN passes through clamp(): a non-finite momentum coordinate (e.g. a
                 # 0*inf from a blown 4-bit block scale) must contribute ZERO climb, never
@@ -278,13 +291,14 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                     # replaces the m buffers, changing the ids): the removal/eval/train
                     # swaps must subtract the SAME clamped e even if a scheduler moved lr.
                     bound=self._climb_bound(group, sign),
+                    step_alpha=self.rho * self._climb_step_scale(group, sign),
                 ))
             cache = self._axpy_cache = {"ids": ids, "buckets": buckets}
         self._axpy_seed += 1
-        alpha = sign * self.rho
         for bk in cache["buckets"]:
             ft._axpy_4bit_batched[(bk["N"] * bk["K"],)](
-                bk["p_addr"], bk["pk_addr"], bk["sc_addr"], alpha, bk["bound"], bk["n"], bk["K"],
+                bk["p_addr"], bk["pk_addr"], bk["sc_addr"], sign * bk["step_alpha"],
+                bk["bound"], bk["n"], bk["K"],
                 self._axpy_seed, FBLOCK=bk["block"], LOWP=bk["lowp"], SR=bk["lowp"], BLOCK=1024,
             )
         return list(leftover.values())
@@ -387,6 +401,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             self._apply(-1.0)
             self._has_e = False
         self._eclamp.clear()  # next climb re-freezes the per-element bound at the CURRENT lr
+        self._estep_scale.clear()
         # 2) base step at the true weights, with the perturbed-point gradient.
         loss = self.inner.step(closure)
         if _PROBE_LOG:
@@ -418,4 +433,5 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._has_e = False
         self._mnorm = 0.0
         self._eclamp.clear()
+        self._estep_scale.clear()
         self._axpy_cache = None

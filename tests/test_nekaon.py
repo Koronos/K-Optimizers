@@ -6,6 +6,7 @@ mechanism's own coverage lives in ``test_msam.py``; this file pins the preset co
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from kaon import Adakaon, Nekaon
@@ -50,6 +51,73 @@ def test_k_zero_is_plain_adakaon():
         assert torch.equal(x.data, y.data)
 
 
+def test_lookahead_converts_momentum_direction_to_step_units():
+    """Nekaon's k remains measured in optimizer steps with LR-independent momentum."""
+    param = torch.nn.Parameter(torch.full((4, 4), 0.25))
+    opt = Nekaon(
+        [param],
+        lr=1e-3,
+        k=1.5,
+        betas=(0.5, 0.999),
+        weight_decay=0.0,
+        momentum_dtype="float32",
+        cautious=False,
+        gradient_centralization=False,
+        foreach=False,
+    )
+    param.grad = torch.full_like(param, 0.1)
+    opt.step()
+    live = param.detach().clone()
+    momentum = opt._momentum_owner().state[param]["m"].detach().clone()
+    opt.eval()
+    climb = live - param.detach()
+    expected = -1.5 * 1e-3 * momentum
+    torch.testing.assert_close(climb, expected, rtol=2e-4, atol=2e-7)
+    assert climb.abs().max() < 0.51 * (1.5e-3), "ordinary lookahead hit its safety clamp"
+
+
+def test_dynamic_lr_lookahead_equals_k_current_optimizer_steps() -> None:
+    """A changing LR affects the new lookahead, never removal of the previous one."""
+    k = 1.5
+    nekaon_param = torch.nn.Parameter(torch.linspace(-0.2, 0.2, 12).reshape(4, 3))
+    base_param = torch.nn.Parameter(nekaon_param.detach().clone())
+    common = dict(
+        betas=(0.5, 0.999),
+        weight_decay=0.0,
+        momentum_dtype="float32",
+        cautious=False,
+        gradient_centralization=False,
+        foreach=False,
+    )
+    nekaon = Nekaon([nekaon_param], lr=1e-4, k=k, **common)
+    base = Adakaon([base_param], lr=1e-4, **common)
+    generator = torch.Generator().manual_seed(41)
+
+    for lr in (1e-4, 1e-2, 3e-4):
+        nekaon.eval()
+        previous_true = nekaon_param.detach().clone()
+        nekaon.train()
+        nekaon.param_groups[0]["lr"] = lr
+        base.param_groups[0]["lr"] = lr
+        grad = torch.randn(nekaon_param.shape, generator=generator)
+        nekaon_param.grad = grad.clone()
+        base_param.grad = grad.clone()
+        nekaon.step()
+        base.step()
+
+        live = nekaon_param.detach().clone()
+        nekaon.eval()
+        current_true = nekaon_param.detach().clone()
+        torch.testing.assert_close(current_true, base_param.detach(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            live - current_true,
+            k * (current_true - previous_true),
+            rtol=3e-4,
+            atol=3e-7,
+        )
+        nekaon.train()
+
+
 def test_rejects_no_momentum_and_negative_k():
     try:
         Nekaon(_params(), betas=(0.0, 0.999))
@@ -61,6 +129,24 @@ def test_rejects_no_momentum_and_negative_k():
         raise AssertionError("k<0 must be rejected")
     except ValueError:
         pass
+
+
+def test_autolr_addon_is_owned_by_inner_core() -> None:
+    opt = Nekaon(
+        _params(),
+        lr=1.0,
+        auto_lr=True,
+        momentum_dtype="float32",
+        foreach=False,
+    )
+    assert not hasattr(opt, "_autolr")
+    assert opt.inner._autolr is not None
+    assert opt.get_d() == opt.inner.get_d()
+
+
+def test_fused_is_fail_closed_until_momentum_units_match() -> None:
+    with pytest.raises(NotImplementedError, match="temporarily disabled"):
+        Nekaon(_params(), fused=True)
 
 
 def test_eval_shows_true_weights_and_train_restores():
