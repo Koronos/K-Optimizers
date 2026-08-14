@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.11]
+
+### Fixed
+- **Adakaon no longer bakes the LR into the momentum EMA.** Every path (per-param,
+  foreach factored/non-factored, and all fused Triton kernels: one-block, chunked,
+  batched, direct-4bit, no-momentum, 1-D) applied `lr` to the update BEFORE the first
+  moment's EMA, so the stored momentum was an average of *lr-scaled* updates: under any
+  LR schedule (warmup, cosine, restarts) the current step was driven by a mix of
+  historical LRs instead of the current one, and the update direction itself changed
+  when earlier LRs differed. The momentum now stores the **LR-independent direction**
+  (preconditioned, RMS-clipped update) and `lr` scales the complete
+  `momentum + weight_decay * p` delta at the end — algebraically identical at constant
+  LR (pinned by `test_unscaled_momentum_preserves_constant_lr_legacy_update`), and a
+  step at LR `x` is now the same step regardless of what LRs preceded it (pinned by
+  `test_momentum_direction_is_independent_of_lr_history`). Weight decay moves with it
+  (`alpha=wd`, scaled by `lr` at the end) so the decoupled decay still tracks the
+  current LR exactly as before.
+- **MSAM/Nekaon convert the direction back to step units.** The `norm="none"` climb
+  (Nekaon's lookahead) is now `e = rho * lr * m_direction`, frozen per climb cycle like
+  the existing per-element bound, so `rho`/`k` keeps meaning "lookahead in optimizer
+  steps" — now measured at the CURRENT lr, which is the semantics the docs always
+  promised (`test_dynamic_lr_lookahead_equals_k_current_optimizer_steps` pins
+  `lookahead == k * (the step that was just taken)` across LR changes). The conversion
+  keys off the owner's `_momentum_is_unscaled` marker: wrapping an optimizer with
+  lr-scaled momentum (AdaBelief, AdamP, ...) keeps the historical `e = rho * m`.
+  `norm="global"`/`"tensor"` normalize the momentum and are invariant to the unit change.
+- **Old checkpoints migrate on load.** `state_dict()` stamps
+  `_adakaon_meta["momentum_units"] = 2`; loading a checkpoint without it rescales the
+  momentum `m -> m / lr` per group through the codec's exact `scale_` (quantized codecs
+  scale `m_scale`, zero requant error), so a pre-0.7.11 resume continues bit-compatibly
+  at the checkpoint's LR.
+- Quantized (int8/4bit) momentum foreach-vs-per-param parity is now "equal to one fp32
+  ULP" instead of bit-exact: the per-slice and stacked scale arithmetic go through
+  different kernels now that lr is applied after the requant round-trip. fp32/bf16
+  momentum parity remains bit-exact, and the full fused suite (116 tests) passes
+  against the fixed native path on CUDA.
+
 ## [0.7.10]
 
 ### Performance

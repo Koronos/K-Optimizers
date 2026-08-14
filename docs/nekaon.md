@@ -1,8 +1,8 @@
 # Nekaon — Adakaon + k-step negative momentum-lookahead
 
 > **Nekaon** is **Adakaon** plus one structural mechanism: between steps the live weights
-> are displaced **k optimizer-steps ahead** along the smoothed (preconditioned, clipped,
-> lr-scaled) update direction, so every gradient is evaluated at the *anticipated* point
+> are displaced **k optimizer-steps ahead** along the smoothed (preconditioned, clipped)
+> update direction scaled by the current lr, so every gradient is evaluated at the *anticipated* point
 > (extragradient / Nesterov-style) while the update lands on the true iterate. It is the
 > answer to **SAM's main problem**: SAM buys its flat-minima bias with a second
 > forward/backward per step (~2× the GEMM phase); Nekaon's perturbation costs **zero extra
@@ -17,11 +17,13 @@
 
 ```
 # end of step t (inside opt.step(), after the Adakaon update):
-w_live <- w + k * m_t        # m = Adakaon's momentum = EMA of the lr-scaled,
+w_live <- w + k * lr * m_t   # m = Adakaon's momentum = EMA of the
                              #     1/sqrt(v)-preconditioned, RMS-clipped update
+                             #     DIRECTION (LR-independent since 0.7.11);
+                             #     * lr converts it to steps at the CURRENT lr
 # training loop: forward/backward  -> grad is evaluated AT the lookahead point
 # start of step t+1:
-w_live <- w_live - k * m_t   # exact removal (m unchanged in between)
+w_live <- w_live - k * lr * m_t   # exact removal (m and the frozen lr unchanged)
 adakaon_step(grad_at_lookahead)   # update lands on the TRUE weights
 ```
 

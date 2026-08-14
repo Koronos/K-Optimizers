@@ -353,12 +353,12 @@ if _HAS_TRITON:
             g = gradient_centralize(g, m2, Cf)
         r_factor, c_factor = factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, beta2, eps1)
 
-        # --- Adakaon-specific: reconstructed update, RMS-clip, lr scale ---
+        # --- Adakaon-specific: reconstructed update, RMS-clip (lr scales the final delta) ---
         upd = tl.where(m2, g * r_factor[:, None] * c_factor[None, :], 0.0)  # 0*inf corners -> 0
         rms = tl.sqrt(tl.sum(upd * upd) / (Rf * Cf))
         denom = rms / clip
         denom = tl.where(denom < 1.0, 1.0, denom)
-        upd = upd * (lr / denom)
+        upd = upd / denom
 
         # --- momentum EMA (storage fp32 / bf16 / int8 / 4bit; EMA always runs in fp32) ---
         # dequant the stored momentum to fp32 (quant primitives are codec-level -> reusable)
@@ -395,7 +395,7 @@ if _HAS_TRITON:
         p_old = tl.load(pp + idx, mask=m2, other=0.0).to(tl.float32)
         delta = m_new
         if WD:
-            delta = delta + (lr * wd) * p_old          # momentum requant above used m_new (sans wd)
+            delta = delta + wd * p_old                 # momentum requant above used m_new (sans wd)
 
         # --- REUSABLE-ish: cautious masking + survivor rescale (operates on delta incl. wd) ---
         if CAUTIOUS:
@@ -405,8 +405,8 @@ if _HAS_TRITON:
             mm = tl.where(mm < 1e-8, 1e-8, mm)
             delta = tl.where(keep, delta / mm, 0.0)
 
-        # --- weight write (plain fp32 or bf16 stochastic rounding) ---
-        res = p_old - delta
+        # --- weight write (plain fp32 or bf16 stochastic rounding); lr on the FULL delta ---
+        res = p_old - lr * delta
         if SR:
             res = sr_round(res, seed + t, idx)
         tl.store(pp + idx, res.to(pp.dtype.element_ty), mask=m2)
@@ -417,10 +417,11 @@ if _HAS_TRITON:
     # a flat view, so a big weight matrix costs ~few memory passes instead of native's ~30.
 
     @triton.jit
-    def _chunked_mom(g_ptr, m_ptr, p_ptr, rfac_ptr, cfac_ptr, keep_ptr, C, n, inv_rms_lr, lrwd, beta1,
+    def _chunked_mom(g_ptr, m_ptr, p_ptr, rfac_ptr, cfac_ptr, keep_ptr, C, n, inv_rms, wd, beta1,
                      CAUTIOUS: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr):
-        """Momentum EMA of the normalized update over a flat chunk; accumulates the cautious keep
-        count (on delta incl. wd, matching native). m is fp32 or bf16 (EMA runs in fp32)."""
+        """Momentum EMA of the normalized (LR-independent) update over a flat chunk; accumulates
+        the cautious keep count (on delta incl. wd, matching native — the mask is invariant to
+        the positive lr scale). m is fp32 or bf16 (EMA runs in fp32)."""
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
@@ -429,21 +430,21 @@ if _HAS_TRITON:
         g = tl.load(g_ptr + offs, mask=mask, other=0.0)
         rf = tl.load(rfac_ptr + i, mask=mask, other=0.0)
         cf = tl.load(cfac_ptr + j, mask=mask, other=0.0)
-        upd = g * rf * cf * inv_rms_lr
+        upd = g * rf * cf * inv_rms
         m = tl.load(m_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         m = beta1 * m + (1.0 - beta1) * upd
         tl.store(m_ptr + offs, m.to(m_ptr.dtype.element_ty), mask=mask)
         if CAUTIOUS:
             delta = m
             if WD:
-                delta = delta + lrwd * tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+                delta = delta + wd * tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr, tl.sum(keep.to(tl.int32)))
 
     @triton.jit
-    def _chunked_apply(g_ptr, m_ptr, p_ptr, n, inv_mean, lrwd, seed,
+    def _chunked_apply(g_ptr, m_ptr, p_ptr, n, inv_mean, lr, wd, seed,
                        CAUTIOUS: tl.constexpr, WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr):
-        """delta = cautious(m + lr*wd*p, g); p -= delta, with bf16 stochastic rounding if SR."""
+        """delta = cautious(m + wd*p, g); p -= lr*delta, with bf16 stochastic rounding if SR."""
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
@@ -451,12 +452,12 @@ if _HAS_TRITON:
         p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         delta = m
         if WD:
-            delta = delta + lrwd * p
+            delta = delta + wd * p
         if CAUTIOUS:
             g = tl.load(g_ptr + offs, mask=mask, other=0.0)
             keep = (delta * g) > 0.0
             delta = tl.where(keep, delta * inv_mean, 0.0)
-        res = p - delta
+        res = p - lr * delta
         if SR:
             res = sr_round(res, seed, offs)
         tl.store(p_ptr + offs, res.to(p_ptr.dtype.element_ty), mask=mask)
@@ -473,7 +474,7 @@ if _HAS_TRITON:
     # Grid is ``(N * K,)`` with ``K = ceil(n/BLOCK)`` chunks per tensor (same n=R*C across the bucket,
     # so K is a constant): ``t = pid // K`` selects the tensor, ``k = pid % K`` the chunk. Grad is the
     # stacked fp32 [N, n] (GC already folded into the copy); r/c factors are stacked [N, R]/[N, C];
-    # per-tensor scalars (``inv_rms_lr``/``inv_mean``) are float32[N] arrays indexed by ``t``. Momentum
+    # per-tensor scalars (``inv_rms``/``inv_mean``) are float32[N] arrays indexed by ``t``. Momentum
     # is read/written via the m pointer array with the same MOM constexpr as the one-block kernel for
     # fp32/bf16; int8/4bit momentum is dequant'd to an fp32 temp host-side (the m array then points at
     # the temp's per-tensor slices, MOM==FP32) and requant'd in torch between the two passes — exactly
@@ -481,8 +482,8 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_mom_batched(
-        g_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, inv_rms_lr_ptr,
-        lrwd, beta1, R, C, n, K,
+        g_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, inv_rms_ptr,
+        wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
@@ -498,8 +499,8 @@ if _HAS_TRITON:
         g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)            # stacked fp32 grad (GC'd)
         rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
         cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
-        inv_rms_lr = tl.load(inv_rms_lr_ptr + t)
-        upd = g * rf * cf * inv_rms_lr
+        inv_rms = tl.load(inv_rms_ptr + t)
+        upd = g * rf * cf * inv_rms
         mi = tl.load(m_addr + t)
         if MOM == 1:  # bf16 storage
             mp = mi.to(tl.pointer_type(tl.bfloat16))
@@ -521,17 +522,17 @@ if _HAS_TRITON:
                 else:
                     pp = pi.to(tl.pointer_type(tl.float32))
                 p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
-                delta = delta + lrwd * p_old
+                delta = delta + wd * p_old
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
     @triton.jit
     def _chunked_apply_batched(
-        g_ptr, m_addr, p_addr, inv_mean_ptr, lrwd, seed, n, K,
+        g_ptr, m_addr, p_addr, inv_mean_ptr, lr, wd, seed, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         SR: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        """Batched pass 2: delta = cautious(m + lr*wd*p, g); p -= delta (bf16 SR if LOWP+SR)."""
+        """Batched pass 2: delta = cautious(m + wd*p, g); p -= lr*delta (bf16 SR if LOWP+SR)."""
         pid = tl.program_id(0)
         t = pid // K
         k = pid % K
@@ -547,13 +548,13 @@ if _HAS_TRITON:
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         delta = m
         if WD:
-            delta = delta + lrwd * p
+            delta = delta + wd * p
         if CAUTIOUS:
             g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)
             inv_mean = tl.load(inv_mean_ptr + t)
             keep = (delta * g) > 0.0
             delta = tl.where(keep, delta * inv_mean, 0.0)
-        res = p - delta
+        res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
@@ -649,18 +650,18 @@ if _HAS_TRITON:
         tl.store(cfac_ptr + t * C + cc, tl.rsqrt(col_new), mask=cmask)
 
     @triton.jit
-    def _finish_rms(rms_ptr, inv_rms_lr_ptr, n, lr, clip, N, BLOCK: tl.constexpr):
+    def _finish_rms(rms_ptr, inv_rms_ptr, n, clip, N, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
         mask = offs < N
         rms = tl.sqrt(tl.load(rms_ptr + offs, mask=mask, other=0.0) / n)
         denom = tl.maximum(rms / clip, 1.0)
-        tl.store(inv_rms_lr_ptr + offs, lr / denom, mask=mask)
+        tl.store(inv_rms_ptr + offs, 1.0 / denom, mask=mask)
 
     # mom/apply that read grad via the pointer array (+ GC via rowmean) instead of a stacked g_ptr.
     @triton.jit
     def _chunked_mom_batched_g(
-        g_addr, rowmean_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, inv_rms_lr_ptr,
-        lrwd, beta1, R, C, n, K,
+        g_addr, rowmean_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, inv_rms_ptr,
+        wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, BLOCK: tl.constexpr,
     ):
@@ -679,8 +680,8 @@ if _HAS_TRITON:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
         rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
         cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
-        inv_rms_lr = tl.load(inv_rms_lr_ptr + t)
-        upd = g * rf * cf * inv_rms_lr
+        inv_rms = tl.load(inv_rms_ptr + t)
+        upd = g * rf * cf * inv_rms
         mi = tl.load(m_addr + t)
         if MOM == 1:
             mp = mi.to(tl.pointer_type(tl.bfloat16))
@@ -698,13 +699,13 @@ if _HAS_TRITON:
             if WD:
                 pi = tl.load(p_addr + t)
                 pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
-                delta = delta + lrwd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+                delta = delta + wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
     @triton.jit
     def _chunked_apply_batched_g(
-        g_addr, rowmean_ptr, m_addr, p_addr, inv_mean_ptr, lrwd, seed, R, C, n, K,
+        g_addr, rowmean_ptr, m_addr, p_addr, inv_mean_ptr, lr, wd, seed, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
     ):
@@ -724,7 +725,7 @@ if _HAS_TRITON:
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         delta = m
         if WD:
-            delta = delta + lrwd * p
+            delta = delta + wd * p
         if CAUTIOUS:
             i = offs // C
             gbase = tl.load(g_addr + t)
@@ -736,7 +737,7 @@ if _HAS_TRITON:
             inv_mean = n.to(tl.float32) / tl.maximum(count, 1.0)
             keep = (delta * g) > 0.0
             delta = tl.where(keep, delta * inv_mean, 0.0)
-        res = p - delta
+        res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
@@ -779,11 +780,11 @@ if _HAS_TRITON:
         tl.store(vp + offs, v, mask=mask)
         update = tl.where(mask, g * tl.rsqrt(v), 0.0)
 
-        # Adafactor RMS-clip on the update, then lr scale
+        # Adafactor RMS-clip on the update (lr scales the final delta)
         rms = tl.sqrt(tl.sum(update * update) / Lf)
         denom = rms / clip
         denom = tl.where(denom < 1.0, 1.0, denom)
-        update = update * (lr / denom)
+        update = update / denom
 
         # Momentum EMA in fp32, then write back through the selected persistent codec.
         if MOMENTUM:
@@ -831,14 +832,14 @@ if _HAS_TRITON:
 
         p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         if WD:
-            delta = delta + (lr * wd) * p_old
+            delta = delta + wd * p_old
         if CAUTIOUS:
             keep = (delta * g) > 0.0
             keepf = tl.where(keep, 1.0, 0.0)
             mm = tl.sum(keepf) / Lf
             mm = tl.where(mm < 1e-8, 1e-8, mm)
             delta = tl.where(keep, delta / mm, 0.0)
-        res = p_old - delta
+        res = p_old - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
@@ -1303,7 +1304,7 @@ if _HAS_TRITON:
     @triton.jit
     def _chunked_nomom_keep_batched_g(
         g_addr, rowmean_ptr, p_addr, rfac_ptr, cfac_ptr, keep_ptr,
-        inv_rms_lr_ptr, lrwd, R, C, n, K,
+        inv_rms_ptr, wd, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
@@ -1322,18 +1323,18 @@ if _HAS_TRITON:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
         rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
         cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
-        delta = g * rf * cf * tl.load(inv_rms_lr_ptr + t)
+        delta = g * rf * cf * tl.load(inv_rms_ptr + t)
         if WD:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-            delta += lrwd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+            delta += wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         keep = ((delta * g) > 0.0) & mask
         tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
     @triton.jit
     def _chunked_nomom_apply_batched_g(
-        g_addr, rowmean_ptr, p_addr, rfac_ptr, cfac_ptr, inv_rms_lr_ptr,
-        inv_mean_ptr, lrwd, seed, R, C, n, K,
+        g_addr, rowmean_ptr, p_addr, rfac_ptr, cfac_ptr, inv_rms_ptr,
+        inv_mean_ptr, lr, wd, seed, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
     ):
@@ -1352,18 +1353,18 @@ if _HAS_TRITON:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
         rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
         cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
-        delta = g * rf * cf * tl.load(inv_rms_lr_ptr + t)
+        delta = g * rf * cf * tl.load(inv_rms_ptr + t)
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         if WD:
-            delta += lrwd * p
+            delta += wd * p
         if CAUTIOUS:
             keep = (delta * g) > 0.0
             count = tl.load(inv_mean_ptr + t).to(tl.float32)
             inv_mean = n.to(tl.float32) / tl.maximum(count, 1.0)
             delta = tl.where(keep, delta * inv_mean, 0.0)
-        res = p - delta
+        res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
@@ -1371,7 +1372,7 @@ if _HAS_TRITON:
     @triton.jit
     def _chunked_4bit_keep_batched_g(
         g_addr, rowmean_ptr, packed_addr, scale_addr, p_addr, rfac_ptr, cfac_ptr,
-        keep_ptr, inv_rms_lr_ptr, lrwd, beta1, R, C, n, K,
+        keep_ptr, inv_rms_ptr, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
         FBLOCK: tl.constexpr, BLOCK: tl.constexpr,
     ):
@@ -1396,7 +1397,7 @@ if _HAS_TRITON:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
         upd = g * tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
         upd *= tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
-        upd *= tl.load(inv_rms_lr_ptr + t)
+        upd *= tl.load(inv_rms_ptr + t)
         packed = tl.load(packed_addr + t).to(tl.pointer_type(tl.uint8))
         scales = tl.load(scale_addr + t).to(tl.pointer_type(tl.float32))
         byte = tl.load(packed + offs // 2, mask=mask, other=0)
@@ -1407,14 +1408,14 @@ if _HAS_TRITON:
         if WD:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-            delta += lrwd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+            delta += wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         keep = ((delta * g) > 0.0) & mask
         tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
     @triton.jit
     def _chunked_4bit_apply_batched_g(
         g_addr, rowmean_ptr, packed_addr, scale_addr, p_addr, rfac_ptr, cfac_ptr,
-        keep_ptr, inv_rms_lr_ptr, lrwd, beta1, seed, R, C, n, K,
+        keep_ptr, inv_rms_ptr, lr, wd, beta1, seed, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, FBLOCK: tl.constexpr, BLOCK: tl.constexpr,
     ):
@@ -1438,7 +1439,7 @@ if _HAS_TRITON:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
         upd = g * tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
         upd *= tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
-        upd *= tl.load(inv_rms_lr_ptr + t)
+        upd *= tl.load(inv_rms_ptr + t)
         packed = tl.load(packed_addr + t).to(tl.pointer_type(tl.uint8))
         scales = tl.load(scale_addr + t).to(tl.pointer_type(tl.float32))
         byte = tl.load(packed + offs // 2, mask=mask, other=0)
@@ -1451,12 +1452,12 @@ if _HAS_TRITON:
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         delta = momentum
         if WD:
-            delta += lrwd * p
+            delta += wd * p
         if CAUTIOUS:
             count = tl.load(keep_ptr + t).to(tl.float32)
             keep = (delta * g) > 0.0
             delta = tl.where(keep, delta * (n.to(tl.float32) / tl.maximum(count, 1.0)), 0.0)
-        res = p - delta
+        res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
         tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
@@ -1625,7 +1626,7 @@ class BigPointerCache:
         self.rfac = torch.empty(self.N * R, dtype=torch.float32, device=dev)
         self.cfac = torch.empty(self.N * C, dtype=torch.float32, device=dev)
         self.rms = torch.empty(self.N, dtype=torch.float32, device=dev)
-        self.inv_rms_lr = torch.empty(self.N, dtype=torch.float32, device=dev)
+        self.inv_rms = torch.empty(self.N, dtype=torch.float32, device=dev)
         self.keep = torch.empty(self.N, dtype=torch.int32, device=dev)
 
     def refresh_grads(self) -> None:

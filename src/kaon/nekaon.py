@@ -8,10 +8,11 @@ Nesterov-style), while the update itself lands on the true iterate:
 .. code-block:: text
 
     # end of step t (inside opt.step(), after the Adakaon update):
-    w_live <- w + k * m_t          # m = EMA of the lr-scaled, preconditioned,
-    # loop: forward/backward        #     RMS-clipped update (Adakaon's momentum,
-    # start of step t+1:            #     which points downhill)
-    w_live <- w_live - k * m_t     # exact removal (m unchanged in between)
+    w_live <- w + k * lr * m_t     # m = EMA of the preconditioned, RMS-clipped
+    # loop: forward/backward        #     update DIRECTION (Adakaon's momentum,
+    # start of step t+1:            #     LR-independent since 0.7.11); * lr
+    w_live <- w_live - k * lr * m_t  # converts it to step units at the CURRENT lr
+    #                                # exact removal (m and the frozen lr unchanged)
     adakaon_step(grad_at_lookahead)
 
 Why this exists (measured on the control battery, 2026-06-10 campaign):

@@ -25,8 +25,8 @@ The perturbation is **recomputed from the stored momentum** on removal, so MSAM 
 **zero extra persistent state** — the whole flat-minima mechanism is memory-free, which
 is the point of putting it on the kaon backend.
 
-Sign of ``rho``. The base optimizer's momentum is an EMA of the (lr-scaled,
-v-normalized) *update*, which points along the gradient — i.e. uphill. ``rho > 0``
+Sign of ``rho``. The base optimizer's momentum is an EMA of the (v-normalized)
+*update*, which points along the gradient — i.e. uphill. ``rho > 0``
 climbs uphill (the SAM-like direction); ``rho < 0`` probes the Nesterov-like downhill
 lookahead instead. Both are exposed because the right sign is an empirical question
 (measured on the control battery, not assumed).
@@ -95,10 +95,11 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             (one radius for the whole net, the SAM/MSAM convention — needs a cross-param
             reduction); ``"tensor"`` gives every param its own radius ``rho`` normalized
             by its own momentum norm (layerwise — no global sync, so the perturbation can
-            fuse into a single batched pass); ``"none"`` applies the **raw** momentum,
-            ``e = rho * m`` — since a kaon momentum is the EMA of the *lr-scaled,
-            preconditioned, RMS-clipped update*, this makes ``rho`` a **lookahead measured
-            in optimizer steps** ("perturb to where ~rho more steps would land"). Unlike a
+            fuse into a single batched pass); ``"none"`` applies the **raw** momentum
+            converted to step units, ``e = rho * lr * m`` — since a kaon momentum is the
+            EMA of the *preconditioned, RMS-clipped update direction*, this makes ``rho``
+            a **lookahead measured in optimizer steps** at the current lr
+            ("perturb to where ~rho more steps would land"). Unlike a
             fixed weight-space radius, that is dimensionless and self-scaling: it tracks
             the LR (and any schedule), the per-coordinate ``1/sqrt(v)`` metric, and the
             model's weight scale by construction — the transfer-robust formulation.
@@ -138,6 +139,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._axpy_cache: dict[str, Any] | None = None  # Triton 4bit fast-path pointer arrays
         self._axpy_seed = 0                             # SR seed counter for the fused axpy
         self._eclamp: dict[int, float] = {}             # per-group climb bound, frozen per cycle
+        self._estep_scale: dict[int, float] = {}        # direction -> step units, frozen per cycle
         self._e_scale = 1.0                             # exact scale frozen with the live climb
         # Param groups and state dictionaries are stable between checkpoint loads.
         # Cache the momentum census/buckets so Nekaon's two perturbation passes do
@@ -227,6 +229,25 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         if sign > 0 and gid not in self._eclamp:
             self._eclamp[gid] = abs(self.rho) * group.get("clip_threshold", 1.0) * group["lr"]
         return self._eclamp[gid]
+
+    def _climb_step_scale(self, group: dict[str, Any], sign: float) -> float:
+        """Convert the stored momentum to OPTIMIZER-STEP units for a ``norm="none"`` climb.
+
+        Inner optimizers that store an LR-independent direction (Adakaon since
+        0.7.11 — marked ``_momentum_is_unscaled``) need a ``* lr`` so ``rho`` keeps
+        meaning "lookahead in optimizer steps"; owners with lr-scaled momentum keep
+        the historical 1.0. FROZEN at climb time per group (like ``_climb_bound``):
+        the removal / eval / train swaps must undo the SAME e even if a scheduler
+        moved lr between them. ``step()`` clears the cache after each removal."""
+        gid = id(group)
+        if sign > 0 and gid not in self._estep_scale:
+            owner = self._momentum_owner()
+            self._estep_scale[gid] = (
+                float(group["lr"])
+                if getattr(owner, "_momentum_is_unscaled", False)
+                else 1.0
+            )
+        return self._estep_scale[gid]
 
     # Below this relative displacement the perturbed gradient is measurably the same as
     # the true one: on a real MLP with fp32 weights (so representation is not the limit),
@@ -330,7 +351,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 scales = (sign * self.rho * applied_scale) / (norms + self.eps)
                 m.mul_(scales.view(n, *([1] * (m.ndim - 1))))
             else:  # "none": raw momentum — rho is a lookahead in OPTIMIZER-STEP units
-                m.mul_(sign * self.rho * applied_scale)
+                m.mul_(sign * self.rho * applied_scale * self._climb_step_scale(group, sign))
                 bound = self._climb_bound(group, sign)
                 # NaN passes through clamp(): a non-finite momentum coordinate (e.g. a
                 # 0*inf from a blown 4-bit block scale) must contribute ZERO climb, never
@@ -428,8 +449,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
     def _launch_fused(self, cache: dict[str, Any], sign: float, scale: float, ft: Any) -> None:
         """Launch a cached fused perturbation plan."""
         self._axpy_seed += 1
-        alpha = sign * self.rho * scale
         for bk in cache["buckets"]:
+            alpha = sign * self.rho * scale * self._climb_step_scale(bk["group"], sign)
             ft._axpy_momentum_batched[(bk["N"] * bk["K"],)](
                 bk["p_addr"], bk["m_addr"], bk["sc_addr"], alpha,
                 self._climb_bound(bk["group"], sign), bk["n"], bk["K"], bk["row_width"],
@@ -553,6 +574,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             self._apply(-1.0)
             self._has_e = False
         self._eclamp.clear()  # next climb re-freezes the per-element bound at the CURRENT lr
+        self._estep_scale.clear()
         # 2) base step at the true weights, with the perturbed-point gradient.
         loss = self.inner.step(closure)
         if _PROBE_LOG:
@@ -611,6 +633,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._has_e = False
         self._mnorm = 0.0
         self._eclamp.clear()
+        self._estep_scale.clear()
         self._axpy_cache = None
         self._axpy_seed = axpy_seed
         self._e_scale = 1.0
