@@ -233,11 +233,24 @@ class _MomentumCodec:
     * ``ema_one``     — per-param.
     * ``ema_stacked`` — foreach.
 
+    Write entry points (Lion / AdaBelief / AdamP / KProdigy, which do their own
+    EMA arithmetic then hand the fp32 result back for storage):
+
+    * ``store_one``     — per-param requant / copy **in place**.
+    * ``store_stacked`` — foreach requant / copy **in place**.
+
     Read-only entry points (KProdigy, which does its own ``d``-scaled EMA in pass
     1 and only needs to *read* the stored momentum back in pass 2):
 
     * ``dequant_one``     — per-param: return the fp32 momentum (no mutation).
     * ``dequant_stacked`` — foreach: return the stacked fp32 momentum (no mutation).
+
+    **Storage-identity contract.** ``state["m"]`` and (when present)
+    ``state["m_scale"]`` keep the same tensor objects for the lifetime of the
+    optimizer state. Writers must ``copy_`` / ``_foreach_copy_`` into those
+    buffers — never reassign. MSAM (and Nekaon) cache ``data_ptr`` tables into
+    both for the fused climb; a reassignment leaves those tables addressing
+    freed memory.
     """
 
     def init_state(self, state: dict[str, Any], grad: Tensor, group: dict[str, Any]) -> None:
@@ -249,6 +262,23 @@ class _MomentumCodec:
     def ema_stacked(
         self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
     ) -> Tensor:
+        raise NotImplementedError
+
+    def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
+        """Write an updated fp32 momentum into ``state`` **in place**.
+
+        Preserves the identity of ``state["m"]`` / ``state["m_scale"]`` (see the
+        class docstring). ``m_fp32`` may be a matrixized ``[R, C]`` view; it is
+        reshaped to the stored layout before quantizing / copying.
+        """
+        raise NotImplementedError
+
+    def store_stacked(self, states: list[dict[str, Any]], m_fp32: Tensor) -> None:
+        """Write stacked fp32 momentum ``[N, *shape]`` into per-param storage in place.
+
+        Same storage-identity contract as :meth:`store_one`: codes and scales are
+        ``copy_``'d into the existing tensors, never replaced.
+        """
         raise NotImplementedError
 
     def dequant_one(self, state: dict[str, Any], like: Tensor) -> Tensor:
@@ -297,6 +327,21 @@ class _FloatCodec(_MomentumCodec):
         torch._foreach_copy_(ms, list(mom.unbind(0)))
         return mom.float()
 
+    def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
+        state["m"].copy_(m_fp32.reshape(state["m"].shape))
+
+    def store_stacked(self, states: list[dict[str, Any]], m_fp32: Tensor) -> None:
+        shape = tuple(m_fp32.shape[1:])
+        vals = list(m_fp32.unbind(0))
+        # ``reshape`` of a non-contiguous ``m`` returns a COPY; ``_foreach_copy_``
+        # would then write the copy and leave state untouched. ``view`` fails loud
+        # when the layout cannot alias; otherwise fall back to per-param ``copy_``.
+        if all(s["m"].is_contiguous() for s in states):
+            torch._foreach_copy_([s["m"].view(shape) for s in states], vals)
+        else:
+            for s, v in zip(states, vals, strict=True):
+                s["m"].copy_(v.reshape_as(s["m"]))
+
     def dequant_one(self, state: dict[str, Any], like: Tensor) -> Tensor:
         m = state["m"]
         return m.float() if m.dtype != torch.float32 else m.clone()
@@ -342,6 +387,32 @@ class _Int8Codec(_MomentumCodec):
         for s, sc in zip(states, new_scale.unbind(0), strict=True):
             s["m_scale"].copy_(sc.view_as(s["m_scale"]))
         return delta
+
+    def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
+        q, scale = _quant_int8(m_fp32.reshape(state["m"].shape))
+        state["m"].copy_(q)
+        state["m_scale"].copy_(scale.reshape_as(state["m_scale"]))
+
+    def store_stacked(self, states: list[dict[str, Any]], m_fp32: Tensor) -> None:
+        n = m_fp32.shape[0]
+        shape = tuple(m_fp32.shape[1:])
+        per = math.prod(shape) if shape else 1
+        row = shape[0] if len(shape) >= 2 else 1
+        rest = max(per // row, 1)
+        q, new_scale = _quant_int8_stacked(m_fp32.reshape(n, row, rest))
+        qs = list(q.unbind(0))
+        # ``reshape`` of a non-contiguous ndim>2 buffer is a COPY; writing it would
+        # leave ``state["m"]`` unchanged. Prefer ``view`` (aliases storage) and fall
+        # back to a per-param ``copy_`` into the original shape when needed.
+        if all(s["m"].is_contiguous() for s in states):
+            torch._foreach_copy_([s["m"].view(row, rest) for s in states], qs)
+        else:
+            for s, qi in zip(states, qs, strict=True):
+                s["m"].copy_(qi.reshape_as(s["m"]))
+        # Same layout `_quant_int8` produces per-param (see int8_scale_shape); copy_
+        # into the existing scale buffer so MSAM's cached pointers stay valid.
+        for s, sc in zip(states, new_scale.unbind(0), strict=True):
+            s["m_scale"].copy_(sc.reshape_as(s["m_scale"]))
 
     def dequant_one(self, state: dict[str, Any], like: Tensor) -> Tensor:
         return state["m"].float().mul_(state["m_scale"])
@@ -409,6 +480,26 @@ class _FourBitCodec(_MomentumCodec):
         for s, sc in zip(states, new_scale.unbind(0), strict=True):
             s["m_scale"].copy_(sc)
         return delta
+
+    def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
+        packed, scale, _ = _quant_4bit(m_fp32, state["m_block"])
+        state["m"].copy_(packed)
+        state["m_scale"].copy_(scale)
+
+    def store_stacked(self, states: list[dict[str, Any]], m_fp32: Tensor) -> None:
+        n = m_fp32.shape[0]
+        per = math.prod(tuple(m_fp32.shape[1:])) if m_fp32.ndim > 1 else 1
+        bs = states[0]["m_block"]
+        new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs)
+        packs = list(new_packed.unbind(0))
+        # Packed buffers are 1-D; still guard non-contiguous storage the same way.
+        if all(s["m"].is_contiguous() for s in states):
+            torch._foreach_copy_([s["m"] for s in states], packs)
+        else:
+            for s, packed in zip(states, packs, strict=True):
+                s["m"].copy_(packed)
+        for s, sc in zip(states, new_scale.unbind(0), strict=True):
+            s["m_scale"].copy_(sc)
 
     def dequant_one(self, state: dict[str, Any], like: Tensor) -> Tensor:
         bs = state["m_block"]

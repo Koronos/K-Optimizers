@@ -5,6 +5,9 @@ MSAM's fused axpy plan (and the batched chunked steps) cache raw ``data_ptr`` ta
 dangling: training silently reads recycled memory, and the first ``empty_cache()`` (previews,
 eval) unmaps the old block and the next ``optimizer.train()`` dies with an illegal memory
 access. Regression for the lone-big-tensor ``_chunked_step`` requant and ``CodecBuffer.write``.
+
+See also ``tests/test_codec_store_identity.py`` for the Lion / AdaBelief / AdamP / KProdigy
+codec-store migration (those bases used to reassign ``m`` / ``m_scale`` on every step).
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import pytest
 import torch
 
 from kaon import Nekaon
+from kaon._momentum_codec import _make_codec
 from kaon._wrappers import CodecBuffer
 
 
@@ -73,3 +77,16 @@ def test_codecbuffer_write_is_in_place(dtype):
     CodecBuffer.write(state, "phi", dtype, torch.randn(64, 16))
     assert state["phi"].data_ptr() == buf_ptr
     assert state["phi_scale"].data_ptr() == scale_ptr
+
+
+@pytest.mark.parametrize("dtype", ["int8", "4bit"])
+def test_codec_store_one_is_in_place(dtype):
+    """Direct codec contract: ``store_one`` must not reassign ``m`` / ``m_scale``."""
+    codec = _make_codec(dtype)
+    state: dict = {}
+    g = torch.randn(32, 16)
+    codec.init_state(state, g, {"momentum_4bit_block": 64})
+    m_ptr, sc_ptr = state["m"].data_ptr(), state["m_scale"].data_ptr()
+    codec.store_one(state, torch.randn_like(g))
+    assert state["m"].data_ptr() == m_ptr
+    assert state["m_scale"].data_ptr() == sc_ptr

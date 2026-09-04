@@ -73,7 +73,6 @@ from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _make_codec,
     _MomentumCodec,
-    _quant_int8,
     load_state_dict_preserving_dtypes,
 )
 
@@ -648,21 +647,15 @@ class KProdigy(Optimizer):
                 # Broadcast each per-param scale ([R,1...] or scalar) under the
                 # leading batch dim.
                 if ndim >= 2:
-                    reduce_dims = tuple(range(2, ndim + 1))
                     scales = torch.stack([s["m_scale"] for s in states])  # [B, R, 1...]
                 else:
-                    reduce_dims = (1,)
                     scales = torch.stack(
                         [s["m_scale"].reshape(1) for s in states]
                     ).reshape(len(states), 1)                            # [B, 1]
                 m_stack.mul_(scales)
                 m_stack.mul_(beta1).add_(grads.reshape(m_stack.shape), alpha=target)
-                absmax = m_stack.abs().amax(dim=reduce_dims, keepdim=True).clamp_(min=1e-12)
-                new_scale = absmax / 127.0
-                q = (m_stack / new_scale).round_().clamp_(-127, 127).to(torch.int8)
-                torch._foreach_copy_(ms, list(q.unbind(0)))
-                for s, sc in zip(states, new_scale.unbind(0), strict=True):
-                    s["m_scale"].copy_(sc.reshape(s["m_scale"].shape))
+                # Requant IN PLACE via the shared codec (MSAM caches m / m_scale ptrs).
+                self._codec(group).store_stacked(states, m_stack)
             else:  # 4bit — shared codec stacked lerp (bit-identical to ema_one)
                 upd = grads if d == 1.0 else grads.mul(d)
                 self._codec(group).ema_stacked(states, upd, lambda t: t, tuple(records[idxs[0]][0].shape), beta1)
@@ -781,7 +774,7 @@ class KProdigy(Optimizer):
         if md == "int8":
             m = state["m"].float().mul_(state["m_scale"])
             m.mul_(beta1).add_(grad_fp32, alpha=target)
-            state["m"], state["m_scale"] = _quant_int8(m)
+            codec.store_one(state, m)
         elif md == "4bit":
             # m <- beta1*m + (1-beta1)*d*grad == m.lerp_(d*grad, 1-beta1)
             codec.ema_one(state, grad_fp32 if d == 1.0 else grad_fp32.mul(d), beta1)

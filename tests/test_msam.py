@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
-from kaon import Adakaon, Lookahead
+from kaon import Adakaon, AdaPNM, Lookahead
 from kaon._wrappers import CodecBuffer
 from kaon.msam import MSAM
 
@@ -292,3 +293,17 @@ def test_wraps_lookahead():
     opt.train()  # swap back to theta THEN re-perturb — exact restore
     for a, w in zip(pa, live, strict=True):
         assert torch.allclose(a.data, w, atol=1e-7, rtol=1e-6)
+
+
+# --------------------------------------------------------------------------- 7
+def test_rejects_adapnm_base():
+    """AdaPNM keeps m_pos/m_neg — MSAM would silently no-op without an explicit reject."""
+    p = torch.nn.Parameter(torch.randn(4, 4))
+    with pytest.raises(TypeError, match="m_pos|dual momentum|AdaPNM"):
+        MSAM([p], base_optimizer=AdaPNM, lr=1e-3, rho=0.3)
+
+
+def test_allows_adapnm_when_rho_zero():
+    """rho=0 is a documented passthrough — dual-momentum bases are fine then."""
+    p = torch.nn.Parameter(torch.randn(4, 4))
+    MSAM([p], base_optimizer=AdaPNM, lr=1e-3, rho=0.0)
