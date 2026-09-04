@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Fused Triton path (Adakaon): pointer caches validate the WEIGHT storage.** Every
+  fused cache (`PointerArrayCache`, `BigPointerCache`, `OneDimPointerCache`,
+  `AdaPnmCache`, `OneDimPnmCache`) and the routing partition keyed on `id(p)` only, so a
+  `p.data` rebind (external EMA, `.to()`, block-swap offloaders, FSDP reshard) left the
+  kernel writing the retired storage: use-after-free of neighbouring tensors and a
+  parameter that silently stopped training. Caches now witness `(id, data_ptr,
+  is_contiguous)` per step (measured +41 us/step on a 428-tensor bag; the `shape` field
+  was rejected at 2x that cost). A rebind that changes the *shape* of `p.data` is not
+  supported (factored state is shape-bound) and is pinned by an `xfail` test.
+- **`reduction_tile` returned a non-power-of-2 `BR`** and `tl.arange` refused to compile:
+  any bag with >= 2 same-shape tensors of `R in [5, 127]` not a power of 2 (LoRA ranks
+  12/24/48/96 over 640-1280 channels, `(9,640)`, `(96,96)`, or one tensor with
+  `beta1=0`) crashed on the first step. Rounded up; all consumers already mask rows.
+- **`momentum_4bit_block != 128` wrote past `m_scale`** in the one-block kernel (`BLK`
+  hard-coded to 128, unmasked scale store). The one-block route now only takes 4-bit
+  state whose block is 128 (others go native, bit-identical to the per-param path), and
+  `requant_4bit`/`dequant_4bit` mask both the store and the load with the real
+  `m_scale` capacity.
+- **Non-contiguous gradients were read through `data_ptr` ignoring strides** on all
+  three fused routes (the check only existed for `ndim > 2`, and was cached). Grad
+  contiguity is now re-checked every step; offending tensors take the native path for
+  that step without rebuilding the caches (memoised demotion set, 3.8x cheaper than a
+  rebuild-per-step).
+- **Triton specialised an integer argument equal to 1** (`C.to(tl.float32)` on a
+  `(20000, 1)` weight) into a Python `int` and failed to compile; also reached AdaPNM
+  through the shared `_reduce_rowcol`.
+- **fp16 weights + `bf16_method="stochastic_rounding"` silently fell back to
+  round-to-nearest**; the constructor and `add_param_group` now raise
+  `NotImplementedError` (validated before the group is added).
+- **Non-finite policy is now uniform: propagate.** `sr_round` no longer turns NaN into
+  `-0.0` (int32 overflow) or a low-payload NaN into `+inf`; the seven cautious sites
+  multiply by the mask instead of `tl.where`, so an `inf`/NaN gradient produces the same
+  non-finite tensor on the fused and native paths (the fused path used to freeze the
+  tensor forever in silence).
+- **Mixed-device param groups** (CPU + CUDA) crashed in `torch.stack` inside the foreach
+  and fused bucketing; `device` is part of every bucket key and kernels launch under the
+  bucket's device.
+
 ## [0.7.11]
 
 ### Fixed

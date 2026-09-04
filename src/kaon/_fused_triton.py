@@ -116,6 +116,34 @@ TILE_CAP = 1 << 13  # 8192 padded lanes
 # with its own regression risk and is intentionally not bundled with the 2-D change.
 TILE_CAP_1D = 1 << 17  # 131072 padded lanes
 DEV = "cuda"
+# Bound methods/getters looked up once: the per-step staleness witness calls each of them per
+# param (see :class:`_WitnessedCache`), and the attribute lookup is a measurable share of the cost.
+_DATA_PTR = torch.Tensor.data_ptr
+_IS_CONTIG = torch.Tensor.is_contiguous
+
+
+def param_witness(plist) -> tuple:
+    """The per-step staleness witness for any cached pointer plan over ``plist``.
+
+    Three flat tuples — ``(ids, data_ptrs, contiguity)`` — one entry per param, because each is
+    a routing input the caches bake in and none of the others implies it:
+
+    * ``id``        — the param set itself changed.
+    * ``data_ptr``  — ``p.data = ...`` rebound the SAME Parameter to different storage (an
+      external EMA, a ``.to(dtype/device)``, a block-swap offloader). Covers dtype and device
+      too: either necessarily moves the storage.
+    * ``contiguity``— ``p.data = p.data.t()`` on a SQUARE weight keeps id, pointer AND shape;
+      only the strides move, and the kernels index row-major from ``data_ptr``.
+
+    NOT observed: ``p.shape``. A rebind that changes the shape while keeping the storage
+    (``p.data = p.data.view(...)``) is UNSUPPORTED — see the limit documented on
+    :func:`kaon.adakaon._param_witness` — and collecting a ``torch.Size`` per param roughly
+    DOUBLES the witness, for an operation that stays broken either way. Cost on a 428-param
+    LoRA-shaped bag: the review's run measured 80 µs for main's ``(ids, data_ptr)``, 131 µs
+    (8.0% of a 1633 µs step) for the three fields kept here and 254 µs (15.6%) with shapes; a
+    re-run here on a differently-composed bag measured 48 / 66 / 112 µs. Same ratio either way.
+    """
+    return (tuple(map(id, plist)), tuple(map(_DATA_PTR, plist)), tuple(map(_IS_CONTIG, plist)))
 
 # Momentum storage kinds (passed to the kernel as a constexpr so the unused branches compile away).
 MOM_FP32, MOM_BF16, MOM_INT8, MOM_4BIT = 0, 1, 2, 3
@@ -137,9 +165,23 @@ def ptr_array(tensors: list, device) -> torch.Tensor:
 
 def reduction_tile(R: int, C: int, work: int = 16384) -> tuple[int, int, int]:
     """Row-block sizing for the fused reduction kernels: ``(BR, BC, RB)`` — one program owns ``BR``
-    rows × ``BC = next_pow2(C)`` cols (≈ ``work`` lanes) and ``RB = ceil(R/BR)`` blocks tile the rows."""
+    rows × ``BC = next_pow2(C)`` cols (≈ ``work`` lanes) and ``RB = ceil(R/BR)`` blocks tile the rows.
+
+    ``BR`` is a POWER OF TWO. It reaches the kernels as a ``tl.constexpr`` driving
+    ``tl.arange(0, BR)``, and Triton rejects anything else outright:
+    ``CompilationError: arange's range must be a power of 2``. The unrounded row count broke
+    the batched-big path for perfectly ordinary weights — ``(96, 96)``, ``(9, 640)``,
+    ``(12, 1024)``, ``(65, 65)`` — which simply failed to compile.
+
+    Rounding UP (not down) keeps a program's block at or above the work target. The padding
+    is free of numerical consequence: every consumer of this ``BR``
+    (:func:`_reduce_rowcol`, :func:`_reduce_rms`, in both Adakaon's and AdaPNM's
+    ``_chunked_reductions_fused``) masks its rows with ``ri < R`` on every load, store and
+    atomic, and ``RB`` below is derived from the PADDED ``BR`` so the row blocks still tile
+    ``R`` exactly once.
+    """
     BC = triton.next_power_of_2(C)  # noqa: N806
-    BR = max(1, min(R, max(1, work // BC)))  # noqa: N806
+    BR = triton.next_power_of_2(max(1, min(R, max(1, work // BC))))  # noqa: N806
     RB = (R + BR - 1) // BR  # noqa: N806
     return BR, BC, RB
 
@@ -213,11 +255,24 @@ if _HAS_TRITON:
 
         REUSABLE device primitive: any bf16-parameter optimizer writes weights through this. Unbiased
         (E[sr_round(x)] == x) for both signs. ``offs`` drives the per-lane noise; vary ``seed`` per step.
+
+        NON-FINITE INPUTS COME BACK BIT-FOR-BIT. Both halves of the trick corrupt them:
+        ``ibits + noise`` OVERFLOWS int32 for a NaN with a payload near ``0x7FFFFFFF`` (it lands
+        on ``-0.0``), and the ``& 0xFFFF0000`` mantissa truncation alone turns a low-payload NaN
+        such as ``0x7F800001`` into ``+inf``. Either way a finite (or wrongly-signalling) weight
+        is manufactured out of a NaN, burying a diverged run instead of surfacing it. The
+        finiteness policy is PROPAGATE, identically to the torch path, so the ORIGINAL bits are
+        returned whenever ``res`` is not finite (``tl.abs`` of a NaN or an inf is never
+        ``<= FLT_MAX``). Finite values are untouched — including an fp32 above bf16's largest
+        finite, which still carries into inf exactly as ``.to(torch.bfloat16)`` would.
         """
         ibits = res.to(tl.int32, bitcast=True)
         noise = (tl.rand(seed, offs) * 65536.0).to(tl.int32)
-        ibits = (ibits + noise) & -65536  # 0xFFFF0000 as a two's-complement int32
-        return ibits.to(tl.float32, bitcast=True)
+        rounded = (ibits + noise) & -65536  # 0xFFFF0000 as a two's-complement int32
+        # 3.4028...e38 is FLT_MAX: the comparison is False for NaN and for +-inf. Inlined
+        # because a Triton kernel cannot read a module global.
+        finite = tl.abs(res) <= 3.4028234663852886e+38
+        return tl.where(finite, rounded, ibits).to(tl.float32, bitcast=True)
 
     @triton.jit
     def dequant_int8(code_ptr, idx, mask, scale_ptr, rr, R):
@@ -244,32 +299,52 @@ if _HAS_TRITON:
         tl.store(scale_ptr + rr, new_scale, mask=rr < R)
 
     @triton.jit
-    def dequant_4bit(packed_ptr, scale_ptr, ri, ci, idx, Chalf, mask, BLK):
+    def dequant_4bit(packed_ptr, scale_ptr, ri, ci, idx, Chalf, mask, BLK, NS):
         """Per-block 4-bit packed momentum -> fp32. REUSABLE by any factored-family fused optimizer.
 
-        Nibble-packed (2 codes/byte) over the row-major-flattened tensor with a per-128-block absmax
+        Nibble-packed (2 codes/byte) over the row-major-flattened tensor with a per-block absmax
         scale; assumes an EVEN column count so a byte's pair stays within one row. Mirrors
-        ``kaon._momentum_codec._FourBitCodec`` dequant (unpack nibble - 8, * block scale)."""
+        ``kaon._momentum_codec._FourBitCodec`` dequant (unpack nibble - 8, * block scale).
+
+        ``NS`` is the CAPACITY of ``scale_ptr`` (the caller's ``m_scale.numel()``): the block index
+        ``idx // BLK`` is derived from ``BLK``, not from the stored layout, so a mismatch reads
+        past the buffer. Bounding the load keeps that an out-of-range 0 instead of whatever the
+        allocator left there. See :func:`requant_4bit` for the write side."""
         byte = tl.load(packed_ptr + (ri * Chalf + ci // 2), mask=mask, other=0)
         nib = tl.where((ci % 2) == 0, byte & 0xF, (byte >> 4) & 0xF)
         q = nib.to(tl.float32) - 8.0
-        sc = tl.load(scale_ptr + (idx // BLK), mask=mask, other=0.0)    # per-block scale
+        blk = idx // BLK
+        sc = tl.load(scale_ptr + blk, mask=mask & (blk < NS), other=0.0)   # per-block scale
         return q * sc
 
     @triton.jit
-    def requant_4bit(m_new, m2, idx, R, C, Chalf, packed_ptr, scale_ptr, NB, BLK,
+    def requant_4bit(m_new, m2, idx, R, C, Chalf, packed_ptr, scale_ptr, NB, NS, BLK,
                      BR: tl.constexpr, BC: tl.constexpr):
         """fp32 momentum -> per-block 4-bit codes + scale, stored in place. REUSABLE.
 
-        Pass 1: segmented per-128-block absmax / 7 (a runtime loop over the tensor's blocks). Pass 2:
-        round half-to-even (libdevice.rint) + clamp [-7, 7] + 8 shift -> nibbles, packed two-per-byte
-        via reshape + ``tl.split`` (no cross-lane write hazard). Element-identical to ``_FourBitCodec``."""
+        Pass 1: segmented per-block absmax / 7 (a runtime loop over the tensor's ``NB`` blocks).
+        Pass 2: round half-to-even (libdevice.rint) + clamp [-7, 7] + 8 shift -> nibbles, packed
+        two-per-byte via reshape + ``tl.split`` (no cross-lane write hazard). Element-identical to
+        ``_FourBitCodec``.
+
+        ``NS`` is the CAPACITY of ``scale_ptr`` in fp32 elements — the caller's
+        ``state["m_scale"].numel()`` for this tensor — and it bounds BOTH scale accesses. What it
+        protects against is precisely an ``m_scale`` SHORTER than the ``NB`` blocks this kernel
+        addresses: ``NB`` follows from ``BLK``, so such a caller would write ``NB - NS`` floats past
+        the end of the buffer and read the missing blocks back out of it. It does NOT make a
+        different block LAYOUT correct — a state quantized with a smaller ``momentum_4bit_block``
+        has its scales at other offsets entirely, and the routing guard in
+        ``Adakaon._fused_partition`` diverts that tensor to the native path instead. In practice
+        ``NS == NB`` here; the masks are the second line of defence that turns a future routing
+        mistake into dropped stores and a neutral 1.0 scale instead of memory corruption."""
         blk = idx // BLK
         for b in range(NB):                                            # segmented per-block absmax
             bmax = tl.max(tl.where((blk == b) & m2, tl.abs(m_new), 0.0))
             bmax = tl.where(bmax < 1e-12, 1e-12, bmax)
-            tl.store(scale_ptr + b, bmax / 7.0)                        # symmetric 4-bit -> [-7, 7]
-        sc = tl.load(scale_ptr + blk, mask=m2, other=1.0)              # per-lane block scale
+            tl.store(scale_ptr + b, bmax / 7.0, mask=b < NS)           # symmetric 4-bit -> [-7, 7]
+        # ``blk < NS`` for the same reason as the store above; the neutral 1.0 keeps the
+        # quantization defined (and finite) for a block whose scale was never written.
+        sc = tl.load(scale_ptr + blk, mask=m2 & (blk < NS), other=1.0)  # per-lane block scale
         q = libdevice.rint(m_new / sc)
         q = tl.minimum(tl.maximum(q, -7.0), 7.0)
         # Canonical odd-length padding matches ``_pack_nibbles``: the unused
@@ -312,7 +387,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _adakaon_tile_kernel(
-        g_addr, p_addr, m_addr, mscale_addr, row_addr, col_addr, Rs_ptr, Cs_ptr,
+        g_addr, p_addr, m_addr, mscale_addr, row_addr, col_addr, Rs_ptr, Cs_ptr, Ns_ptr,
         lr, beta1, beta2, eps1, clip, wd, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr,
         CAUTIOUS: tl.constexpr, WD: tl.constexpr,
@@ -372,7 +447,11 @@ if _HAS_TRITON:
                 scale_ptr = tl.load(mscale_addr + t).to(tl.pointer_type(tl.float32))
                 Chalf = C // 2
                 BLK = tl.minimum(R * C, 128)                           # flat elems per 4-bit block
-                m_old = dequant_4bit(packed_ptr, scale_ptr, ri, ci, idx, Chalf, m2, BLK)
+                # Ns_ptr[t] is this tensor's ALLOCATED m_scale length; it bounds the dequant's
+                # scale load and the requant's scale store/reload below, so a layout the routing
+                # guard failed to divert can only lose scales, never touch foreign memory.
+                NS = tl.load(Ns_ptr + t)
+                m_old = dequant_4bit(packed_ptr, scale_ptr, ri, ci, idx, Chalf, m2, BLK, NS)
             elif MOM == 1:  # bf16
                 m_old = tl.load(mi.to(tl.pointer_type(tl.bfloat16)) + idx, mask=m2, other=0.0).to(tl.float32)
             else:  # fp32
@@ -383,7 +462,8 @@ if _HAS_TRITON:
                 requant_int8(m_new, m2, code_ptr, idx, scale_ptr, rr, R)
             elif MOM == 3:
                 NB = (R * C + BLK - 1) // BLK
-                requant_4bit(m_new, m2, idx, R, C, Chalf, packed_ptr, scale_ptr, NB, BLK, BR, BC)
+                requant_4bit(m_new, m2, idx, R, C, Chalf, packed_ptr, scale_ptr,
+                             NB, NS, BLK, BR, BC)
             elif MOM == 1:
                 tl.store(mi.to(tl.pointer_type(tl.bfloat16)) + idx, m_new.to(tl.bfloat16), mask=m2)
             else:
@@ -403,7 +483,14 @@ if _HAS_TRITON:
             keepf = tl.where(keep, 1.0, 0.0)
             mm = tl.sum(keepf) / (Rf * Cf)
             mm = tl.where(mm < 1e-8, 1e-8, mm)
-            delta = tl.where(keep, delta / mm, 0.0)
+            # MULTIPLY by the 0/1 survivor mask, never ``tl.where``: 0 * NaN == NaN, so a
+            # non-finite delta PROPAGATES exactly as native's ``delta.mul_(mask).div_(denom)``
+            # does (_backend.cautious_batched_). ``tl.where`` substituted a hard 0 and FROZE the
+            # tensor for the rest of the run — a silently dead weight instead of a visible NaN.
+            # Finite values are unchanged: x * 1.0 == x. A REJECTED coordinate subtracts -0.0
+            # rather than the old +0.0, which is the same weight except that a stored -0.0 flips
+            # to +0.0 (they compare equal; the only difference is the sign bit).
+            delta = (delta * keepf) / mm
 
         # --- weight write (plain fp32 or bf16 stochastic rounding); lr on the FULL delta ---
         res = p_old - lr * delta
@@ -456,7 +543,8 @@ if _HAS_TRITON:
         if CAUTIOUS:
             g = tl.load(g_ptr + offs, mask=mask, other=0.0)
             keep = (delta * g) > 0.0
-            delta = tl.where(keep, delta * inv_mean, 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, inv_mean, 0.0)
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed, offs)
@@ -553,7 +641,8 @@ if _HAS_TRITON:
             g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)
             inv_mean = tl.load(inv_mean_ptr + t)
             keep = (delta * g) > 0.0
-            delta = tl.where(keep, delta * inv_mean, 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, inv_mean, 0.0)
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -587,7 +676,10 @@ if _HAS_TRITON:
         gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
         g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
         if GC:
-            rmean = tl.sum(g, axis=1) / C.to(tl.float32)        # [BR] per-row mean over real C
+            # ``C * 1.0``, never ``C.to(tl.float32)``: Triton SPECIALIZES an int argument whose
+            # value is 1 into a Python int, which has no ``.to`` — a (20000, 1) weight on the big
+            # route failed to compile at all. Multiplying promotes either form to fp32.
+            rmean = tl.sum(g, axis=1) / (C * 1.0)               # [BR] per-row mean over real C
             tl.store(rowmean_ptr + t * R + ri, rmean, mask=rmask)
             g = tl.where(m2, g - rmean[:, None], 0.0)
         gsq = g * g
@@ -645,7 +737,7 @@ if _HAS_TRITON:
         )
         tl.store(rowp + rr, row_new, mask=rmask)
         tl.store(colp + cc, col_new, mask=cmask)
-        row_mean = tl.sum(tl.where(rmask, row_new, 0.0)) / R.to(tl.float32)
+        row_mean = tl.sum(tl.where(rmask, row_new, 0.0)) / (R * 1.0)  # see _reduce_rowcol on `* 1.0`
         tl.store(rfac_ptr + t * R + rr, tl.rsqrt(row_new / row_mean), mask=rmask)
         tl.store(cfac_ptr + t * C + cc, tl.rsqrt(col_new), mask=cmask)
 
@@ -736,7 +828,8 @@ if _HAS_TRITON:
             count = tl.load(inv_mean_ptr + t).to(tl.float32)
             inv_mean = n.to(tl.float32) / tl.maximum(count, 1.0)
             keep = (delta * g) > 0.0
-            delta = tl.where(keep, delta * inv_mean, 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, inv_mean, 0.0)
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -820,9 +913,12 @@ if _HAS_TRITON:
                 # Reuse the matrix codec with a synthetic [1,L] row. BL is at least 2,
                 # so adjacent nibbles always have one unambiguous writer.
                 idx = offs
+                # FBLOCK is this bucket's REAL m_block, so the block count is exactly the
+                # allocated m_scale length -> NB and NS coincide here by construction.
+                NB = (L + FBLOCK - 1) // FBLOCK
                 requant_4bit(
                     m_new[None, :], mask[None, :], idx[None, :], 1, L, (L + 1) // 2,
-                    mp, sp, (L + FBLOCK - 1) // FBLOCK, FBLOCK, BR=1, BC=BL,
+                    mp, sp, NB, NB, FBLOCK, BR=1, BC=BL,
                 )
             else:
                 tl.store(mp + offs, m_new, mask=mask)
@@ -838,7 +934,8 @@ if _HAS_TRITON:
             keepf = tl.where(keep, 1.0, 0.0)
             mm = tl.sum(keepf) / Lf
             mm = tl.where(mm < 1e-8, 1e-8, mm)
-            delta = tl.where(keep, delta / mm, 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = (delta * keepf) / mm
         res = p_old - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -902,8 +999,11 @@ if _HAS_TRITON:
             negp = negi.to(tl.pointer_type(tl.uint8))
             pscale = tl.load(posc_addr + t).to(tl.pointer_type(tl.float32))
             nscale = tl.load(negc_addr + t).to(tl.pointer_type(tl.float32))
-            m_pos = dequant_4bit(posp, pscale, ri, ci, idx, Chalf, m2, BLK)
-            m_neg = dequant_4bit(negp, nscale, ri, ci, idx, Chalf, m2, BLK)
+            # AdaPNM's launcher (kaon/adapnm.py) is outside this change's scope and has no
+            # capacity array to pass: NS == NB keeps today's behaviour exactly.
+            NS = (R * C + BLK - 1) // BLK
+            m_pos = dequant_4bit(posp, pscale, ri, ci, idx, Chalf, m2, BLK, NS)
+            m_neg = dequant_4bit(negp, nscale, ri, ci, idx, Chalf, m2, BLK, NS)
         elif MOM == 1:  # bf16
             m_pos = tl.load(posi.to(tl.pointer_type(tl.bfloat16)) + idx, mask=m2, other=0.0).to(tl.float32)
             m_neg = tl.load(negi.to(tl.pointer_type(tl.bfloat16)) + idx, mask=m2, other=0.0).to(tl.float32)
@@ -915,7 +1015,7 @@ if _HAS_TRITON:
             requant_int8(m_pos, m2, posp, idx, pscale, rr, R)
         elif MOM == 3:
             NB = (R * C + BLK - 1) // BLK
-            requant_4bit(m_pos, m2, idx, R, C, Chalf, posp, pscale, NB, BLK, BR, BC)
+            requant_4bit(m_pos, m2, idx, R, C, Chalf, posp, pscale, NB, NB, BLK, BR, BC)
         elif MOM == 1:
             tl.store(posi.to(tl.pointer_type(tl.bfloat16)) + idx, m_pos.to(tl.bfloat16), mask=m2)
         else:
@@ -1363,7 +1463,8 @@ if _HAS_TRITON:
             keep = (delta * g) > 0.0
             count = tl.load(inv_mean_ptr + t).to(tl.float32)
             inv_mean = n.to(tl.float32) / tl.maximum(count, 1.0)
-            delta = tl.where(keep, delta * inv_mean, 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, inv_mean, 0.0)
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -1456,7 +1557,8 @@ if _HAS_TRITON:
         if CAUTIOUS:
             count = tl.load(keep_ptr + t).to(tl.float32)
             keep = (delta * g) > 0.0
-            delta = tl.where(keep, delta * (n.to(tl.float32) / tl.maximum(count, 1.0)), 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, n.to(tl.float32) / tl.maximum(count, 1.0), 0.0)
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -1531,7 +1633,59 @@ if _HAS_TRITON:
 
 
 # ============================================================ pointer-array cache (reusable)
-class PointerArrayCache:
+class _WitnessedCache:
+    """Shared staleness witness for every cached pointer array — see :func:`param_witness`.
+
+    ``id(p)`` ALONE IS NOT A WITNESS. ``p.data = ...`` rebinds the SAME Parameter object to
+    fresh storage — an external EMA writing weights back, a ``.to(dtype/device)``, or a
+    block-swap offloader that re-materializes a block on every pull and frees it on evict.
+    The ids still match, the cached ``data_ptr`` does not, and the kernel writes the whole
+    step into memory the optimizer no longer owns: silent corruption while the buffer is
+    still mapped, an illegal memory access once the allocator hands it back. Confirmed on
+    all four routes (one-block, 1-D, 0-D, big batched). Contiguity closes the one SUPPORTED
+    rebind that keeps the pointer (``p.data.t()``); the other one (``view``, which changes the
+    shape) is an unsupported operation, documented on ``Adakaon._param_witness``. Same guard the
+    native plan uses (``Adakaon._foreach_plan``) and MSAM's ``p_witness``; the grad side is
+    already covered per step by ``refresh_grads``.
+    """
+
+    def _witness(self, plist) -> None:
+        """Record the witness for ``plist`` (call once, at cache build)."""
+        self.witness = param_witness(plist)
+        self.ids, self.ptrs = self.witness[0], self.witness[1]
+        self.src = plist
+
+    def stale(self, plist) -> bool:
+        """True when the cached pointer arrays no longer describe ``plist``.
+
+        Called per step by callers that build ``plist`` fresh each time (the big-tensor shape
+        buckets): see :func:`param_witness` for what it observes and what each field costs.
+        """
+        return self.witness != param_witness(plist)
+
+    def built_from(self, plist) -> bool:
+        """O(1) alternative to :meth:`stale` for a caller that ALREADY revalidated the witness.
+
+        ``Adakaon._fused_partition`` compares ids and ``data_ptr``s across the whole group
+        every step and hands back the very same route lists while nothing changed; any change
+        (or the per-step non-contiguous-grad demotion) rebuilds them into FRESH list objects.
+        Under that contract, "this is the list I was built from" is exactly as strong as
+        recomparing the tuples — and skips a second witness sweep per step (~131 µs on the
+        428-param bag). Callers without that contract must use :meth:`stale`.
+        """
+        return plist is self.src
+
+
+def fourbit_kernel_blocks(numel: int) -> int:
+    """Number of 4-bit absmax blocks the ONE-BLOCK tile kernel writes for an ``numel``-element
+    tensor. The kernel hardcodes ``BLK = min(numel, 128)``, so this is the momentum layout a
+    tensor must already have to be eligible for that route (see ``Adakaon._fused_partition``);
+    ``kaon._momentum_codec.fourbit_block_size`` produces exactly it for the default
+    ``momentum_4bit_block=128``."""
+    return (numel + min(numel, 128) - 1) // max(min(numel, 128), 1)
+
+
+class PointerArrayCache(_WitnessedCache):
     """Per-tensor pointer arrays, BUCKETED by padded tile, cached across steps.
 
     Optimizer-agnostic plumbing. A single global (BR,BC)=max would pad every tiny adapter up to the
@@ -1542,15 +1696,18 @@ class PointerArrayCache:
     """
 
     def __init__(self, plist, state_of, mom_dtype):
-        self.ids = tuple(id(p) for p in plist)
-        i64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=DEV)  # noqa: E731
-        i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=DEV)  # noqa: E731
-        groups: dict[tuple[int, int, torch.dtype], list] = {}
+        self._witness(plist)
+        # The device is part of the bucket key (and every index array is built ON that device):
+        # one launch owns one device, and a group holding params on two of them would otherwise
+        # hand a kernel a pointer array from the wrong context.
+        groups: dict[tuple[int, int, torch.dtype, torch.device], list] = {}
         for p in plist:
             br, bc = next_pow2_tile(*eff_2d(p))
-            groups.setdefault((br, bc, p.dtype), []).append(p)
+            groups.setdefault((br, bc, p.dtype, p.device), []).append(p)
         self.buckets = []
-        for (BR, BC, _dtype), bl in groups.items():  # noqa: N806
+        for (BR, BC, _dtype, dev), bl in groups.items():  # noqa: N806
+            i64 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int64, device=_d)  # noqa: E731
+            i32 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int32, device=_d)  # noqa: E731
             st = [state_of(p) for p in bl]
             momentum = "m" in st[0]
             mdtype = st[0]["m"].dtype if momentum else torch.float32
@@ -1570,13 +1727,32 @@ class PointerArrayCache:
             # dereference mscale (constexpr-elided), so reuse m_addr as a harmless valid pointer.
             quant = mom in (MOM_INT8, MOM_4BIT)
             mscale_addr = i64([s["m_scale"].data_ptr() for s in st]) if quant else m_addr
+            Rs = i32([p.shape[0] for p in bl])  # noqa: N806
+            # Per-tensor m_scale CAPACITY for the 4-bit requant's bounded scale store. The tile
+            # kernel writes ``fourbit_kernel_blocks(numel)`` scales (its block size is a hardcoded
+            # 128); a shorter buffer means a non-default ``momentum_4bit_block`` was routed here,
+            # which used to run off the end of ``m_scale``. Float momenta never dereference this
+            # array (the branch is constexpr-elided), so they reuse ``Rs``.
+            if mom == MOM_4BIT:
+                have = [s["m_scale"].numel() for s in st]
+                short = [(tuple(q.shape), h) for q, h in zip(bl, have, strict=True)
+                         if h < fourbit_kernel_blocks(q.numel())]
+                if short:
+                    raise RuntimeError(
+                        "fused one-block 4-bit momentum needs 128-element absmax blocks; these "
+                        f"tensors carry a different layout: {short[:4]} - route them to the "
+                        "native path (see Adakaon._fused_partition)"
+                    )
+                mscale_n = i32(have)
+            else:
+                mscale_n = Rs
             self.buckets.append(dict(
-                plist=bl, BR=BR, BC=BC, mom=mom, momentum=momentum,
+                plist=bl, BR=BR, BC=BC, mom=mom, momentum=momentum, dev=dev,
                 p_addr=i64([p.data_ptr() for p in bl]),
-                m_addr=m_addr, mscale_addr=mscale_addr,
+                m_addr=m_addr, mscale_addr=mscale_addr, mscale_n=mscale_n,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
                 col_addr=i64([s["col"].data_ptr() for s in st]),
-                Rs=i32([p.shape[0] for p in bl]), Cs=i32([eff_2d(p)[1] for p in bl]),
+                Rs=Rs, Cs=i32([eff_2d(p)[1] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
                 grad_ptrs=tuple(p.grad.data_ptr() for p in bl),
@@ -1597,15 +1773,15 @@ class PointerArrayCache:
         for b in self.buckets:
             ptrs = tuple(p.grad.data_ptr() for p in b["plist"])
             if b["grad_ptrs"] != ptrs:
-                b["g_addr"] = torch.tensor(ptrs, dtype=torch.int64, device=DEV)
+                b["g_addr"] = torch.tensor(ptrs, dtype=torch.int64, device=b["dev"])
                 b["grad_ptrs"] = ptrs
 
 
-class BigPointerCache:
+class BigPointerCache(_WitnessedCache):
     """Stable pointer arrays and reusable reduction scratch for one big shape bucket."""
 
     def __init__(self, plist, state_of, R, C):  # noqa: N803
-        self.ids = tuple(id(p) for p in plist)
+        self._witness(plist)
         self.plist = plist
         self.N, self.R, self.C = len(plist), R, C  # noqa: N806
         dev = plist[0].device
@@ -1636,7 +1812,7 @@ class BigPointerCache:
             self.grad_ptrs = ptrs
 
 
-class AdaPnmCache:
+class AdaPnmCache(_WitnessedCache):
     """Like :class:`PointerArrayCache` but for AdaPNM's TWO momenta (``m_pos`` / ``m_neg``).
 
     Stores the two physical momentum buffers' pointer arrays (+ their fp32 scales for int8/4bit);
@@ -1645,15 +1821,15 @@ class AdaPnmCache:
     cache."""
 
     def __init__(self, plist, state_of):
-        self.ids = tuple(id(p) for p in plist)
-        i64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=DEV)  # noqa: E731
-        i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=DEV)  # noqa: E731
-        groups: dict[tuple[int, int, torch.dtype], list] = {}
+        self._witness(plist)
+        groups: dict[tuple[int, int, torch.dtype, torch.device], list] = {}
         for p in plist:
             br, bc = next_pow2_tile(*eff_2d(p))
-            groups.setdefault((br, bc, p.dtype), []).append(p)
+            groups.setdefault((br, bc, p.dtype, p.device), []).append(p)
         self.buckets = []
-        for (BR, BC, _dtype), bl in groups.items():  # noqa: N806
+        for (BR, BC, _dtype, dev), bl in groups.items():  # noqa: N806
+            i64 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int64, device=_d)  # noqa: E731
+            i32 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int32, device=_d)  # noqa: E731
             st = [state_of(p) for p in bl]
             mdtype = st[0]["m_pos"].dtype
             mom = (MOM_INT8 if mdtype == torch.int8 else MOM_4BIT if mdtype == torch.uint8
@@ -1664,7 +1840,7 @@ class AdaPnmCache:
             posc = i64([s["m_pos_scale"].data_ptr() for s in st]) if quant else pos_addr
             negc = i64([s["m_neg_scale"].data_ptr() for s in st]) if quant else neg_addr
             self.buckets.append(dict(
-                plist=bl, BR=BR, BC=BC, mom=mom,
+                plist=bl, BR=BR, BC=BC, mom=mom, dev=dev,
                 p_addr=i64([p.data_ptr() for p in bl]),
                 pos_addr=pos_addr, neg_addr=neg_addr, posc_addr=posc, negc_addr=negc,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
@@ -1678,7 +1854,7 @@ class AdaPnmCache:
     refresh_grads = PointerArrayCache.refresh_grads
 
 
-class OneDimPointerCache:
+class OneDimPointerCache(_WitnessedCache):
     """Per-tensor pointer arrays for the non-factored ``ndim <= 1`` path, bucketed by (padded block
     ``BL`` = ``next_pow2(numel)``, momentum kind, 4-bit block, param dtype) — one launch per distinct
     bucket. Holds ``g/p/m/v`` base-address arrays + the true element counts ``Ls`` (for masking). The
@@ -1689,10 +1865,8 @@ class OneDimPointerCache:
     pointers refreshed on realloc)."""
 
     def __init__(self, plist, state_of):
-        self.ids = tuple(id(p) for p in plist)
-        i64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=DEV)  # noqa: E731
-        i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=DEV)  # noqa: E731
-        groups: dict[tuple[int, int, int, torch.dtype], list] = {}
+        self._witness(plist)
+        groups: dict[tuple[int, int, int, torch.dtype, torch.device], list] = {}
         for p in plist:
             st = state_of(p)
             momentum = "m" in st
@@ -1702,9 +1876,11 @@ class OneDimPointerCache:
             block = st.get("m_block", 1)
             # 4-bit packing requires a pair of lanes even for a scalar parameter.
             bl = max(2 if mom == MOM_4BIT else 1, triton.next_power_of_2(max(p.numel(), 1)))
-            groups.setdefault((bl, mom, block, p.dtype), []).append(p)
+            groups.setdefault((bl, mom, block, p.dtype, p.device), []).append(p)
         self.buckets = []
-        for (BL, mom, block, _dtype), bl in groups.items():  # noqa: N806
+        for (BL, mom, block, _dtype, dev), bl in groups.items():  # noqa: N806
+            i64 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int64, device=_d)  # noqa: E731
+            i32 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int32, device=_d)  # noqa: E731
             st = [state_of(p) for p in bl]
             momentum = "m" in st[0]
             quant = mom in (MOM_INT8, MOM_4BIT)
@@ -1712,7 +1888,7 @@ class OneDimPointerCache:
             m_addr = i64([s["m"].data_ptr() for s in st]) if momentum else v_addr
             mscale_addr = i64([s["m_scale"].data_ptr() for s in st]) if quant else m_addr
             self.buckets.append(dict(
-                plist=bl, BL=BL, mom=mom, momentum=momentum, block=block,
+                plist=bl, BL=BL, mom=mom, momentum=momentum, block=block, dev=dev,
                 p_addr=i64([p.data_ptr() for p in bl]),
                 m_addr=m_addr, mscale_addr=mscale_addr, v_addr=v_addr,
                 Ls=i32([p.numel() for p in bl]),
@@ -1724,24 +1900,25 @@ class OneDimPointerCache:
     refresh_grads = PointerArrayCache.refresh_grads
 
 
-class OneDimPnmCache:
+class OneDimPnmCache(_WitnessedCache):
     """Like :class:`OneDimPointerCache` but for AdaPNM's two 1-D momenta (``m_pos``/``m_neg``). Stores
     both physical buffers' address arrays + ``v``; the optimizer passes them (positive, negative) by
     step parity. fp32/bf16 only (quant 1-D and ams_bound route to native). Bucketed by ``next_pow2(L)``."""
 
     def __init__(self, plist, state_of):
-        self.ids = tuple(id(p) for p in plist)
-        i64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=DEV)  # noqa: E731
-        i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=DEV)  # noqa: E731
-        groups: dict[tuple[int, torch.dtype], list] = {}
+        self._witness(plist)
+        groups: dict[tuple[int, torch.dtype, torch.device], list] = {}
         for p in plist:
-            groups.setdefault((triton.next_power_of_2(p.shape[0]), p.dtype), []).append(p)
+            key = (triton.next_power_of_2(p.shape[0]), p.dtype, p.device)
+            groups.setdefault(key, []).append(p)
         self.buckets = []
-        for (BL, _dtype), bl in groups.items():  # noqa: N806
+        for (BL, _dtype, dev), bl in groups.items():  # noqa: N806
+            i64 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int64, device=_d)  # noqa: E731
+            i32 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int32, device=_d)  # noqa: E731
             st = [state_of(p) for p in bl]
             mom = MOM_BF16 if st[0]["m_pos"].dtype == torch.bfloat16 else MOM_FP32
             self.buckets.append(dict(
-                plist=bl, BL=BL, mom=mom,
+                plist=bl, BL=BL, mom=mom, dev=dev,
                 p_addr=i64([p.data_ptr() for p in bl]),
                 pos_addr=i64([s["m_pos"].data_ptr() for s in st]),
                 neg_addr=i64([s["m_neg"].data_ptr() for s in st]),

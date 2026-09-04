@@ -69,6 +69,7 @@ from kaon._momentum_codec import (
     _quant_int8,
     _quant_int8_stacked,
     _unpack_nibbles,
+    fourbit_block_size,
     load_state_dict_preserving_dtypes,
 )
 
@@ -131,6 +132,7 @@ def _identity(t: Tensor) -> Tensor:
 
 # Unbound, so the per-step staleness guard is a C-level ``map()`` instead of a genexpr.
 _DATA_PTR = Tensor.data_ptr
+_IS_CONTIG = Tensor.is_contiguous
 
 
 class _ForeachChunk:
@@ -242,10 +244,10 @@ class _ForeachPlan:
     only in this optimization and nothing else.
     """
 
-    __slots__ = ("buckets", "chunks", "ids", "ptrs", "steps")
+    __slots__ = ("buckets", "chunks", "steps", "witness")
 
-    def __init__(self, ids: tuple, ptrs: tuple, buckets: list[tuple]) -> None:
-        self.ids, self.ptrs, self.buckets = ids, ptrs, buckets
+    def __init__(self, witness: tuple, buckets: list[tuple]) -> None:
+        self.witness, self.buckets = witness, buckets
         self.chunks: list[_ForeachChunk] | None = None
         self.steps: tuple[int, ...] = ()
 
@@ -261,6 +263,83 @@ class _ForeachPlan:
             for i in range(0, len(plist), n)
         ]
         return self.chunks
+
+
+def _param_witness(plist: list[Tensor]) -> tuple:
+    """Per-step staleness witness for a cached plan over ``plist``: ``(ids, data_ptrs,
+    contiguity)``, one flat tuple each.
+
+    Deliberately duplicated from :func:`kaon._fused_triton.param_witness` (same three fields, same
+    order) rather than imported: this one guards the NATIVE foreach plan, which has to work in a
+    build without Triton, and ``kaon.adakaon`` never imports the Triton module at module scope.
+
+    Each field is load-bearing and none implies another. ``id`` catches a changed param set.
+    ``data_ptr`` catches ``p.data = <fresh storage>`` — an external EMA, a ``.to(dtype/device)``,
+    Rengu-Flow's block-swap offloader — and, through it, every dtype and device change.
+    Contiguity catches ``p.data = p.data.t()``, which on a SQUARE weight keeps id, pointer AND
+    shape and moves only the strides, while every kernel indexes row-major off ``data_ptr``.
+
+    LIMIT — a rebind that CHANGES THE SHAPE (``p.data = p.data.view(...)`` / ``reshape``) is not
+    supported and is deliberately not watched here. The factored second moment is bound to the
+    effective 2-D shape: ``state["row"]``/``state["col"]`` were allocated with the old lengths and
+    there is no meaningful migration of an EMA onto a different factorization. Rebuilding the plan
+    on such a rebind does not fix it, it makes it worse — the fused pointer arrays would then carry
+    the NEW R/C against the OLD row/col buffers and write past them. As it stands the native path
+    raises a size mismatch on the next step and the fused path silently keeps stepping the
+    pre-rebind geometry; validating ``row``/``col`` against ``p`` (or migrating the state) is
+    follow-up work, tracked in ``tests/test_fused_safety.py`` next to the routing tests.
+
+    COST on a 428-param LoRA-shaped bag. The review's run: 80 µs for main's ``(ids, data_ptr)``,
+    131 µs (8.0% of a 1633 µs fused step) for the three fields kept here, 254 µs (15.6%) with
+    ``torch.Size`` added — which is why shapes are out. A re-run here, on a differently-composed
+    bag of the same size, measured 48 / 66 / 112 µs against a ~640 µs step; the ratios agree.
+    The witness runs once per group in :meth:`_fused_partition` (the route caches then revalidate
+    by list identity — see ``_WitnessedCache.built_from``) plus once per big shape bucket, and the
+    per-step grad contiguity sweep in :meth:`_fused_demote` adds ~60 µs on the same bag.
+    """
+    return (tuple(map(id, plist)), tuple(map(_DATA_PTR, plist)), tuple(map(_IS_CONTIG, plist)))
+
+
+def _same_shape_device_buckets(plist: list[Tensor]) -> dict[tuple, list[Tensor]]:
+    """Group big 2-D tensors for the batched chunked kernel: EXACT shape, dtype AND device.
+
+    A bucket is launched as one grid against pointer arrays that :class:`BigPointerCache` builds
+    on ``plist[0].device``; two CUDA devices sharing a shape would run the second one's tensors
+    against index tensors from the first. The device belongs in the grouping, not only in the
+    cache key that is derived from it.
+    """
+    by_shape: dict[tuple, list[Tensor]] = {}
+    for p in plist:
+        by_shape.setdefault((tuple(p.shape), p.dtype, p.device), []).append(p)
+    return by_shape
+
+
+def _demote_non_contiguous_grads(
+    one_block: list[Tensor], big: list[Tensor], one_dim: list[Tensor], native: list[Tensor],
+) -> tuple[list[Tensor], list[Tensor], list[Tensor], list[Tensor]]:
+    """Move any param whose GRAD is not contiguous onto the native subset FOR THIS STEP.
+
+    Every fused kernel addresses the gradient as ``base + ri*C + ci`` (or ``base + offs``) read
+    straight off ``grad.data_ptr()``. A transposed (``grad = x.t()``) or strided
+    (``grad = buf[::2]``) gradient has the right shape and the wrong layout, so the kernel
+    silently steps the wrong numbers — measured as a ~1e-3 relative divergence from native with
+    no error raised anywhere. ``fused_eligible`` / ``fused_1d_eligible`` check
+    ``p.is_contiguous()``, never the grad's.
+
+    Contiguity belongs to THIS step's gradient (a fresh tensor every backward), so it cannot be
+    frozen into the cached routing partition: this runs per step, returns new lists and leaves
+    the cache untouched. Only the offending tensors move — one strided grad on one adapter must
+    not cost the rest of its bucket the fused path.
+    """
+    fused = (one_block, big, one_dim)
+    if all(p.grad.is_contiguous() for sub in fused for p in sub):
+        return one_block, big, one_dim, native
+    kept: tuple[list[Tensor], ...] = ([], [], [])
+    demoted: list[Tensor] = []
+    for keep, sub in zip(kept, fused, strict=True):
+        for p in sub:
+            (keep if p.grad.is_contiguous() else demoted).append(p)
+    return kept[0], kept[1], kept[2], native + demoted
 
 
 class Adakaon(AutoLRMixin, Optimizer):
@@ -421,7 +500,8 @@ class Adakaon(AutoLRMixin, Optimizer):
         # off this marker; optimizers without it keep lr-scaled momentum.
         self._momentum_is_unscaled = True
         self._t = 0
-        self._fused_part: dict[int, tuple] = {}          # group id -> cached (ids, one_block, big, one_dim, native)
+        self._fused_part: dict[int, tuple] = {}          # group id -> (witness, one_block, big, one_dim, native)
+        self._fused_demoted: dict[int, tuple] = {}       # group id -> memo of the non-contiguous-grad demotion
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
         self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPointerCache (1-D)
         self._fused_big_caches: dict[tuple[int, tuple[int, ...], Any], Any] = {}
@@ -444,6 +524,43 @@ class Adakaon(AutoLRMixin, Optimizer):
         # Off (default) -> zero overhead, step == _step_impl.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        """Add a group, rejecting the fp16 + stochastic-rounding combination up front.
+
+        ``Optimizer.__init__`` routes every constructor group through here too, so one check
+        covers construction and later additions. There is no fp16 stochastic-rounding write in
+        kaon: ``kaon.add_stochastic_`` raises ``NotImplementedError`` for it and the fused
+        kernel's ``sr_round`` is a bf16-only bit trick. The step used to reach neither — the
+        param fell off the foreach fast path and the fused routing, and the per-param fallback
+        wrote round-to-nearest — so an fp16 run silently lost every update smaller than half an
+        fp16 ulp, which is exactly the loss stochastic rounding exists to prevent. Say so at
+        construction instead, and point at the supported route.
+
+        The check runs BEFORE ``super()``: a caller that catches the error must not be left
+        holding a group the optimizer cannot step.
+        """
+        if not isinstance(param_group, dict):
+            super().add_param_group(param_group)   # let torch raise its own TypeError
+            return
+        params = param_group["params"]
+        if isinstance(params, torch.Tensor):
+            params = [params]
+        else:
+            # ``params`` may be a generator; materialize it here (exactly as torch is about to)
+            # so validating it does not consume what ``super()`` still has to read.
+            params = list(params)
+            param_group["params"] = params
+        method = param_group.get("bf16_method", self.defaults.get("bf16_method"))
+        if method == "stochastic_rounding":
+            for p in params:
+                if p.dtype == torch.float16:
+                    raise NotImplementedError(
+                        "bf16_method='stochastic_rounding' does not support torch.float16 "
+                        "parameters (stochastic rounding is implemented for bfloat16 only); "
+                        "use bf16_method='kahan' for fp16 parameters, or keep them in fp32"
+                    )
+        super().add_param_group(param_group)
+
     def _invalidate_fused_caches(self) -> None:
         """Drop every host-side cache that may retain pointers or views into optimizer state.
 
@@ -455,6 +572,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         stepping a detached copy of the state.
         """
         self._fused_part.clear()
+        self._fused_demoted.clear()
         self._fused_ob_caches.clear()
         self._fused_od_caches.clear()
         self._fused_big_caches.clear()
@@ -557,7 +675,9 @@ class Adakaon(AutoLRMixin, Optimizer):
             for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("Adakaon does not support sparse gradients")
-            one_block, big, one_dim, native = self._fused_partition(group, params, ft)
+            parts = self._fused_partition(group, params, ft)
+            # Routing is cached; grad CONTIGUITY is not cacheable (fresh tensor every backward).
+            one_block, big, one_dim, native = self._fused_demote(id(group), parts)
             if native:  # GC for the native subset (fused subsets centralize in-kernel / in-reductions)
                 if group["gradient_centralization"]:
                     centralize_grads_(native)
@@ -584,23 +704,35 @@ class Adakaon(AutoLRMixin, Optimizer):
                 centralize_grads_(big)
             self._native_dispatch(big, group)
             return
-        # Group by EXACT shape; same-shape buckets of >=2 take the batched chunked kernel, lone
-        # tensors take the per-tensor chunked kernel.
-        by_shape: dict[tuple[tuple[int, ...], Any], list[Tensor]] = {}
-        for p in big:
-            by_shape.setdefault((tuple(p.shape), p.dtype), []).append(p)
-        for plist in by_shape.values():
-            if len(plist) >= 2 or group["betas"][0] == 0.0:
-                self._chunked_step_batched(plist, group, ft)
-            else:
-                self._chunked_step(plist[0], group, ft)
+        # Group by EXACT shape (and dtype and DEVICE); same-shape buckets of >=2 take the
+        # batched chunked kernel, lone tensors take the per-tensor chunked kernel.
+        for plist in _same_shape_device_buckets(big).values():
+            # One device scope per bucket, covering every launch inside the chunked steps (see
+            # _fused_one_block): the bucket's pointer arrays and scratch live on plist[0].device,
+            # and a Triton launch targets the CURRENT device. PLAUSIBLE, not verified — one GPU here.
+            with torch.cuda.device(plist[0].device):
+                if len(plist) >= 2 or group["betas"][0] == 0.0:
+                    self._chunked_step_batched(plist, group, ft)
+                else:
+                    self._chunked_step(plist[0], group, ft)
 
     def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
-        """Split a group's params into (one-block, chunked-big, one-dim, native), cached per param-set."""
+        """Split a group's params into (one-block, chunked-big, one-dim, native), cached per param-set.
+
+        Keyed on :func:`_param_witness` — ids, ``data_ptr``s and contiguity — because each is a
+        routing input the partition (and the pointer arrays derived from it) bakes in, and
+        ``p.data = ...`` can change any of them while the Parameter object stays the same. An
+        id-only key kept dispatching a stale plan at memory the optimizer no longer owns. Same
+        guard as :meth:`_foreach_plan`, including its shape-rebind limit.
+
+        Grad properties deliberately stay OUT of this key: a gradient is a new tensor every
+        backward, so its contiguity is re-checked per step in :func:`_demote_non_contiguous_grads`
+        rather than frozen into the routing.
+        """
         gid = id(group)
-        ids = tuple(id(p) for p in params)
+        witness = _param_witness(params)
         cached = self._fused_part.get(gid)
-        if cached is not None and cached[0] == ids:
+        if cached is not None and cached[0] == witness:
             return cached[1], cached[2], cached[3], cached[4]
         md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
         one_block: list[Tensor] = []
@@ -611,15 +743,27 @@ class Adakaon(AutoLRMixin, Optimizer):
         for p in params:
             # bf16 params need stochastic rounding (the kernel's only bf16 write); kahan/none -> native
             bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding")
-            # ndim>2 (conv) is matrixized to (out, in*kh*kw); every momentum
-            # layout is row-major compatible with that view (int8 scales dim-0,
-            # 4-bit blocks the same flat storage).
-            conv_ok = p.ndim <= 2 or (p.grad is not None and p.grad.is_contiguous())
-            two_d = bf_ok and conv_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous() \
+            # ndim>2 (conv) is matrixized to (out, in*kh*kw); every momentum layout is row-major
+            # compatible with that view (int8 scales dim-0, 4-bit blocks the same flat storage).
+            # The matrixized write-back needs a contiguous GRAD — enforced per step by
+            # _demote_non_contiguous_grads, not here, because the grad changes every backward.
+            two_d = bf_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous() \
                 and p.dtype in (torch.float32, torch.bfloat16)
-            ok = bf_ok and conv_ok and ft.fused_eligible(p, cap)
-            if ok and momentum and md == "4bit" and ft.eff_2d(p)[1] % 2 != 0:
-                ok = False                                  # one-block 4bit needs even C
+            ok = bf_ok and ft.fused_eligible(p, cap)
+            if ok and momentum and md == "4bit":
+                if ft.eff_2d(p)[1] % 2 != 0:
+                    ok = False                              # one-block 4bit needs even C
+                elif self._fourbit_block(p, group) != min(_FOURBIT_BLOCK, p.numel()):
+                    # The one-block tile kernel hardcodes its absmax block at
+                    # ``BLK = min(R*C, 128)`` for dequant AND requant. Under any other
+                    # ``momentum_4bit_block`` that does not merely read the wrong scales: the
+                    # requant writes ceil(numel/128) floats into an ``m_scale`` sized for the
+                    # REAL block count, i.e. past the end of the buffer (a (64,128) weight with
+                    # block=0 wrote 63 floats out of bounds). Route it to the native / chunked
+                    # path, which honours ``state["m_block"]``. Making the block a constexpr
+                    # instead would multiply the JIT variants; the 1-D kernel already buckets by
+                    # block (OneDimPointerCache) and needs no guard.
+                    ok = False
             if ok:
                 one_block.append(p)
             elif two_d and ft.next_pow2_tile(*ft.eff_2d(p))[0] * ft.next_pow2_tile(*ft.eff_2d(p))[1] > cap:
@@ -657,8 +801,39 @@ class Adakaon(AutoLRMixin, Optimizer):
                     f"[census] one_block={len(one_block)} big={len(big)} one_dim={len(one_dim)} "
                     f"native={len(native)} noncontig_grads={noncontig[:8]} disable={sorted(_FUSED_DISABLE)}\n"
                 )
-        self._fused_part[gid] = (ids, one_block, big, one_dim, native)
+        self._fused_part[gid] = (witness, one_block, big, one_dim, native)
         return one_block, big, one_dim, native
+
+    def _fused_demote(self, gid: int, parts: tuple) -> tuple:
+        """This step's routing, with any non-contiguous-grad tensor moved to the native subset.
+
+        Thin memo over :func:`_demote_non_contiguous_grads`. The demotion has to build fresh
+        route lists, and a fresh list means every downstream pointer cache sees a new object and
+        rebuilds itself (``_WitnessedCache.built_from``) — so a tensor whose grad is PERSISTENTLY
+        strided would throw away the whole bucket's index tensors on every step. Reuse the lists
+        while both the partition (identity of its four lists) and the demoted SET are unchanged;
+        the contiguity sweep itself still runs every step, since that is what detects the change.
+        """
+        demoted = tuple(id(p) for sub in parts[:3] for p in sub if not p.grad.is_contiguous())
+        if not demoted:
+            self._fused_demoted.pop(gid, None)
+            return parts
+        cached = self._fused_demoted.get(gid)
+        if (cached is not None and cached[0] == demoted
+                and all(a is b for a, b in zip(cached[1], parts, strict=True))):
+            return cached[2]
+        out = _demote_non_contiguous_grads(*parts)
+        self._fused_demoted[gid] = (demoted, parts, out)
+        return out
+
+    def _fourbit_block(self, p: Tensor, group: dict[str, Any]) -> int:
+        """This param's 4-bit absmax block size: the one already in state when there is one (a
+        checkpoint can carry a layout the current group setting would not produce), else the one
+        :meth:`_init_state` is about to pick."""
+        st = self.state.get(p)
+        if st and "m_block" in st:
+            return st["m_block"]
+        return fourbit_block_size(p.grad, group)
 
     def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
         """Launch the one-block pointer-array kernel over the eligible small 2-D weights."""
@@ -666,10 +841,12 @@ class Adakaon(AutoLRMixin, Optimizer):
             st = self.state[p]
             if not st:
                 self._init_state(p, st, group)
-        ids = tuple(id(p) for p in plist)
         gid = id(group)
         cache = self._fused_ob_caches.get(gid)
-        if cache is None or cache.ids != ids:
+        # ``built_from`` (identity), not ``stale`` (tuple rebuild): _fused_partition already
+        # revalidated ids+data_ptrs for the whole group this step and only returns this exact
+        # list object while nothing moved. See _WitnessedCache.built_from.
+        if cache is None or not cache.built_from(plist):
             cache = ft.PointerArrayCache(plist, lambda p: self.state[p], None)
             self._fused_ob_caches[gid] = cache
         cache.refresh_grads()
@@ -677,15 +854,22 @@ class Adakaon(AutoLRMixin, Optimizer):
         lr, eps1 = group["lr"], group["eps"][0]
         clip, wd = group["clip_threshold"], group["weight_decay"]
         cautious, gc = group["cautious"], group["gradient_centralization"]
+        # A bucket's index arrays live on ITS device (PointerArrayCache buckets by device), and a
+        # Triton launch goes to the CURRENT device, not to the one the arguments came from. A group
+        # spanning cuda:0 and cuda:1 would otherwise launch every bucket on whichever device
+        # happened to be current. PLAUSIBLE, not verified: this machine has one GPU, so the
+        # multi-device path is reasoned about rather than tested.
         for bk in cache.buckets:
             lanes = bk["BR"] * bk["BC"]
-            ft._adakaon_tile_kernel[(len(bk["plist"]),)](
-                bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["row_addr"], bk["col_addr"],
-                bk["Rs"], bk["Cs"], lr, b1, b2, eps1, clip, wd, self._t,
-                LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0, GC=gc, SR=bk["lowp"],
-                MOMENTUM=bk["momentum"],
-                BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
-            )
+            with torch.cuda.device(bk["dev"]):
+                ft._adakaon_tile_kernel[(len(bk["plist"]),)](
+                    bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["row_addr"],
+                    bk["col_addr"], bk["Rs"], bk["Cs"], bk["mscale_n"],
+                    lr, b1, b2, eps1, clip, wd, self._t,
+                    LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0, GC=gc,
+                    SR=bk["lowp"], MOMENTUM=bk["momentum"],
+                    BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
+                )
 
     def _fused_one_dim(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
         """One-block non-factored kernel over the eligible ``ndim <= 1`` weights (biases / norm
@@ -695,10 +879,9 @@ class Adakaon(AutoLRMixin, Optimizer):
             st = self.state[p]
             if not st:
                 self._init_state(p, st, group)
-        ids = tuple(id(p) for p in plist)
         gid = id(group)
         cache = self._fused_od_caches.get(gid)
-        if cache is None or cache.ids != ids:
+        if cache is None or not cache.built_from(plist):   # see _fused_one_block
             cache = ft.OneDimPointerCache(plist, lambda p: self.state[p])
             self._fused_od_caches[gid] = cache
         cache.refresh_grads()
@@ -706,14 +889,15 @@ class Adakaon(AutoLRMixin, Optimizer):
         lr, eps1 = group["lr"], group["eps"][0]
         clip, wd = group["clip_threshold"], group["weight_decay"]
         cautious = group["cautious"]
-        for bk in cache.buckets:
-            ft._adam_1d_kernel[(len(bk["plist"]),)](
-                bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["v_addr"], bk["Ls"],
-                lr, b1, b2, eps1, clip, wd, self._t,
-                LOWP=bk["lowp"], MOM=bk["mom"], MOMENTUM=bk["momentum"], CAUTIOUS=cautious,
-                WD=wd != 0, SR=bk["lowp"], BL=bk["BL"], FBLOCK=bk["block"],
-                num_warps=ft.warps_for(bk["BL"]),
-            )
+        for bk in cache.buckets:                       # see _fused_one_block on the device scope
+            with torch.cuda.device(bk["dev"]):
+                ft._adam_1d_kernel[(len(bk["plist"]),)](
+                    bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["v_addr"],
+                    bk["Ls"], lr, b1, b2, eps1, clip, wd, self._t,
+                    LOWP=bk["lowp"], MOM=bk["mom"], MOMENTUM=bk["momentum"], CAUTIOUS=cautious,
+                    WD=wd != 0, SR=bk["lowp"], BL=bk["BL"], FBLOCK=bk["block"],
+                    num_warps=ft.warps_for(bk["BL"]),
+                )
 
     def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:
         """Shared torch part of a big-tensor step: GC + row/col EMA + rms (matvec, no [R,C] temp).
@@ -824,10 +1008,9 @@ class Adakaon(AutoLRMixin, Optimizer):
         lowp = plist[0].dtype == torch.bfloat16
         sr = lowp and (group["bf16_method"] == "stochastic_rounding")
         states = [self.state[p] for p in plist]
-        cache_key = (id(group), tuple(plist[0].shape), plist[0].dtype)
+        cache_key = (id(group), tuple(plist[0].shape), plist[0].dtype, plist[0].device)
         cache = self._fused_big_caches.get(cache_key)
-        ids = tuple(id(p) for p in plist)
-        if cache is None or cache.ids != ids:
+        if cache is None or cache.stale(plist):
             cache = ft.BigPointerCache(plist, lambda p: self.state[p], R, C)
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()
@@ -1102,38 +1285,44 @@ class Adakaon(AutoLRMixin, Optimizer):
             if not state:
                 self._init_state(p, state, group)
             g = p.grad
+            # DEVICE is part of every bucket key: a bucket is stacked with ``torch.stack``,
+            # which refuses to mix devices ("Expected all tensors to be on the same device"),
+            # so a group holding a CPU and a CUDA weight of the same shape used to crash the
+            # whole step rather than step each on its own device.
             if g.ndim >= 2:
                 matrixize = g.ndim > 2  # conv kernels always reshape to 2-D before factoring
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                bucket = factored.setdefault((eff, p.dtype, matrixize), ([], []))
+                bucket = factored.setdefault((eff, p.dtype, p.device, matrixize), ([], []))
             else:  # ndim <= 1 — 0-D scalars ride as length 1 (g.numel() == g.shape[0] for 1-D)
-                bucket = flat.setdefault((g.numel(), p.dtype), ([], []))
+                bucket = flat.setdefault((g.numel(), p.dtype, p.device), ([], []))
             bucket[0].append(p)
             bucket[1].append(state)
         buckets = [(max(eff[0] * eff[1], 1), pl, st, eff, matrixize, 0)
-                   for (eff, _dtype, matrixize), (pl, st) in factored.items()]
+                   for (eff, _dtype, _device, matrixize), (pl, st) in factored.items()]
         buckets += [(max(length, 1), pl, st, None, False, length)
-                    for (length, _dtype), (pl, st) in flat.items()]
+                    for (length, _dtype, _device), (pl, st) in flat.items()]
         return buckets
 
     def _foreach_plan(self, params: list[Tensor], group: dict[str, Any],
                       budget: int) -> list[_ForeachChunk]:
         """This step's chunks for ``group``, from the cached plan when it is still valid.
 
-        The plan is rebuilt when the param set changes (``id`` per param) or when any
-        ``p.data`` is rebound to different storage (``data_ptr`` per param) — a dtype or
-        device change necessarily moves the pointer, so one guard covers re-bucketing too.
-        Everything else that can invalidate it is event-driven: see
-        :meth:`_invalidate_fused_caches` and the per-parameter fallback in
-        :meth:`_native_dispatch`.
+        The plan is rebuilt whenever :func:`_param_witness` moves: the param set (``id``), the
+        storage a param points at (``data_ptr``, which also covers dtype and device), or its
+        contiguity. Contiguity matters because the plan caches ``p.data`` VIEWS: ``p.data =
+        p.data.t()`` on a square weight keeps both id and pointer while moving the strides, and
+        the cached view would keep stepping the pre-transpose layout. A SHAPE-changing rebind is
+        an unsupported operation (see :func:`_param_witness`); the stale bucketing makes the next
+        step raise a size mismatch, which is the intended outcome. Everything else that can
+        invalidate the plan is event-driven: see :meth:`_invalidate_fused_caches` and the
+        per-parameter fallback in :meth:`_native_dispatch`.
         """
         gid = id(group)
         cached = self._foreach_cache_enabled
-        ids = tuple(map(id, params))
-        ptrs = tuple(map(_DATA_PTR, params))
+        witness = _param_witness(params)
         plan = self._foreach_plans.get(gid) if cached else None
-        if plan is None or plan.ids != ids or plan.ptrs != ptrs:
-            plan = _ForeachPlan(ids, ptrs, self._foreach_buckets(params, group))
+        if plan is None or plan.witness != witness:
+            plan = _ForeachPlan(witness, self._foreach_buckets(params, group))
             if cached:
                 self._foreach_plans[gid] = plan
         return plan.rechunk(budget, group, cached)
