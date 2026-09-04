@@ -4,7 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Default bf16 momentum EMA now runs in fp32** (then `copy_` into the bf16
+  buffer), matching the fused Triton kernels. Previously `_FloatCodec` did
+  `m.lerp_(update.to(bf16), …)`, rounding the update *before* the EMA — the only
+  `momentum_dtype` where native and fused diverged (~3.5e-4 rel vs ~1e-7
+  elsewhere). **Numeric trajectory of the default `momentum_dtype="bfloat16"`
+  changes** (fidelity improvement; fp32/int8/4bit unchanged). Foreach vs
+  per-param parity for bf16 is now **1 fp32 ULP** (`rtol=1e-6`, `atol=1e-9`)
+  rather than bit-exact: a 1-ULP difference in the stacked vs per-param update
+  (distinct reduction order) used to be hidden by rounding that update to bf16
+  *before* the EMA. fp32 momentum remains bit-exact.
+- **Lion warns on `momentum_dtype="4bit"`** (still accepted for checkpoint
+  compat): measured ~12–13% sign flips; loss ~32× / ~3916× worse vs bf16.
+  Prefer `int8`. Docs/docstring updated (old "+0.005 loss" was wrong).
+- **`warn_if_4bit_high_beta1`** in `_momentum_codec` (wired from Lion in this
+  lot): 4bit + `beta1 >= 0.99` amplifies quant error ~`1/sqrt(1-beta1^2)`
+  (measured block-128 table in `docs/momentum.md`).
+
+### Performance
+- **int8 `ema_one`**: `.float().mul_(scale)` (one temp), drop `delta.clone()`,
+  write codes with `(m/scale).round_().clamp_` into `state["m"]` — measured
+  13→8 B/elem transient, 14→12 kernels, ~1.29×, bit-identical. Same clone
+  removal on int8/4bit `ema_stacked` / 4bit `ema_one` (the strided 4bit dequant
+  slice is kept as-is: materialising it changed the `lerp_` kernel and broke the
+  per-param/stacked bit-exactness).
+
 ### Fixed
+- **Resume under bf16/fp16 params is byte-identical again.**
+  `load_state_dict_preserving_dtypes` used to cast state back to the saved dtype
+  *after* torch had already rounded floating buffers through the param dtype
+  (~0.3% relative drift per resume on `m_scale`/`row`/`col`/`v`). It now
+  re-applies the checkpoint tensors (values + dtype), `copy_` when identity can
+  be kept for MSAM's cached pointers, and accepts int/str state keys (JSON drift).
 - **Lion / AdaBelief / AdamP / KProdigy requantize momentum in place.** Their
   `_store_one` / `_store_stacked` (and KProdigy's int8 EMA) reassigned
   `state["m"]` / `state["m_scale"]` on every step. MSAM/Nekaon cache `data_ptr`

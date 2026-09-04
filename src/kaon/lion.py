@@ -66,6 +66,7 @@ it drops into per-parameter / gradient-release training loops unchanged.
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Iterable
 from typing import Any, Literal
 
@@ -91,6 +92,7 @@ from kaon._momentum_codec import (
     _make_codec,
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
+    warn_if_4bit_high_beta1,
 )
 
 __all__ = ["Lion"]
@@ -119,9 +121,15 @@ class Lion(AutoLRMixin, Optimizer):
             per-step delta. Lion usually wants this a touch larger than Adam.
         momentum_dtype: storage for the single momentum buffer — ``"bfloat16"``
             (default, ~2 B/param), ``"float32"`` (4 B/param), ``"int8"`` (~1
-            B/param, per-row absmax), or ``"4bit"`` (~0.5 B/param, per-block
-            absmax, nibble-packed). Same storage layout as Adakaon's first
-            moment, so checkpoints resume bit-exactly via ``load_state_dict``.
+            B/param, per-row absmax; **recommended cheap option**), or
+            ``"4bit"`` (~0.5 B/param, per-block absmax, nibble-packed). Same
+            storage layout as Adakaon's first moment, so checkpoints resume
+            bit-exactly via ``load_state_dict``. **Warning:** Lion's update is
+            ``sign(β1·m + (1-β1)·g)``, so 4-bit quantization noise flips signs
+            (~12–13% of coordinates measured); final loss was ~32× worse vs bf16
+            at Lion-scale lr, and ~3916× worse at lr=1e-3; ``cautious=True``
+            (default) made loss worse still. Prefer ``"int8"``. ``"4bit"`` remains
+            accepted for checkpoint compatibility.
         momentum_4bit_block: block size for ``momentum_dtype="4bit"`` (consecutive
             flattened elements sharing one absmax scale). Default ``128``.
             ``0``/negative means whole-tensor (a single scale).
@@ -185,6 +193,18 @@ class Lion(AutoLRMixin, Optimizer):
             )
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
+        # 4bit + Lion is harmful (sign flips); still accepted for checkpoint compat.
+        if momentum_dtype == "4bit":
+            warnings.warn(
+                "Lion(momentum_dtype='4bit'): measured ~12–13% sign flips from "
+                "quantization noise; final loss ~32× worse vs bf16 (Lion-scale lr) "
+                "and ~3916× worse at lr=1e-3; cautious=True (default) raised loss "
+                "further. Prefer momentum_dtype='int8' (~1 B/param, near-lossless). "
+                "4bit remains accepted so old checkpoints still load.",
+                UserWarning,
+                stacklevel=2,
+            )
+        warn_if_4bit_high_beta1(beta1, momentum_dtype)
         defaults = {
             "lr": lr,
             "betas": (beta1, beta2),

@@ -318,6 +318,31 @@ def test_invalid_args_rejected():
         Lion(p, bf16_method="bogus")
 
 
+def test_lion_warns_on_4bit_momentum():
+    """4bit remains constructible (checkpoint compat) but warns with measured cost."""
+    import warnings
+
+    p = [torch.nn.Parameter(torch.randn(4, 4))]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        Lion(p, momentum_dtype="4bit", betas=(0.9, 0.99))
+    msgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    assert any("12" in m and "int8" in m for m in msgs), msgs
+
+
+def test_lion_warns_on_4bit_high_beta1():
+    import warnings
+
+    p = [torch.nn.Parameter(torch.randn(4, 4))]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        Lion(p, momentum_dtype="4bit", betas=(0.99, 0.99))
+    msgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    # Both the Lion-specific 4bit warn and the high-beta1 amplify warn.
+    assert any("12" in m for m in msgs)
+    assert any("amplif" in m.lower() or "1/sqrt" in m for m in msgs)
+
+
 def test_kahan_runs():
     """bf16 + kahan path (per-param, +shift buffer) steps without NaN."""
     torch.manual_seed(0)

@@ -257,11 +257,16 @@ def test_foreach_matches_per_param(cfg):
     """foreach=True is numerically equal to the per-parameter path.
 
     fp32 params keep stochastic rounding a no-op, so any difference between the
-    two code paths would be a real bug. fp32/bf16 momentum stays bit-exact on
-    CPU; quantized momentum can differ by one fp32 ULP because the per-slice and
-    stacked scale arithmetic go through different kernels now that lr is applied
-    after the (unscaled) requant round-trip.
+    two code paths would be a real bug. fp32 momentum stays bit-exact on CPU.
+    bf16 momentum (the default) can differ by one fp32 ULP: the codec now runs
+    the EMA in fp32 (matching fused Triton) then ``copy_``s into the bf16
+    buffer, so a 1-ULP difference in the per-param vs stacked *update* (distinct
+    reduction order) is no longer hidden by rounding that update to bf16
+    *before* the EMA. Quantized momentum can likewise differ by one fp32 ULP
+    because the per-slice and stacked scale arithmetic go through different
+    kernels now that lr is applied after the (unscaled) requant round-trip.
     """
+    torch.manual_seed(0)
     pa = _parity_params()
     pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
     oa = Adakaon(pa, foreach=True, **cfg)
@@ -273,13 +278,17 @@ def test_foreach_matches_per_param(cfg):
             a.grad, b.grad = grad.clone(), grad.clone()
         oa.step()
         ob.step()
-    quantized = cfg.get("momentum_dtype") in ("int8", "4bit")
+    md = cfg.get("momentum_dtype", "bfloat16")
+    # Default / omitted dtype is bf16. beta1=0 allocates no momentum — bit-exact.
+    no_mom = cfg.get("betas", (0.9, 0.999))[0] == 0.0
+    if no_mom or md == "float32":
+        rtol, atol = 0, 0
+    elif md in ("int8", "4bit"):
+        rtol, atol = 2e-7, 5e-9
+    else:  # bfloat16: 1 fp32 ULP (visible now that EMA is in fp32)
+        rtol, atol = 1e-6, 1e-9
     for a, b in zip(pa, pb, strict=False):
-        torch.testing.assert_close(
-            a.detach(), b.detach(),
-            rtol=2e-7 if quantized else 0,
-            atol=5e-9 if quantized else 0,
-        )
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=rtol, atol=atol)
 
 
 def test_foreach_chunking_is_exact():
@@ -688,10 +697,12 @@ def test_foreach_budget_capped_at_4x_cutoff():
 
 
 def test_foreach_batch_cutoff_routes_large_to_loop_exactly():
-    """A weight above the cutoff loops; smaller ones stack — result is identical.
+    """A weight above the cutoff loops; smaller ones stack — result matches.
 
     The cutoff is decoupled from the (here ample) stack budget, so the large
-    tensor loops on its size alone, not on memory pressure.
+    tensor loops on its size alone, not on memory pressure. Default momentum
+    is bf16, whose EMA now runs in fp32, so foreach vs per-param is equal to
+    one fp32 ULP rather than bit-exact (see ``test_foreach_matches_per_param``).
     """
     torch.manual_seed(0)
     pa = [
@@ -711,7 +722,7 @@ def test_foreach_batch_cutoff_routes_large_to_loop_exactly():
         oa.step()
         ob.step()
     for a, b in zip(pa, pb, strict=False):
-        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=1e-6, atol=1e-9)
 
 
 def test_foreach_single_param_uses_fallback():

@@ -6,17 +6,18 @@ fidelity, the per-param vs stacked bit-exactness contract, scale layout, byte
 footprint, the symmetric-level usage (one code intentionally unused), and the
 zero-momentum / absmax-floor edge cases.
 
-Rationale note (measured, 2026-06-07): the bf16 codec runs its EMA in the *stored*
-bf16 dtype rather than dequantising to fp32 first (the way int8/4bit do). A proxy
-A/B (Adakaon-bf16, C96/N800, 3 seeds) found EMA-in-bf16 vs EMA-in-fp32 identical to
-within seed noise (te 0.0780 vs 0.0780, gap +0.0074 vs +0.0073) — the momentum EMA
-is a slow average and bf16's 8-bit mantissa is ample, so the leaner in-place bf16
-lerp is kept. These tests therefore pin behaviour/fidelity *bounds*, not exact bf16
-numerics, so that choice stays free to revisit.
+The bf16 codec runs its EMA in fp32 then ``copy_``s into the bf16 buffer (same
+as the fused Triton kernels). A prior leaner in-bf16 lerp rounded the update
+before the EMA and was the only dtype where native/fused diverged; that path is
+gone. These tests pin behaviour including bf16/fp32-EMA agreement.
 """
 
 from __future__ import annotations
 
+import copy
+import warnings
+
+import pytest
 import torch
 
 from kaon._momentum_codec import (
@@ -35,6 +36,7 @@ from kaon._momentum_codec import (
     _quant_int8,
     _quant_int8_stacked,
     _unpack_nibbles,
+    warn_if_4bit_high_beta1,
 )
 
 DTYPES = ["bfloat16", "float32", "int8", "4bit"]
@@ -201,3 +203,178 @@ def test_scale_folds_value_exactly_for_quantized():
         # quantized codecs scale the per-row/block scale -> exact; float scales in-dtype
         atol = 0 if md in ("int8", "4bit", "float32") else 1e-2
         assert torch.allclose(after, before * 0.25, atol=atol, rtol=1e-5), md
+
+
+def test_bf16_ema_matches_fp32_ema_then_round():
+    """bf16 codec EMA == fp32 lerp then round-to-bf16 (fused-kernel contract)."""
+    torch.manual_seed(3)
+    shape = (8, 12)
+    updates = [torch.randn(*shape) for _ in range(5)]
+    beta1 = 0.9
+
+    bf = _make_codec("bfloat16")
+    st = _ema_state(bf, shape)
+    # Reference: keep an fp32 shadow, lerp in fp32, write bf16.
+    shadow = torch.zeros(shape, dtype=torch.float32)
+    for u in updates:
+        d = bf.ema_one(st, u.clone(), beta1)
+        shadow.lerp_(u, 1.0 - beta1)
+        assert torch.equal(d, shadow)
+        assert torch.equal(st["m"], shadow.bfloat16())
+        # Next step must read the rounded store (fused does too).
+        shadow = st["m"].float()
+
+
+def test_bf16_ema_stacked_matches_ema_one():
+    """Stacked bf16 EMA stays bit-exact vs per-param after the fp32-EMA change."""
+    torch.manual_seed(4)
+    shape = (6, 10)
+    updates = [torch.randn(*shape) for _ in range(3)]
+    cA, cB = _make_codec("bfloat16"), _make_codec("bfloat16")
+    sA = [_ema_state(cA, shape) for _ in range(3)]
+    sB = [_ema_state(cB, shape) for _ in range(3)]
+    dA = [cA.ema_one(sA[i], updates[i].clone(), 0.9) for i in range(3)]
+    dB = cB.ema_stacked(sB, torch.stack(updates), lambda t: t, shape, 0.9)
+    for i in range(3):
+        assert torch.equal(dA[i], dB[i])
+        assert torch.equal(sA[i]["m"], sB[i]["m"])
+
+
+def _legacy_int8_ema_one(state: dict, update: torch.Tensor, beta1: float) -> torch.Tensor:
+    """Pre-optimisation ``_Int8Codec.ema_one`` (two fp32 temps + clone + ``.to(int8)``)."""
+    m = state["m"].float() * state["m_scale"]
+    m.lerp_(update, 1.0 - beta1)
+    delta = m.clone()
+    q, scale = _quant_int8(m)
+    state["m"].copy_(q)
+    state["m_scale"].copy_(scale.reshape_as(state["m_scale"]))
+    return delta
+
+
+def _legacy_int8_ema_stacked(states, update, mat, eff, beta1):
+    """Pre-optimisation ``_Int8Codec.ema_stacked`` (kept the ``delta = m.clone()``)."""
+    rowshape = (eff[0], 1) if len(eff) == 2 else (1,)
+    scale = torch.stack([s["m_scale"].view(*rowshape) for s in states])
+    m = torch.stack([mat(s["m"]) for s in states]).float().mul_(scale)
+    m.lerp_(update, 1.0 - beta1)
+    delta = m.clone()
+    q, new_scale = _quant_int8_stacked(m)
+    torch._foreach_copy_([mat(s["m"]) for s in states], list(q.unbind(0)))
+    for s, sc in zip(states, new_scale.unbind(0), strict=True):
+        s["m_scale"].copy_(sc.view_as(s["m_scale"]))
+    return delta
+
+
+def test_int8_ema_one_bit_identical_to_legacy():
+    """``.float().mul_`` + no-clone + direct code write == legacy bit-for-bit."""
+    torch.manual_seed(5)
+    shape = (16, 24)
+    codec = _Int8Codec()
+    st_new = _ema_state(codec, shape)
+    st_old = copy.deepcopy(st_new)
+    # Seed both with the same codes via one shared path.
+    u0 = torch.randn(*shape)
+    _legacy_int8_ema_one(st_new, u0.clone(), 0.9)
+    st_old = copy.deepcopy(st_new)
+
+    for k in range(5):
+        u = torch.randn(*shape)
+        if k == 4:
+            # An all-zero row exercises the absmax floor of the inlined quantizer.
+            u[3] = 0.0
+            st_new["m"][3] = 0
+            st_old["m"][3] = 0
+        d_new = codec.ema_one(st_new, u.clone(), 0.9)
+        d_old = _legacy_int8_ema_one(st_old, u.clone(), 0.9)
+        assert torch.equal(d_new, d_old)
+        assert torch.equal(st_new["m"], st_old["m"])
+        assert torch.equal(st_new["m_scale"], st_old["m_scale"])
+        assert torch.isfinite(st_new["m_scale"]).all() and (st_new["m_scale"] > 0).all()
+
+
+def test_int8_ema_stacked_bit_identical_to_legacy():
+    torch.manual_seed(6)
+    shape = (8, 12)
+    codec = _Int8Codec()
+    states_new = [_ema_state(codec, shape) for _ in range(3)]
+    # Warm up identically.
+    warm = torch.stack([torch.randn(*shape) for _ in range(3)])
+    codec.ema_stacked(states_new, warm, lambda t: t, shape, 0.9)
+    states_old = copy.deepcopy(states_new)
+
+    upd = torch.stack([torch.randn(*shape) for _ in range(3)])
+    d_new = codec.ema_stacked(states_new, upd.clone(), lambda t: t, shape, 0.9)
+    d_old = _legacy_int8_ema_stacked(states_old, upd.clone(), lambda t: t, shape, 0.9)
+    assert torch.equal(d_new, d_old)
+    for a, b in zip(states_new, states_old, strict=True):
+        assert torch.equal(a["m"], b["m"])
+        assert torch.equal(a["m_scale"], b["m_scale"])
+
+
+def _legacy_4bit_ema_one(state, update, beta1):
+    bs = state["m_block"]
+    m = _dequant_4bit(state["m"], state["m_scale"], state["m_numel"], bs)
+    m = m.view_as(update)
+    m.lerp_(update, 1.0 - beta1)
+    delta = m.clone()
+    packed, scale, _ = _quant_4bit(m, bs)
+    state["m"].copy_(packed)
+    state["m_scale"].copy_(scale)
+    return delta
+
+
+def test_4bit_ema_one_bit_identical_without_clone():
+    torch.manual_seed(7)
+    shape = (9, 11)  # numel not a block multiple
+    codec = _FourBitCodec()
+    st_new = _ema_state(codec, shape)
+    u0 = torch.randn(*shape)
+    codec.ema_one(st_new, u0.clone(), 0.9)
+    st_old = copy.deepcopy(st_new)
+    for _ in range(3):
+        u = torch.randn(*shape)
+        d_new = codec.ema_one(st_new, u.clone(), 0.85)
+        d_old = _legacy_4bit_ema_one(st_old, u.clone(), 0.85)
+        assert torch.equal(d_new, d_old)
+        assert torch.equal(st_new["m"], st_old["m"])
+        assert torch.equal(st_new["m_scale"], st_old["m_scale"])
+
+
+@pytest.mark.parametrize("shape", [(5, 7), (37,), (9, 11)])
+def test_4bit_ema_one_matches_ema_stacked_when_per_not_block_multiple(shape):
+    """``per % block != 0`` (the common case) keeps per-param and stacked bit-for-bit.
+
+    A ``.contiguous()`` on the strided dequant slice picked a different ``lerp_`` kernel
+    and broke this contract (caught in review); pin it with a block that does not
+    divide ``numel``.
+    """
+    torch.manual_seed(8)
+    group = {"momentum_4bit_block": 8}
+    cA, cB = _FourBitCodec(), _FourBitCodec()
+    sA, sB = [], []
+    for _ in range(3):
+        stA, stB = {}, {}
+        cA.init_state(stA, torch.zeros(shape), group)
+        cB.init_state(stB, torch.zeros(shape), group)
+        sA.append(stA)
+        sB.append(stB)
+    assert sA[0]["m_numel"] % sA[0]["m_block"] != 0
+    for _ in range(4):
+        updates = [torch.randn(*shape) for _ in range(3)]
+        dA = [cA.ema_one(sA[i], updates[i].clone(), 0.9) for i in range(3)]
+        dB = cB.ema_stacked(sB, torch.stack([u.clone() for u in updates]), lambda t: t, shape, 0.9)
+        for i in range(3):
+            assert torch.equal(dA[i], dB[i]), f"delta slice {i}"
+            assert torch.equal(sA[i]["m"], sB[i]["m"]), f"codes {i}"
+            assert torch.equal(sA[i]["m_scale"], sB[i]["m_scale"]), f"scale {i}"
+
+
+def test_warn_if_4bit_high_beta1():
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        warn_if_4bit_high_beta1(0.99, "4bit")
+        warn_if_4bit_high_beta1(0.9, "4bit")
+        warn_if_4bit_high_beta1(0.99, "int8")
+    msgs = [str(x.message) for x in w if issubclass(x.category, UserWarning)]
+    assert len(msgs) == 1
+    assert "1/sqrt" in msgs[0] or "amplif" in msgs[0].lower()
