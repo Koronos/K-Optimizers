@@ -414,6 +414,108 @@ def test_sparse_grad_rejected():
         opt.step()
 
 
+@pytest.mark.parametrize("foreach", [False, True])
+def test_late_first_grad_stays_finite(foreach):
+    """A param whose first grad arrives after global step 1 must still init v = g^2."""
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(8))
+    opt = ADOPT(
+        [p], lr=1e-2, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", foreach=foreach,
+    )
+    for _ in range(3):
+        opt.step()  # no grads — global clock advances, param untouched
+    g0 = torch.randn(8)
+    p.grad = g0.clone()
+    opt.step()
+    assert torch.isfinite(p).all()
+    torch.testing.assert_close(opt.state[p]["v"], g0 * g0, rtol=0, atol=0)
+    assert opt.state[p]["step"] == 1
+
+
+def test_empty_grad_step_then_normal_no_nan():
+    """Empty .step() must not perturb a factored weight; next steps match a no-gap run."""
+    torch.manual_seed(1)
+    shape = (4, 6)
+    p0 = torch.randn(shape)
+    g1 = torch.randn(shape)
+    g2 = torch.randn(shape)
+
+    p_ref = torch.nn.Parameter(p0.clone())
+    opt_ref = ADOPT(
+        [p_ref], lr=1e-2, clip=True, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", foreach=False,
+    )
+    p_ref.grad = g1.clone()
+    opt_ref.step()
+    p_ref.grad = g2.clone()
+    opt_ref.step()
+
+    p = torch.nn.Parameter(p0.clone())
+    opt = ADOPT(
+        [p], lr=1e-2, clip=True, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", foreach=False,
+    )
+    opt.step()  # no grad — must not corrupt the factored v init path
+    p.grad = g1.clone()
+    opt.step()
+    p.grad = g2.clone()
+    opt.step()
+
+    assert torch.isfinite(p).all()
+    assert torch.isfinite(opt.state[p]["row"]).all()
+    assert torch.isfinite(opt.state[p]["col"]).all()
+    torch.testing.assert_close(p.detach(), p_ref.detach(), rtol=0, atol=0)
+
+
+def test_checkpoint_without_param_step_uses_group_step_for_clip():
+    """<=0.7.11 checkpoints without state['step'] resume the clip at group['step'] - 1."""
+    torch.manual_seed(0)
+    shape = (4, 6)
+    grads = [torch.randn(shape) for _ in range(60)]
+    g_next = torch.randn(shape)
+
+    p_ref = torch.nn.Parameter(torch.randn(shape))
+    p_mig = torch.nn.Parameter(p_ref.detach().clone())
+    kw = dict(
+        lr=1e-2, clip=True, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", foreach=False,
+    )
+    opt_ref = ADOPT([p_ref], **kw)
+    opt_mig = ADOPT([p_mig], **kw)
+    for g in grads:
+        p_ref.grad = g.clone()
+        p_mig.grad = g.clone()
+        opt_ref.step()
+        opt_mig.step()
+    assert opt_ref.param_groups[0]["step"] == 60
+    del opt_mig.state[p_mig]["step"]
+
+    p_ref.grad = g_next.clone()
+    p_mig.grad = g_next.clone()
+    opt_ref.step()
+    opt_mig.step()
+
+    torch.testing.assert_close(p_mig.detach(), p_ref.detach(), rtol=0, atol=0)
+
+
+def test_per_group_momentum_dtype_codec():
+    """Different param groups resolve momentum storage dtype independently."""
+    torch.manual_seed(2)
+    p_bf16 = torch.nn.Parameter(torch.randn(4))
+    p_fp32 = torch.nn.Parameter(torch.randn(4))
+    opt = ADOPT(
+        [{"params": [p_bf16], "momentum_dtype": "bfloat16"},
+         {"params": [p_fp32], "momentum_dtype": "float32"}],
+        lr=1e-3,
+    )
+    for p in (p_bf16, p_fp32):
+        p.grad = torch.randn_like(p)
+    opt.step()
+    assert opt.state[p_bf16]["m"].dtype == torch.bfloat16
+    assert opt.state[p_fp32]["m"].dtype == torch.float32
+
+
 # ============================================================ 0-D scalar params
 # LyCORIS ``use_scalar`` gates (and friends) are 0-D weights. They used to be gated
 # out of the foreach path and stepped one-by-one, which is ~20 CUDA launches per

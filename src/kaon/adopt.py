@@ -41,6 +41,16 @@ and the kozistr ``pytorch_optimizer`` port), with the internal step 0-indexed:
 There is **no bias correction** on either moment (the step-0 ``v`` init and the
 v-lag are what make this correct — the paper's whole point), unlike Adam/AdaPNM.
 
+**Per-parameter step counter.** Each parameter keeps its own official 0-indexed
+``state["step"]`` that governs the step-0 ``v = g_0^2`` init (skipped when a
+param's first gradient arrives after the group's first ``.step()`` calls) and the
+Algorithm-2 clip ``c_t = step ** 0.25``. ``group["step"]`` remains a global group
+clock (incremented every ``.step()`` even when no params have gradients) for
+schedulers and checkpoint compatibility. Checkpoints from kaon <= 0.7.11 have no
+per-param ``step``; on resume, if ``v`` / ``row`` already exist the counter is
+seeded from ``max(1, group["step"] - 1)`` so the clip schedule continues where the
+global clock left off rather than restarting at ``c_1``.
+
 **The clip (which arXiv revision).** The first arXiv revision normalized with a
 plain ``sqrt(v) + eps`` denominator; the revised paper's **Algorithm 2** (the
 practical version, and the current official default) adds the per-step clip
@@ -113,6 +123,7 @@ from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _make_codec,
+    _MomentumCodec,
     load_state_dict_preserving_dtypes,
 )
 
@@ -225,13 +236,32 @@ class ADOPT(AutoLRMixin, Optimizer):
             "step": 0,
         }
         super().__init__(params, defaults)
-        self._codec = _make_codec(momentum_dtype)
+        self._codecs: dict[str, _MomentumCodec] = {}
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
 
         # Composable parameter-free LR (continuous Mechanic) via AutoLRMixin. off -> zero overhead.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
+
+    def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
+        md = group["momentum_dtype"]
+        codec = self._codecs.get(md)
+        if codec is None:
+            codec = self._codecs[md] = _make_codec(md)
+        return codec
+
+    @staticmethod
+    def _pstep(state: dict[str, Any], group: dict[str, Any]) -> int:
+        """Per-parameter official step; migrates checkpoints that predate ``state['step']``.
+
+        Called after ``group['step']`` is incremented for the current ``.step()`` call.
+        """
+        if "step" in state:
+            return state["step"]
+        if "v" in state or "row" in state:
+            return max(1, group["step"] - 1)
+        return 0
 
     # ------------------------------------------------------------------- state
     @torch.no_grad()
@@ -246,7 +276,8 @@ class ADOPT(AutoLRMixin, Optimizer):
             state["col"] = torch.zeros(col_shape, dtype=torch.float32, device=p.device)
         else:
             state["v"] = torch.zeros_like(grad, dtype=torch.float32)
-        self._codec.init_state(state, grad, group)
+        state.setdefault("step", 0)
+        self._codec(group).init_state(state, grad, group)
         if is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
 
@@ -304,24 +335,22 @@ class ADOPT(AutoLRMixin, Optimizer):
 
     # ----------------------------------------------------------- coefficients
     @staticmethod
-    def _coeffs(group: dict[str, Any]) -> dict[str, float]:
+    def _coeffs(group: dict[str, Any], pstep: int) -> dict[str, float]:
         """Per-step scalar coefficients shared by the per-param and foreach paths.
 
-        ``group["step"]`` is 1 on the first ``.step()`` call; the official ADOPT
-        counter is 0-indexed, so ``ostep = step - 1`` is the official step. The
-        ``ostep == 0`` step only initializes ``v`` and skips the param update; the
-        clip uses ``c_t = ostep ** 0.25`` (the first updating step, ``ostep == 1``,
-        clips at 1.0).
+        ``pstep`` is the per-parameter official 0-indexed counter in ``state["step"]``.
+        ``pstep == 0`` only initializes ``v`` and skips the param update; updating
+        steps use ``pstep >= 1`` with ``c_t = pstep ** 0.25`` (the first update at
+        ``pstep == 1`` clips at 1.0). ``group["step"]`` remains a global group clock.
         """
         beta1, beta2 = group["betas"]
-        ostep = group["step"] - 1
-        clip = ostep ** 0.25 if group["clip"] else None
+        clip = pstep ** 0.25 if group["clip"] else None
         return {
             "beta1": beta1,
             "beta2": beta2,
             "lr": group["lr"],
             "eps": group["eps"],
-            "ostep": ostep,
+            "pstep": pstep,
             "clip": clip,
         }
 
@@ -352,31 +381,38 @@ class ADOPT(AutoLRMixin, Optimizer):
         """Batched step. Factored (ndim>=2) and non-factored (ndim<=1) buckets, by shape.
 
         0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
-        with real shape-(1,) params."""
-        c = self._coeffs(group)
-
-        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+        with real shape-(1,) params. Params are bucketed by matching per-param ``pstep``
+        first; ``pstep == 0`` runs the batched init (``v = g_0^2``) without a param update."""
+        by_pstep: dict[int, list[Tensor]] = {}
         for p in params:
             state = self.state[p]
             if not state:
                 self._init_state(p, state, group)
-            g = p.grad
-            if g.ndim >= 2:
-                matrixize = g.ndim > 2
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
+            by_pstep.setdefault(self._pstep(state, group), []).append(p)
 
-        for (eff, _dtype, matrixize), plist in factored_buckets.items():
-            stepn = max(1, budget // max(eff[0] * eff[1], 1))
-            for i in range(0, len(plist), stepn):
-                self._factored_bucket(plist[i:i + stepn], eff, matrixize, c, group)
-        for (length, _dtype), plist in flat_buckets.items():
-            stepn = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), stepn):
-                self._nonfactored_bucket(plist[i:i + stepn], length, c, group)
+        for pstep, pstep_params in by_pstep.items():
+            c = self._coeffs(group, pstep)
+            factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+            flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+            for p in pstep_params:
+                g = p.grad
+                if g.ndim >= 2:
+                    matrixize = g.ndim > 2
+                    eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
+                    factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+                else:
+                    flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
+
+            for (eff, _dtype, matrixize), plist in factored_buckets.items():
+                stepn = max(1, budget // max(eff[0] * eff[1], 1))
+                for i in range(0, len(plist), stepn):
+                    self._factored_bucket(plist[i:i + stepn], eff, matrixize, c, group)
+            for (length, _dtype), plist in flat_buckets.items():
+                stepn = max(1, budget // max(length, 1))
+                for i in range(0, len(plist), stepn):
+                    self._nonfactored_bucket(plist[i:i + stepn], length, c, group)
+            for p in pstep_params:
+                self.state[p]["step"] = pstep + 1
 
     @torch.no_grad()
     def _factored_bucket(
@@ -402,9 +438,7 @@ class ADOPT(AutoLRMixin, Optimizer):
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
-        if c["ostep"] == 0:
-            # Step-0 init: v = g_0^2 (no EMA, no WD, no param update). Mirror the
-            # factored row/col reductions of g^2 (eps1 = 0, like the official).
+        if c["pstep"] == 0:
             grad_sq = grad * grad
             torch._foreach_copy_(rows, list(grad_sq.mean(dim=-1).unbind(0)))
             torch._foreach_copy_(cols, list(grad_sq.mean(dim=-2).unbind(0)))
@@ -423,7 +457,7 @@ class ADOPT(AutoLRMixin, Optimizer):
             normed.clamp_(-c["clip"], c["clip"])
 
         # --- momentum EMA of the NORMALIZED grad, then p -= lr * m ---
-        m = self._codec.ema_stacked(states, normed, mat, (R, C), c["beta1"])       # [N, R, C]
+        m = self._codec(group).ema_stacked(states, normed, mat, (R, C), c["beta1"])  # [N, R, C]
         delta = m.mul_(c["lr"])
 
         if cautious:
@@ -462,7 +496,7 @@ class ADOPT(AutoLRMixin, Optimizer):
         grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
-        if c["ostep"] == 0:
+        if c["pstep"] == 0:
             torch._foreach_copy_(vs, list((grad * grad).unbind(0)))       # v = g_0^2
             return
 
@@ -475,7 +509,7 @@ class ADOPT(AutoLRMixin, Optimizer):
         if c["clip"] is not None:
             normed.clamp_(-c["clip"], c["clip"])
 
-        m = self._codec.ema_stacked(states, normed, flat_view, (length,), c["beta1"])  # [N, L]
+        m = self._codec(group).ema_stacked(states, normed, flat_view, (length,), c["beta1"])
         delta = m.mul_(c["lr"])
 
         if cautious:
@@ -489,7 +523,6 @@ class ADOPT(AutoLRMixin, Optimizer):
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
-        c = self._coeffs(group)
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
 
@@ -500,8 +533,9 @@ class ADOPT(AutoLRMixin, Optimizer):
         grad = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
         ndim = grad.ndim
         factored = ndim >= 2
+        pstep = self._pstep(state, group)
 
-        if c["ostep"] == 0:
+        if pstep == 0:
             # Step-0 init: v = g_0^2, no param update, no WD.
             if factored:
                 matrixize = ndim > 2
@@ -511,7 +545,10 @@ class ADOPT(AutoLRMixin, Optimizer):
                 state["col"].copy_(grad_sq.mean(dim=-2))
             else:
                 state["v"].copy_(grad * grad)
+            state["step"] = 1
             return
+
+        c = self._coeffs(group, pstep)
 
         # Decoupled weight decay BEFORE the moment ops.
         if wd != 0:
@@ -530,7 +567,7 @@ class ADOPT(AutoLRMixin, Optimizer):
             # matrixized normed grad back before the EMA (matches Adakaon).
             if matrixize:
                 normed = normed.view_as(grad)
-            m = self._codec.ema_one(state, normed, c["beta1"])
+            m = self._codec(group).ema_one(state, normed, c["beta1"])
             delta = m.mul_(c["lr"])
             # fold g_t into v AFTER use (eps1 = 0 to match the official).
             update_factored_state(gv, state["row"], state["col"], c["beta2"], 0.0)
@@ -540,7 +577,7 @@ class ADOPT(AutoLRMixin, Optimizer):
             normed = grad / denom
             if c["clip"] is not None:
                 normed.clamp_(-c["clip"], c["clip"])
-            m = self._codec.ema_one(state, normed, c["beta1"])
+            m = self._codec(group).ema_one(state, normed, c["beta1"])
             delta = m.mul_(c["lr"])
             # fold g_t into v AFTER use.
             v.mul_(c["beta2"]).addcmul_(grad, grad, value=1.0 - c["beta2"])
@@ -548,3 +585,4 @@ class ADOPT(AutoLRMixin, Optimizer):
         if cautious:
             delta = cautious_one_(delta, grad)
         subtract_one_(p, delta, state, bf16_method)
+        state["step"] = pstep + 1

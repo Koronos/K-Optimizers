@@ -30,11 +30,25 @@ import math
 import struct
 import sys
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 
 from kaon import Adakaon
 from kaon._backend import FOREACH_BATCH_CUTOFF
+
+_FUSED_TILE_CAPS = (4096, 8192, 16384, 32768)
+
+
+def _fmt_ms(ms: float | None) -> str:
+    """Format a step timing for ktune tables; ``None`` means OOM."""
+    return "OOM" if ms is None else f"{ms:8.1f} ms/step"
+
+
+def _best_timing(results: list[tuple[Any, float | None]]) -> tuple[Any, float] | None:
+    """Return the fastest (key, ms) pair, excluding OOM entries."""
+    ok = [(key, ms) for key, ms in results if ms is not None]
+    return min(ok, key=lambda r: r[1]) if ok else None
 
 
 def _read_safetensors_shapes(path: str, prefix: str | None) -> list[tuple[int, ...]]:
@@ -91,7 +105,17 @@ def _opt_kwargs(args: argparse.Namespace) -> dict:
     return kw
 
 
-def _time_step(params, opt_kwargs, *, foreach, cutoff=None, iters=40, warmup=12) -> float | None:
+def _time_step(
+    params,
+    opt_kwargs,
+    *,
+    foreach,
+    cutoff=None,
+    fused=False,
+    fused_tile_cap=None,
+    iters=40,
+    warmup=12,
+) -> float | None:
     gc.collect()
     if params[0].is_cuda:
         torch.cuda.empty_cache()
@@ -99,6 +123,10 @@ def _time_step(params, opt_kwargs, *, foreach, cutoff=None, iters=40, warmup=12)
     kw = dict(opt_kwargs, foreach=foreach)
     if foreach and cutoff is not None:
         kw["foreach_batch_cutoff"] = cutoff
+    if fused:
+        kw["fused"] = True
+        if fused_tile_cap is not None:
+            kw["fused_tile_cap"] = fused_tile_cap
     opt = Adakaon(params, **kw)
     try:
         for _ in range(warmup):
@@ -188,10 +216,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     loop_ms = _time_step(params, opt_kwargs, foreach=False)
     default_ms = _time_step(params, opt_kwargs, foreach=True, cutoff=FOREACH_BATCH_CUTOFF)
-    print(f"per-param loop            : {loop_ms:8.1f} ms/step")
-    if default_ms:
+    print(f"per-param loop            : {_fmt_ms(loop_ms)}")
+    if default_ms is not None and loop_ms is not None:
         speed = loop_ms / default_ms
-        print(f"foreach @ default ({FOREACH_BATCH_CUTOFF//1000}k)  : {default_ms:8.1f} ms/step  ({speed:.2f}x vs loop)")
+        print(
+            f"foreach @ default ({FOREACH_BATCH_CUTOFF//1000}k)  : "
+            f"{_fmt_ms(default_ms)}  ({speed:.2f}x vs loop)"
+        )
+    elif default_ms is not None:
+        print(f"foreach @ default ({FOREACH_BATCH_CUTOFF//1000}k)  : {_fmt_ms(default_ms)}")
     print()
 
     cutoffs = [int(x) for x in args.cutoffs.split(",")]
@@ -200,23 +233,65 @@ def main(argv: Sequence[str] | None = None) -> int:
     for c in cutoffs:
         ms = _time_step(params, opt_kwargs, foreach=True, cutoff=c)
         results.append((c, ms))
-        tag = "OOM" if ms is None else f"{ms:8.1f} ms"
+        tag = _fmt_ms(ms)
         star = "  <- default" if c == FOREACH_BATCH_CUTOFF else ""
         print(f"  cutoff {c//1000:>6}k : {tag}{star}")
 
-    ok = [(c, ms) for c, ms in results if ms is not None]
-    if not ok:
+    best = _best_timing(results)
+    if best is None:
         print("\nAll cutoffs OOM'd — lower the model size (try --lora-rank) or free VRAM.")
         return 1
-    best_c, best_ms = min(ok, key=lambda r: r[1])
+    best_c, best_ms = best
     print()
     if default_ms is not None and best_ms >= default_ms * 0.95:
         print(f"==> Keep the default: foreach_batch_cutoff={FOREACH_BATCH_CUTOFF} "
               f"(within ~5% of the best, {best_c//1000}k).")
-    else:
+    elif default_ms is not None:
         print(f"==> Consider foreach_batch_cutoff={best_c} on this GPU "
               f"({default_ms:.0f} ms -> {best_ms:.0f} ms, "
               f"{(1 - best_ms/default_ms)*100:.0f}% faster). The stack budget cap follows at 4x.")
+    else:
+        print(f"==> Best foreach_batch_cutoff={best_c} ({best_ms:.0f} ms/step); "
+              "default foreach path OOM'd on this run.")
+
+    if device.type == "cuda":
+        try:
+            from kaon import _fused_triton
+
+            has_triton = bool(_fused_triton.HAS_TRITON)
+        except ImportError:
+            has_triton = False
+        if has_triton:
+            print()
+            print("fused sweep (fused_tile_cap):")
+            fused_results: list[tuple[int, float | None]] = []
+            fused_cutoff = best_c if best_c is not None else FOREACH_BATCH_CUTOFF
+            for cap in _FUSED_TILE_CAPS:
+                ms = _time_step(
+                    params, opt_kwargs, foreach=True, cutoff=fused_cutoff,
+                    fused=True, fused_tile_cap=cap,
+                )
+                fused_results.append((cap, ms))
+                print(f"  fused_tile_cap {cap:>5} : {_fmt_ms(ms)}")
+            fused_best = _best_timing(fused_results)
+            if fused_best is not None:
+                cap_best, fused_ms = fused_best
+                baseline = default_ms if default_ms is not None else best_ms
+                if fused_ms < baseline * 0.95:
+                    print(
+                        f"==> Consider fused=True with fused_tile_cap={cap_best} "
+                        f"({baseline:.0f} ms -> {fused_ms:.0f} ms)."
+                    )
+                elif fused_ms <= baseline * 1.05:
+                    print(
+                        f"==> fused best fused_tile_cap={cap_best} ({fused_ms:.0f} ms/step) "
+                        f"is within ~5% of foreach ({baseline:.0f} ms/step)."
+                    )
+                else:
+                    print(
+                        f"==> fused best fused_tile_cap={cap_best} ({fused_ms:.0f} ms/step) "
+                        f"is slower than foreach ({baseline:.0f} ms/step); keep foreach."
+                    )
     if args.lora_rank is not None:
         print("    (LoRA tensors are tiny, so the cutoff rarely binds — defaults are almost always fine.)")
     return 0

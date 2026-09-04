@@ -218,3 +218,62 @@ def test_state_dict_roundtrip_int8():
         a = CodecBuffer.read(opt.state[p], "phi", "int8", p)
         b = CodecBuffer.read(opt2.state[p2], "phi", "int8", p2)
         torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def test_sync_foreach_matches_per_param():
+    """foreach sync is element-for-element equal to the per-param path."""
+    shape = (8, 8)
+    params_loop = _make_params([shape] * 12, seed=4)
+    params_fe = _make_params([shape] * 12, seed=4)
+    k = 2
+    grads = _grad_seq(params_loop, k, seed=5)
+
+    opt_loop = Lookahead(
+        params_loop, lr=1e-2, k=k, alpha=0.5, slow_dtype="float32",
+        bf16_method="none", foreach=False,
+    )
+    opt_fe = Lookahead(
+        params_fe, lr=1e-2, k=k, alpha=0.5, slow_dtype="float32",
+        bf16_method="none", foreach=True,
+    )
+    for gs in grads:
+        for p, g in zip(params_loop, gs, strict=True):
+            p.grad = g.clone()
+        for p, g in zip(params_fe, gs, strict=True):
+            p.grad = g.clone()
+        opt_loop.step()
+        opt_fe.step()
+    for a, b in zip(params_loop, params_fe, strict=True):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+def test_sync_foreach_chunks_under_budget(monkeypatch):
+    """Forced stack budget must split a large same-shape bucket into several chunks."""
+    from kaon import lookahead as la_mod
+
+    chunk_sizes: list[int] = []
+    orig_sub = la_mod.subtract_batched_
+
+    def spy_sub(weights, delta, bf16_method):
+        chunk_sizes.append(len(weights))
+        return orig_sub(weights, delta, bf16_method)
+
+    monkeypatch.setattr(la_mod, "subtract_batched_", spy_sub)
+
+    def fake_budget(_stack_budget, _cutoff, _bytes_per, _device):
+        return 2 * 8 * 8  # two 8x8 tensors per chunk
+
+    monkeypatch.setattr(la_mod, "foreach_budget", fake_budget)
+
+    shape = (8, 8)
+    params = _make_params([shape] * 12, seed=6)
+    opt = Lookahead(
+        params, lr=1e-2, k=1, alpha=0.5, slow_dtype="float32",
+        bf16_method="none", foreach=True, foreach_stack_budget=1,
+    )
+    for p in params:
+        p.grad = torch.randn_like(p)
+    opt.step()
+    assert sum(chunk_sizes) == 12
+    assert max(chunk_sizes) == 2
+    assert len(chunk_sizes) == 6

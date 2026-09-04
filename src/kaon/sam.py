@@ -68,10 +68,14 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._backend import foreach_budget
 from kaon._stochastic_rounding import add_stochastic_
 from kaon._wrappers import WrapsInnerOptimizer
 
 __all__ = ["SAM"]
+
+# Stacked climb transient: weight + grad + perturbation (+ fp32 intermediates).
+_STACK_BYTES_PER_ELEM = 32
 
 
 class SAM(WrapsInnerOptimizer, Optimizer):
@@ -142,11 +146,13 @@ class SAM(WrapsInnerOptimizer, Optimizer):
     def _grad_norm(self) -> Tensor:
         """Global L2 norm of the gradient over all params, ``sqrt(sum_i ||g_i||^2)``.
 
-        Computed via ``(g*g).sum()`` rather than ``torch.dot``/``.norm()`` — on this GPU
-        ``torch.dot`` SIGFPEs, and ``Tensor.norm`` dispatches to a dot for contiguous
-        tensors. With ``adaptive=True`` each gradient is scaled by ``|w|`` first (ASAM).
+        Batched via ``torch._foreach_norm``; per-tensor norms are stacked and reduced
+        in **fp32** (a bf16 norm stack would change the global value). The returned
+        ``scale = rho / (norm + eps)`` is therefore fp32 even when weights/grads are
+        bf16 — slightly more accurate than the pre-0.7.12 per-param bf16 accumulation.
+        With ``adaptive=True`` each gradient is scaled by ``|w|`` first (ASAM).
         """
-        sq_sum: Tensor | None = None
+        norms: list[Tensor] = []
         for group in self.param_groups:
             adaptive = group["adaptive"]
             for p in group["params"]:
@@ -155,13 +161,50 @@ class SAM(WrapsInnerOptimizer, Optimizer):
                 g = p.grad
                 if adaptive:
                     g = p.abs() * g
-                s = (g * g).sum()
-                sq_sum = s if sq_sum is None else sq_sum + s
-        if sq_sum is None:
-            # No grads at all — return a scalar zero on a sensible device.
+                norms.append(g)
+        if not norms:
             dev = self.param_groups[0]["params"][0].device
             return torch.zeros((), device=dev)
-        return sq_sum.sqrt()
+        per = torch._foreach_norm(norms)  # type: ignore[attr-defined]
+        return torch.linalg.vector_norm(torch.stack(per).float())
+
+    @staticmethod
+    def _bucket_params(params: list[Tensor]) -> dict[tuple[Any, ...], list[Tensor]]:
+        buckets: dict[tuple[Any, ...], list[Tensor]] = {}
+        for p in params:
+            buckets.setdefault((tuple(p.shape), p.dtype, p.device), []).append(p)
+        return buckets
+
+    def _chunk_budget(self, plist: list[Tensor]) -> int:
+        return foreach_budget(
+            self._foreach_stack_budget,
+            self._foreach_batch_cutoff,
+            _STACK_BYTES_PER_ELEM,
+            plist[0].device,
+        )
+
+    @torch.no_grad()
+    def _climb_chunk(
+        self,
+        plist: list[Tensor],
+        *,
+        scale: Tensor,
+        adaptive: bool,
+    ) -> None:
+        weights = torch.stack([p.data for p in plist])
+        old_stack = weights.clone()
+        grads = torch.stack([p.grad for p in plist])
+        if adaptive:
+            e_w = grads * scale.to(weights.device) * (weights * weights)
+        else:
+            e_w = grads * scale.to(weights.device)
+        if weights.dtype == torch.float32:
+            weights.add_(e_w)
+        else:
+            add_stochastic_(weights, e_w, alpha=1.0)
+        for p, old in zip(plist, old_stack.unbind(0), strict=True):
+            self.state[p]["old_p"] = old
+        torch._foreach_copy_([p.data for p in plist], list(weights.unbind(0)))  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------ pass 1
     @torch.no_grad()
@@ -176,18 +219,12 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         for group in self.param_groups:
             adaptive = group["adaptive"]
             scale = group["rho"] / (grad_norm + self.eps)
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                # Exact restore for any dtype: snapshot the pre-climb weight.
-                self.state[p]["old_p"] = p.data.clone()
-                e_w = p.grad * scale.to(p.device)
-                if adaptive:
-                    e_w = e_w * (p.data * p.data)
-                # bf16-correct climb: stochastic-round the perturbation into the weight
-                # (no-op fast path for fp32; SR bit-trick for bf16) instead of a truncating
-                # ``p.add_(e_w)`` that would drop sub-ULP perturbation on low-precision weights.
-                add_stochastic_(p.data, e_w, alpha=1.0)
+            with_grad = [p for p in group["params"] if p.grad is not None]
+            for plist in self._bucket_params(with_grad).values():
+                budget = self._chunk_budget(plist)
+                n_per = max(1, budget // max(p.numel() for p in plist))
+                for i in range(0, len(plist), n_per):
+                    self._climb_chunk(plist[i:i + n_per], scale=scale, adaptive=adaptive)
         if zero_grad:
             self.zero_grad()
 
@@ -203,8 +240,6 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         """
         for group in self.param_groups:
             for p in group["params"]:
-                if p.grad is None:
-                    continue
                 old_p = self.state[p].pop("old_p", None)
                 if old_p is not None:
                     p.data.copy_(old_p)

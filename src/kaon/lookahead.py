@@ -62,7 +62,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from kaon._backend import subtract_batched_, subtract_one_
+from kaon._backend import foreach_budget, subtract_batched_, subtract_one_
 from kaon._momentum_codec import _FOURBIT_BLOCK, load_state_dict_preserving_dtypes
 from kaon._wrappers import CodecBuffer, TrainEvalWeights, WrapsInnerOptimizer
 from kaon.adakaon import Adakaon
@@ -70,6 +70,9 @@ from kaon.adakaon import Adakaon
 __all__ = ["Lookahead"]
 
 SlowDtype = Literal["bfloat16", "float32", "int8", "4bit"]
+
+# sync foreach transient: theta + phi + delta (fp32 intermediates).
+_SYNC_STACK_BYTES_PER_ELEM = 48
 
 
 class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
@@ -197,17 +200,26 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
     def _sync_foreach(
         self, params: list[Tensor], group: dict[str, Any], alpha: float, md: str, bf16_method: str
     ) -> None:
+        chunk_budget = foreach_budget(
+            self._foreach_stack_budget,
+            self._foreach_batch_cutoff,
+            _SYNC_STACK_BYTES_PER_ELEM,
+            params[0].device,
+        )
         buckets: dict[tuple[Any, ...], list[Tensor]] = {}
         for p in params:
             buckets.setdefault((tuple(p.shape), p.dtype), []).append(p)
         for (shape, _dtype), plist in buckets.items():
-            states = [self.state[p] for p in plist]
-            theta = torch.stack([p.detach() for p in plist]).float()        # [N, *shape]
-            phi = CodecBuffer.read_stacked(states, "phi", md, shape)        # [N, *shape]
-            phi.lerp_(theta, alpha)
-            CodecBuffer.write_stacked(states, "phi", md, phi)
-            delta = theta.sub_(phi)                                         # theta - phi_new
-            subtract_batched_([p.data for p in plist], delta, bf16_method)
+            n_per = max(1, chunk_budget // max(p.numel() for p in plist))
+            for i in range(0, len(plist), n_per):
+                chunk = plist[i:i + n_per]
+                states = [self.state[p] for p in chunk]
+                theta = torch.stack([p.detach() for p in chunk]).float()        # [N, *shape]
+                phi = CodecBuffer.read_stacked(states, "phi", md, shape)        # [N, *shape]
+                phi.lerp_(theta, alpha)
+                CodecBuffer.write_stacked(states, "phi", md, phi)
+                delta = theta.sub_(phi)                                         # theta - phi_new
+                subtract_batched_([p.data for p in chunk], delta, bf16_method)
 
     # ================================================================= state_dict glue
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
