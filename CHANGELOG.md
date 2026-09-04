@@ -135,6 +135,51 @@ All notable changes to this project will be documented in this file.
 - **Mixed-device param groups** (CPU + CUDA) crashed in `torch.stack` inside the foreach
   and fused bucketing; `device` is part of every bucket key and kernels launch under the
   bucket's device.
+- **AdaBelief / AdamP bias-correct on a per-parameter step.** Both advanced
+  `group["step"]` on every `step()`, including groups with no gradients, so a
+  param whose first gradient arrives at step 100 was corrected with `bc1 ≈ 1`
+  instead of `1 - beta1` and took a first update ~10x too short. Each param now
+  carries `state["step"]` for `bc1`/`bc2` (foreach buckets by it alongside
+  shape/dtype, 0-D and shape-(1,) params still riding as batched views) while
+  `group["step"]` stays the global clock for schedulers. Trajectories change only
+  for params with late gradients; when every param has a gradient from step 1 the
+  output is bit-identical to before. Checkpoints without `state["step"]` infer the
+  group clock on load.
+- **AdamP projects bf16 weights in fp32 on the per-param path.** `_project_one`
+  normalized the weight in its storage dtype, so a bf16 weight was projected
+  through bf16 norms and dot products while the foreach path (which stacks in
+  fp32) was not: the two diverged by 6e-3 relative on the same inputs. Both paths
+  now share one fp32 working dtype and write back to the parameter dtype only in
+  the final subtract.
+- **KProdigy's bf16 momentum EMA runs in fp32.** The EMA was computed in bf16
+  (three roundings: gradient cast, product, sum) and was not invariant to
+  batching — CPU bf16 elementwise kernels round the vectorized body and the
+  scalar tail differently, so a `numel % 16 != 0` tensor picked up an ulp of
+  momentum error when it was folded into a stack (1.07e-4 relative on D, 3.4e-2
+  on the weights, with shapes (3,7)/(5,11)/(127,)). Per-param and foreach now
+  both widen to fp32 and round once on write, aligned with this release's change
+  to the shared bf16 codec. bf16 momentum runs differ from previous releases
+  here; the change is a fidelity improvement and the two paths are again
+  bit-identical.
+
+- **KProdigy folds the D statistics on the host in one transfer.** Pass 1 summed
+  2N zero-dim GPU tensors in a Python loop and then called `.item()` twice; the
+  partials are now stacked, copied once, and folded sequentially in
+  `numpy.float32` in the same order (2253 -> 128 kernel launches and 2 -> 0
+  synchronizations per step on a 428-tensor bag; the fold itself 20.4 -> 0.32 ms).
+  Steps that do not update D skip the transfer entirely. The bf16 momentum EMA is
+  batched per bucket (20.44 -> 5.75 ms) and the dead `_flat_full_bucket` wrapper
+  is gone. The per-param/foreach *D trajectory* is no longer bit-identical — the
+  batched `[B, L]` reduction is a different tree, ~3.3e-7 relative at
+  `slice_p=11` on CPU — and the tests now pin it to 1e-6 relative.
+- **AdamP's batched projection removes the radial temporaries.** The stacked path
+  built six `[N, R, C]` tensors (normalized weights, radial components and two
+  `torch.where` results) even though at most one branch fires per slice. It now
+  reduces to one broadcast coefficient per row/tensor applied with `addcmul_`:
+  31.2 -> 20.4 ms isolated (-35%) and 496 -> 369 MB of step peak (-26%). The fp32
+  reassociation makes it differ from the normalized-vector form by ~5e-8
+  relative. The per-param path also dropped its two host synchronizations per
+  param per step (`if cos.max() < ...`) for an on-device mask.
 
 ## [0.7.11]
 

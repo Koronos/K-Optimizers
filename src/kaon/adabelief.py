@@ -264,6 +264,7 @@ class AdaBelief(AutoLRMixin, Optimizer):
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
         grad = p.grad
+        state["step"] = 0
         factored = p.ndim >= 2
         if factored:
             gv = grad if p.ndim == 2 else grad.reshape(grad.shape[0], -1)
@@ -353,6 +354,8 @@ class AdaBelief(AutoLRMixin, Optimizer):
                 continue
             if group["gradient_centralization"]:
                 centralize_grads_(params)
+            for p in params:
+                self._prepare_param_step(p, group)
             if self._foreach and self._group_foreach_eligible(group):
                 chunk_budget = foreach_budget(
                     self._foreach_stack_budget, self._foreach_batch_cutoff,
@@ -391,10 +394,9 @@ class AdaBelief(AutoLRMixin, Optimizer):
 
     # ----------------------------------------------------------- coefficients
     @staticmethod
-    def _coeffs(group: dict[str, Any]) -> dict[str, float]:
+    def _coeffs(group: dict[str, Any], step: int) -> dict[str, float]:
         """All per-step scalar coefficients (shared by the per-param and foreach paths)."""
         beta1, beta2 = group["betas"]
-        step = group["step"]
         bc1 = 1.0 - beta1 ** step
         bc2_sq = math.sqrt(1.0 - beta2 ** step)
         return {
@@ -404,6 +406,20 @@ class AdaBelief(AutoLRMixin, Optimizer):
             "bc2_sq": bc2_sq,
             "step_size": group["lr"] / bc1,
         }
+
+    def _prepare_param_step(self, p: Tensor, group: dict[str, Any]) -> None:
+        """Initialize and advance the bias-correction clock for one active param."""
+        state = self.state[p]
+        if not state:
+            self._init_state(p, state, group)
+            state["step"] = 1
+        elif "step" not in state:
+            # Legacy checkpoints only stored the group clock. At the first
+            # resumed update, the already-advanced global clock is the best
+            # exact reconstruction for params that had trained normally.
+            state["step"] = group["step"]
+        else:
+            state["step"] += 1
 
     # ----------------------------------------------------------------- foreach
     @staticmethod
@@ -434,7 +450,6 @@ class AdaBelief(AutoLRMixin, Optimizer):
 
         0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
         with real shape-(1,) params."""
-        c = self._coeffs(group)
         md = group["momentum_dtype"]
 
         factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
@@ -443,19 +458,25 @@ class AdaBelief(AutoLRMixin, Optimizer):
             state = self.state[p]
             if not state:
                 self._init_state(p, state, group)
+            # _step_impl advances every param's step before this runs, so the
+            # clamp only covers a state allocated on the line above (step 0),
+            # whose bias correction would otherwise be 1 - beta**0 == 0.
+            pstep = max(state["step"], 1)
             g = p.grad
             if g.ndim >= 2:
                 matrixize = g.ndim > 2
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+                factored_buckets.setdefault((eff, p.dtype, matrixize, pstep), []).append(p)
             else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
+                flat_buckets.setdefault((g.numel(), p.dtype, pstep), []).append(p)
 
-        for (eff, _dtype, matrixize), plist in factored_buckets.items():
+        for (eff, _dtype, matrixize, pstep), plist in factored_buckets.items():
+            c = self._coeffs(group, pstep)
             stepn = max(1, budget // max(eff[0] * eff[1], 1))
             for i in range(0, len(plist), stepn):
                 self._factored_bucket(plist[i:i + stepn], eff, matrixize, md, c, group)
-        for (length, _dtype), plist in flat_buckets.items():
+        for (length, _dtype, pstep), plist in flat_buckets.items():
+            c = self._coeffs(group, pstep)
             stepn = max(1, budget // max(length, 1))
             for i in range(0, len(plist), stepn):
                 self._nonfactored_bucket(plist[i:i + stepn], length, md, c, group)
@@ -578,15 +599,14 @@ class AdaBelief(AutoLRMixin, Optimizer):
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
-        c = self._coeffs(group)
+        state = self.state[p]
+        if not state or "step" not in state:
+            self._prepare_param_step(p, group)
+        c = self._coeffs(group, state["step"])
         md = group["momentum_dtype"]
         eps = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
-
-        state = self.state[p]
-        if not state:
-            self._init_state(p, state, group)
 
         grad = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
         ndim = grad.ndim

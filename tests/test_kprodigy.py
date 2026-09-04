@@ -10,6 +10,7 @@ setups.
 from __future__ import annotations
 
 import io
+import math
 
 import pytest
 import torch
@@ -189,70 +190,180 @@ def test_state_dict_roundtrip():
 
 # -- Adakaon-engine update backend (foreach) -----------------------------
 
-def _mixed_params(dtype=torch.float32):
+# D stays pinned at d0 unless the estimator works, which would make every
+# per-param vs foreach comparison below hold vacuously. The parity tests assert
+# the trajectory climbed by at least this factor over their 30 steps (the
+# fixture reached ~1.6x when it was measured, so the bar is deliberately loose).
+_D_MIN_GROWTH = 1.2
+
+
+def _assert_d_climbed(ds, d0):
+    """The D trajectory has to move, or the parity assertions prove nothing.
+
+    The midpoint is checked too: growth concentrated in the last step (or a
+    trajectory that was already at its ceiling) would not exercise the estimator
+    over the run. D is non-decreasing by construction here (``growth_rate=inf``
+    caps each step at ``d_max``), so the midpoint bound is the informative half.
+    """
+    assert ds[-1] > _D_MIN_GROWTH * d0
+    assert d0 < ds[len(ds) // 2] <= ds[-1]
+
+
+def _assert_params_close(a, b, rtol=1e-6):
+    """Per-param parity, relative, with the absolute floor tied to the scale.
+
+    At ``lr=1.0`` these weights reach ~1e4 after 30 steps of a consistently
+    directed gradient, where a fixed ``atol=1e-7`` asserts nothing at all.
+    """
+    ref = b.detach()
+    torch.testing.assert_close(
+        a.detach(), ref, rtol=rtol, atol=rtol * float(ref.abs().max())
+    )
+
+
+def _mixed_params(dtype=torch.float32, device="cpu"):
     """2-D + conv (4-D) + 1-D params -> exercises factored, full and flat buckets."""
-    g = torch.Generator().manual_seed(0)
-    shapes = [(32, 16), (24, 12), (8, 4, 3, 3), (16,), (32,), (10, 5, 1, 1)]
+    g = torch.Generator(device=device).manual_seed(0)
+    shapes = [
+        (32, 16), (24, 12), (8, 4, 3, 3), (16,), (32,), (10, 5, 1, 1),
+        # numel % 16 != 0: low-precision elementwise kernels split into a
+        # vectorized body plus a scalar tail, and the two round differently, so
+        # a tensor that is batched into a stack must not change value.
+        (3, 7), (5, 11), (127,),
+    ]
     return [
-        torch.nn.Parameter(torch.randn(*s, generator=g, dtype=dtype) * 0.1)
+        torch.nn.Parameter(torch.randn(*s, generator=g, dtype=dtype, device=device) * 0.1)
         for s in shapes
     ]
 
 
-def _run_kprodigy(ps, *, foreach, steps=12, **kw):
+def _run_kprodigy(ps, *, foreach, steps=30, **kw):
+    """D trajectory only; use ``_run_kprodigy_opt`` when the state matters."""
+    return _run_kprodigy_opt(ps, foreach=foreach, steps=steps, **kw)[0]
+
+
+def _run_kprodigy_opt(ps, *, foreach, steps=30, **kw):
     opt = KProdigy(ps, lr=1.0, **{"foreach": foreach, **kw})
-    g = torch.Generator().manual_seed(123)
+    g = torch.Generator(device=ps[0].device).manual_seed(123)
+    # A fixed, consistently directed gradient makes <g, p0-p> positive after
+    # the first update, so this fixture exercises the D estimator rather than
+    # accidentally pinning D at d0.
+    directions = [
+        torch.randn(p.shape, generator=g, dtype=p.dtype, device=p.device) * 0.5
+        for p in ps
+    ]
     ds = []
     for _ in range(steps):
-        for p in ps:
-            p.grad = torch.randn(p.shape, generator=g, dtype=p.dtype) * 0.05
+        for p, grad in zip(ps, directions, strict=True):
+            p.grad = grad.clone()
         opt.step()
         ds.append(opt.get_d())
-    return ds
+    return ds, opt
 
 
 @pytest.mark.parametrize("momentum_dtype", ["float32", "bfloat16", "int8", "4bit"])
 @pytest.mark.parametrize("second_moment", ["full", "factored"])
 @pytest.mark.parametrize("cautious", [False, True])
 def test_foreach_matches_per_param(momentum_dtype, second_moment, cautious):
-    """The engine-backed (foreach) update is bit-exact vs the per-param loop on
-    fp32 weights, across momentum dtype / second moment / cautious, on 2-D + conv
-    + 1-D params. (D-estimation is shared, so D is identical by construction.)"""
+    """The engine-backed update agrees with the per-param path while D moves."""
     base = _mixed_params()
     pa = [torch.nn.Parameter(p.detach().clone()) for p in base]
     pb = [torch.nn.Parameter(p.detach().clone()) for p in base]
-    kw = dict(momentum_dtype=momentum_dtype, second_moment=second_moment, cautious=cautious)
+    kw = dict(
+        momentum_dtype=momentum_dtype,
+        second_moment=second_moment,
+        cautious=cautious,
+        d0=1e-6,
+    )
     d_pp = _run_kprodigy(pa, foreach=False, **kw)
     d_fe = _run_kprodigy(pb, foreach=True, **kw)
-    assert d_pp == pytest.approx(d_fe, rel=0, abs=0)  # D identical
+    _assert_d_climbed(d_pp, kw["d0"])
+    _assert_d_climbed(d_fe, kw["d0"])
+    for pp_step, fe_step in zip(d_pp, d_fe, strict=True):
+        assert pp_step == pytest.approx(fe_step, rel=1e-6, abs=0)
     for a, b in zip(pa, pb, strict=True):
-        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+        _assert_params_close(a, b)
 
 
 @pytest.mark.parametrize("momentum_dtype", ["float32", "bfloat16", "int8", "4bit"])
 @pytest.mark.parametrize("second_moment", ["full", "factored"])
 @pytest.mark.parametrize("slice_p", [1, 11])
 def test_pass1_foreach_matches_per_param(momentum_dtype, second_moment, slice_p):
-    """Pass-1 (the D-estimation global reduction + the d-scaled momentum / factored
-    second-moment EMAs) must be bit-identical batched (foreach) vs the per-param
-    loop: the same D trajectory AND the same final weights, across momentum dtype
-    x {full, factored} x slice_p, on 2-D + conv + 1-D params."""
+    """Batched pass 1 tracks the per-param D trajectory within one ppm."""
     base = _mixed_params()
     pa = [torch.nn.Parameter(p.detach().clone()) for p in base]
     pb = [torch.nn.Parameter(p.detach().clone()) for p in base]
-    kw = dict(momentum_dtype=momentum_dtype, second_moment=second_moment, slice_p=slice_p)
-    d_pp = _run_kprodigy(pa, foreach=False, steps=15, **kw)
-    d_fe = _run_kprodigy(pb, foreach=True, steps=15, **kw)
-    assert d_pp == pytest.approx(d_fe, rel=0, abs=0)  # D trajectory bit-identical
+    kw = dict(
+        momentum_dtype=momentum_dtype,
+        second_moment=second_moment,
+        slice_p=slice_p,
+        d0=1e-6,
+    )
+    d_pp = _run_kprodigy(pa, foreach=False, **kw)
+    d_fe = _run_kprodigy(pb, foreach=True, **kw)
+    _assert_d_climbed(d_pp, kw["d0"])
+    _assert_d_climbed(d_fe, kw["d0"])
+    assert d_pp == pytest.approx(d_fe, rel=1e-6, abs=0)
     for a, b in zip(pa, pb, strict=True):
-        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+        _assert_params_close(a, b)
+
+
+@pytest.mark.parametrize("second_moment", ["full", "factored"])
+def test_bf16_momentum_ema_is_invariant_to_bucket_size(second_moment):
+    """bf16 momentum must not change when a tensor is folded into a stack.
+
+    Two conditions have to hold at once for the in-bf16 EMA to be caught, and
+    the shared fixture only meets the first: ``numel % 16 != 0`` (CPU
+    low-precision elementwise kernels take a vectorized body plus a scalar tail,
+    which round differently) AND at least two params per shape, since
+    ``_pass1_momentum_foreach`` buckets by ``(momentum_dtype, shape)`` and a
+    bucket of one stacks to the same numel as the lone tensor.
+    """
+    shapes = [(3, 7), (3, 7), (5, 11), (5, 11), (127,), (127,)]
+    g = torch.Generator().manual_seed(7)
+    base = [torch.nn.Parameter(torch.randn(*s, generator=g) * 0.1) for s in shapes]
+    pa = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    kw = dict(momentum_dtype="bfloat16", second_moment=second_moment, d0=1e-6)
+    d_pp, opt_pp = _run_kprodigy_opt(pa, foreach=False, **kw)
+    d_fe, opt_fe = _run_kprodigy_opt(pb, foreach=True, **kw)
+
+    # The stored momentum is the quantity the EMA rounds, so it is compared bit
+    # for bit; D and the weights inherit the pass-1 reduction tolerance.
+    for a, b in zip(pa, pb, strict=True):
+        ma, mb = opt_pp.state[a]["m"], opt_fe.state[b]["m"]
+        assert ma.dtype == torch.bfloat16
+        assert float(ma.abs().max()) > 0.0  # the EMA ran at all
+        torch.testing.assert_close(mb, ma, rtol=0, atol=0)
+    _assert_d_climbed(d_pp, kw["d0"])
+    for pp_step, fe_step in zip(d_pp, d_fe, strict=True):
+        assert pp_step == pytest.approx(fe_step, rel=1e-6, abs=0)
+    for a, b in zip(pa, pb, strict=True):
+        _assert_params_close(a, b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_pass1_foreach_cuda_d_is_stable_for_30_steps():
+    """CUDA's batched reduction tracks the per-param D for 30 steps of growth."""
+    base = _mixed_params(device="cuda")
+    pa = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    kw = dict(momentum_dtype="bfloat16", second_moment="full", d0=1e-6)
+    d_pp = _run_kprodigy(pa, foreach=False, steps=30, **kw)
+    d_fe = _run_kprodigy(pb, foreach=True, steps=30, **kw)
+    assert all(math.isfinite(d) for d in d_fe)
+    _assert_d_climbed(d_fe, kw["d0"])
+    # Every step, not just the last: a path that diverged and reconverged would
+    # otherwise slip through.
+    for pp_step, fe_step in zip(d_pp, d_fe, strict=True):
+        assert pp_step == pytest.approx(fe_step, rel=1e-6, abs=0)
 
 
 @pytest.mark.parametrize("independent_d", [True, False])
 def test_pass1_foreach_matches_per_param_multigroup(independent_d):
     """Pass-1 batching keeps the per-group D accumulation order-equivalent: the
-    foreach and per-param paths give bit-identical per-group D and weights for a
-    multi-group (SDXL-like) setup, with both global and independent D."""
+    foreach and per-param paths agree within one ppm for a multi-group
+    (SDXL-like) setup, with both global and independent D."""
     base = _mixed_params()
     g1, g2 = base[:3], base[3:]
 
@@ -264,13 +375,18 @@ def test_pass1_foreach_matches_per_param_multigroup(independent_d):
     def run(a, b, foreach):
         opt = KProdigy(
             [{"params": a, "lr": 1.0}, {"params": b, "lr": 1.0}],
-            lr=1.0, foreach=foreach, independent_d=independent_d, slice_p=11,
+            lr=1.0, foreach=foreach, independent_d=independent_d, slice_p=11, d0=1e-6,
         )
         gen = torch.Generator().manual_seed(99)
+        # Consistently directed, as in _run_kprodigy: per-step random gradients
+        # leave D sitting at d0 and the comparison below would hold vacuously.
+        directions = [
+            torch.randn(p.shape, generator=gen, dtype=p.dtype) * 0.5 for p in a + b
+        ]
         ds = []
-        for _ in range(15):
-            for p in a + b:
-                p.grad = torch.randn(p.shape, generator=gen, dtype=p.dtype) * 0.05
+        for _ in range(30):
+            for p, grad in zip(a + b, directions, strict=True):
+                p.grad = grad.clone()
             opt.step()
             ds.append(tuple(grp["d"] for grp in opt.param_groups))
         return ds
@@ -279,9 +395,12 @@ def test_pass1_foreach_matches_per_param_multigroup(independent_d):
     a2, b2 = build()
     d_pp = run(a1, b1, foreach=False)
     d_fe = run(a2, b2, foreach=True)
-    assert d_pp == d_fe  # per-group D trajectory bit-identical
+    for i in range(len(d_fe[-1])):
+        _assert_d_climbed([step[i] for step in d_fe], 1e-6)
+    for pp_step, fe_step in zip(d_pp, d_fe, strict=True):
+        assert pp_step == pytest.approx(fe_step, rel=1e-6, abs=0)
     for x, y in zip(a1 + b1, a2 + b2, strict=True):
-        torch.testing.assert_close(x.detach(), y.detach(), rtol=0, atol=0)
+        _assert_params_close(x, y)
 
 
 def test_foreach_4bit_cautious_converges():

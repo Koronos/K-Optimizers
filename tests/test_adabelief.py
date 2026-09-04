@@ -263,6 +263,109 @@ def test_foreach_chunking_is_exact():
         assert torch.allclose(a, b, rtol=0.0, atol=1e-7)
 
 
+@pytest.mark.parametrize("shape", [(), (1,)])
+@pytest.mark.parametrize("foreach", [False, True])
+def test_late_gradient_uses_first_parameter_step(shape, foreach):
+    """A parameter's first gradient uses t=1 even when the group clock is old."""
+    active = torch.nn.Parameter(torch.tensor(0.25).reshape(shape))
+    late = torch.nn.Parameter(torch.tensor(-0.5).reshape(shape))
+    opt = AdaBelief(
+        [active, late],
+        lr=1e-3,
+        cautious=False,
+        gradient_centralization=False,
+        momentum_dtype="float32",
+        bf16_method="none",
+        foreach=foreach,
+    )
+    for _ in range(9):
+        active.grad = torch.full_like(active, 0.2)
+        late.grad = None
+        opt.step()
+
+    expected = torch.nn.Parameter(late.detach().clone())
+    fresh = AdaBelief(
+        [expected],
+        lr=1e-3,
+        cautious=False,
+        gradient_centralization=False,
+        momentum_dtype="float32",
+        bf16_method="none",
+        foreach=False,
+    )
+    grad = torch.full_like(late, -0.3)
+    active.grad = torch.full_like(active, 0.2)
+    late.grad = grad.clone()
+    expected.grad = grad.clone()
+    opt.step()
+    fresh.step()
+
+    assert opt.param_groups[0]["step"] == 10
+    assert opt.state[late]["step"] == 1
+    torch.testing.assert_close(late, expected, rtol=0, atol=1e-7)
+
+
+def test_parameter_step_is_exactly_legacy_when_all_params_have_grad():
+    """Per-param t equals the old group t when every param starts at step one."""
+    pa = torch.nn.Parameter(torch.tensor([0.3, -0.2]))
+    pb = torch.nn.Parameter(pa.detach().clone())
+    current = AdaBelief(
+        [pa], lr=1e-3, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", bf16_method="none", foreach=False,
+    )
+    legacy = AdaBelief(
+        [pb], lr=1e-3, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", bf16_method="none", foreach=False,
+    )
+    grads = [
+        torch.tensor([0.2, -0.4]),
+        torch.tensor([-0.1, 0.3]),
+        torch.tensor([0.5, 0.1]),
+    ]
+    for grad in grads:
+        pa.grad = grad.clone()
+        pb.grad = grad.clone()
+        if legacy.state[pb]:
+            legacy.state[pb].pop("step", None)
+        current.step()
+        legacy.step()
+    assert torch.equal(pa, pb)
+    assert current.state[pa]["step"] == current.param_groups[0]["step"]
+
+
+def test_legacy_checkpoint_without_parameter_step_infers_group_clock():
+    """A pre-change checkpoint resumes with its historical group-step correction."""
+    p = torch.nn.Parameter(torch.tensor([0.3, -0.2]))
+    opt = AdaBelief(
+        [p], lr=1e-3, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", bf16_method="none", foreach=False,
+    )
+    for grad in (torch.tensor([0.2, -0.4]), torch.tensor([-0.1, 0.3])):
+        p.grad = grad
+        opt.step()
+
+    buf = io.BytesIO()
+    torch.save(opt.state_dict(), buf)
+    buf.seek(0)
+    legacy = torch.load(buf, weights_only=False)
+    next(iter(legacy["state"].values())).pop("step")
+
+    resumed_p = torch.nn.Parameter(p.detach().clone())
+    resumed = AdaBelief(
+        [resumed_p], lr=1e-3, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", bf16_method="none", foreach=False,
+    )
+    resumed.load_state_dict(legacy)
+    grad = torch.tensor([0.5, 0.1])
+    p.grad = grad.clone()
+    resumed_p.grad = grad.clone()
+    opt.step()
+    resumed.step()
+
+    assert resumed.state[resumed_p]["step"] == resumed.param_groups[0]["step"]
+    assert torch.equal(p, resumed_p)
+
+
 def test_overfits_regression(toy_mlp, random_batch):
     """AdaBelief should drive a tiny MLP's training loss down on a fixed batch."""
     x, y = random_batch
