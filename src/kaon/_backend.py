@@ -143,7 +143,7 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str) -> 
     elif p0.dtype == delta.dtype:
         torch._foreach_sub_(pviews, list(delta.unbind(0)))
     else:
-        torch._foreach_sub_(pviews, [d.to(p0.dtype) for d in delta.unbind(0)])
+        torch._foreach_sub_(pviews, list(delta.to(p0.dtype).unbind(0)))
 
 
 # ----------------------------- cautious masking -----------------------------
@@ -184,12 +184,13 @@ def centralize_grads_(params: list[Tensor]) -> None:
     loop here added ~1024 kernel launches/step on a 512-adapter bag (3x slower). Same-shape grads
     are stacked and centralized in a handful of ops; lone shapes go in place.
     """
-    by_shape: dict[tuple[int, ...], list[Tensor]] = {}
+    by_key: dict[tuple[tuple[int, ...], torch.device, torch.dtype], list[Tensor]] = {}
     for p in params:
         g = p.grad
         if g is not None and g.ndim >= 2:
-            by_shape.setdefault(tuple(g.shape), []).append(g)
-    for grads in by_shape.values():
+            key = (tuple(g.shape), g.device, g.dtype)
+            by_key.setdefault(key, []).append(g)
+    for grads in by_key.values():
         if len(grads) == 1:
             g = grads[0]
             g.sub_(g.mean(dim=tuple(range(1, g.ndim)), keepdim=True))
