@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **ADOPT** — per-parameter ``state["step"]`` governs the step-0 ``v`` init and the
+  ``step**0.25`` clip so a param whose first gradient arrives late (or a ``.step()``
+  with no grads) no longer leaves factored ``row``/``col`` at zero and diverges to
+  NaN; ``momentum_dtype`` is resolved per param group (not silently from the
+  constructor kwarg). Checkpoints without per-param ``step`` seed the counter from
+  ``max(1, group["step"] - 1)`` when ``v``/``row`` already exist.
+- **SAM** — ``second_step`` restores every ``old_p`` snapshot even when the second
+  backward left ``p.grad`` as ``None``; global grad norm and the climb are batched
+  (``torch._foreach_norm``, stacked chunks bounded by ``foreach_budget``). The
+  batched norm accumulates in fp32 so ``scale`` is slightly more accurate on bf16
+  weights than the old per-param bf16 reduction.
+- **Lookahead** — ``_sync_foreach`` chunks stacked slow-weight syncs with
+  ``foreach_budget`` instead of materializing an unbounded ``[N, *shape]`` transient.
+- **ktune** — OOM timings format as ``OOM`` instead of raising ``TypeError``; when
+  CUDA+Triton are available, sweeps ``fused=True`` over ``fused_tile_cap`` and
+  reports the best tile.
+
 ## [0.7.11]
 
 ### Fixed

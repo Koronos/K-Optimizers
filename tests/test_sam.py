@@ -194,3 +194,86 @@ def test_step_without_closure_raises():
     except RuntimeError:
         return
     raise AssertionError("SAM.step() without a closure must raise")
+
+
+def test_second_step_restores_param_without_second_grad():
+    """If a param had grad in first_step but None in second_step, restore w and drop old_p."""
+    rho = 0.05
+    w = torch.nn.Parameter(torch.randn(4, 3))
+    b = torch.nn.Parameter(torch.randn(5))
+    params = [w, b]
+    _attach_grads(params, seed=10)
+    b0 = b.data.clone()
+
+    opt = SAM(params, Adakaon, rho=rho, lr=1e-3)
+    opt.first_step(zero_grad=True)
+
+    w.grad = torch.randn_like(w)
+    b.grad = None
+
+    opt.second_step(zero_grad=False)
+
+    assert torch.equal(b.data, b0)
+    assert "old_p" not in opt.state[b]
+
+
+def _manual_first_step_fp32(params, rho, eps, adaptive=False):
+    """Reference per-parameter first_step for fp32 checks (fp32 accumulation order)."""
+    gn = _global_grad_norm(params, adaptive=adaptive)
+    scale = torch.tensor(rho / (gn + eps), dtype=torch.float32)
+    for p in params:
+        if p.grad is None:
+            continue
+        e = p.grad.float() * scale
+        if adaptive:
+            e = e * (p.data.float() * p.data.float())
+        p.data.add_(e.to(p.dtype))
+
+
+def test_first_step_foreach_fp32_bit_identical():
+    """Batched first_step matches a manual per-parameter climb in fp32."""
+    rho = 0.05
+    eps = 1e-12
+    for adaptive in (False, True):
+        params = _quadratic_params(seed=20 if adaptive else 21)
+        ref = _quadratic_params(seed=20 if adaptive else 21)
+        _attach_grads(params, seed=30)
+        _attach_grads(ref, seed=30)
+
+        opt = SAM(params, Adakaon, rho=rho, adaptive=adaptive, eps=eps, lr=1e-3)
+        opt.first_step(zero_grad=False)
+        _manual_first_step_fp32(ref, rho, eps, adaptive=adaptive)
+
+        for p, rp in zip(params, ref, strict=True):
+            torch.testing.assert_close(p.data, rp.data, rtol=1e-6, atol=1e-6)
+
+
+def test_first_step_chunking_matches_per_param(monkeypatch):
+    """Forced foreach budget splits the climb into chunks without changing the result."""
+    from kaon import sam as sam_mod
+
+    def tiny_budget(_stack_budget, _cutoff, _bytes_per, _device):
+        return 2 * 4 * 3  # two (4, 3) tensors per chunk
+
+    monkeypatch.setattr(sam_mod, "foreach_budget", tiny_budget)
+
+    rho = 0.05
+    eps = 1e-12
+    g = torch.Generator().manual_seed(40)
+    params = [
+        torch.nn.Parameter(torch.randn(4, 3, generator=g, dtype=torch.float32).requires_grad_(True))
+        for _ in range(8)
+    ]
+    ref = [
+        torch.nn.Parameter(p.detach().clone().requires_grad_(True))
+        for p in params
+    ]
+    _attach_grads(params, seed=41)
+    _attach_grads(ref, seed=41)
+
+    opt = SAM(params, Adakaon, rho=rho, eps=eps, lr=1e-3)
+    opt.first_step(zero_grad=False)
+    _manual_first_step_fp32(ref, rho, eps)
+
+    for p, rp in zip(params, ref, strict=True):
+        torch.testing.assert_close(p.data, rp.data, rtol=1e-6, atol=1e-6)
