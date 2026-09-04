@@ -25,6 +25,7 @@ Supported ``momentum_dtype`` codecs:
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any
 
 import torch
@@ -38,6 +39,7 @@ __all__ = [
     "_Int8Codec",
     "_FourBitCodec",
     "_make_codec",
+    "warn_if_4bit_high_beta1",
     "load_state_dict_preserving_dtypes",
     "_quant_int8",
     "_quant_int8_stacked",
@@ -303,8 +305,11 @@ class _MomentumCodec:
 class _FloatCodec(_MomentumCodec):
     """fp32 / bf16 momentum: store ``m`` directly in ``dtype``.
 
-    The EMA runs in the *stored* dtype (``update.to(m.dtype)``) exactly as the
-    original code did, so fp32/bf16 stay bit-for-bit identical after the refactor.
+    The EMA always runs in fp32 (matching the fused Triton kernels). For bf16
+    storage the result is ``copy_``'d back into the bf16 buffer; previously bf16
+    did ``m.lerp_(update.to(bf16), ...)`` which rounded the update *before* the
+    EMA and diverged from fused (~3.5e-4 vs ~1e-7). fp32 storage is unchanged
+    (EMA already lived in fp32).
     """
 
     def __init__(self, dtype: torch.dtype) -> None:
@@ -315,17 +320,28 @@ class _FloatCodec(_MomentumCodec):
 
     def ema_one(self, state: dict[str, Any], update: Tensor, beta1: float) -> Tensor:
         m = state["m"]
-        m.lerp_(update.to(m.dtype), 1.0 - beta1)
-        return m.float() if m.dtype != torch.float32 else m.clone()
+        if m.dtype == torch.float32:
+            m.lerp_(update, 1.0 - beta1)
+            return m.clone()
+        # bf16 (or any non-fp32 store): EMA in fp32, round only on write-back.
+        m_fp = m.float()
+        m_fp.lerp_(update, 1.0 - beta1)
+        m.copy_(m_fp)
+        return m_fp
 
     def ema_stacked(
         self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
     ) -> Tensor:
         ms = [mat(s["m"]) for s in states]
         mom = torch.stack(ms)                                        # [N, …], momentum dtype
-        mom.lerp_(update.to(mom.dtype), 1.0 - beta1)
-        torch._foreach_copy_(ms, list(mom.unbind(0)))
-        return mom.float()
+        if mom.dtype == torch.float32:
+            mom.lerp_(update, 1.0 - beta1)
+            torch._foreach_copy_(ms, list(mom.unbind(0)))
+            return mom
+        mom_fp = mom.float()
+        mom_fp.lerp_(update, 1.0 - beta1)
+        torch._foreach_copy_(ms, list(mom_fp.unbind(0)))             # rounds to bf16 on write
+        return mom_fp
 
     def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
         state["m"].copy_(m_fp32.reshape(state["m"].shape))
@@ -366,13 +382,17 @@ class _Int8Codec(_MomentumCodec):
         )
 
     def ema_one(self, state: dict[str, Any], update: Tensor, beta1: float) -> Tensor:
-        m = state["m"].float() * state["m_scale"]                    # dequant
+        # One fp32 temp (``.float().mul_``) instead of ``.float() * scale`` (two temps).
+        m = state["m"].float().mul_(state["m_scale"])                # dequant
         m.lerp_(update, 1.0 - beta1)
-        delta = m.clone()
-        q, scale = _quant_int8(m)                                    # requant
-        state["m"].copy_(q)
+        # ``_quant_int8`` does not mutate ``m`` (uses ``/``, not ``div_``); return it
+        # as delta and write codes with a non-mutating ``/`` so the EMA value stays.
+        dims = tuple(range(1, m.ndim)) if m.ndim >= 2 else ()
+        absmax = m.abs().amax(dim=dims, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
+        scale = absmax / _INT8_ABSMAX
+        state["m"].copy_((m / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP))
         state["m_scale"].copy_(scale.reshape_as(state["m_scale"]))
-        return delta
+        return m
 
     def ema_stacked(
         self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
@@ -381,12 +401,12 @@ class _Int8Codec(_MomentumCodec):
         scale = torch.stack([s["m_scale"].view(*rowshape) for s in states])
         m = torch.stack([mat(s["m"]) for s in states]).float().mul_(scale)  # dequant
         m.lerp_(update, 1.0 - beta1)
-        delta = m.clone()
+        # No clone: ``_quant_int8_stacked`` does not mutate ``m``.
         q, new_scale = _quant_int8_stacked(m)                        # requant
         torch._foreach_copy_([mat(s["m"]) for s in states], list(q.unbind(0)))
         for s, sc in zip(states, new_scale.unbind(0), strict=True):
             s["m_scale"].copy_(sc.view_as(s["m_scale"]))
-        return delta
+        return m
 
     def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
         q, scale = _quant_int8(m_fp32.reshape(state["m"].shape))
@@ -455,14 +475,15 @@ class _FourBitCodec(_MomentumCodec):
 
     def ema_one(self, state: dict[str, Any], update: Tensor, beta1: float) -> Tensor:
         bs = state["m_block"]
+        # ``_dequant_4bit`` always returns a fresh tensor (never a view of state).
         m = _dequant_4bit(state["m"], state["m_scale"], state["m_numel"], bs)
         m = m.view_as(update)                                        # dequant -> update shape
         m.lerp_(update, 1.0 - beta1)
-        delta = m.clone()
+        # No clone: ``_quant_4bit`` does not mutate ``m``.
         packed, scale, _ = _quant_4bit(m, bs)                        # requant
         state["m"].copy_(packed)
         state["m_scale"].copy_(scale)
-        return delta
+        return m
 
     def ema_stacked(
         self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
@@ -472,14 +493,18 @@ class _FourBitCodec(_MomentumCodec):
         bs = states[0]["m_block"]
         packed = torch.stack([s["m"] for s in states])              # [N, ceil(per/2)]
         sc = torch.stack([s["m_scale"] for s in states])            # [N, nblocks]
-        m = _dequant_4bit_stacked(packed, sc, per, bs).view_as(update)  # dequant
+        # ``_dequant_4bit_stacked`` returns a fresh tensor (never a view of the state).
+        # When ``per`` is not a block multiple the ``[:, :per]`` slice is non-contiguous;
+        # do NOT materialise it: ``lerp_`` picks a different kernel on a contiguous copy
+        # and the per-param / stacked paths stop agreeing bit-for-bit. Every consumer of
+        # the delta is elementwise, so the strided view is fine.
+        m = _dequant_4bit_stacked(packed, sc, per, bs).view_as(update)
         m.lerp_(update, 1.0 - beta1)
-        delta = m.clone()
         new_packed, new_scale = _quant_4bit_stacked(m.reshape(n, per), bs)  # requant
         torch._foreach_copy_([s["m"] for s in states], list(new_packed.unbind(0)))
-        for s, sc in zip(states, new_scale.unbind(0), strict=True):
-            s["m_scale"].copy_(sc)
-        return delta
+        for s, sc_i in zip(states, new_scale.unbind(0), strict=True):
+            s["m_scale"].copy_(sc_i)
+        return m
 
     def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
         packed, scale, _ = _quant_4bit(m_fp32, state["m_block"])
@@ -528,39 +553,90 @@ def _make_codec(momentum_dtype: str) -> _MomentumCodec:
     return _FloatCodec(torch.bfloat16 if momentum_dtype == "bfloat16" else torch.float32)
 
 
+def warn_if_4bit_high_beta1(beta1: float, momentum_dtype: str) -> None:
+    """Warn when 4-bit momentum is paired with a high EMA decay.
+
+    The dequant→EMA→requant loop amplifies quantization error by roughly
+    ``1/sqrt(1-beta1**2)``. Measured (block 128, real SDXL-scale grads):
+
+    =======  =======  =====
+    beta1    rel-L2   cos
+    =======  =======  =====
+    0.9      0.25     0.97
+    0.95     0.38     —
+    0.99     1.50     0.37
+    0.999    4.2      —
+    =======  =======  =====
+
+    Call from optimizer constructors after beta validation (one helper, not
+    duplicated per optimizer). Threshold ``beta1 >= 0.99``.
+    """
+    if momentum_dtype == "4bit" and beta1 >= 0.99:
+        warnings.warn(
+            f"momentum_dtype='4bit' with beta1={beta1} amplifies quantization "
+            f"error ~1/sqrt(1-beta1^2) "
+            f"(measured block-128: beta1=0.99 → rel-L2≈1.50, cos≈0.37; "
+            f"beta1=0.999 → rel-L2≈4.2). Prefer int8, or lower beta1.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def load_state_dict_preserving_dtypes(
     optimizer: torch.optim.Optimizer, state_dict: dict[str, Any]
 ) -> None:
-    """Restore optimizer state WITHOUT torch's lossy momentum upcast.
+    """Restore optimizer state byte-identical to the checkpoint.
 
-    ``torch.optim.Optimizer.load_state_dict`` casts every per-param state tensor
-    to the *param's* dtype (fp32) on load. For kaon's quantized first moment
-    that silently inflates bf16/int8/4bit momentum back to fp32 on resume —
-    discarding the memory-efficient representation the user configured (e.g. int8
-    -> fp32 is 4x the momentum bytes, defeating the point) AND breaking bit-exact
-    resume. We snapshot the stored per-tensor dtypes, run the default load, then
-    cast each state tensor back to how it was saved: bf16->fp32->bf16 is exact,
-    and the int8/uint8 *codes* round-trip through fp32 exactly, so the resumed
-    state is byte-identical to the checkpoint.
+    ``torch.optim.Optimizer.load_state_dict`` casts every *floating* per-param
+    state tensor to the *param's* dtype on load. With bf16/fp16 weights that is
+    lossy for fp32 buffers (``m_scale``, ``row``, ``col``, ``v``, fp32 ``m``):
+    values round through the param dtype (~0.3% relative drift per resume) and a
+    later ``.to(saved_dtype)`` cannot recover the bits. Casting alone was enough
+    only when params were fp32 (the historical docstring claim).
 
-    torch numbers params ``0..N-1`` in flattened ``param_groups`` order and the
-    state keys are those same ids, so the stored dtype for the param at flattened
-    position ``i`` is ``saved["state"][i]`` (load_state_dict already required the
-    structures to match).
+    Fix: snapshot the checkpoint tensors (by flattened param index + key), run
+    the default load, then put the originals back with ``.to(device=p.device)``
+    (dtype and values preserved). When the post-load destination already has the
+    correct dtype and shape we ``copy_`` into it (no extra allocation; same
+    aliasing behaviour as the base loader); otherwise we reassign a fresh clone
+    (unavoidable when torch widened/narrowed the dtype). Note that
+    ``Optimizer.load_state_dict`` rebuilds every state tensor, so no pointer that
+    existed *before* the load survives either way — MSAM/Nekaon drop their cached
+    plan on load and re-validate pointers per step.
+
+    State keys may be ``int`` or ``str`` (JSON round-trip drift); they are
+    normalised to ``int`` before the torch load (same convention as
+    :mod:`kaon._wrappers`).
     """
     saved = state_dict.get("state", {})
-    saved_dtypes = {
-        idx: {k: v.dtype for k, v in s.items() if torch.is_tensor(v)}
-        for idx, s in saved.items()
-    }
-    torch.optim.Optimizer.load_state_dict(optimizer, state_dict)
+    # Snapshot references + normalise int/str keys for torch (JSON may stringify them).
+    # No clone here: the ``copy_`` branch below never aliases, and the reassignment
+    # branch clones on its own — cloning everything doubled the resume peak.
+    saved_tensors: dict[int, dict[str, Tensor]] = {}
+    normalized_state: dict[int, Any] = {}
+    for idx, s in saved.items():
+        i = int(idx)
+        normalized_state[i] = s
+        saved_tensors[i] = {k: v for k, v in s.items() if torch.is_tensor(v)}
+
+    sd = dict(state_dict)
+    sd["state"] = normalized_state
+    torch.optim.Optimizer.load_state_dict(optimizer, sd)
+
     params = [p for group in optimizer.param_groups for p in group["params"]]
     for i, p in enumerate(params):
-        dtypes = saved_dtypes.get(i)
-        if dtypes is None or p not in optimizer.state:
+        src = saved_tensors.get(i)
+        if src is None or p not in optimizer.state:
             continue
         st = optimizer.state[p]
-        for key, dtype in dtypes.items():
-            t = st.get(key)
-            if torch.is_tensor(t) and t.dtype != dtype:
-                st[key] = t.to(dtype)
+        for key, src_t in src.items():
+            dst = st.get(key)
+            if (
+                torch.is_tensor(dst)
+                and dst.dtype == src_t.dtype
+                and dst.shape == src_t.shape
+            ):
+                dst.copy_(src_t)  # in place: no allocation, exact dtype + values
+            else:
+                # torch changed the dtype/shape: put back a private copy of the original.
+                st[key] = src_t.detach().clone().to(device=p.device)

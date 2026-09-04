@@ -150,3 +150,24 @@ model.
 > strengthens confidence substantially but does not fully close the gap to that
 > scale. Nothing observed across 32×32→64×64, 1.5 M→27 M params, and 1.5 k→10 k
 > steps hints at low-bit momentum breaking down.
+
+## 4-bit error amplification at high β1
+
+The dequant → EMA → requant loop is an AR(1) filter on top of per-step
+quantization noise. Steady-state error scales roughly as
+**`1 / sqrt(1 − β1²)`** — mild at the usual Adam/Adakaon `β1=0.9`, catastrophic as
+`β1 → 1`. Measured on real SDXL-scale gradients with block size 128:
+
+| β1 | rel-L2 vs fp32 | cos |
+|---|---|---|
+| 0.9 | 0.25 | 0.97 |
+| 0.95 | 0.38 | — |
+| 0.99 | 1.50 | 0.37 |
+| 0.999 | 4.2 | — |
+
+`kaon._momentum_codec.warn_if_4bit_high_beta1(beta1, momentum_dtype)` fires a
+`UserWarning` when `momentum_dtype == "4bit"` and `beta1 >= 0.99`. Prefer
+`momentum_dtype="int8"` (or lower β1) if you need a long-horizon first moment.
+This is independent of the Lion-specific sign-flip issue (see [lion.md](lion.md)):
+factored-Adam optimizers still track well at β1=0.9 with 4bit, but high-β1 4bit
+is a fidelity trap for any codec consumer.

@@ -35,15 +35,18 @@ there is no preconditioner blow-up to clip; each step is bounded by construction
 ## Memory & the no-second-moment win
 
 One momentum buffer, no second moment: **~2 B/param (bf16) / ~1 B (int8) / ~0.5 B (4bit)**.
-The 4bit path (0.5 B/param) is Lion's signature — lighter than Adakaon (which still
-keeps a small factored second moment) and far under AdamW (8 B). Memory is its strongest axis.
+The int8 path (~1 B/param) is the practical cheap default for Lion; 4bit (0.5 B/param) is
+lighter still but **not recommended** for Lion (sign flips — see caveat below). Memory remains
+Lion's strongest axis versus Adakaon (factored second moment) and AdamW (8 B).
 
 > **Caveat (measured): prefer `int8` over `4bit` for Lion.** Unlike the factored-Adam optimizers
-> (Adakaon/AdaPNM, where 4bit momentum is ~lossless), Lion's update is `sign(momentum)` — the
-> momentum's *sign* IS the direction, so 4bit quantization noise flips signs and costs held-out
-> quality (proxy: 4bit ≈ +0.005 loss vs bf16, while **int8 is loss-equivalent to bf16** at 1
-> B/param). Use `momentum_dtype="int8"` for cheap-but-lossless Lion momentum; reach for `4bit`
-> only when 0.5 B/param is truly required and a small quality hit is acceptable.
+> (Adakaon/AdaPNM, where 4bit momentum is near-lossless at moderate β1), Lion's update is
+> `sign(β1·m + (1-β1)·g)` — the momentum's *sign* IS the direction. Measured: ~12–13% of
+> coordinates flip sign under 4bit noise; final loss was **~32× worse** vs bf16 at Lion-scale
+> lr, and **~3916× worse** at lr=1e-3; with `cautious=True` (the default) loss rose further.
+> **int8 is near loss-equivalent to bf16** at 1 B/param. Use `momentum_dtype="int8"`; `4bit`
+> stays accepted only for checkpoint compatibility (constructor warns). The docs previously
+> understated this as "+0.005 loss" — three orders of magnitude too optimistic.
 
 ## Reused from Adakaon (shared backend — no duplication)
 
