@@ -84,8 +84,9 @@ Reused from Adakaon/AdaPNM: the factored second-moment helpers
 stochastic-rounding bf16 weight write (:func:`kaon._backend.subtract_*`),
 cautious masking, gradient centralization, and the bucketed foreach pattern.
 New here: the three-sequence ``z``/``x``/``y`` recurrence, the ``c_t`` (``ckp1``)
-polynomial-weighted averaging, and the in-place :meth:`train` / :meth:`eval`
-``y <-> x`` swap.
+polynomial-weighted averaging, the in-place :meth:`train` / :meth:`eval`
+``y <-> x`` swap, and the stochastically-rounded ``z`` write-back that a bf16-stored
+``z`` needs in order to move at all (:meth:`ScheduleFree._store_z`).
 
 Required call pattern
 ---------------------
@@ -182,18 +183,35 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
             ``ndim>=2`` grads. On by default (pin ``False`` for reference parity).
         momentum_dtype: storage dtype for the full-size ``z`` (and optional
             ``exp_avg``) buffers — ``"bfloat16"`` (default), ``"float32"``,
-            ``"int8"`` or ``"4bit"``. **Note:** ``z`` is read+written every step and
-            participates in the *exact* iterate average, so quantizing it injects a
-            small per-step requant error; ``"float32"`` is the bit-exact choice (the
-            reference test uses it), ``"bfloat16"`` is the memory-friendly default
-            mirroring how kaon stores weights.
+            ``"int8"`` or ``"4bit"``. **This is not a "small per-step error" knob.**
+            ``z`` is read, stepped by ``lr*d`` and written back every step, and that
+            step is routinely *smaller than one quantum of its own storage*: at
+            ``|z| ~ 1`` a bf16 ULP is ~8e-3 (and an int8 absmax quantum ~8e-3 too)
+            while ``lr*d`` is ~1e-3 or less. A round-to-nearest write-back then
+            returns the OLD value, so ``z`` stops moving altogether and the iterate
+            average keeps averaging a frozen sequence — the failure is a stalled
+            ``z``, not a bounded rounding error. ``"bfloat16"`` therefore writes
+            ``z`` through :func:`~kaon._stochastic_rounding.add_stochastic_`
+            (unbiased, so sub-quantum steps survive *in expectation*; see
+            :meth:`_store_z`), which makes it the memory-friendly default.
+            ``"float32"`` is the exact choice (the reference test uses it).
+            ``"int8"`` / ``"4bit"`` still requant ``z`` with round-to-nearest and are
+            therefore still exposed to the stall at small ``lr*d``; pick them only
+            when the memory saving outweighs that.
         momentum_4bit_block: block size for ``momentum_dtype="4bit"`` (default
             ``128``).
-        bf16_method: low-precision weight-write strategy for ``z`` writes and the
-            ``y`` write-back — ``"stochastic_rounding"`` (default), ``"kahan"`` or
-            ``"none"``.
-        foreach: batch the step with multi-tensor ops (default ``True``); numerically
-            equal to the per-param path.
+        bf16_method: low-precision **weight**-write strategy for the ``y`` write-back
+            only — ``"stochastic_rounding"`` (default), ``"kahan"`` or ``"none"``.
+            It does NOT govern ``z``: bf16 ``z`` always uses stochastic rounding and
+            never has a Kahan/shift buffer (see :meth:`_store_z`).
+        foreach: batch the step with multi-tensor ops (default ``True``). Numerically
+            **equal** to the per-param path — bit-for-bit — for ``momentum_dtype``
+            ``"float32"`` / ``"int8"`` / ``"4bit"``, which keep that contract unchanged.
+            A bf16 ``z`` is the exception: its write-back is stochastically rounded and
+            the batched path draws its noise once per stacked bucket while the per-param
+            path draws once per tensor, so the two then follow the *same law* rather than
+            the same bits (equivalence in expectation; the divergence per write is one
+            bf16 grid step of ``z``).
         foreach_batch_cutoff: per-tensor element cap above which a weight loops
             (default ``2_000_000``).
         foreach_stack_budget: max elements per stacked chunk (``None`` adapts to VRAM).
@@ -355,7 +373,6 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
             self._alloc_full("exp_avg", grad, state, group, copy=False)
         if is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
-            state["shift_z"] = torch.zeros_like(p)
 
     # The read/write of the full-size buffers go through the shared CodecBuffer
     # (kaon._wrappers) — the same codec storage Lookahead's phi uses, byte-identical to the
@@ -386,6 +403,57 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
     ) -> None:
         CodecBuffer.write_stacked(states, prefix, md, m_fp32)
 
+    # z's write-back is NOT the plain codec write the other full-size buffers use: at
+    # ``momentum_dtype="bfloat16"`` it has to be stochastically rounded, otherwise the
+    # z-sequence freezes (see :meth:`_store_z`). The gate is on the *storage dtype of z*
+    # only — not on ``bf16_method`` (which governs the weight write-back) and not on the
+    # weights' dtype: an fp32 model with a bf16 ``z`` has exactly the same stall.
+    @staticmethod
+    def _store_z(state: dict[str, Any], md: str, z_fp32: Tensor) -> None:
+        """Write the updated fp32 ``z`` into its storage; bf16 storage rounds stochastically.
+
+        A bf16 ``z`` cannot use the codec's round-to-nearest ``copy_``: the per-step
+        z-step is ``lr_t*d``, which for any realistic LR sits *below* the bf16 ULP of
+        ``z`` (~8e-3 at ``|z| ~ 1``), so RNE writes the OLD value back and ``z`` never
+        moves — the iterate average then averages a frozen sequence.
+        :func:`~kaon._stochastic_rounding.add_stochastic_` rounds up with probability
+        equal to the fractional distance, so those sub-ULP steps survive in
+        expectation.
+
+        The write is phrased as the increment ``z_new - z_stored`` (``z_stored`` is a
+        bf16 value, hence exact in fp32, so the increment reconstructs ``z_new``) which
+        is what lets it go through the shared primitive and keeps the identity of
+        ``state["z"]`` — ``add_stochastic_`` copies into it, never replaces it.
+        """
+        if md != "bfloat16":
+            CodecBuffer.write(state, "z", md, z_fp32)
+            return
+        buf = state["z"]
+        delta = buf.float().neg_().add_(z_fp32.reshape(buf.shape))
+        add_stochastic_(buf, delta)
+
+    @staticmethod
+    def _store_z_stacked(states: list[dict[str, Any]], md: str, z_fp32: Tensor) -> None:
+        """Batched :meth:`_store_z` over a foreach bucket's stacked ``z`` ``[N, *shape]``.
+
+        One noise draw over the whole stack (not one per param) followed by a single
+        ``_foreach_copy_`` into the per-param storages — the same shape of work
+        :func:`kaon._backend.subtract_batched_` does for bf16 weights. Since the draws
+        differ from the per-param path's, a bf16 ``z`` makes the two paths agree in
+        expectation instead of bit-for-bit (the quantized and fp32 codecs stay exact).
+        """
+        if md != "bfloat16":
+            CodecBuffer.write_stacked(states, "z", md, z_fp32)
+            return
+        shape = tuple(z_fp32.shape[1:])
+        # Same aliasing contract as CodecBuffer.write_stacked: z is a contiguous clone
+        # (and a same-shape reshape is a view anyway), so these views reach the storage.
+        bufs = [s["z"].reshape(shape) for s in states]
+        stacked = torch.stack(bufs)                                       # [N, *shape], bf16
+        delta = stacked.float().neg_().add_(z_fp32)
+        add_stochastic_(stacked, delta)
+        torch._foreach_copy_(bufs, list(stacked.unbind(0)))
+
     # ============================================================================ step
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
@@ -400,7 +468,12 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
                 if p.grad.is_sparse:
                     raise RuntimeError("ScheduleFree does not support sparse gradients")
             if not params:
-                group["step"] += 1
+                # A group with no gradients this iteration is a COMPLETE no-op: `step`
+                # must NOT advance. `step` is the k that feeds `_coeffs` (t**r weighting,
+                # the bias corrections) while `lr_max` / `weight_sum` only advance inside
+                # `_coeffs`, i.e. only on steps this group actually took. Bumping `step`
+                # here desynchronizes the three, so a group that starts getting grads late
+                # (frozen / conditionally-active params) resumes with the wrong t.
                 continue
             if group["gradient_centralization"]:
                 centralize_grads_(params)
@@ -604,7 +677,7 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         # y <- (1-ckp1)*y + ckp1*z, then y += d * y_d_coef ; z -= lr_t*d
         self._lerp_then_add_batched(ys, z, d, c["ckp1"], c["y_d_coef"], bf16_method)
         z.sub_(d, alpha=c["lr_t"])
-        self._store_full_stacked(states, "z", md, z)
+        self._store_z_stacked(states, md, z)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -646,7 +719,7 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         ys = [flat_view(p.data) for p in plist]
         self._lerp_then_add_batched(ys, z, d, c["ckp1"], c["y_d_coef"], bf16_method)
         z.sub_(d, alpha=c["lr_t"])
-        self._store_full_stacked(states, "z", md, z)
+        self._store_z_stacked(states, md, z)
 
     @torch.no_grad()
     def _lerp_then_add_batched(
@@ -719,14 +792,20 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
 
         # z step: z -= lr_t * d
         z.sub_(d, alpha=c["lr_t"])
-        self._store_full(state, "z", md, z)
+        self._store_z(state, md, z)
 
     @torch.no_grad()
-    def _subtract_y(self, p: Tensor, delta_fp32: Tensor, state: dict[str, Any], bf16_method: str) -> None:
+    def _subtract_y(
+        self,
+        p: Tensor,
+        delta_fp32: Tensor,
+        state: dict[str, Any],
+        bf16_method: str,
+    ) -> None:
         """``p -= delta`` (the y write-back) with bf16-correct handling.
 
-        Mirrors :func:`kaon._backend.subtract_one_` but uses ``shift`` for the y
-        kahan buffer (``z`` has its own ``shift_z``).
+        Mirrors :func:`kaon._backend.subtract_one_`; ``shift`` belongs only to y.
+        A bf16 z always uses stochastic rounding and has no Kahan/shift buffer.
         """
         low = is_low_precision(p)
         if low and bf16_method == "kahan":

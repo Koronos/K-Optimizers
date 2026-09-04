@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **ScheduleFree stochastically rounds bf16 `z` on every write.** This is independent
+  of `bf16_method` and consumes RNG even when model weights are fp32, so sub-ULP
+  `z` updates remain unbiased without a Kahan/shift buffer.
+- **AdaPNM handles empty groups and late gradients consistently.** Parameter-local
+  steps retain the correct bias correction and global PNM parity, while the shared
+  momentum codec preserves state-buffer identities required by cached pointers.
+- **AdaPNM int8 1-D scales now use scalar shape `()` instead of `(1,)`.** The value
+  is unchanged; checkpoints have been verified across foreach and per-parameter
+  paths in both directions.
 - **Lion / AdaBelief / AdamP / KProdigy requantize momentum in place.** Their
   `_store_one` / `_store_stacked` (and KProdigy's int8 EMA) reassigned
   `state["m"]` / `state["m_scale"]` on every step. MSAM/Nekaon cache `data_ptr`
@@ -30,6 +39,12 @@ All notable changes to this project will be documented in this file.
   the update (max|Δw| = 0 over many steps). `ndim > 2` params now require
   contiguity for the foreach path (same gate as Adakaon) and fall back to
   per-param otherwise.
+
+### Performance
+- **AdaPNM fused caches are keyed by `(group, lag)`.** Stable late-gradient buckets
+  reuse their pointer caches instead of rebuilding them every step, avoiding the
+  measured 3.9 -> 29 ms/step regression and reducing 400 reconstructions to a
+  stable cache set; inactive lags are pruned to keep memory bounded.
 
 ## [0.7.11]
 
