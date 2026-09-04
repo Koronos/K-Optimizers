@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Stochastic rounding preserves NaN on CUDA.** The int32 bit-trick added noise to the
+  canonical NaN pattern `0x7FFFFFFF`, overflowed the sign bit and wrote `-0.0` instead:
+  a diverging run looked healthy while weights were silently zeroed (CPU kept the NaN,
+  so no CPU test could see it). NaN now propagates like every other PyTorch op; `+-inf`
+  and finite overflow to `inf` behave exactly as before (bit-identical to 0.7.11 with
+  the same noise).
+- **Stochastic rounding no longer consumes the global RNG.** Noise comes from a
+  per-device `torch.Generator` owned by the module, seeded from the global initial seed
+  and re-seeded whenever `torch.manual_seed` changes it, so dataloader / dropout streams
+  no longer depend on how many parameters were rounded. Re-seeding to the *same* value
+  inside one process is not observable; call `kaon.reseed_stochastic_rounding()` then.
+- **`centralize_grads_` groups by `(shape, device, dtype)`.** A param group mixing CPU
+  and CUDA tensors crashed in `torch.stack` on the first step (default config).
+
+### Performance
+- `add_stochastic_` writes back with `copy_(fp32)` (no bf16 temporary) and draws int32
+  noise directly (4 B/elem transient instead of 10 B/elem).
+- `subtract_batched_` casts the stacked delta once per bucket instead of once per
+  parameter when the stack dtype differs from the params (`aten::_to_copy` no longer
+  scales with bucket size; 5-15x on the cast-heavy bags).
+
 ## [0.7.11]
 
 ### Fixed

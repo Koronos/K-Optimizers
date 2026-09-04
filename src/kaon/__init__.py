@@ -29,6 +29,7 @@ Quickstart::
     )
 """
 
+from kaon._stochastic_rounding import reseed_generators as reseed_stochastic_rounding
 from kaon._version import __version__
 from kaon.adabelief import AdaBelief
 from kaon.adakaon import Adakaon
@@ -59,4 +60,5 @@ __all__ = [
     "SAM",
     "ScheduleFree",
     "__version__",
+    "reseed_stochastic_rounding",
 ]

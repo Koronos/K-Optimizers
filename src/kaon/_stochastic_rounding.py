@@ -25,6 +25,17 @@ step equals the unbiased rounding of the input.
 
 For fp16 targets (different exponent layout) the bit trick does not apply
 directly; ``NotImplementedError`` is raised — fall back to ``bf16_method='kahan'``.
+
+**RNG isolation.** Noise is drawn from a per-device :class:`torch.Generator`
+owned by this module (not the global CUDA/CPU RNG). The generator is seeded
+from the global initial seed on first use and re-seeded whenever
+:func:`torch.manual_seed` / :func:`torch.cuda.manual_seed_all` changes that
+seed, so ``torch.manual_seed`` before each run still yields reproducible
+training. Subsequent ``torch.rand`` calls are unaffected by stochastic-rounding
+steps. Limitation: re-seeding to the *same* value inside one process (with no
+different seed in between) is not observable through the global RNG, so the
+module generator keeps its stream; call :func:`kaon.reseed_stochastic_rounding` (alias of :func:`reseed_generators`) after
+``torch.manual_seed`` in that case (test suites, sweeps in one process).
 """
 
 from __future__ import annotations
@@ -32,7 +43,39 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-__all__ = ["add_stochastic_"]
+__all__ = ["add_stochastic_", "reseed_generators"]
+
+# Per-device RNG — isolated from the global stream so SR does not perturb dataloader/dropout.
+# Value is (generator, global_initial_seed at last sync).
+_generators: dict[torch.device, tuple[torch.Generator, int]] = {}
+
+
+def _global_initial_seed(device: torch.device) -> int:
+    """Initial seed of the global RNG for ``device`` (multi-GPU safe on CUDA)."""
+    if device.type == "cuda":
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        return torch.cuda.default_generators[idx].initial_seed()
+    return torch.initial_seed()
+
+
+def reseed_generators() -> None:
+    """Drop the module generators so the next SR call re-seeds from the global RNG.
+
+    Needed only when ``torch.manual_seed`` is called again with the *same* seed in one
+    process; a seed change is picked up automatically.
+    """
+    _generators.clear()
+
+
+def _device_generator(device: torch.device) -> torch.Generator:
+    """Return the module-owned generator for ``device``, synced to the global seed."""
+    seed = _global_initial_seed(device)
+    entry = _generators.get(device)
+    if entry is None or entry[1] != seed:
+        gen = torch.Generator(device=device)
+        gen.manual_seed(seed)
+        _generators[device] = (gen, seed)
+    return _generators[device][0]
 
 
 @torch.no_grad()
@@ -91,13 +134,23 @@ def _add_stochastic_bf16_(
         size=bits.shape,
         dtype=torch.int32,
         device=bits.device,
+        generator=_device_generator(bits.device),
     )
+    # Only NaN needs masking: CUDA canonicalizes fp32 NaN to 0x7FFFFFFF (and
+    # -NaN to 0xFFFFFFFF); adding noise overflows to 0x8000xxxx and the AND
+    # yields -0.0. ±inf and finites above bf16 max are already safe (inf noise
+    # stays in-range; large finites may stochastically round to inf like RNE).
+    # One extra kernel: fold the NaN test into the add operand. +-inf need no mask
+    # (0x7F800000 + noise <= 0x7F80FFFF and the AND below restores it). Measured
+    # cheaper than isfinite() + mul_ (two kernels) on CUDA and CPU.
+    noise = torch.where(result_fp32 != result_fp32, 0, noise)
     # In two's complement, ``-0x10000`` is the int32 mask ``0xFFFF0000``.
     bits.add_(noise).bitwise_and_(-0x10000)
 
-    # The lower 16 bits of result_fp32 are now zero, so the cast to bf16 is
-    # exact. (We benchmarked copying the top-16-bit lanes via an int16 view to
-    # skip this convert; the strided copy is ~25% SLOWER on CUDA than the fused
-    # contiguous cast, so the straightforward cast wins. A fused Triton kernel
-    # for the whole add+round remains the real optimization — see CHANGELOG.)
-    target_bf16.copy_(result_fp32.to(torch.bfloat16))
+    # Lower 16 bits are now zero, so the bf16 cast is exact. copy_ fuses the
+    # dtype conversion into the destination without a full-sized bf16 temp.
+    # We benchmarked copying the top-16-bit lanes via an int16 view to skip
+    # this convert; the strided copy is slower on CUDA than the fused contiguous
+    # cast, so copy_ wins. A fused Triton kernel for the whole add+round remains
+    # the real optimization — see CHANGELOG.
+    target_bf16.copy_(result_fp32)
