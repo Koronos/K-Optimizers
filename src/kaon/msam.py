@@ -130,6 +130,20 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self.eps = float(eps)
         self._bind_inner(base_optimizer(params, **kwargs), state_key="msam")
         self.base_optimizer = self.inner
+        # Dual-momentum bases (AdaPNM: m_pos/m_neg) never allocate a single `m`
+        # buffer; without this guard MSAM's climb would silently find zero targets
+        # and become a no-op wrapper. rho=0 is a documented transparent passthrough.
+        if self.rho != 0.0:
+            from kaon.adapnm import AdaPNM
+
+            owner = self._momentum_owner()
+            if isinstance(owner, AdaPNM):
+                raise TypeError(
+                    f"MSAM cannot wrap {type(owner).__name__}: it keeps dual momentum "
+                    f"(m_pos/m_neg), not a single `m` buffer that the climb reads. "
+                    f"Use a base with a kaon-codec first moment (Adakaon, Lion, …), "
+                    f"or set rho=0 for a passthrough."
+                )
         # Live weights carry the perturbation only while (training mode AND a momentum
         # exists). eval()/train() toggle the mode; _has_e tracks whether a perturbation
         # is currently defined (false until the first inner step populates momentum).
@@ -153,6 +167,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         self._inert_streak = 0                          # consecutive climbs too small to do anything
         self._inert_checks = 0                          # bounded: the check reads weights
         self._inert_warned = False
+        self._no_m_warned = False                       # beta1=0 / no-`m` base warned once
 
     # ------------------------------------------------------------- perturbation
     def _momentum_owner(self) -> Any:
@@ -281,24 +296,54 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             params = [p for p in group["params"] if p.numel()][: self._INERT_SAMPLE]
             if not params:
                 continue
-            e = abs(self.rho) * group["lr"] * group.get("clip_threshold", 1.0)
-            w = float(torch.stack([p.detach().abs().mean().float() for p in params]).mean())
-            if w == 0.0:
-                continue
+            # Displacement scale depends on the norm mode (sample ≤ _INERT_SAMPLE params):
+            #   "none"   — per-coordinate |e| ≲ |rho| * lr * clip; compare to mean |w|
+            #   "global" — L2 radius |rho| over the net; relative = |rho| / ||w||_2 (sample)
+            #   "tensor" — per-tensor L2 radius |rho|; relative = mean_t |rho| / ||p_t||_2
             dtype = params[0].dtype
-            half_ulp = 0.5 * torch.finfo(dtype).eps * w
+            if self.norm == "none":
+                e = abs(self.rho) * group["lr"] * group.get("clip_threshold", 1.0)
+                w = float(torch.stack([p.detach().abs().mean().float() for p in params]).mean())
+                if w == 0.0:
+                    continue
+                half_ulp = 0.5 * torch.finfo(dtype).eps * w
+                rel = e / w
+                tip = "Raise lr or rho/k, or set rho/k=0 to drop the cost."
+            elif self.norm == "global":
+                # ||w||_2 over the sampled params (documented sample, not the full net).
+                w_sq = sum(float(p.detach().float().pow(2).sum()) for p in params)
+                w_norm = w_sq ** 0.5
+                if w_norm == 0.0:
+                    continue
+                e = abs(self.rho)
+                half_ulp = 0.5 * torch.finfo(dtype).eps * w_norm
+                rel = e / w_norm
+                tip = "Raise rho/k, or set rho/k=0 to drop the cost."
+            else:  # "tensor"
+                rels = []
+                for p in params:
+                    pn = float(p.detach().float().pow(2).sum()) ** 0.5
+                    if pn > 0.0:
+                        rels.append(abs(self.rho) / pn)
+                if not rels:
+                    continue
+                rel = sum(rels) / len(rels)
+                e = abs(self.rho)
+                w_mean = float(torch.stack([p.detach().abs().mean().float() for p in params]).mean())
+                half_ulp = 0.5 * torch.finfo(dtype).eps * max(w_mean, 1e-12)
+                tip = "Raise rho/k, or set rho/k=0 to drop the cost."
             if dtype != torch.float32 and e < half_ulp:
                 msg = (
                     f"{type(self).__name__}: the lookahead displacement (<= {e:.2e}) is below "
                     f"half a {dtype} ulp ({half_ulp:.2e}), so it cannot move the weights at all. "
                     f"Use fp32 weights for these parameters, or set rho/k=0 to drop the cost."
                 )
-            elif e / w < self._INERT_REL:
+            elif rel < self._INERT_REL:
                 msg = (
                     f"{type(self).__name__}: the lookahead displaces the weights by only "
-                    f"{e / w:.1e} relative (lr={group['lr']:.2e}); below ~{self._INERT_REL:.0e} the "
-                    f"perturbed gradient is indistinguishable from the true one, so the mechanism "
-                    f"is inert. Raise lr or rho/k, or set rho/k=0 to drop the cost."
+                    f"{rel:.1e} relative (norm={self.norm!r}, lr={group['lr']:.2e}); below "
+                    f"~{self._INERT_REL:.0e} the perturbed gradient is indistinguishable from "
+                    f"the true one, so the mechanism is inert. {tip}"
                 )
             if msg is not None:
                 break
@@ -370,7 +415,9 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
 
         Returns the list of torch-path leftover buckets, or ``None`` if Triton is
         unavailable (caller then runs the full torch path). Momentum buffers are
-        requantized in place, so pointer arrays remain valid until state is reset."""
+        requantized in place by the shared codec contract, so pointer arrays remain
+        valid until state is reset — and ``_plan_addrs_valid`` rechecks them in case
+        a non-codec writer still reassigned."""
         try:
             import kaon._fused_triton as ft
             if not ft.HAS_TRITON:
@@ -378,9 +425,11 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         except Exception:  # noqa: BLE001 — optional dependency; torch path is always correct
             return None
         # Momentum storage has stable identity for the lifetime of optimizer
-        # state (all codecs requantize in place).  Reuse the complete dispatch
-        # plan until _momentum_params observes a state-size change or load resets
-        # the cache; this removes two O(parameter-count) pointer scans per step.
+        # state when writers follow the codec's in-place store contract.  Reuse
+        # the complete dispatch plan until _momentum_params observes a state-size
+        # change, load resets the cache, or a witness pointer moves. Validating
+        # the plan is a cheap O(N) data_ptr pass (2-3 ints per param); rebuilding
+        # it is the expensive part (ptr_array allocation + bucket regrouping).
         self._momentum_params()  # O(1) cache-key check; catches late-gradient state growth
         cache = self._axpy_cache
         if cache is not None and cache["scale"] == scale and self._plan_addrs_valid(cache):
@@ -414,14 +463,20 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 "4bit": ft.MOM_4BIT,
             }[md]
             m_addr = ft.ptr_array([st["m"] for st in states], dev)
+            # Witness via the STATE DICTS (stable objects) + address tuples, not via
+            # retained Tensor refs: a base that reassigns st["m"] keeps the old Tensor
+            # alive in a witness field (its data_ptr never changes) while the dict
+            # already points at a new buffer — the plan would stay falsely valid.
             buckets.append(dict(
                 p_addr=ft.ptr_array(plist, dev),
-                # Momentum buffers are requantized in place, but nothing pins a WEIGHT's
-                # storage: an external EMA, a .to() or an FSDP reshard rebinds p.data and
-                # leaves p_addr pointing at freed memory. Witness the first param of each
-                # bucket (a reallocation moves the whole model, not one tensor) so the plan
-                # is rebuilt instead of writing to a dangling address.
-                p_witness=plist[0], p_witness_addr=plist[0].data_ptr(),
+                plist=plist,
+                states=states,
+                p_addrs=tuple(p.data_ptr() for p in plist),
+                m_addrs=tuple(st["m"].data_ptr() for st in states),
+                sc_addrs=(
+                    tuple(st["m_scale"].data_ptr() for st in states)
+                    if md in ("int8", "4bit") else None
+                ),
                 m_addr=m_addr,
                 sc_addr=(
                     ft.ptr_array([st["m_scale"] for st in states], dev)
@@ -441,10 +496,21 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
 
     @staticmethod
     def _plan_addrs_valid(cache: dict[str, Any]) -> bool:
-        """True while every cached weight pointer still addresses its parameter."""
-        return all(
-            bk["p_witness"].data_ptr() == bk["p_witness_addr"] for bk in cache["buckets"]
-        )
+        """True while every cached weight / momentum pointer still matches live storage.
+
+        Re-reads ``data_ptr()`` from the param list and from ``states[*]["m"]`` /
+        ``["m_scale"]`` (the dicts are stable; the tensors they name may be replaced).
+        """
+        for bk in cache["buckets"]:
+            if tuple(p.data_ptr() for p in bk["plist"]) != bk["p_addrs"]:
+                return False
+            if tuple(st["m"].data_ptr() for st in bk["states"]) != bk["m_addrs"]:
+                return False
+            if bk["sc_addrs"] is not None and (
+                tuple(st["m_scale"].data_ptr() for st in bk["states"]) != bk["sc_addrs"]
+            ):
+                return False
+        return True
 
     def _launch_fused(self, cache: dict[str, Any], sign: float, scale: float, ft: Any) -> None:
         """Launch a cached fused perturbation plan."""
@@ -590,6 +656,17 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 self._warn_if_inert()
                 self._apply(+1.0, scale=1.0)
                 self._has_e = True
+            elif not self._no_m_warned and self.inner.state and not self._momentum_params():
+                # beta1=0 (Adakaon/KProdigy) never allocates `m`; MSAM would otherwise
+                # stay a silent no-op. Only warn once the inner already has state —
+                # a smoke step() with no gradients must not trip this.
+                self._no_m_warned = True
+                warnings.warn(
+                    f"{type(self).__name__}: no first-moment buffer `m` found on the base "
+                    f"optimizer (e.g. betas[0]=0). The lookahead has no effect; set rho/k=0 "
+                    f"to drop the cost, or enable momentum on the base.",
+                    stacklevel=2,
+                )
         if _PROBE_LOG:
             self._probe("CLIMB")
         return loss

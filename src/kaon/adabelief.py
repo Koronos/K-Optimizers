@@ -108,12 +108,8 @@ from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
     _dequant_4bit_stacked,
-    _quant_4bit,
-    _quant_4bit_stacked,
-    _quant_int8,
-    _quant_int8_stacked,
+    _make_codec,
     fourbit_block_size,
-    int8_scale_shape,
     load_state_dict_preserving_dtypes,
 )
 
@@ -228,6 +224,7 @@ class AdaBelief(AutoLRMixin, Optimizer):
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
+        self._codecs: dict[str, Any] = {}
 
         # Composable parameter-free LR (continuous Mechanic) via AutoLRMixin. off -> zero overhead.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
@@ -300,23 +297,20 @@ class AdaBelief(AutoLRMixin, Optimizer):
         m = _dequant_4bit(state["m"], state["m_scale"], state["m_numel"], state["m_block"])
         return m.view_as(like)
 
-    @staticmethod
-    def _store_one(state: dict[str, Any], md: str, m_fp32: Tensor) -> None:
+    def _codec(self, md: str):
+        codec = self._codecs.get(md)
+        if codec is None:
+            codec = self._codecs[md] = _make_codec(md)
+        return codec
+
+    def _store_one(self, state: dict[str, Any], md: str, m_fp32: Tensor) -> None:
         """Write an updated fp32 momentum back into the configured storage layout.
 
-        ``m_fp32`` may be the matrixized ``[R, C]`` view; the int8 per-row scale and
-        the float buffer both reduce/store over the param's *original* shape, so
-        reshape back first (dim-0 — the int8 row axis — is preserved).
+        ``m_fp32`` may be the matrixized ``[R, C]`` view; the shared codec reshapes
+        to the param's original storage and writes **in place** (MSAM caches
+        ``data_ptr`` of ``m`` / ``m_scale``).
         """
-        if md in ("bfloat16", "float32"):
-            tgt = state["m"]
-            tgt.copy_(m_fp32.reshape(tgt.shape))
-        elif md == "int8":
-            m_orig = m_fp32.reshape(state["m"].shape)
-            state["m"], state["m_scale"] = _quant_int8(m_orig)
-        else:  # 4bit
-            packed, scale, _ = _quant_4bit(m_fp32, state["m_block"])
-            state["m"], state["m_scale"] = packed, scale
+        self._codec(md).store_one(state, m_fp32)
 
     @staticmethod
     def _dequant_stacked(
@@ -338,35 +332,9 @@ class AdaBelief(AutoLRMixin, Optimizer):
         bs = states[0]["m_block"]
         return _dequant_4bit_stacked(packed, sc, per, bs).reshape((n, *shape))
 
-    @staticmethod
-    def _store_stacked(states: list[dict[str, Any]], md: str, m_fp32: Tensor) -> None:
+    def _store_stacked(self, states: list[dict[str, Any]], md: str, m_fp32: Tensor) -> None:
         """Write stacked fp32 momentum ``[N, *shape]`` back into per-param storage."""
-        n = m_fp32.shape[0]
-        shape = tuple(m_fp32.shape[1:])
-        per = math.prod(shape)
-        if md in ("bfloat16", "float32"):
-            ms = [s["m"].reshape(shape) for s in states]
-            torch._foreach_copy_(ms, list(m_fp32.unbind(0)))
-        elif md == "int8":
-            row = shape[0] if len(shape) >= 2 else 1
-            rest = max(per // row, 1)
-            q, new_scale = _quant_int8_stacked(m_fp32.reshape(n, row, rest))  # [N,R,rest]->[N,R,1]
-            torch._foreach_copy_(
-                [s["m"].reshape(row, rest) for s in states], list(q.unbind(0))
-            )
-            # Store the scale in the layout `_quant_int8` (the per-param requant)
-            # produces, so the two paths stay interchangeable. Hardcoding (row, 1)
-            # here reshaped a conv's (R,1,1,1) scale to (R,1) and a 0-D param's ()
-            # scale to (1,); the next per-param step on that state then raised on
-            # the mismatched broadcast.
-            for s, sc in zip(states, new_scale.unbind(0), strict=True):  # sc: [R, 1]
-                s["m_scale"] = sc.reshape(int8_scale_shape(s["m"]))
-        else:  # 4bit
-            bs = states[0]["m_block"]
-            new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs)
-            torch._foreach_copy_([s["m"] for s in states], list(new_packed.unbind(0)))
-            for s, sc in zip(states, new_scale.unbind(0), strict=True):
-                s["m_scale"].copy_(sc)
+        self._codec(md).store_stacked(states, m_fp32)
 
     # -------------------------------------------------------------------- step
     @torch.no_grad()

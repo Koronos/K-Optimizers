@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Lion / AdaBelief / AdamP / KProdigy requantize momentum in place.** Their
+  `_store_one` / `_store_stacked` (and KProdigy's int8 EMA) reassigned
+  `state["m"]` / `state["m_scale"]` on every step. MSAM/Nekaon cache `data_ptr`
+  tables into those buffers for the fused climb, so a reassignment left the plan
+  reading freed memory (measured climb error ≈ 76% of the bound with
+  `MSAM(Lion, momentum_dtype="int8")`). All four now delegate to
+  `_MomentumCodec.store_one` / `store_stacked`, which `copy_` into the existing
+  tensors — the same contract Adakaon's codecs already followed since 0.7.8.
+  Numeric output is bit-identical (same quantizers); only storage identity changes.
+  Note: int8 `m_scale` for 1-D params stays shape `()` (as allocated); the old
+  foreach path had rewritten it to `(1,)` via reassignment. Values match; old
+  checkpoints with either layout still load.
+- **MSAM fused-plan witnesses cover `m` / `m_scale`.** `_plan_addrs_valid` now
+  re-reads `data_ptr` from the live state dicts (and every weight in the bucket),
+  so a base that still reassigns momentum invalidates the plan instead of climbing
+  on dangling pointers. `MSAM(AdaPNM, …)` with `rho != 0` raises `TypeError`
+  (dual `m_pos`/`m_neg`, no single `m`); `rho=0` remains a passthrough. The
+  inert-lookahead threshold is mode-aware (`none`: per-coordinate `|rho|*lr*clip`;
+  `global`/`tensor`: `|rho|` vs weight L2 norms) so `norm="global", rho=0.3,
+  lr=1e-6` no longer spuriously suggests raising lr.
+- **Lion `foreach` no longer silently skips `channels_last` convs.** The batched
+  write flattened via `reshape`, which copies a non-contiguous weight and drops
+  the update (max|Δw| = 0 over many steps). `ndim > 2` params now require
+  contiguity for the foreach path (same gate as Adakaon) and fall back to
+  per-param otherwise.
+
 ## [0.7.11]
 
 ### Fixed

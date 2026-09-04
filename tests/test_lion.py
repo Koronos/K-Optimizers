@@ -524,3 +524,30 @@ def test_int8_stacked_store_keeps_per_param_scale_layout():
             p.grad = torch.randn(shape) * 0.02
         resume.step()
         assert all(torch.isfinite(p).all() for p in batched), shape
+
+
+def test_foreach_channels_last_conv_updates_like_per_param():
+    """channels_last 4-D weights must not take the foreach path (reshape would copy).
+
+    Regression: ``subtract_batched_`` wrote into a reshape-copy of a non-contiguous
+    conv, so ``Lion(foreach=True)`` left the live weight untouched (max|dw|=0).
+    """
+    torch.manual_seed(0)
+    shape = (4, 8, 3, 3)
+    base = torch.randn(shape).to(memory_format=torch.channels_last)
+    assert not base.is_contiguous()
+    pa = torch.nn.Parameter(base.clone())
+    pb = torch.nn.Parameter(base.clone())
+    assert not pa.is_contiguous() and not pb.is_contiguous()
+    oa = Lion([pa], foreach=True, lr=1e-2, momentum_dtype="float32", bf16_method="none")
+    ob = Lion([pb], foreach=False, lr=1e-2, momentum_dtype="float32", bf16_method="none")
+    before = pa.detach().clone()
+    for seed in range(3):
+        g = torch.Generator().manual_seed(seed)
+        gr = torch.randn(shape, generator=g).to(memory_format=torch.channels_last)
+        pa.grad = gr.clone()
+        pb.grad = gr.clone()
+        oa.step()
+        ob.step()
+    assert float((pa.detach() - before).abs().max()) > 0, "foreach left channels_last weight unchanged"
+    torch.testing.assert_close(pa.detach(), pb.detach(), rtol=0, atol=0)
