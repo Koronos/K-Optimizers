@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import torch
 
-from kaon import ScheduleFree
+from kaon import ScheduleFree, reseed_stochastic_rounding
 
 
 def _ref_schedulefree_1d(
@@ -254,9 +254,10 @@ def test_foreach_matches_per_param(cfg):
             p.grad = g.clone()
         for p, g in zip(pb, gs, strict=True):
             p.grad = g.clone()
-        rng = torch.get_rng_state()
+        # SR noise comes from kaon's own generator: re-seed it so both paths draw alike.
+        reseed_stochastic_rounding()
         oa.step()
-        torch.set_rng_state(rng)
+        reseed_stochastic_rounding()
         ob.step()
     # The weights are the contract this test has always pinned. How closely the two
     # paths' stored z can agree depends on its storage: a bf16 z is stochastically
@@ -265,13 +266,11 @@ def test_foreach_matches_per_param(cfg):
     # only differs by the stacked-vs-per-param reassociation ulps, and the quantized
     # codes can straddle a requant boundary, so those are left to the weights.
     md = cfg["momentum_dtype"]
-    # Stacks of N=2 same-shape params reassociate fp32 ops, so fp32/int8/4bit weights
-    # agree to ulps; the bf16 path is bit-exact because the replayed RNG feeds both.
+    # Stacks of N=2 same-shape params reassociate fp32 ops (and the bf16 codec runs its
+    # EMA in fp32 since this release), so weights agree to fp32 ulps on every path; the
+    # bf16 z itself is bit-exact because the re-seeded SR generator feeds both paths.
     def _weights_agree(a: torch.Tensor, b: torch.Tensor) -> None:
-        if md == "bfloat16":
-            assert torch.equal(a, b)
-        else:
-            torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)
 
     for a, b in zip(pa, pb, strict=True):
         _weights_agree(a, b)
@@ -385,13 +384,12 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
             p.grad = g.clone()
         for p, g in zip(params_b, gs, strict=True):
             p.grad = g.clone()
-        # A bf16-stored z is written with stochastic rounding, so a step consumes the
-        # global RNG. Both runs are on the same code path with (claimed) identical
-        # state, so replaying the same RNG state is what makes "bit-exact" a statement
-        # about the resumed *state* instead of about two different noise draws.
-        rng = torch.get_rng_state()
+        # A bf16-stored z is written with stochastic rounding from kaon's own generator.
+        # Re-seeding it before each step hands both runs the same draws, which is what
+        # makes "bit-exact" a statement about the resumed *state* and not about noise.
+        reseed_stochastic_rounding()
         opt_a.step()
-        torch.set_rng_state(rng)
+        reseed_stochastic_rounding()
         opt_b.step()
     for a, b in zip(params_a, params_b, strict=True):
         assert torch.equal(a, b), "resumed run must continue bit-exactly"
@@ -524,9 +522,10 @@ def _scalar_parity(cfg, shapes=None, steps: int = 10, seed: int = 11, grad_seed:
         for a, b in zip(pa, pb, strict=True):
             grad = torch.randn(a.shape, generator=gg) * 0.02
             a.grad, b.grad = grad.clone(), grad.clone()
-        rng = torch.get_rng_state()
+        # SR noise comes from kaon's own generator: re-seed it so both paths draw alike.
+        reseed_stochastic_rounding()
         oa.step()
-        torch.set_rng_state(rng)
+        reseed_stochastic_rounding()
         ob.step()
     return pa, pb, oa, ob
 
