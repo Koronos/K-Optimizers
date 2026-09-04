@@ -217,14 +217,26 @@ def test_train_eval_idempotent():
     ],
 )
 def test_foreach_matches_per_param(cfg):
-    """foreach=True is element-for-element equal to the per-parameter path (fp32 weights)."""
+    """foreach=True is element-for-element equal to the per-parameter path (fp32 weights).
+
+    Each shape appears twice so `_store_z_stacked` runs with N>1 (the write-back
+    that `_foreach_copy_` must actually land). Param order follows real buckets:
+    all factored groups contiguous, then flat, matching foreach visit order so
+    the replayed RNG feeds the same draw to each coordinate on the per-param path
+    — without it a bf16 z would only agree in expectation.
+    """
     def mk() -> list[torch.nn.Parameter]:
         return [
             torch.nn.Parameter(torch.randn(8, 4)),
+            torch.nn.Parameter(torch.randn(8, 4)),
             torch.nn.Parameter(torch.randn(7, 3)),
+            torch.nn.Parameter(torch.randn(7, 3)),
+            torch.nn.Parameter(torch.randn(3, 2, 3, 3)),
+            torch.nn.Parameter(torch.randn(3, 2, 3, 3)),
+            torch.nn.Parameter(torch.randn(5)),
             torch.nn.Parameter(torch.randn(5)),
             torch.nn.Parameter(torch.randn(6)),
-            torch.nn.Parameter(torch.randn(3, 2, 3, 3)),
+            torch.nn.Parameter(torch.randn(6)),
         ]
 
     torch.manual_seed(1)
@@ -242,15 +254,37 @@ def test_foreach_matches_per_param(cfg):
             p.grad = g.clone()
         for p, g in zip(pb, gs, strict=True):
             p.grad = g.clone()
+        rng = torch.get_rng_state()
         oa.step()
+        torch.set_rng_state(rng)
         ob.step()
+    # The weights are the contract this test has always pinned. How closely the two
+    # paths' stored z can agree depends on its storage: a bf16 z is stochastically
+    # rounded and the replayed RNG hands both paths the same draws, so it must land
+    # bit for bit (a `_store_z_stacked` that never writes back fails here). An fp32 z
+    # only differs by the stacked-vs-per-param reassociation ulps, and the quantized
+    # codes can straddle a requant boundary, so those are left to the weights.
+    md = cfg["momentum_dtype"]
+    # Stacks of N=2 same-shape params reassociate fp32 ops, so fp32/int8/4bit weights
+    # agree to ulps; the bf16 path is bit-exact because the replayed RNG feeds both.
+    def _weights_agree(a: torch.Tensor, b: torch.Tensor) -> None:
+        if md == "bfloat16":
+            assert torch.equal(a, b)
+        else:
+            torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)
+
     for a, b in zip(pa, pb, strict=True):
-        assert torch.equal(a, b)
-    # parity must hold after the eval swap too.
+        _weights_agree(a, b)
+        if md == "bfloat16":
+            assert torch.equal(oa.state[a]["z"], ob.state[b]["z"])
+        elif md == "float32":
+            torch.testing.assert_close(
+                oa.state[a]["z"], ob.state[b]["z"], rtol=1e-6, atol=1e-7
+            )
     oa.eval()
     ob.eval()
     for a, b in zip(pa, pb, strict=True):
-        assert torch.equal(a, b)
+        _weights_agree(a, b)
 
 
 def test_foreach_chunking_is_exact():
@@ -351,7 +385,13 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
             p.grad = g.clone()
         for p, g in zip(params_b, gs, strict=True):
             p.grad = g.clone()
+        # A bf16-stored z is written with stochastic rounding, so a step consumes the
+        # global RNG. Both runs are on the same code path with (claimed) identical
+        # state, so replaying the same RNG state is what makes "bit-exact" a statement
+        # about the resumed *state* instead of about two different noise draws.
+        rng = torch.get_rng_state()
         opt_a.step()
+        torch.set_rng_state(rng)
         opt_b.step()
     for a, b in zip(params_a, params_b, strict=True):
         assert torch.equal(a, b), "resumed run must continue bit-exactly"
@@ -484,7 +524,9 @@ def _scalar_parity(cfg, shapes=None, steps: int = 10, seed: int = 11, grad_seed:
         for a, b in zip(pa, pb, strict=True):
             grad = torch.randn(a.shape, generator=gg) * 0.02
             a.grad, b.grad = grad.clone(), grad.clone()
+        rng = torch.get_rng_state()
         oa.step()
+        torch.set_rng_state(rng)
         ob.step()
     return pa, pb, oa, ob
 
@@ -507,16 +549,22 @@ _SCALAR_CFGS = [
 @pytest.mark.parametrize("cfg", _SCALAR_CFGS)
 def test_foreach_scalar_0d_matches_per_param(cfg):
     """0-D scalars through the batched bucket are element-for-element equal to the
-    per-parameter path (fp32 weights, so stochastic rounding is not in play).
+    per-parameter path (fp32 weights, so the *weight* write-back's stochastic rounding
+    is not in play).
 
     For a length-1 slice every per-slice reduction the batched code does must
     degenerate to the per-param scalar one (the RMS clip's ``norm/sqrt(1)``, the
     cautious mask's mean over one element, the int8 absmax over one element) — this
     test is the proof of that, not an assumption.
+
+    A bf16-stored ``z`` is stochastically rounded. Replaying the same RNG state before
+    each optimizer step makes every coordinate consume the same draw on both paths.
     """
-    pa, pb, oa, _ob = _scalar_parity(cfg)
+    torch.manual_seed(0)  # pins the stochastic-rounding draws (bf16 z) run to run
+    pa, pb, oa, ob = _scalar_parity(cfg, steps=10)
     for a, b in zip(pa, pb, strict=True):
-        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+        assert torch.equal(a, b)
+        assert torch.equal(oa.state[a]["z"], ob.state[b]["z"])
     # State keeps the per-param layout: a 0-D param keeps 0-D buffers (checkpoint compat).
     for a in pa:
         if a.ndim == 0:
@@ -603,3 +651,150 @@ def test_scalar_0d_train_eval_roundtrip():
     for a, b, y in zip(pa, pb, y_a, strict=True):
         torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
         assert not torch.equal(a.detach(), y)  # eval view really differed from train view
+
+
+# ================================================ bf16 z storage: the z-step must survive
+# ``z`` is stepped by ``lr_t*d`` and written back to its ``momentum_dtype`` storage on every
+# step. At bf16 that step is normally FAR below the ULP of ``z`` itself, so a
+# round-to-nearest write-back hands back the OLD value and the z-sequence freezes at its
+# initialization — which the iterate average then averages happily. Nothing else in the
+# optimizer reveals this (weights keep moving, losses keep dropping, everything is finite),
+# so it has to be pinned on the displacement of the *stored* z.
+_BF16Z_STEPS = 200
+_BF16Z_LR = 1e-4
+
+
+def _const_grad_z_displacement(momentum_dtype: str, shape, *, foreach: bool) -> torch.Tensor:
+    """bf16 weights at magnitude 1.0 under a constant unit gradient; return ``z - z0``.
+
+    Two params, so ``foreach=True`` really batches (it needs >= 2 eligible tensors).
+    ``weight_decay=0`` keeps ``d`` independent of the iterate and gradient centralization
+    is off (it would subtract the mean of a constant gradient, i.e. zero it), so
+    ``d == g / sqrt(v_hat) ~ 1`` on both the factored and non-factored paths and the
+    fp32-storage displacement is ``~ -steps*lr`` on every element. Returned flat over all
+    elements of all params.
+    """
+    params = [torch.nn.Parameter(torch.ones(shape, dtype=torch.bfloat16)) for _ in range(2)]
+    opt = ScheduleFree(
+        params, lr=_BF16Z_LR, momentum_dtype=momentum_dtype, weight_decay=0.0,
+        gradient_centralization=False, foreach=foreach,
+    )
+    opt.train()
+    for _ in range(_BF16Z_STEPS):
+        for p in params:
+            p.grad = torch.ones_like(p)
+        opt.step()
+    return torch.cat([(opt.state[p]["z"].detach().float() - 1.0).reshape(-1) for p in params])
+
+
+@pytest.mark.parametrize("shape", [(2048,), (32, 64)], ids=["flat1d", "factored2d"])
+@pytest.mark.parametrize("foreach", [False, True], ids=["per_param", "foreach"])
+def test_bf16_z_displacement_matches_fp32_storage(shape, foreach):
+    """A bf16-stored z must travel, on average, as far as an fp32-stored z.
+
+    200 steps at lr=1e-4 displace z by ~2e-2 in total, while one bf16 ULP just below
+    ``|z| = 1`` is ~3.9e-3: *every* individual write is sub-ULP. Round-to-nearest
+    therefore gives a mean displacement of exactly 0 (z never leaves 1.0); stochastic
+    rounding is unbiased, and the mean over 4096 elements concentrates far inside the 20%
+    band asserted here (per-element spread ~9e-3, ~1.4e-4 once averaged).
+    """
+    torch.manual_seed(0)
+    ref = _const_grad_z_displacement("float32", shape, foreach=foreach).mean().item()
+    # Re-seed: the reference run also consumes draws (its bf16 *weight* write-back is
+    # stochastically rounded), so without this the measured bf16-z displacement would
+    # depend on how many of them it happened to consume.
+    torch.manual_seed(0)
+    got = _const_grad_z_displacement("bfloat16", shape, foreach=foreach).mean().item()
+    # Sanity: the reference is the -steps*lr*d (d ~ 1) walk this test's bound assumes.
+    assert ref == pytest.approx(-_BF16Z_STEPS * _BF16Z_LR, rel=0.05)
+    assert abs(got - ref) <= 0.2 * abs(ref), (
+        f"bf16-stored z moved {got:.3e} vs {ref:.3e} at fp32 storage — sub-ULP z-steps "
+        "are being lost to the round-to-nearest write-back"
+    )
+
+
+@pytest.mark.parametrize("momentum_dtype", ["bfloat16", "float32", "int8", "4bit"])
+@pytest.mark.parametrize("foreach", [False, True], ids=["per_param", "foreach"])
+def test_z_store_preserves_storage_identity(momentum_dtype, foreach):
+    """Every z write-back lands IN the existing buffers — same object, same ``data_ptr``,
+    same dtype and shape — on both paths. The stochastically-rounded bf16 write is the
+    new one here; pointer caches over optimizer state must not be left dangling."""
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.ones(64, dtype=torch.bfloat16)) for _ in range(2)]
+    opt = ScheduleFree(params, lr=1e-3, momentum_dtype=momentum_dtype, foreach=foreach)
+    opt.train()
+    for p in params:
+        p.grad = torch.ones_like(p)
+    opt.step()
+    keys = ["z"] + [k for k in opt.state[params[0]] if k.startswith("z_")]
+    before = [
+        {k: (id(opt.state[p][k]), opt.state[p][k].data_ptr(), opt.state[p][k].dtype)
+         for k in keys if torch.is_tensor(opt.state[p][k])}
+        for p in params
+    ]
+    for _ in range(3):
+        for p in params:
+            p.grad = torch.ones_like(p)
+        opt.step()
+    for p, snap in zip(params, before, strict=True):
+        for k, (obj_id, ptr, dtype) in snap.items():
+            t = opt.state[p][k]
+            assert id(t) == obj_id, f"{k} was replaced, not written in place"
+            assert t.data_ptr() == ptr, f"{k} moved storage"
+            assert t.dtype == dtype
+
+
+# ================================================ groups that skip a step (no gradients)
+def test_group_without_grads_does_not_advance_its_step():
+    """A group with no gradients this iteration must be a COMPLETE no-op.
+
+    ``group['step']`` is the ``k`` that feeds ``_coeffs`` (the ``t**r`` average weight and
+    the bias corrections), while ``lr_max`` / ``weight_sum`` advance only inside
+    ``_coeffs`` — i.e. only on the steps the group actually took. Advancing ``step`` for a
+    grad-less group desynchronizes the three: with ``r != 0`` the group's later steps land
+    on the wrong ``t`` and its average weighting no longer matches its own ``weight_sum``.
+    That is the frozen-then-unfrozen parameter case (and any conditionally-active branch).
+    """
+    cfg = dict(lr=1e-2, r=1.0, weight_lr_power=2.0, momentum_dtype="float32",
+               gradient_centralization=False)
+    torch.manual_seed(0)
+    p_hot = torch.nn.Parameter(torch.randn(16))                              # always stepped
+    late = [torch.nn.Parameter(torch.randn(16)) for _ in range(2)]           # grad-less first
+    opt = ScheduleFree([{"params": [p_hot]}, {"params": late}], **cfg)
+    # Reference: the same params under the same gradients, in an optimizer that only ever
+    # sees the steps they have gradients for.
+    ref = [torch.nn.Parameter(p.detach().clone()) for p in late]
+    opt_ref = ScheduleFree(ref, **cfg)
+    late_group = opt.param_groups[1]
+
+    gen = torch.Generator().manual_seed(5)
+    frozen = [p.detach().clone() for p in late]
+    for _ in range(3):
+        p_hot.grad = torch.randn(16, generator=gen)
+        for p in late:
+            p.grad = None
+        opt.step()
+    assert late_group["step"] == 0, "a grad-less group advanced its step counter"
+    assert late_group["weight_sum"] == 0.0
+    assert late_group["lr_max"] == -1.0
+    for p, f in zip(late, frozen, strict=True):
+        torch.testing.assert_close(p.detach(), f, rtol=0, atol=0)
+
+    live = 4
+    for _ in range(live):
+        p_hot.grad = torch.randn(16, generator=gen)
+        for p, q in zip(late, ref, strict=True):
+            g = torch.randn(16, generator=gen)
+            p.grad, q.grad = g.clone(), g.clone()
+        opt.step()
+        opt_ref.step()
+
+    assert late_group["step"] == live == opt_ref.param_groups[0]["step"]
+    # step / weight_sum / lr_max stay mutually consistent: weight_sum is exactly the sum
+    # of t**r * lr_max**weight_lr_power over the steps the group actually took.
+    assert late_group["weight_sum"] == pytest.approx(
+        sum(t * (1e-2 ** 2.0) for t in range(1, live + 1))
+    )
+    assert late_group["lr_max"] == pytest.approx(1e-2)
+    for p, q in zip(late, ref, strict=True):
+        torch.testing.assert_close(p.detach(), q.detach(), rtol=0, atol=0)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import kaon._fused_triton as ft
 from kaon import AdaPNM
 from kaon._fused_triton import HAS_TRITON
 
@@ -41,6 +42,22 @@ def _parts(opt):
         od += d
         nat += n
     return ob, big, od, nat
+
+
+def _assert_native_parity(fused_params, native_params, tol=1e-5):
+    """Fused weights must track the native path within this file's fp32 parity bound.
+
+    The two paths reduce in different orders (tiled Triton row/col reductions vs torch
+    reductions), so they were never bit-identical; ``tol`` is the same relative bound
+    the rest of this file's fp32 parity tests use. A wrong bias correction or a stale
+    pointer cache moves the weights far above it.
+    """
+    d = max(
+        (a.detach().float() - b.detach().float()).abs().max().item()
+        for a, b in zip(fused_params, native_params, strict=True)
+    )
+    scale = max(b.detach().float().abs().max().item() for b in native_params)
+    assert d / scale < tol, f"fused vs native rel={d / scale:.2e}"
 
 
 def _run_parity(shapes, dtype, mdtype, *, cautious=True, gc=True, wd=0.0, steps=6, seed=1):
@@ -137,6 +154,99 @@ def test_load_state_dict_invalidates_pointer_caches():
     new_caches = tuple(opt._fused_ob_caches.values()) + tuple(opt._fused_od_caches.values())
     assert new_caches
     assert all(new is not old for new in new_caches for old in old_caches)
+
+
+def test_late_grads_reuse_fused_caches_by_group_and_lag(monkeypatch):
+    shapes = [(8, 16)] * 16 + [(64,)] * 8
+    fused_params = _bag(shapes, torch.float32, seed=101)
+    native_params = _clone(fused_params)
+    cfg = dict(
+        lr=2e-3,
+        momentum_dtype="float32",
+        cautious=False,
+        gradient_centralization=False,
+        clip_threshold=0.0,
+        foreach=False,
+    )
+    fused = AdaPNM(fused_params, fused=True, **cfg)
+    native = AdaPNM(native_params, fused=False, **cfg)
+    constructions = {"one_block": {}, "one_dim": {}}
+
+    def count_init(cls, category):
+        original = cls.__init__
+
+        def wrapped(cache, plist, state_for):
+            group_step = fused.param_groups[0]["step"]
+            lag = group_step - fused.state[plist[0]]["step"]
+            counts = constructions[category]
+            counts[lag] = counts.get(lag, 0) + 1
+            original(cache, plist, state_for)
+
+        return wrapped
+
+    monkeypatch.setattr(
+        ft.AdaPnmCache,
+        "__init__",
+        count_init(ft.AdaPnmCache, "one_block"),
+    )
+    monkeypatch.setattr(
+        ft.OneDimPnmCache,
+        "__init__",
+        count_init(ft.OneDimPnmCache, "one_dim"),
+    )
+
+    late = set(range(8, 16)) | set(range(20, 24))
+    gen = torch.Generator(device=DEV).manual_seed(103)
+    for step in range(20):
+        grads = [
+            torch.randn(p.shape, generator=gen, device=DEV)
+            for p in fused_params
+        ]
+        for index, (fused_p, native_p, grad) in enumerate(
+            zip(fused_params, native_params, grads, strict=True)
+        ):
+            missing = step == 0 and index in late
+            fused_p.grad = None if missing else grad.clone()
+            native_p.grad = None if missing else grad.clone()
+        fused.step()
+        native.step()
+
+    torch.cuda.synchronize()
+    _assert_native_parity(fused_params, native_params)
+    assert constructions == {
+        "one_block": {0: 1, 1: 1},
+        "one_dim": {0: 1, 1: 1},
+    }
+    gid = id(fused.param_groups[0])
+    assert set(fused._fused_ob_caches) == {(gid, 0), (gid, 1)}
+    assert set(fused._fused_od_caches) == {(gid, 0), (gid, 1)}
+
+    ob_caches = dict(fused._fused_ob_caches)
+    od_caches = dict(fused._fused_od_caches)
+    for fused_p, native_p in zip(fused_params, native_params, strict=True):
+        fused_p.grad = None
+        native_p.grad = None
+    fused.step()
+    native.step()
+    assert fused.param_groups[0]["step"] == 20
+    assert all(fused._fused_ob_caches[key] is cache for key, cache in ob_caches.items())
+    assert all(fused._fused_od_caches[key] is cache for key, cache in od_caches.items())
+
+    for index, (fused_p, native_p) in enumerate(
+        zip(fused_params, native_params, strict=True)
+    ):
+        grad = torch.ones_like(fused_p)
+        fused_p.grad = None if index in late else grad
+        native_p.grad = None if index in late else grad.clone()
+    fused.step()
+    native.step()
+    assert set(fused._fused_ob_caches) == {(gid, 0)}
+    assert set(fused._fused_od_caches) == {(gid, 0)}
+    _assert_native_parity(fused_params, native_params)
+    assert constructions == {
+        "one_block": {0: 1, 1: 1},
+        "one_dim": {0: 1, 1: 1},
+    }
 
 
 # ----------------------------------------------------------------- one-block parity
@@ -422,3 +532,47 @@ def test_big_batched_matches_native_foreach_toggle():
     torch.cuda.synchronize()
     d = max((a - b).abs().max().item() for a, b in zip(pv, pn))
     assert d < 1e-5, f"batched vs native-foreach max|Δp|={d:.2e}"
+
+
+def test_fused_empty_step_does_not_advance_global_parity():
+    p = _bag([(8, 16)], torch.float32, seed=71)[0]
+    opt = AdaPNM(
+        [p], fused=True, lr=2e-3, momentum_dtype="float32",
+        cautious=False, gradient_centralization=False,
+    )
+    opt.step()
+    assert opt.param_groups[0]["step"] == 0
+    p.grad = torch.ones_like(p)
+    opt.step()
+    assert opt.param_groups[0]["step"] == 1
+    assert opt.state[p]["step"] == 1
+    assert torch.count_nonzero(opt.state[p]["m_pos"]) > 0
+    assert torch.count_nonzero(opt.state[p]["m_neg"]) == 0
+
+
+def test_fused_mixed_local_steps_use_local_bias_and_global_parity():
+    active, late = _bag([(8, 16), (8, 16)], torch.float32, seed=73)
+    expected = late.detach().clone().requires_grad_(True)
+    cfg = dict(
+        lr=2e-3, betas=(0.8, 0.9), beta0=0.0, clip_threshold=0.0,
+        momentum_dtype="float32", cautious=False, gradient_centralization=False,
+    )
+    opt = AdaPNM([active, late], fused=True, **cfg)
+    for _ in range(3):
+        active.grad = torch.ones_like(active)
+        late.grad = None
+        opt.step()
+    grad = torch.randn_like(late)
+    active.grad = torch.ones_like(active)
+    late.grad = grad.clone()
+    opt.step()
+
+    ref = AdaPNM([expected], fused=True, **cfg)
+    expected.grad = grad.clone()
+    ref.step()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(late, expected, rtol=1e-5, atol=1e-6)
+    assert opt.state[active]["step"] == 4
+    assert opt.state[late]["step"] == 1
+    assert torch.count_nonzero(opt.state[late]["m_pos"]) == 0
+    assert torch.count_nonzero(opt.state[late]["m_neg"]) > 0

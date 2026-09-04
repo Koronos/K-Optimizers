@@ -100,11 +100,9 @@ weight update (:func:`kaon._stochastic_rounding.add_stochastic_`),
 ``load_state_dict_preserving_dtypes`` for dtype-safe checkpoint resume, and the
 bucketed foreach batching pattern. New here: **two** momentum buffers with the
 PNM alternation + positive-negative mixing and ``noise_norm`` renormalization, the
-``beta1**2`` first-moment decay with ``beta1`` bias correction, and the read-it-
-yourself EMA (the shared codec's ``ema_*`` helpers do an Adam *momentum-of-update*
-and update a *single* buffer, so they cannot be reused verbatim; AdaPNM uses the
-codec's storage + *read-only* ``_dequant``/requant primitives and runs the
-raw-gradient EMA on the positive buffer itself).
+``beta1**2`` first-moment decay with ``beta1`` bias correction, and the
+read-it-yourself EMA. AdaPNM uses the shared codec's ``dequant_*`` and
+``store_*`` entry points around its raw-gradient EMA on the positive buffer.
 
 It is a standard ``torch.optim.Optimizer`` with a single per-parameter step, so it
 drops into per-parameter / gradient-release training loops unchanged.
@@ -136,14 +134,8 @@ from kaon._backend import (
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
-    _dequant_4bit,
-    _dequant_4bit_stacked,
-    _quant_4bit,
-    _quant_4bit_stacked,
-    _quant_int8,
-    _quant_int8_stacked,
+    _make_codec,
     fourbit_block_size,
-    int8_scale_shape,
     load_state_dict_preserving_dtypes,
 )
 
@@ -195,14 +187,13 @@ def _probe_write(line: str) -> None:
 def _probe_group(opt: AdaPNM, group: dict[str, Any]) -> None:
     """Inspect every factored param after a step: worst denom multiplier + first non-finite."""
     step = group["step"]
-    c = opt._coeffs(group)
-    bc2_sq = c["bc2_sq"]
     routing = _probe_routing(opt, group)
     worst_mult, worst_shape = 0.0, None
     for p in group["params"]:
         st = opt.state.get(p)
         if not st or "col" not in st:
             continue
+        bc2_sq = opt._coeffs(group, st.get("step", step))["bc2_sq"]
         col = st["col"]
         row = st["row"]
         cfac_max = col.clamp_min(1e-30).rsqrt().max().item()
@@ -424,8 +415,8 @@ class AdaPNM(AutoLRMixin, Optimizer):
         # array, no [N,R,C] stack, GC in-kernel). Default False until the A/B confirms a win.
         self._fused_reductions = True
         self._fused_part: dict[int, tuple] = {}
-        self._fused_ob_caches: dict[int, Any] = {}
-        self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPnmCache (1-D)
+        self._fused_ob_caches: dict[tuple[int, int], Any] = {}
+        self._fused_od_caches: dict[tuple[int, int], Any] = {}
         if self._fused:
             from kaon._fused_triton import HAS_TRITON, TILE_CAP
             if not HAS_TRITON:
@@ -484,6 +475,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
         grad = p.grad
+        state["step"] = 0
         factored = p.ndim >= 2
         if factored:
             gv = grad if p.ndim == 2 else grad.reshape(grad.shape[0], -1)
@@ -503,94 +495,50 @@ class AdaPNM(AutoLRMixin, Optimizer):
 
     # -------------------------------------------------- momentum read / write
     @staticmethod
-    def _dequant_one(state: dict[str, Any], prefix: str, md: str, like: Tensor) -> Tensor:
-        """Read one stored momentum back as a fresh fp32 tensor shaped like ``like``.
+    def _codec_state(state: dict[str, Any], prefix: str) -> dict[str, Any]:
+        """Alias an AdaPNM-prefixed momentum as the shared codec's ``m`` keys."""
+        alias = {"m": state[prefix]}
+        for suffix in ("scale", "numel", "block"):
+            key = f"{prefix}_{suffix}"
+            if key in state:
+                alias[f"m_{suffix}"] = state[key]
+        return alias
 
-        Buffers are stored in the param's original shape; conv kernels are
-        matrixized at use-site so ``like`` may be the ``[R, C]`` view — reshape to
-        match (the per-row int8 scale's row grouping is preserved across the
-        reshape because dim-0 is unchanged).
-        """
-        if md in ("bfloat16", "float32"):
-            return state[prefix].float().reshape_as(like)
-        if md == "int8":
-            return state[prefix].float().mul_(state[f"{prefix}_scale"]).reshape_as(like)
-        m = _dequant_4bit(
-            state[prefix], state[f"{prefix}_scale"], state[f"{prefix}_numel"], state[f"{prefix}_block"]
-        )
-        return m.view_as(like)
+    @staticmethod
+    def _dequant_one(state: dict[str, Any], prefix: str, md: str, like: Tensor) -> Tensor:
+        alias = AdaPNM._codec_state(state, prefix)
+        return _make_codec(md).dequant_one(alias, like).reshape_as(like)
 
     @staticmethod
     def _store_one(state: dict[str, Any], prefix: str, md: str, m_fp32: Tensor) -> None:
-        """Write an updated fp32 momentum back into the configured storage layout.
-
-        ``m_fp32`` may be the matrixized ``[R, C]`` view; the int8 per-row scale and
-        the float buffer both reduce/store over the param's *original* shape, so
-        reshape back first (dim-0 — the int8 row axis — is preserved).
-        """
-        if md in ("bfloat16", "float32"):
-            tgt = state[prefix]
-            tgt.copy_(m_fp32.reshape(tgt.shape))
-        elif md == "int8":
-            m_orig = m_fp32.reshape(state[prefix].shape)
-            state[prefix], state[f"{prefix}_scale"] = _quant_int8(m_orig)
-        else:  # 4bit
-            packed, scale, _ = _quant_4bit(m_fp32, state[f"{prefix}_block"])
-            state[prefix], state[f"{prefix}_scale"] = packed, scale
+        _make_codec(md).store_one(AdaPNM._codec_state(state, prefix), m_fp32)
 
     @staticmethod
     def _dequant_stacked(
         states: list[dict[str, Any]], prefix: str, md: str, shape: tuple[int, ...]
     ) -> Tensor:
-        """Stacked fp32 momentum ``[N, *shape]`` from per-param storage (see Lion)."""
-        n = len(states)
-        per = math.prod(shape)
-        if md in ("bfloat16", "float32"):
-            # Buffers are stored in the param's original shape; reshape to the
-            # effective (matrixized [R, C] / flat [L]) view so stacking aligns.
-            return torch.stack([s[prefix].reshape(shape) for s in states]).float()
-        if md == "int8":
-            row = shape[0] if len(shape) >= 2 else 1
-            rest = max(per // row, 1)
-            m = torch.stack([s[prefix].reshape(row, rest) for s in states]).float()  # [N, R, rest]
-            scale = torch.stack([s[f"{prefix}_scale"].reshape(row, 1) for s in states])  # [N, R, 1]
-            return m.mul_(scale).reshape((n, *shape))
-        packed = torch.stack([s[prefix] for s in states])
-        sc = torch.stack([s[f"{prefix}_scale"] for s in states])
-        bs = states[0][f"{prefix}_block"]
-        return _dequant_4bit_stacked(packed, sc, per, bs).reshape((n, *shape))
+        aliases = [AdaPNM._codec_state(state, prefix) for state in states]
+        mat = lambda tensor: tensor.reshape(shape)  # noqa: E731
+        return _make_codec(md).dequant_stacked(aliases, mat, shape)
 
     @staticmethod
     def _store_stacked(
         states: list[dict[str, Any]], prefix: str, md: str, m_fp32: Tensor
     ) -> None:
-        """Write stacked fp32 momentum ``[N, *shape]`` back into per-param storage."""
-        n = m_fp32.shape[0]
-        shape = tuple(m_fp32.shape[1:])
-        per = math.prod(shape)
-        if md in ("bfloat16", "float32"):
-            ms = [s[prefix].reshape(shape) for s in states]
-            torch._foreach_copy_(ms, list(m_fp32.unbind(0)))
-        elif md == "int8":
-            row = shape[0] if len(shape) >= 2 else 1
-            rest = max(per // row, 1)
-            q, new_scale = _quant_int8_stacked(m_fp32.reshape(n, row, rest))  # [N,R,rest]->[N,R,1]
-            torch._foreach_copy_(
-                [s[prefix].reshape(row, rest) for s in states], list(q.unbind(0))
-            )
-            # Store the scale in the layout `_quant_int8` (the per-param requant)
-            # produces, so the two paths stay interchangeable. Hardcoding (row, 1)
-            # here reshaped a conv's (R,1,1,1) scale to (R,1) and a 0-D param's ()
-            # scale to (1,); the next per-param step on that state then raised on
-            # the mismatched broadcast.
-            for s, sc in zip(states, new_scale.unbind(0), strict=True):  # sc: [R, 1]
-                s[f"{prefix}_scale"] = sc.reshape(int8_scale_shape(s[prefix]))
-        else:  # 4bit
-            bs = states[0][f"{prefix}_block"]
-            new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs)
-            torch._foreach_copy_([s[prefix] for s in states], list(new_packed.unbind(0)))
-            for s, sc in zip(states, new_scale.unbind(0), strict=True):
-                s[f"{prefix}_scale"].copy_(sc)
+        aliases = [AdaPNM._codec_state(state, prefix) for state in states]
+        _make_codec(md).store_stacked(aliases, m_fp32)
+
+    def _prepare_param_steps(self, params: list[Tensor], group: dict[str, Any]) -> None:
+        """Initialize state and advance each parameter's bias-correction counter."""
+        for p in params:
+            state = self.state[p]
+            if not state:
+                self._init_state(p, state, group)
+            elif "step" not in state:
+                # The group counter was already advanced for this update. A legacy
+                # state with moments therefore finished the preceding group step.
+                state["step"] = group["step"] - 1
+            state["step"] += 1
 
     @staticmethod
     def _pos_neg_prefixes(step: int) -> tuple[str, str]:
@@ -616,9 +564,10 @@ class AdaPNM(AutoLRMixin, Optimizer):
             for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("AdaPNM does not support sparse gradients")
-            group["step"] += 1
             if not params:
                 continue
+            group["step"] += 1
+            self._prepare_param_steps(params, group)
             if group["gradient_centralization"]:
                 centralize_grads_(params)
             self._native_dispatch(params, group)
@@ -660,25 +609,73 @@ class AdaPNM(AutoLRMixin, Optimizer):
             for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("AdaPNM does not support sparse gradients")
-            group["step"] += 1
             if not params:
                 continue
-            c = self._coeffs(group)
+            group["step"] += 1
+            self._prepare_param_steps(params, group)
             pos_pref, neg_pref = self._pos_neg_prefixes(group["step"])
             one_block, big, one_dim, native = self._fused_partition(group, params, ft)
             if native:
                 if group["gradient_centralization"]:
                     centralize_grads_(native)
                 self._native_dispatch(native, group)
-            if one_block:
-                self._fused_one_block(one_block, group, ft, c)
-            if big:
-                self._fused_big(big, group, ft, c, pos_pref, neg_pref)
-            if one_dim:
-                self._fused_one_dim(one_dim, group, ft, c, pos_pref, neg_pref)
+            group_step = group["step"]
+            one_block_buckets = self._local_step_buckets(one_block, group_step)
+            big_buckets = self._local_step_buckets(big, group_step)
+            one_dim_buckets = self._local_step_buckets(one_dim, group_step)
+            gid = id(group)
+            active_ob = set(one_block_buckets)
+            active_od = set(one_dim_buckets)
+            self._fused_ob_caches = {
+                key: cache
+                for key, cache in self._fused_ob_caches.items()
+                if key[0] != gid or key[1] in active_ob
+            }
+            self._fused_od_caches = {
+                key: cache
+                for key, cache in self._fused_od_caches.items()
+                if key[0] != gid or key[1] in active_od
+            }
+            for lag, plist in one_block_buckets.items():
+                c = self._coeffs(group, group_step - lag)
+                self._fused_one_block(plist, group, ft, lag, c)
+            for lag, plist in big_buckets.items():
+                self._fused_big(
+                    plist,
+                    group,
+                    ft,
+                    self._coeffs(group, group_step - lag),
+                    pos_pref,
+                    neg_pref,
+                )
+            for lag, plist in one_dim_buckets.items():
+                self._fused_one_dim(
+                    plist,
+                    group,
+                    ft,
+                    lag,
+                    self._coeffs(group, group_step - lag),
+                    pos_pref,
+                    neg_pref,
+                )
             if _PROBE_LOG:
                 _probe_group(self, group)
         return loss
+
+    def _local_step_buckets(
+        self, params: list[Tensor], group_step: int
+    ) -> dict[int, list[Tensor]]:
+        """Bucket parameters by stable lag behind the group's absolute step."""
+        buckets: dict[int, list[Tensor]] = {}
+        for p in params:
+            state = self.state[p]
+            assert state and state.get("step", 0) >= 1, (
+                "AdaPNM parameter state must be prepared before fused bucketing"
+            )
+            lag = group_step - state["step"]
+            assert lag >= 0, "AdaPNM parameter step cannot exceed its group step"
+            buckets.setdefault(lag, []).append(p)
+        return buckets
 
     def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
         gid = id(group)
@@ -719,17 +716,25 @@ class AdaPNM(AutoLRMixin, Optimizer):
             _probe_census(one_block, big, native, md, bf16m, cap, ft)
         return one_block, big, one_dim, native
 
-    def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict) -> None:
+    def _fused_one_block(
+        self,
+        plist: list[Tensor],
+        group: dict[str, Any],
+        ft: Any,
+        lag: int,
+        c: dict,
+    ) -> None:
         for p in plist:
             st = self.state[p]
-            if not st:
-                self._init_state(p, st, group)
+            assert st and st.get("step", 0) >= 1, (
+                "AdaPNM parameter state must be prepared before fused one-block step"
+            )
         ids = tuple(id(p) for p in plist)
-        gid = id(group)
-        cache = self._fused_ob_caches.get(gid)
+        key = (id(group), lag)
+        cache = self._fused_ob_caches.get(key)
         if cache is None or cache.ids != ids:
             cache = ft.AdaPnmCache(plist, lambda p: self.state[p])
-            self._fused_ob_caches[gid] = cache
+            self._fused_ob_caches[key] = cache
         cache.refresh_grads()
         odd = group["step"] % 2 == 1
         lr, wd, eps1 = group["lr"], group["weight_decay"], group["eps"]
@@ -751,20 +756,29 @@ class AdaPNM(AutoLRMixin, Optimizer):
                 GC=gc, SR=bk["lowp"], CLIP=clip > 0.0, BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
             )
 
-    def _fused_one_dim(self, plist: list[Tensor], group: dict[str, Any], ft: Any, c: dict,
-                       pos_pref: str, neg_pref: str) -> None:
+    def _fused_one_dim(
+        self,
+        plist: list[Tensor],
+        group: dict[str, Any],
+        ft: Any,
+        lag: int,
+        c: dict,
+        pos_pref: str,
+        neg_pref: str,
+    ) -> None:
         """One-block non-factored kernel over eligible 1-D weights (biases / norm scales). GC is a no-op
         on 1-D. fp32/bf16 momenta only; ams_bound and quant route to native (excluded in the partition)."""
         for p in plist:
             st = self.state[p]
-            if not st:
-                self._init_state(p, st, group)
+            assert st and st.get("step", 0) >= 1, (
+                "AdaPNM parameter state must be prepared before fused one-dim step"
+            )
         ids = tuple(id(p) for p in plist)
-        gid = id(group)
-        cache = self._fused_od_caches.get(gid)
+        key = (id(group), lag)
+        cache = self._fused_od_caches.get(key)
         if cache is None or cache.ids != ids:
             cache = ft.OneDimPnmCache(plist, lambda p: self.state[p])
-            self._fused_od_caches[gid] = cache
+            self._fused_od_caches[key] = cache
         cache.refresh_grads()
         odd = group["step"] % 2 == 1
         lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
@@ -819,8 +833,9 @@ class AdaPNM(AutoLRMixin, Optimizer):
     def _chunked_step(self, p: Tensor, group: dict[str, Any], ft: Any, c: dict,
                       pos_pref: str, neg_pref: str) -> None:
         st = self.state[p]
-        if not st:
-            self._init_state(p, st, group)
+        assert st and st.get("step", 0) >= 1, (
+            "AdaPNM parameter state must be prepared before fused chunked step"
+        )
         R, C = p.shape[0], p.numel() // p.shape[0]  # noqa: N806 — matrix dims (conv -> matrixized)
         n = R * C
         md = group["momentum_dtype"]
@@ -884,8 +899,9 @@ class AdaPNM(AutoLRMixin, Optimizer):
         temp in the float case), turned into ``sc_apply[N]`` between passes."""
         for p in plist:
             st = self.state[p]
-            if not st:
-                self._init_state(p, st, group)
+            assert st and st.get("step", 0) >= 1, (
+                "AdaPNM parameter state must be prepared before batched chunked step"
+            )
         N = len(plist)  # noqa: N806
         R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]  # noqa: N806 — conv -> matrixized
         n = R * C
@@ -1005,11 +1021,12 @@ class AdaPNM(AutoLRMixin, Optimizer):
 
     # ----------------------------------------------------------- coefficients
     @staticmethod
-    def _coeffs(group: dict[str, Any]) -> dict[str, float]:
-        """All per-step scalar coefficients (shared by the per-param and foreach paths)."""
+    def _coeffs(group: dict[str, Any], step: int | None = None) -> dict[str, float]:
+        """Scalar coefficients; bias corrections use the parameter-local step."""
         beta1, beta2 = group["betas"]
         beta0 = group["beta0"]
-        step = group["step"]
+        step = group["step"] if step is None else step
+        assert step >= 1, "AdaPNM coefficients require a prepared 1-indexed step"
         beta1_sq = beta1 * beta1
         noise_norm = math.sqrt((1.0 + beta0) ** 2 + beta0 ** 2)
         bc1 = 1.0 - beta1 ** step          # bias correction uses beta1, NOT beta1^2
@@ -1054,29 +1071,37 @@ class AdaPNM(AutoLRMixin, Optimizer):
 
         0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
         with real shape-(1,) params."""
-        c = self._coeffs(group)
         md = group["momentum_dtype"]
         pos, neg = self._pos_neg_prefixes(group["step"])
+        group_step = group["step"]
+        assert group_step >= 1, "AdaPNM foreach step requires an advanced group step"
 
         factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
         flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
         for p in params:
             state = self.state[p]
-            if not state:
-                self._init_state(p, state, group)
+            assert state and state.get("step", 0) >= 1, (
+                "AdaPNM parameter state must be prepared before foreach step"
+            )
+            lag = group_step - state["step"]
+            assert lag >= 0, "AdaPNM parameter step cannot exceed its group step"
             g = p.grad
             if g.ndim >= 2:
                 matrixize = g.ndim > 2
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+                key = (eff, p.dtype, matrixize, lag)
+                factored_buckets.setdefault(key, []).append(p)
             else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
+                key = (g.numel(), p.dtype, lag)
+                flat_buckets.setdefault(key, []).append(p)
 
-        for (eff, _dtype, matrixize), plist in factored_buckets.items():
+        for (eff, _dtype, matrixize, lag), plist in factored_buckets.items():
+            c = self._coeffs(group, group_step - lag)
             stepn = max(1, budget // max(eff[0] * eff[1], 1))
             for i in range(0, len(plist), stepn):
                 self._factored_bucket(plist[i:i + stepn], eff, matrixize, md, pos, neg, c, group)
-        for (length, _dtype), plist in flat_buckets.items():
+        for (length, _dtype, lag), plist in flat_buckets.items():
+            c = self._coeffs(group, group_step - lag)
             stepn = max(1, budget // max(length, 1))
             for i in range(0, len(plist), stepn):
                 self._nonfactored_bucket(plist[i:i + stepn], length, md, pos, neg, c, group)
@@ -1231,17 +1256,17 @@ class AdaPNM(AutoLRMixin, Optimizer):
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
-        c = self._coeffs(group)
+        state = self.state[p]
+        assert state and state.get("step", 0) >= 1, (
+            "AdaPNM parameter state must be prepared before per-parameter step"
+        )
+        c = self._coeffs(group, state["step"])
         md = group["momentum_dtype"]
         eps1 = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         ams_bound = group["ams_bound"]
         pos, neg = self._pos_neg_prefixes(group["step"])
-
-        state = self.state[p]
-        if not state:
-            self._init_state(p, state, group)
 
         grad = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
         ndim = grad.ndim

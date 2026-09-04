@@ -8,6 +8,7 @@ checked for self-consistency / foreach parity, not numpy parity).
 
 from __future__ import annotations
 
+import copy
 import io
 import math
 
@@ -140,6 +141,77 @@ def test_positive_negative_alternation_and_mixing():
     # step 2 (even): roles swap -> the *neg* buffer received g2; m_pos unchanged.
     torch.testing.assert_close(st["m_neg"], (1.0 - b1sq) * g2, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(st["m_pos"], (1.0 - b1sq) * g1, rtol=1e-5, atol=1e-6)
+
+
+def test_empty_step_does_not_advance_group_or_alternation():
+    p = torch.nn.Parameter(torch.zeros(3))
+    opt = AdaPNM(
+        [p], lr=1e-2, momentum_dtype="float32", foreach=False,
+        cautious=False, gradient_centralization=False,
+    )
+    opt.step()
+    assert opt.param_groups[0]["step"] == 0
+
+    grad = torch.tensor([1.0, -2.0, 3.0])
+    p.grad = grad
+    opt.step()
+    state = opt.state[p]
+    assert opt.param_groups[0]["step"] == 1
+    assert state["step"] == 1
+    assert torch.count_nonzero(state["m_pos"]) > 0
+    assert torch.count_nonzero(state["m_neg"]) == 0
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_late_first_grad_uses_first_update_bias_correction(foreach):
+    active = torch.nn.Parameter(torch.zeros(4))
+    late = torch.nn.Parameter(torch.tensor([0.25, -0.5, 0.75, -1.0]))
+    expected = torch.nn.Parameter(late.detach().clone())
+    cfg = dict(
+        lr=1e-2, betas=(0.8, 0.9), beta0=0.0, eps=1e-8,
+        clip_threshold=0.0, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", foreach=foreach,
+    )
+    opt = AdaPNM([active, late], **cfg)
+    for _ in range(3):
+        active.grad = torch.ones_like(active)
+        late.grad = None
+        opt.step()
+
+    grad = torch.tensor([0.5, -0.25, 1.5, -2.0])
+    active.grad = torch.ones_like(active)
+    late.grad = grad.clone()
+    opt.step()
+
+    ref = AdaPNM([expected], **cfg)
+    expected.grad = grad.clone()
+    ref.step()
+    torch.testing.assert_close(late, expected, rtol=0, atol=0)
+    assert opt.state[late]["step"] == 1
+    assert opt.state[active]["step"] == 4
+    assert opt.param_groups[0]["step"] == 4
+
+
+def test_global_parity_stays_exact_with_staggered_local_steps():
+    always = torch.nn.Parameter(torch.zeros(2))
+    late = torch.nn.Parameter(torch.zeros(2))
+    opt = AdaPNM(
+        [always, late], lr=0.0, betas=(0.8, 0.9), momentum_dtype="float32",
+        foreach=True, cautious=False, gradient_centralization=False,
+    )
+    always.grad = torch.tensor([1.0, 2.0])
+    late.grad = None
+    opt.step()
+    always.grad = torch.tensor([3.0, 4.0])
+    late.grad = torch.tensor([5.0, 6.0])
+    opt.step()
+
+    b1sq = 0.8 ** 2
+    torch.testing.assert_close(opt.state[always]["m_neg"], (1.0 - b1sq) * always.grad)
+    torch.testing.assert_close(opt.state[late]["m_neg"], (1.0 - b1sq) * late.grad)
+    assert torch.count_nonzero(opt.state[late]["m_pos"]) == 0
+    assert opt.state[always]["step"] == 2
+    assert opt.state[late]["step"] == 1
 
 
 def test_noise_norm_constant():
@@ -349,6 +421,7 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
     for p_a, p_b in zip(params_a, params_b, strict=True):
         for key in ("m_pos", "m_neg"):
             assert opt_b.state[p_b][key].dtype == opt_a.state[p_a][key].dtype
+        assert opt_b.state[p_b]["step"] == opt_a.state[p_a]["step"]
 
     # resumed run continues bit-exactly.
     torch.manual_seed(123)
@@ -362,6 +435,64 @@ def test_checkpoint_roundtrip_preserves_momentum_dtype(momentum_dtype):
         opt_b.step()
     for a, b in zip(params_a, params_b, strict=True):
         assert torch.equal(a, b), "resumed run must continue bit-exactly"
+
+
+def test_legacy_checkpoint_without_param_step_infers_current_group_step():
+    p = torch.nn.Parameter(torch.randn(5))
+    opt = AdaPNM(
+        [p], lr=1e-3, momentum_dtype="float32", foreach=False,
+        cautious=False, gradient_centralization=False,
+    )
+    for _ in range(3):
+        p.grad = torch.randn_like(p)
+        opt.step()
+
+    legacy = copy.deepcopy(opt.state_dict())
+    for state in legacy["state"].values():
+        state.pop("step")
+    resumed_p = torch.nn.Parameter(p.detach().clone())
+    resumed = AdaPNM(
+        [resumed_p], lr=1e-3, momentum_dtype="float32", foreach=False,
+        cautious=False, gradient_centralization=False,
+    )
+    resumed.load_state_dict(legacy)
+    assert "step" not in resumed.state[resumed_p]
+
+    grad = torch.randn_like(p)
+    p.grad = grad.clone()
+    resumed_p.grad = grad.clone()
+    opt.step()
+    resumed.step()
+    torch.testing.assert_close(resumed_p, p, rtol=0, atol=0)
+    assert resumed.state[resumed_p]["step"] == 4
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+@pytest.mark.parametrize("momentum_dtype", ["int8", "4bit"])
+def test_quantized_momentum_store_preserves_buffer_identity(momentum_dtype, foreach):
+    params = [torch.nn.Parameter(torch.randn(4, 8)) for _ in range(3)]
+    opt = AdaPNM(
+        params, lr=1e-3, momentum_dtype=momentum_dtype, foreach=foreach,
+        cautious=False, gradient_centralization=False,
+    )
+    for p in params:
+        p.grad = torch.randn_like(p)
+    opt.step()
+    identities = {
+        id(p): {
+            key: (id(opt.state[p][key]), opt.state[p][key].data_ptr())
+            for key in ("m_pos", "m_neg", "m_pos_scale", "m_neg_scale")
+        }
+        for p in params
+    }
+    for _ in range(4):
+        for p in params:
+            p.grad = torch.randn_like(p)
+        opt.step()
+    for p in params:
+        for key, identity in identities[id(p)].items():
+            value = opt.state[p][key]
+            assert (id(value), value.data_ptr()) == identity
 
 
 def test_conv_net_trains_no_nan():
@@ -500,6 +631,24 @@ def test_foreach_scalar_0d_takes_batched_path(monkeypatch):
             p.grad = torch.randn(p.shape, generator=gg) * 0.02
         opt.step()
     assert not looped, f"{len(looped)} params fell back to the per-param loop"
+
+
+def test_foreach_scalar_and_vector_with_same_local_step_share_bucket(monkeypatch):
+    bucket_shapes = []
+    original = AdaPNM._nonfactored_bucket
+
+    def spy(self, plist, *args, **kwargs):
+        bucket_shapes.append([tuple(p.shape) for p in plist])
+        return original(self, plist, *args, **kwargs)
+
+    monkeypatch.setattr(AdaPNM, "_nonfactored_bucket", spy)
+    scalar = torch.nn.Parameter(torch.tensor(0.1))
+    vector = torch.nn.Parameter(torch.tensor([0.2]))
+    opt = AdaPNM([scalar, vector], foreach=True, momentum_dtype="float32")
+    scalar.grad = torch.tensor(0.3)
+    vector.grad = torch.tensor([0.4])
+    opt.step()
+    assert bucket_shapes == [[(), (1,)]]
 
 
 def test_foreach_scalar_0d_mixed_with_other_shapes():
