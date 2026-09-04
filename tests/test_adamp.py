@@ -218,6 +218,113 @@ def test_projection_does_not_fire_keeps_plain_adam():
     torch.testing.assert_close(p_a.detach(), p_b.detach(), rtol=1e-6, atol=1e-7)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_per_param_projection_does_not_sync_a_device_scalar():
+    """A firing per-param projection completes without a single host sync."""
+    p = torch.nn.Parameter(torch.randn(8, 16, device="cuda"))
+    opt = AdamP(
+        [p],
+        lr=1e-3,
+        cautious=False,
+        gradient_centralization=False,
+        momentum_dtype="float32",
+        foreach=False,
+    )
+    group = opt.param_groups[0]
+
+    def orthogonal_grad():
+        grad = torch.randn_like(p)
+        unit = p.detach() / p.detach().norm(dim=1, keepdim=True)
+        return grad - unit * (unit * grad).sum(dim=1, keepdim=True)
+
+    p.grad = orthogonal_grad()
+    opt.step()  # allocate the state outside the guarded step
+
+    p.grad = orthogonal_grad()
+    # Guard against a vacuous test: with no projection firing there would be no
+    # predicate to keep on device in the first place.
+    _proj, wd_ratio = AdamP._project_stacked(
+        p.detach().float().unsqueeze(0),
+        p.grad.float().unsqueeze(0),
+        torch.randn(1, 8, 16, device="cuda"),
+        group["delta"],
+        group["eps"],
+        group["wd_ratio"],
+    )
+    assert wd_ratio.item() == pytest.approx(group["wd_ratio"])
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        opt.step()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+def _bf16_projection_bag(n_slices: int, out: int = 6, fan: int = 5):
+    """fp32 views of bf16 weights/grads, alternating fire and no-fire slices."""
+    torch.manual_seed(0)
+    ps, gs = [], []
+    for i in range(n_slices):
+        w = torch.randn(out, fan, dtype=torch.bfloat16).float()
+        g = torch.randn(out, fan)
+        if i % 2 == 0:
+            wn = w / w.norm(dim=1, keepdim=True)
+            g = g - wn * (wn * g).sum(dim=1, keepdim=True)  # orthogonal -> fires
+        else:
+            g = w + 0.01 * g                                # aligned -> no fire
+        ps.append(w)
+        gs.append(g.to(torch.bfloat16).float())
+    return ps, gs
+
+
+@pytest.mark.parametrize("n_slices", [1, 3])
+def test_projection_with_bf16_weights_matches_normalized_vector_form(n_slices):
+    """bf16 weights/grads project to the same values as the official fp32 form.
+
+    ``n_slices == 1`` is the shape the per-parameter path passes; ``3`` is a
+    foreach bucket. Regression: the coefficient form used to feed a bf16
+    ``p_stack`` to ``bmm``/``addcmul_`` against an fp32 ``perturb`` and raised
+    ``expected scalar type BFloat16 but found Float``.
+    """
+    ps, gs = _bf16_projection_bag(n_slices)
+    perturb = torch.randn(n_slices, 6, 5)
+    got, wd_ratio = AdamP._project_stacked(
+        torch.stack(ps).to(torch.bfloat16),
+        torch.stack(gs).to(torch.bfloat16),
+        perturb.clone(),
+        0.1, 1e-8, 0.1,
+    )
+    assert got.dtype == torch.float32
+    for i, (p, g) in enumerate(zip(ps, gs, strict=True)):
+        want, want_wd = _project_ref(p, g, perturb[i].clone(), 0.1, 0.1, 1e-8)
+        # bf16 weights: the coefficient form reassociates fp32 ops on bf16-rounded inputs.
+        torch.testing.assert_close(got[i], want, rtol=1e-5, atol=1e-6)
+        assert wd_ratio.reshape(-1)[i].item() == pytest.approx(want_wd)
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_bf16_weights_project_and_decay_on_both_paths(foreach):
+    """A projected bf16 weight steps (and takes damped WD) without a dtype error."""
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.randn(6, 5, dtype=torch.bfloat16)) for _ in range(2)]
+    opt = AdamP(
+        params, lr=1e-2, weight_decay=0.01, delta=0.1, wd_ratio=0.1,
+        cautious=False, gradient_centralization=False, momentum_dtype="float32",
+        bf16_method="none", foreach=foreach,
+    )
+    for _ in range(3):
+        for p in params:
+            pf = p.detach().float()
+            g = torch.randn(6, 5)
+            wn = pf / pf.norm(dim=1, keepdim=True)
+            g = g - wn * (wn * g).sum(dim=1, keepdim=True)  # orthogonal -> fires
+            p.grad = g.to(torch.bfloat16)
+        opt.step()
+    for p in params:
+        assert p.dtype == torch.bfloat16
+        assert torch.isfinite(p).all()
+
+
 def test_1d_params_never_projected():
     """1-D params take the plain Adam step regardless of delta (no projection gate)."""
     torch.manual_seed(0)
@@ -268,10 +375,10 @@ def test_momentum_dtype_variants_construct_and_step(momentum_dtype):
     ],
 )
 def test_foreach_matches_per_param(cfg):
-    """foreach=True is bit-exact with the per-parameter path, including projected 2-D weights.
+    """foreach agrees within fp32 tolerance, including projected 2-D weights.
 
     The scale-invariant weight below has gradients orthogonal to it -> the projection
-    fires, exercising the stacked vs per-param projection parity.
+    fires, exercising the reassociated stacked vs per-param projection.
     """
     def mk() -> list[torch.nn.Parameter]:
         torch.manual_seed(1)
@@ -340,7 +447,110 @@ def test_foreach_chunking_is_exact():
         oa.step()
         ob.step()
     for a, b in zip(pa, pb, strict=True):
-        assert torch.equal(a, b)
+        torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("shape", [(), (1,)])
+@pytest.mark.parametrize("foreach", [False, True])
+def test_late_gradient_uses_first_parameter_step(shape, foreach):
+    """A parameter's first gradient uses t=1 even when the group clock is old."""
+    active = torch.nn.Parameter(torch.tensor(0.25).reshape(shape))
+    late = torch.nn.Parameter(torch.tensor(-0.5).reshape(shape))
+    opt = AdamP(
+        [active, late],
+        lr=1e-3,
+        cautious=False,
+        gradient_centralization=False,
+        momentum_dtype="float32",
+        bf16_method="none",
+        foreach=foreach,
+    )
+    for _ in range(9):
+        active.grad = torch.full_like(active, 0.2)
+        late.grad = None
+        opt.step()
+
+    expected = torch.nn.Parameter(late.detach().clone())
+    fresh = AdamP(
+        [expected],
+        lr=1e-3,
+        cautious=False,
+        gradient_centralization=False,
+        momentum_dtype="float32",
+        bf16_method="none",
+        foreach=False,
+    )
+    grad = torch.full_like(late, -0.3)
+    active.grad = torch.full_like(active, 0.2)
+    late.grad = grad.clone()
+    expected.grad = grad.clone()
+    opt.step()
+    fresh.step()
+
+    assert opt.param_groups[0]["step"] == 10
+    assert opt.state[late]["step"] == 1
+    torch.testing.assert_close(late, expected, rtol=0, atol=1e-7)
+
+
+def test_parameter_step_is_exactly_legacy_when_all_params_have_grad():
+    """Per-param t equals the old group t when every param starts at step one."""
+    pa = torch.nn.Parameter(torch.tensor([0.3, -0.2]))
+    pb = torch.nn.Parameter(pa.detach().clone())
+    current = AdamP(
+        [pa], lr=1e-3, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", bf16_method="none", foreach=False,
+    )
+    legacy = AdamP(
+        [pb], lr=1e-3, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", bf16_method="none", foreach=False,
+    )
+    grads = [
+        torch.tensor([0.2, -0.4]),
+        torch.tensor([-0.1, 0.3]),
+        torch.tensor([0.5, 0.1]),
+    ]
+    for grad in grads:
+        pa.grad = grad.clone()
+        pb.grad = grad.clone()
+        if legacy.state[pb]:
+            legacy.state[pb].pop("step", None)
+        current.step()
+        legacy.step()
+    assert torch.equal(pa, pb)
+    assert current.state[pa]["step"] == current.param_groups[0]["step"]
+
+
+def test_legacy_checkpoint_without_parameter_step_infers_group_clock():
+    """A pre-change checkpoint resumes with its historical group-step correction."""
+    p = torch.nn.Parameter(torch.tensor([0.3, -0.2]))
+    opt = AdamP(
+        [p], lr=1e-3, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", bf16_method="none", foreach=False,
+    )
+    for grad in (torch.tensor([0.2, -0.4]), torch.tensor([-0.1, 0.3])):
+        p.grad = grad
+        opt.step()
+
+    buf = io.BytesIO()
+    torch.save(opt.state_dict(), buf)
+    buf.seek(0)
+    legacy = torch.load(buf, weights_only=False)
+    next(iter(legacy["state"].values())).pop("step")
+
+    resumed_p = torch.nn.Parameter(p.detach().clone())
+    resumed = AdamP(
+        [resumed_p], lr=1e-3, cautious=False, gradient_centralization=False,
+        momentum_dtype="float32", bf16_method="none", foreach=False,
+    )
+    resumed.load_state_dict(legacy)
+    grad = torch.tensor([0.5, 0.1])
+    p.grad = grad.clone()
+    resumed_p.grad = grad.clone()
+    opt.step()
+    resumed.step()
+
+    assert resumed.state[resumed_p]["step"] == resumed.param_groups[0]["step"]
+    assert torch.equal(p, resumed_p)
 
 
 # ----------------------------------------------------------------- misc

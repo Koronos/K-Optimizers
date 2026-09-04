@@ -32,7 +32,13 @@ statistics + computes the new D, pass 2 applies the weight update. The D math
 (float32/bfloat16/int8/4bit), **cautious** masking, **conv-aware matrixized
 factoring**, and **stochastic-rounding** bf16 weights — with Prodigy's effective
 learning rate (``lr × D``) folded into the update. Set ``foreach=False`` for the
-per-parameter path.
+per-parameter path. The foreach pass-1 reduction keeps the per-parameter fold
+order but accumulates its fp32 scalar partials on the host after one device
+transfer. The two paths are no longer promised to be bit-identical: the batched
+``[B, L]`` bucket reduction uses a different tree than a per-tensor ``sum()``,
+which on CPU shows up at ``slice_p=11`` as ~3.3e-7 relative on D (CUDA measured
+bit-identical across the 16 momentum/second-moment configs). The contract is
+agreement to 1e-6 relative on the D trajectory, ~3x the observed margin.
 
 Memory at ``beta1=0`` (no momentum), ``second_moment="factored"``, ``slice_p=11``
 is well under AdamW; even the full-precision default (bf16 momentum + full fp32
@@ -53,6 +59,7 @@ import math
 from collections.abc import Iterable
 from typing import Any, Literal
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
@@ -242,8 +249,7 @@ class KProdigy(Optimizer):
         self._foreach_stack_budget = foreach_stack_budget
         # Internal switch to batch pass-1 (the D-estimation reduction + moment
         # EMAs) as well as pass-2. Always True in normal use; exposed only so
-        # benchmarks can isolate the pass-1 batching speedup. The result is
-        # bit-identical either way, so this never affects numerics.
+        # benchmarks can isolate the pass-1 batching speedup.
         self._foreach_pass1 = foreach
         # One momentum codec per dtype string, shared with Adakaon. The codec
         # owns storage + dequant; KProdigy does its own d-scaled EMA in pass 1
@@ -359,8 +365,7 @@ class KProdigy(Optimizer):
         # UNCHANGED Prodigy D-estimation: global reduction over all params, the
         # d-scaled momentum EMA, and the (full / factored) second-moment EMA.
         # The foreach path batches every elementwise op with torch.stack /
-        # torch._foreach_*, but keeps the *scalar* numerator/denominator fold in
-        # the original per-parameter order so the D trajectory is bit-identical.
+        # torch._foreach_* and preserves parameter order in a CPU fp32 fold.
         d_numerator = lead["d_numerator"] * beta3
         pass1_ctx = {
             "beta1": beta1, "beta2": beta2, "beta3": beta3, "d": d, "dlr": dlr,
@@ -375,9 +380,9 @@ class KProdigy(Optimizer):
 
         # ---- D update --------------------------------------------------------
         if should_update_d and lr > 0.0:
-            denom_val = float(d_denom.item()) if device_seen is not None else 0.0
+            denom_val = d_denom if device_seen is not None else 0.0
             if denom_val > 0.0:
-                global_num = d_numerator + float(delta_numerator.item())
+                global_num = d_numerator + delta_numerator
                 d_hat = d_coef * global_num / denom_val
                 if d == d0:
                     d = max(d, d_hat)
@@ -416,7 +421,7 @@ class KProdigy(Optimizer):
     @torch.no_grad()
     def _pass1_per_param(
         self, groups: list[dict[str, Any]], ctx: dict[str, Any]
-    ) -> tuple[Tensor, Tensor, torch.device | None]:
+    ) -> tuple[float, float, torch.device | None]:
         """Reference (per-parameter) pass 1. Bit-exact original behaviour."""
         beta1, beta2, beta3 = ctx["beta1"], ctx["beta2"], ctx["beta3"]
         d, dlr, d_over_d0 = ctx["d"], ctx["dlr"], ctx["d_over_d0"]
@@ -474,23 +479,24 @@ class KProdigy(Optimizer):
                     gv = self._matrixize(grad_fp32, group)
                     update_factored_state(gv, state["row"], state["col"], beta2, group["eps_factored"])
 
-        return delta_numerator, d_denom, device_seen
+        if device_seen is None:
+            return 0.0, 0.0, device_seen
+        values = torch.stack((delta_numerator, d_denom)).cpu().tolist()
+        return float(values[0]), float(values[1]), device_seen
 
     # -- pass-1: foreach (stacked / bucketed) batched path -----------------
 
     @torch.no_grad()
     def _pass1_foreach(
         self, groups: list[dict[str, Any]], ctx: dict[str, Any]
-    ) -> tuple[Tensor, Tensor, torch.device | None]:
+    ) -> tuple[float, float, torch.device | None]:
         """Batched pass 1: every elementwise op (the D-estimation inner products
         and ``s`` buffer, the d-scaled momentum EMA, and the full/factored
         second-moment EMA) is computed with stacked / ``torch._foreach_*`` kernels,
         bucketed by effective shape the same way pass 2 / Adakaon are.
 
-        The *scalar* numerator/denominator accumulation is still folded in the
-        exact original per-parameter order (a cheap left-fold over an ``[N]``
-        vector of per-param partials), so the D trajectory is bit-identical to
-        :meth:`_pass1_per_param`.
+        The scalar numerator/denominator partials cross to CPU together, then
+        accumulate sequentially as numpy.float32 in original parameter order.
         """
         beta1, beta2, beta3 = ctx["beta1"], ctx["beta2"], ctx["beta3"]
         d, dlr, d_over_d0 = ctx["d"], ctx["dlr"], ctx["d_over_d0"]
@@ -524,11 +530,7 @@ class KProdigy(Optimizer):
                 records.append((p, grad_fp32, state, group, do_d))
 
         if not records:
-            return (
-                torch.zeros((), dtype=torch.float32),
-                torch.zeros((), dtype=torch.float32),
-                device_seen,
-            )
+            return 0.0, 0.0, device_seen
 
         n = len(records)
         # Per-param scalar partials, kept in record order for the ordered fold.
@@ -552,8 +554,9 @@ class KProdigy(Optimizer):
                 records[i][0].detach().flatten()[::slice_p] for i in idxs
             ]).float()                                                    # [B, L]
             p0 = torch.stack([records[i][2]["p0"].expand_as(sliced_p[0]) for i in idxs])
-            # numerator partials: <g, p0 - p> per param (tail reduction is
-            # bit-identical to a per-tensor .sum()).
+            # numerator partials: <g, p0 - p> per param. The [B, L] row reduction
+            # is not the same tree as a per-tensor .sum(): with slice_p=11 the two
+            # differ by ~3.3e-7 relative on D (CPU), inside the 1e-6 contract.
             num = (sliced_g * (p0 - sliced_p)).sum(dim=-1)               # [B]
             num_partials[idxs] = num.to(num_partials.dtype)
             # s EMA: s <- beta3*s + alpha_s * g (stacked, bit-identical).
@@ -572,21 +575,27 @@ class KProdigy(Optimizer):
         # -- (b) batched second-moment EMA --------------------------------
         self._pass1_second_moment_foreach(records, beta2, d)
 
-        # -- ordered scalar fold (bit-identical accumulation) -------------
-        # Reconstruct the EXACT original per-param add sequence:
+        # -- ordered scalar fold (one D2H synchronization) -----------------
+        # Reconstruct the original per-param add sequence:
         #   delta_numerator += (d_over_d0 * dlr) * <g, p0-p>_i
         #   d_denom         += |s_i|.sum
-        # in record (group->params) order. This is a cheap O(N) left-fold over
-        # the [N] partials (N = #params), not over weight elements.
+        # in record (group->params) order. Moving both rows together replaces
+        # 2*N scalar GPU additions plus two later .item() synchronizations.
+        if not d_buckets:
+            # Nothing contributed to D this step (lr == 0 everywhere, or a
+            # d_update_freq skip): return without touching the host, the same
+            # as the per-param path, which never syncs on a skipped step.
+            return 0.0, 0.0, device_seen
         const = d_over_d0 * dlr
-        delta_numerator = torch.zeros((), dtype=torch.float32, device=device_seen)
-        d_denom = torch.zeros((), dtype=torch.float32, device=device_seen)
         scaled_num = num_partials * const
+        host = torch.stack((scaled_num, denom_partials)).cpu().numpy()
+        delta_numerator = np.float32(0.0)
+        d_denom = np.float32(0.0)
         for i in range(n):
             if records[i][4]:  # do_d
-                delta_numerator = delta_numerator + scaled_num[i]
-                d_denom = d_denom + denom_partials[i]
-        return delta_numerator, d_denom, device_seen
+                delta_numerator = np.float32(delta_numerator + host[0, i])
+                d_denom = np.float32(d_denom + host[1, i])
+        return float(delta_numerator), float(d_denom), device_seen
 
     @torch.no_grad()
     def _pass1_momentum_foreach(
@@ -595,10 +604,16 @@ class KProdigy(Optimizer):
     ) -> None:
         """Batched d-scaled first-moment EMA, bucketed by (momentum_dtype, shape).
 
-        Each dtype reproduces the exact per-param arithmetic of
-        :meth:`_update_momentum` (mul_/add_ for float/bf16/int8 with the native
-        dim-0 row scale; the shared codec's stacked lerp for 4bit), so the stored
-        momentum is bit-identical to the per-param path.
+        Every dtype reproduces the arithmetic of :meth:`_update_momentum` — fp32
+        EMA for float32/bf16/int8 (int8 with the native dim-0 row scale), the
+        shared codec's stacked lerp for 4bit — so agreement with the per-param
+        path is bounded by the module's 1e-6 relative contract. Only the bf16
+        momentum is bit-identical, and only because its EMA is now computed in
+        fp32 and rounded once on write: an EMA that runs in the storage dtype
+        depends on the bucket size, since CPU elementwise kernels round the
+        vectorized body and the scalar tail differently. fp32 storage still
+        carries that asymmetry (a pre-existing 1 fp32 ulp on CPU), which is
+        inside the contract but not bit-for-bit.
         """
         buckets: dict[tuple[str, tuple[int, ...]], list[int]] = {}
         for i, (p, _g, _state, group, _do_d) in enumerate(records):
@@ -609,24 +624,17 @@ class KProdigy(Optimizer):
             grads = torch.stack([records[i][1] for i in idxs])          # [B, *shape]
             states = [records[i][2] for i in idxs]
             group = records[idxs[0]][3]
-            if md == "bfloat16":
-                # bf16 storage EMAs *in bf16*: whether stacking the [*shape] buffers
-                # into a [B, *shape] tensor changes the in-place add's rounding is
-                # shape-dependent (it does for some shapes at the denormal-scale d0
-                # bootstrap), so it cannot be guaranteed bit-identical. The bf16
-                # momentum EMA therefore stays a per-tensor loop (the exact original
-                # op) — bit-identical by construction. The D-reduction and the
-                # second moment, the actual step-cost dominators, are still batched.
-                target = d * (1 - beta1)
-                for j, s in zip(idxs, states, strict=True):
-                    m = s["m"]
-                    m.mul_(beta1).add_(records[j][1].to(m.dtype), alpha=target)
-            elif md == "float32":
-                # fp32 storage EMA is bit-identical stacked (no denormal ambiguity).
+            if md in ("bfloat16", "float32"):
+                # Widen once, EMA in fp32, round once on write — exactly what
+                # _update_momentum does per param. Running the EMA in the storage
+                # dtype would NOT be stack-invariant for bf16: CPU bf16 kernels
+                # round the vectorized body and the scalar tail differently, so a
+                # (3, 7) tensor drifts by an ulp when it is folded into a [B, 3, 7]
+                # stack (measured: 1.07e-4 relative on D, 3.4e-2 on the weights).
                 target = d * (1 - beta1)
                 ms = [s["m"] for s in states]
-                m_stack = torch.stack(ms)                               # [B, *shape]
-                m_stack.mul_(beta1).add_(grads.to(m_stack.dtype), alpha=target)
+                m_stack = torch.stack(ms).float()                       # [B, *shape]
+                m_stack.mul_(beta1).add_(grads, alpha=target)
                 torch._foreach_copy_(ms, list(m_stack.unbind(0)))
             elif md == "int8":
                 # int8 EMA runs in fp32 (dequant -> EMA -> requant), which IS
@@ -766,9 +774,16 @@ class KProdigy(Optimizer):
     ) -> None:
         """EMA ``m <- beta1*m + (1-beta1)*d*grad`` in the momentum dtype.
 
-        float/bf16/int8 keep the *exact* arithmetic of the original KProdigy
+        float32/int8 keep the *exact* arithmetic of the original KProdigy
         (mul_/add_) so the D-validated behaviour is byte-identical; 4bit uses the
-        shared codec's dequant/EMA/requant.
+        shared codec's dequant/EMA/requant. bf16 storage runs the EMA in fp32 and
+        rounds once on write, aligned with this release's change to the shared
+        bf16 codec (EMA in fp32, rounding on write, landing in a separate batch):
+        the original in-bf16 mul_/add_ rounded three times (grad cast, product, sum)
+        and, worse, was not reproducible across kernels — CPU bf16 elementwise
+        ops round the vectorized body and the scalar tail differently, so the
+        same EMA over a ``numel % 16 != 0`` tensor changed by an ulp depending on
+        whether it ran alone or inside a batched stack.
         """
         target = d * (1 - beta1)
         if md == "int8":
@@ -778,9 +793,11 @@ class KProdigy(Optimizer):
         elif md == "4bit":
             # m <- beta1*m + (1-beta1)*d*grad == m.lerp_(d*grad, 1-beta1)
             codec.ema_one(state, grad_fp32 if d == 1.0 else grad_fp32.mul(d), beta1)
+        elif md == "float32":
+            state["m"].mul_(beta1).add_(grad_fp32, alpha=target)
         else:
             m = state["m"]
-            m.mul_(beta1).add_(grad_fp32.to(m.dtype), alpha=target)
+            m.copy_(m.float().mul_(beta1).add_(grad_fp32, alpha=target))
 
     # -- shape helpers (conv-aware factoring) ------------------------------
 
@@ -848,7 +865,6 @@ class KProdigy(Optimizer):
         bucket with a handful of stacked kernels (Adakaon's foreach engine),
         applying Prodigy's d-scaled update math."""
         factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
         full_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
         for p in params:
             state = self.state[p]
@@ -861,8 +877,6 @@ class KProdigy(Optimizer):
                 matrixize = g.ndim > 2 and group["factor_conv_as_matrix"]
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
                 factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
 
         for (eff, _dt, matrixize), plist in factored_buckets.items():
             step = max(1, budget // max(eff[0] * eff[1], 1))
@@ -873,10 +887,6 @@ class KProdigy(Optimizer):
             step = max(1, budget // max(per, 1))
             for i in range(0, len(plist), step):
                 self._full_bucket(plist[i:i + step], shape, group, d, dlr)
-        for (length, _dt), plist in flat_buckets.items():
-            step = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), step):
-                self._flat_full_bucket(plist[i:i + step], length, group, d, dlr)
 
     def _numer_stacked(
         self, plist: list[Tensor], group: dict[str, Any], mat: Any, eff: tuple[int, ...]
@@ -948,15 +958,6 @@ class KProdigy(Optimizer):
             delta = cautious_batched_(delta, grad)
 
         subtract_batched_([p.data for p in plist], delta, bf16_method)
-
-    @torch.no_grad()
-    def _flat_full_bucket(
-        self, plist: list[Tensor], length: int, group: dict[str, Any], d: float, dlr: float
-    ) -> None:
-        """Batched update for ``ndim <= 1`` params under factored second_moment (they use
-        the full ``v`` fallback; 0-D scalars ride as length 1). Same math as
-        :meth:`_full_bucket` for a [N, L] stack."""
-        self._full_bucket(plist, (length,), group, d, dlr)
 
     # -- weight update -----------------------------------------------------
 

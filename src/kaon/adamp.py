@@ -65,9 +65,9 @@ can be ``bfloat16``/``float32``/``int8``/``4bit``.
 (channel-view fires, else layer-view fires, else nothing) with a *per-channel*
 reduction. The foreach buckets are keyed by shape, so every slice in a bucket
 shares the same view dimensions; the per-tensor branch is then a boolean mask over
-the stack and the radial removal is a masked, broadcast subtract — element-for-
-element identical to the per-param path (verified by the parity test, including
-weights that DO trigger the projection).
+the stack and the radial removal is a masked broadcast coefficient applied with
+``addcmul_``. Reassociating the fp32 radial expression changes results by about
+5e-8 relative versus the historical normalized-vector implementation.
 
 It is a standard ``torch.optim.Optimizer`` with a single per-parameter step, so it
 drops into per-parameter / gradient-release training loops unchanged.
@@ -268,6 +268,7 @@ class AdamP(AutoLRMixin, Optimizer):
     @torch.no_grad()
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
         grad = p.grad
+        state["step"] = 0
         factored = p.ndim >= 2
         if factored:
             gv = grad if p.ndim == 2 else grad.reshape(grad.shape[0], -1)
@@ -344,10 +345,9 @@ class AdamP(AutoLRMixin, Optimizer):
 
     # ----------------------------------------------------------- coefficients
     @staticmethod
-    def _coeffs(group: dict[str, Any]) -> dict[str, float]:
+    def _coeffs(group: dict[str, Any], step: int) -> dict[str, float]:
         """All per-step scalar coefficients (shared by the per-param and foreach paths)."""
         beta1, beta2 = group["betas"]
-        step = group["step"]
         bc1 = 1.0 - beta1 ** step
         bc2_sq = math.sqrt(1.0 - beta2 ** step)
         return {
@@ -358,64 +358,45 @@ class AdamP(AutoLRMixin, Optimizer):
             "step_size": group["lr"] / bc1,
         }
 
+    def _prepare_param_step(self, p: Tensor, group: dict[str, Any]) -> None:
+        """Initialize and advance the bias-correction clock for one active param."""
+        state = self.state[p]
+        if not state:
+            self._init_state(p, state, group)
+            state["step"] = 1
+        elif "step" not in state:
+            # Legacy checkpoints only stored the group clock. The global clock
+            # has already advanced for this call, so it reconstructs the normal
+            # all-params-active trajectory exactly.
+            state["step"] = group["step"]
+        else:
+            state["step"] += 1
+
     # ------------------------------------------------------------- projection
-    @staticmethod
-    def _projection_channel(
-        p: Tensor, grad: Tensor, perturb: Tensor, delta: float, eps: float
-    ) -> tuple[Tensor, bool]:
-        """Per-param **channel-view** projection (``p`` viewed as ``[out, -1]``).
-
-        Returns ``(perturb, fired)``. ``perturb`` is modified in place when fired.
-        Mirrors the official ``_projection`` first iteration exactly.
-        """
-        view = p.reshape(p.shape[0], -1)
-        gview = grad.reshape(grad.shape[0], -1)
-        cos = torch.nn.functional.cosine_similarity(gview, view, dim=1, eps=eps).abs_()
-        if cos.max() < delta / math.sqrt(view.shape[1]):
-            expand = [-1] + [1] * (perturb.ndim - 1)
-            p_n = p / view.norm(dim=1).view(expand).add_(eps)
-            pv = p_n.reshape(p_n.shape[0], -1)
-            dot = (pv * perturb.reshape(perturb.shape[0], -1)).sum(dim=1).view(expand)
-            perturb.sub_(p_n * dot)
-            return perturb, True
-        return perturb, False
-
-    @staticmethod
-    def _projection_layer(
-        p: Tensor, grad: Tensor, perturb: Tensor, delta: float, eps: float
-    ) -> tuple[Tensor, bool]:
-        """Per-param **layer-view** projection (``p`` viewed as ``[1, -1]``).
-
-        Returns ``(perturb, fired)``. Mirrors the official ``_projection`` second
-        iteration exactly.
-        """
-        view = p.reshape(1, -1)
-        gview = grad.reshape(1, -1)
-        cos = torch.nn.functional.cosine_similarity(gview, view, dim=1, eps=eps).abs_()
-        if cos.max() < delta / math.sqrt(view.shape[1]):
-            p_n = p / view.norm(dim=1).add_(eps)  # scalar norm over the whole tensor
-            dot = (p_n.reshape(1, -1) * perturb.reshape(1, -1)).sum()
-            perturb.sub_(p_n * dot)
-            return perturb, True
-        return perturb, False
-
     def _project_one(
         self, p: Tensor, grad: Tensor, perturb: Tensor, group: dict[str, Any]
-    ) -> tuple[Tensor, float]:
-        """Official per-param projection: channel view first, else layer view, else none.
+    ) -> tuple[Tensor, Tensor]:
+        """Device-only per-param projection: channel first, else layer, else none.
 
         ``grad`` and ``p`` are in the param's ORIGINAL shape (not matrixized) so the
-        ``[out, -1]`` / ``[1, -1]`` views match the official. Returns
-        ``(perturb, wd_ratio)``.
+        official views are preserved. The one-element batch avoids converting either
+        projection predicate to a Python bool (and synchronizing CUDA). ``p`` is a
+        low-precision weight on bf16/fp16 runs, so it is widened here — the same
+        thing :meth:`_factored_bucket` does when it stacks — because the whole
+        projection (``bmm``, the norms, the in-place ``addcmul_`` into the fp32
+        ``perturb``) has to run in one working dtype.
         """
-        delta, eps = group["delta"], group["eps"]
-        perturb, fired = self._projection_channel(p, grad, perturb, delta, eps)
-        if fired:
-            return perturb, group["wd_ratio"]
-        perturb, fired = self._projection_layer(p, grad, perturb, delta, eps)
-        if fired:
-            return perturb, group["wd_ratio"]
-        return perturb, 1.0
+        rows = p.shape[0]
+        cols = p.numel() // rows
+        projected, wd_ratio = self._project_stacked(
+            p.detach().float().reshape(1, rows, cols),
+            grad.float().reshape(1, rows, cols),
+            perturb.reshape(1, rows, cols),
+            group["delta"],
+            group["eps"],
+            group["wd_ratio"],
+        )
+        return projected.reshape_as(perturb), wd_ratio.reshape(())
 
     @staticmethod
     def _project_stacked(
@@ -430,40 +411,60 @@ class AdamP(AutoLRMixin, Optimizer):
 
         Every slice in a bucket shares the view dims (bucket keyed by shape), so the
         per-tensor branch (channel fires / else layer fires / else none) is a boolean
-        mask over the stack. The radial removal is then a masked broadcast subtract,
-        element-for-element identical to the per-param path.
+        mask over the stack. The radial removal is a masked broadcast coefficient;
+        reassociation versus the normalized-vector form is bounded by the parity tests.
 
         ``p_stack``/``g_stack``/``perturb`` are the matrixized ``[N, R, C]`` stacks
         (``R = out``, ``C = fan-in``). Returns ``(perturb, wd_ratio[N,1,1])``.
+
+        ``perturb`` (the Adam direction, always fp32) sets the working dtype: the
+        weights and gradients are widened to it, and the result is written back to
+        the parameter's own dtype by the caller's subtract.
         """
         n, r, c = p_stack.shape
+        work = perturb.dtype
+        if p_stack.dtype != work:
+            p_stack = p_stack.to(work)
+        if g_stack.dtype != work:
+            g_stack = g_stack.to(work)
 
         # --- channel view: [N, R, C], cosine per (slice, row) over C ---
-        cos_ch = torch.nn.functional.cosine_similarity(g_stack, p_stack, dim=-1, eps=eps).abs_()  # [N, R]
+        cos_ch = torch.nn.functional.cosine_similarity(
+            g_stack, p_stack, dim=-1, eps=eps
+        ).abs_()  # [N, R]
         ch_fire = cos_ch.amax(dim=1) < (delta / math.sqrt(c))  # [N] bool
 
         # --- layer view: [N, 1, R*C], cosine per slice over R*C ---
         gflat = g_stack.reshape(n, 1, r * c)
         pflat = p_stack.reshape(n, 1, r * c)
-        cos_ly = torch.nn.functional.cosine_similarity(gflat, pflat, dim=-1, eps=eps).abs_()  # [N, 1]
+        cos_ly = torch.nn.functional.cosine_similarity(
+            gflat, pflat, dim=-1, eps=eps
+        ).abs_()  # [N, 1]
         ly_fire = (cos_ly.amax(dim=1) < (delta / math.sqrt(r * c))) & (~ch_fire)  # [N] bool
-
-        # Channel radial removal: p_n = p / (rownorm + eps); subtract p_n*<p_n,perturb>_row.
-        ch_norm = p_stack.norm(dim=-1, keepdim=True).add_(eps)              # [N, R, 1]
-        pn_ch = p_stack / ch_norm                                          # [N, R, C]
-        radial_ch = pn_ch * (pn_ch * perturb).sum(dim=-1, keepdim=True)    # [N, R, C]
-
-        # Layer radial removal: p_n over the whole [R*C] block.
-        ly_norm = p_stack.reshape(n, 1, r * c).norm(dim=-1, keepdim=True).add_(eps)  # [N, 1, 1]
-        pn_ly = (p_stack.reshape(n, 1, r * c) / ly_norm).reshape(n, r, c)  # [N, R, C]
-        ly_dot = (pn_ly.reshape(n, r * c) * perturb.reshape(n, r * c)).sum(dim=-1)  # [N]
-        radial_ly = pn_ly * ly_dot.view(n, 1, 1)                           # [N, R, C]
 
         ch_mask = ch_fire.view(n, 1, 1)
         ly_mask = ly_fire.view(n, 1, 1)
+
+        # radial = p * (sum(p * perturb) / (||p|| + eps)^2). bmm produces only
+        # [N,R,1] coefficients; addcmul_ applies them without any [N,R,C] radial
+        # or normalized-weight temporaries. Layer fire excludes channel fire, so
+        # the pre-channel row dots are also valid for every layer-fired slice.
+        row_dot = torch.bmm(
+            p_stack.reshape(n * r, 1, c),
+            perturb.reshape(n * r, c, 1),
+        ).reshape(n, r, 1)
+        ch_norm = p_stack.norm(dim=-1, keepdim=True).add_(eps)
         zero = perturb.new_zeros(())
-        perturb = perturb - torch.where(ch_mask, radial_ch, zero)
-        perturb = perturb - torch.where(ly_mask, radial_ly, zero)
+        ch_coef = torch.where(ch_mask, row_dot.div(ch_norm.square()), zero)
+        perturb.addcmul_(p_stack, ch_coef, value=-1.0)
+
+        ly_norm = p_stack.reshape(n, r * c).norm(dim=-1).view(n, 1, 1).add_(eps)
+        ly_coef = torch.where(
+            ly_mask,
+            row_dot.sum(dim=1, keepdim=True).div_(ly_norm.square()),
+            zero,
+        )
+        perturb.addcmul_(p_stack, ly_coef, value=-1.0)
 
         fired = (ch_fire | ly_fire).view(n, 1, 1)
         wd_ratio = torch.where(
@@ -488,6 +489,8 @@ class AdamP(AutoLRMixin, Optimizer):
                 continue
             if group["gradient_centralization"]:
                 centralize_grads_(params)
+            for p in params:
+                self._prepare_param_step(p, group)
             if self._foreach and self._group_foreach_eligible(group):
                 chunk_budget = foreach_budget(
                     self._foreach_stack_budget, self._foreach_batch_cutoff,
@@ -552,7 +555,6 @@ class AdamP(AutoLRMixin, Optimizer):
 
         0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
         with real shape-(1,) params."""
-        c = self._coeffs(group)
         md = group["momentum_dtype"]
 
         factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
@@ -561,19 +563,25 @@ class AdamP(AutoLRMixin, Optimizer):
             state = self.state[p]
             if not state:
                 self._init_state(p, state, group)
+            # _step_impl advances every param's step before this runs, so the
+            # clamp only covers a state allocated on the line above (step 0),
+            # whose bias correction would otherwise be 1 - beta**0 == 0.
+            pstep = max(state["step"], 1)
             g = p.grad
             if g.ndim >= 2:
                 matrixize = g.ndim > 2
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+                factored_buckets.setdefault((eff, p.dtype, matrixize, pstep), []).append(p)
             else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
+                flat_buckets.setdefault((g.numel(), p.dtype, pstep), []).append(p)
 
-        for (eff, _dtype, matrixize), plist in factored_buckets.items():
+        for (eff, _dtype, matrixize, pstep), plist in factored_buckets.items():
+            c = self._coeffs(group, pstep)
             stepn = max(1, budget // max(eff[0] * eff[1], 1))
             for i in range(0, len(plist), stepn):
                 self._factored_bucket(plist[i:i + stepn], eff, matrixize, md, c, group)
-        for (length, _dtype), plist in flat_buckets.items():
+        for (length, _dtype, pstep), plist in flat_buckets.items():
+            c = self._coeffs(group, pstep)
             stepn = max(1, budget // max(length, 1))
             for i in range(0, len(plist), stepn):
                 self._nonfactored_bucket(plist[i:i + stepn], length, md, c, group)
@@ -701,16 +709,15 @@ class AdamP(AutoLRMixin, Optimizer):
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
-        c = self._coeffs(group)
+        state = self.state[p]
+        if not state or "step" not in state:
+            self._prepare_param_step(p, group)
+        c = self._coeffs(group, state["step"])
         md = group["momentum_dtype"]
         eps = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         nesterov = group["nesterov"]
-
-        state = self.state[p]
-        if not state:
-            self._init_state(p, state, group)
 
         grad = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
         ndim = grad.ndim
