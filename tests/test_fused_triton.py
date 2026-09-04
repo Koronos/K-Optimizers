@@ -66,9 +66,11 @@ if HAS_TRITON:
         mask = (ri < R) & (ci < C)
         idx = ri * C + ci
         momentum = tl.load(m_ptr + idx, mask=mask, other=0.0)
+        # NB blocks written, NS = NB of capacity: the probe's scale buffer is sized for the
+        # kernel's own block count, so the bounded store never drops one.
         requant_4bit(
             momentum, mask, idx, R, C, Chalf, packed_ptr, scale_ptr,
-            NB, BLK, BR, BC,
+            NB, NB, BLK, BR, BC,
         )
 
     @triton.jit
@@ -120,7 +122,8 @@ def _fused(params, **kw):
 def _parts(opt):
     """(one_block, big, one_dim, native) param lists from the cached fused partition (after a step)."""
     ob, big, od, nat = [], [], [], []
-    for (_ids, o, b, d, n) in opt._fused_part.values():
+    for entry in opt._fused_part.values():
+        o, b, d, n = entry[-4:]              # leading field is the staleness witness
         ob += o
         big += b
         od += d
