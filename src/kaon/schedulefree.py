@@ -119,6 +119,7 @@ from torch.optim import Optimizer
 
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
+    _sr_write_,
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
@@ -135,7 +136,6 @@ from kaon._momentum_codec import (
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
 )
-from kaon._stochastic_rounding import add_stochastic_
 from kaon._wrappers import CodecBuffer, TrainEvalWeights
 
 __all__ = ["ScheduleFree"]
@@ -191,7 +191,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
             returns the OLD value, so ``z`` stops moving altogether and the iterate
             average keeps averaging a frozen sequence — the failure is a stalled
             ``z``, not a bounded rounding error. ``"bfloat16"`` therefore writes
-            ``z`` through :func:`~kaon._stochastic_rounding.add_stochastic_`
+            ``z`` stochastically rounded through :func:`kaon._backend._sr_write_`
             (unbiased, so sub-quantum steps survive *in expectation*; see
             :meth:`_store_z`), which makes it the memory-friendly default.
             ``"float32"`` is the exact choice (the reference test uses it).
@@ -416,21 +416,30 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
         z-step is ``lr_t*d``, which for any realistic LR sits *below* the bf16 ULP of
         ``z`` (~8e-3 at ``|z| ~ 1``), so RNE writes the OLD value back and ``z`` never
         moves — the iterate average then averages a frozen sequence.
-        :func:`~kaon._stochastic_rounding.add_stochastic_` rounds up with probability
-        equal to the fractional distance, so those sub-ULP steps survive in
-        expectation.
+        Stochastic rounding rounds up with probability equal to the fractional
+        distance, so those sub-ULP steps survive in expectation.
 
         The write is phrased as the increment ``z_new - z_stored`` (``z_stored`` is a
         bf16 value, hence exact in fp32, so the increment reconstructs ``z_new``) which
         is what lets it go through the shared primitive and keeps the identity of
-        ``state["z"]`` — ``add_stochastic_`` copies into it, never replaces it.
+        ``state["z"]`` — the SR write copies into it, never replaces it.
+
+        The SR itself goes through :func:`kaon._backend._sr_write_`, the same entry point
+        every bf16 *weight* write in the library uses: one Triton launch with no temporary
+        on CUDA, the torch ``add_stochastic_`` reference everywhere else. Calling
+        ``add_stochastic_`` directly here cost ~7 extra kernels and two z-sized fp32/int32
+        temporaries per bucket — measured 0.73x the step and +98 MiB of transient on the
+        UNet/DiT bag before this went through the shared primitive.
         """
         if md != "bfloat16":
             CodecBuffer.write(state, "z", md, z_fp32)
             return
         buf = state["z"]
-        delta = buf.float().neg_().add_(z_fp32.reshape(buf.shape))
-        add_stochastic_(buf, delta)
+        # ``z_new - z_stored`` in ONE promoting kernel (fp32 - bf16 -> fp32). The old
+        # ``buf.float().neg_().add_(...)`` spelling allocated the same single temporary
+        # but took three passes over it; the rounded result is bit-identical.
+        delta = z_fp32.reshape(buf.shape) - buf
+        _sr_write_(buf, delta, 1.0)
 
     @staticmethod
     def _store_z_stacked(states: list[dict[str, Any]], md: str, z_fp32: Tensor) -> None:
@@ -438,9 +447,17 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
 
         One noise draw over the whole stack (not one per param) followed by a single
         ``_foreach_copy_`` into the per-param storages — the same shape of work
-        :func:`kaon._backend.subtract_batched_` does for bf16 weights. Since the draws
-        differ from the per-param path's, a bf16 ``z`` makes the two paths agree in
-        expectation instead of bit-for-bit (the quantized and fp32 codecs stay exact).
+        :func:`kaon._backend.subtract_batched_` does for bf16 weights, and through the
+        same :func:`kaon._backend._sr_write_` entry point (one Triton launch, no
+        temporary, on CUDA). Since the draws differ from the per-param path's, a bf16
+        ``z`` makes the two paths agree in expectation instead of bit-for-bit (the
+        quantized and fp32 codecs stay exact).
+
+        ``N == 1`` — every bucket of a big-unique-shape model (UNet/DiT) — skips the
+        stack entirely and rounds straight into the parameter's own ``z``: a one-tensor
+        ``torch.stack`` is a full copy, and with the copy-back that is two z-sized
+        transfers per bucket for nothing. The arithmetic and the number of drawn
+        elements are unchanged.
         """
         if md != "bfloat16":
             CodecBuffer.write_stacked(states, "z", md, z_fp32)
@@ -449,10 +466,13 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
         # Same aliasing contract as CodecBuffer.write_stacked: z is a contiguous clone
         # (and a same-shape reshape is a view anyway), so these views reach the storage.
         bufs = [s["z"].reshape(shape) for s in states]
-        stacked = torch.stack(bufs)                                       # [N, *shape], bf16
-        delta = stacked.float().neg_().add_(z_fp32)
-        add_stochastic_(stacked, delta)
-        torch._foreach_copy_(bufs, list(stacked.unbind(0)))
+        single = len(bufs) == 1
+        # [N, *shape], bf16 — a VIEW of the sole storage when N == 1, else a stacked copy.
+        stacked = bufs[0].unsqueeze(0) if single else torch.stack(bufs)
+        delta = z_fp32 - stacked                    # one promoting kernel; see _store_z
+        _sr_write_(stacked, delta, 1.0)
+        if not single:
+            torch._foreach_copy_(bufs, list(stacked.unbind(0)))
 
     # ============================================================================ step
     @torch.no_grad()
@@ -602,7 +622,19 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
     # threaded through every bucket, so nothing here depends on a per-parameter clock. ``z``
     # and ``exp_avg`` go through the codec-buffer helpers, which take ``states`` rather than
     # a ``mat`` callback, so there is no codec view cache to prebuild.
-    _FOREACH_SPEC = ForeachSpec(factored_state=("row", "col"), flat_state=("v",))
+    # ``single_alias``: a one-parameter bucket — every bucket of a big-unique-shape model
+    # (UNet/DiT), where each weight owns its shape — ``unsqueeze``es instead of stacking, so
+    # ``grad_stack`` / ``param_stack`` widen straight from the parameter's storage instead of
+    # copying it to a same-dtype stack first. Both stacks are read-only in
+    # ``_factored_bucket`` / ``_nonfactored_bucket`` (the y-update makes its own mutable
+    # stack in ``_lerp_then_add_batched``), which is the precondition for aliasing them, and
+    # ``_param_foreach_eligible`` already rejects an ``ndim > 2`` param whose data or grad is
+    # non-contiguous — the case where the matrixizing ``view`` on the unsqueezed tensor would
+    # not be expressible. Bit-identical: stacking one tensor is a copy, and the widening cast
+    # that follows it is elementwise. Same contract AdaMuon has had since 0.7.11.
+    _FOREACH_SPEC = ForeachSpec(
+        factored_state=("row", "col"), flat_state=("v",), single_alias=True,
+    )
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
@@ -807,8 +839,16 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
     ) -> None:
         """``p -= delta`` (the y write-back) with bf16-correct handling.
 
-        Mirrors :func:`kaon._backend.subtract_one_`; ``shift`` belongs only to y.
-        A bf16 z always uses stochastic rounding and has no Kahan/shift buffer.
+        Mirrors :func:`kaon._backend.subtract_one_` — including its SR entry point
+        :func:`kaon._backend._sr_write_` (Triton on CUDA, the torch reference
+        elsewhere); ``shift`` belongs only to y. A bf16 z always uses stochastic
+        rounding and has no Kahan/shift buffer.
+
+        The SR branch is reached by every param above ``foreach_batch_cutoff`` even in a
+        ``foreach=True`` run, so calling ``add_stochastic_`` here left the big weights of
+        a UNet/DiT bag on the torch path while the batched buckets already used Triton —
+        measured +42 MiB of transient per step for the two weight-sized temporaries it
+        draws (an fp32 upcast and an int32 noise tensor).
         """
         low = is_low_precision(p)
         if low and bf16_method == "kahan":
@@ -818,6 +858,6 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
             p.add_(shift)
             shift.add_(p_before.sub_(p))
         elif low and bf16_method == "stochastic_rounding" and p.dtype == torch.bfloat16:
-            add_stochastic_(p.data, delta_fp32, alpha=-1.0)
+            _sr_write_(p.data, delta_fp32, -1.0)
         else:
             p.data.sub_(delta_fp32.to(p.dtype))

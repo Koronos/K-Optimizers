@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from kaon import ScheduleFree, reseed_stochastic_rounding
+from kaon import schedulefree as sf_module
 
 
 def _ref_schedulefree_1d(
@@ -837,3 +838,101 @@ def test_foreach_plan_cache_is_numerically_invisible():
     off = _plan_run_schedulefree(cache=False)
     for i, (a, b) in enumerate(zip(on, off, strict=True)):
         assert torch.equal(a, b), f"tensor {i} differs"
+
+
+# ------------------------------------------------------- SR write-back routing (perf lock)
+# Every bf16 stochastic-rounding write in the library goes through
+# ``kaon._backend._sr_write_``, which prefers the one-launch, zero-temporary Triton kernel
+# on CUDA and falls back to the torch reference elsewhere. ScheduleFree has two such
+# writes that used to call ``add_stochastic_`` directly — the ``z`` write-back and the
+# per-parameter ``y`` write-back — which cost ~7 extra kernels and two param-sized
+# temporaries each. These lock the routing; the numerics are covered by
+# ``test_bf16_z_displacement_matches_fp32_storage`` and the storage-identity tests.
+
+
+def _spy_on_sr_write(monkeypatch):
+    """Record every ``_sr_write_`` the ScheduleFree module makes; keep the real behaviour."""
+    calls = []
+    real = sf_module._sr_write_
+
+    def spy(target, source, alpha, triton=None):
+        calls.append((target.dtype, tuple(target.shape), alpha))
+        return real(target, source, alpha, triton)
+
+    monkeypatch.setattr(sf_module, "_sr_write_", spy)
+    return calls
+
+
+@pytest.mark.parametrize("foreach", [False, True], ids=["per_param", "foreach"])
+@pytest.mark.parametrize("momentum_dtype", ["bfloat16", "float32"])
+def test_bf16_z_store_routes_through_sr_write(monkeypatch, foreach, momentum_dtype):
+    """A bf16-stored ``z`` writes back through the shared SR primitive; an fp32 ``z``
+    takes the plain codec write and must not touch it at all.
+
+    The parameters are fp32, so the ``y`` write-back never takes an SR branch and every
+    recorded call belongs to the ``z`` store.
+    """
+    torch.manual_seed(0)
+    params = [torch.randn(6, 4, requires_grad=True) for _ in range(3)]
+    opt = ScheduleFree(params, lr=1e-3, momentum_dtype=momentum_dtype, foreach=foreach)
+    calls = _spy_on_sr_write(monkeypatch)
+    for _ in range(2):
+        for p in params:
+            p.grad = torch.randn_like(p)
+        opt.step()
+    if momentum_dtype == "float32":
+        assert calls == [], "an fp32 z must not be stochastically rounded"
+        return
+    assert calls, "the bf16 z write-back bypassed kaon._backend._sr_write_"
+    assert all(dtype is torch.bfloat16 for dtype, _shape, _alpha in calls)
+    # foreach stacks the three same-shape params into one bucket; per-param writes each.
+    assert len(calls) == (2 if foreach else 6)
+
+
+def test_bf16_y_write_above_the_foreach_cutoff_routes_through_sr_write(monkeypatch):
+    """A weight too large to batch falls to the per-parameter path even under
+    ``foreach=True`` — its bf16 ``y`` write-back must still use the shared primitive.
+
+    ``momentum_dtype="float32"`` keeps the ``z`` store off the SR path, so the recorded
+    calls are exactly the ``y`` write-backs.
+    """
+    torch.manual_seed(0)
+    small = torch.randn(32, 32, dtype=torch.bfloat16, requires_grad=True)
+    big = torch.randn(64, 64, dtype=torch.bfloat16, requires_grad=True)
+    opt = ScheduleFree(
+        [small, big], lr=1e-3, momentum_dtype="float32", foreach=True,
+        bf16_method="stochastic_rounding", foreach_batch_cutoff=2048,
+    )
+    calls = _spy_on_sr_write(monkeypatch)
+    for p in (small, big):
+        p.grad = torch.randn_like(p)
+    opt.step()
+    shapes = [shape for _dtype, shape, _alpha in calls]
+    assert (64, 64) in shapes, (
+        "the above-cutoff weight's bf16 write-back bypassed kaon._backend._sr_write_"
+    )
+    assert all(dtype is torch.bfloat16 for dtype, _shape, _alpha in calls)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton SR kernel needs CUDA")
+def test_bf16_z_store_reaches_the_triton_sr_kernel():
+    """On CUDA the z write-back must land in the fused kernel (one launch, no temporary),
+    not in the multi-kernel torch fallback."""
+    import kaon._fused_triton as ft
+
+    if not ft.HAS_TRITON:
+        pytest.skip("Triton not installed")
+    torch.manual_seed(0)
+    params = [torch.randn(6, 4, device="cuda", requires_grad=True) for _ in range(3)]
+    opt = ScheduleFree(params, lr=1e-3, momentum_dtype="bfloat16", foreach=True)
+    launched = []
+    real = ft.sr_add_
+    try:
+        ft.sr_add_ = lambda target, source, alpha=1.0: (
+            launched.append(target.numel()), real(target, source, alpha))[1]
+        for p in params:
+            p.grad = torch.randn_like(p)
+        opt.step()
+    finally:
+        ft.sr_add_ = real
+    assert launched, "the bf16 z store did not reach kaon._fused_triton.sr_add_"

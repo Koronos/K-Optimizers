@@ -307,3 +307,105 @@ def test_allows_adapnm_when_rho_zero():
     """rho=0 is a documented passthrough — dual-momentum bases are fine then."""
     p = torch.nn.Parameter(torch.randn(4, 4))
     MSAM([p], base_optimizer=AdaPNM, lr=1e-3, rho=0.0)
+
+
+# --------------------------------------------------------------------------- 8
+# The fused plan's pointer witness runs on EVERY climb and removal — twice per step over
+# every momentum-carrying parameter — so it is both a correctness gate and a hot path.
+# These lock the two properties together: it still sees each rebind channel, and the scan
+# stays a C-level ``map`` rather than a Python generator expression.
+
+def _witness_cache(n_conv=300, n_scalar=128, quantized=True):
+    """A synthetic ``_axpy_cache`` in the shape the fused planner builds: two buckets
+    (a conv bag and a 0-D bag) over ``n_conv + n_scalar`` params, on CPU."""
+    buckets = []
+    for count, numel in ((n_conv, 16 * 8 * 3 * 3), (n_scalar, 1)):
+        plist = [torch.empty(numel) for _ in range(count)]
+        states = [
+            {"m": torch.empty(numel, dtype=torch.int8 if quantized else torch.float32),
+             "m_scale": torch.empty(max(1, numel // 128))}
+            for _ in range(count)
+        ]
+        buckets.append(dict(
+            plist=plist,
+            states=states,
+            p_addrs=tuple(p.data_ptr() for p in plist),
+            m_addrs=tuple(st["m"].data_ptr() for st in states),
+            sc_addrs=(tuple(st["m_scale"].data_ptr() for st in states)
+                      if quantized else None),
+        ))
+    return {"buckets": buckets}
+
+
+@pytest.mark.parametrize("bucket", [0, 1], ids=["conv_bucket", "scalar_bucket"])
+@pytest.mark.parametrize("channel", ["weight", "m", "m_scale"])
+def test_plan_witness_sees_every_rebind_channel(bucket, channel):
+    """Each of the three cached address tables is checked, in every bucket: a rebound
+    weight (``p.data = ...``), a reassigned ``m`` and a reassigned ``m_scale`` each
+    invalidate the plan on their own. Missing any one lets the next fused launch
+    dereference freed storage."""
+    cache = _witness_cache(n_conv=4, n_scalar=3)
+    assert MSAM._plan_addrs_valid(cache)
+    bk = cache["buckets"][bucket]
+    if channel == "weight":
+        bk["plist"][-1].data = bk["plist"][-1].data.clone()
+    else:
+        bk["states"][-1][channel] = bk["states"][-1][channel].clone()
+    assert not MSAM._plan_addrs_valid(cache), f"{channel} rebind went unnoticed"
+
+
+def test_plan_witness_ignores_an_in_place_requant():
+    """The codec contract is an in-place store: writing through the SAME buffers must
+    keep the plan valid (otherwise every step rebuilds the pointer arrays)."""
+    cache = _witness_cache(n_conv=4, n_scalar=3)
+    for bk in cache["buckets"]:
+        for p, st in zip(bk["plist"], bk["states"], strict=True):
+            p.data.zero_()
+            st["m"].zero_()
+            st["m_scale"].fill_(2.0)
+    assert MSAM._plan_addrs_valid(cache)
+
+
+def test_plan_witness_scan_stays_c_level():
+    """The witness must scan the addresses with ``map`` (the loop runs in C), not with a
+    generator expression: at 428 parameters and three address tables the genexpr form
+    measured ~1.4x the wall time, ~0.1 ms of pure CPU per optimizer step.
+
+    Compared against a genexpr reference timed in the same loop, so the bound tracks the
+    machine instead of an absolute number.
+    """
+    import time
+
+    cache = _witness_cache()  # 428 params, quantized -> all three tables
+
+    def genexpr_reference(c):
+        for bk in c["buckets"]:
+            if tuple(p.data_ptr() for p in bk["plist"]) != bk["p_addrs"]:
+                return False
+            if tuple(st["m"].data_ptr() for st in bk["states"]) != bk["m_addrs"]:
+                return False
+            if bk["sc_addrs"] is not None and (
+                tuple(st["m_scale"].data_ptr() for st in bk["states"]) != bk["sc_addrs"]
+            ):
+                return False
+        return True
+
+    assert genexpr_reference(cache) and MSAM._plan_addrs_valid(cache)
+
+    def best_of(fn, reps=7, inner=20):
+        out = []
+        for _ in range(reps):
+            t0 = time.perf_counter()
+            for _ in range(inner):
+                fn(cache)
+            out.append((time.perf_counter() - t0) / inner)
+        return min(out)
+
+    ref = shipped = float("inf")
+    for _ in range(3):  # interleaved so a scheduling hiccup cannot bias one arm
+        ref = min(ref, best_of(genexpr_reference))
+        shipped = min(shipped, best_of(MSAM._plan_addrs_valid))
+    assert shipped <= 0.95 * ref, (
+        f"the plan witness costs {shipped * 1e6:.1f} us per call vs {ref * 1e6:.1f} us for "
+        "a plain generator expression — the C-level map scan has been lost"
+    )

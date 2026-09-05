@@ -475,6 +475,64 @@ this audit):
   is gone. The per-param/foreach *D trajectory* is no longer bit-identical — the
   batched `[B, L]` reduction is a different tree, ~3.3e-7 relative at
   `slice_p=11` on CPU — and the tests now pin it to 1e-6 relative.
+- **ScheduleFree's bf16 stochastic-rounding writes go through the shared
+  `_backend._sr_write_`.** Three of them did not: the `z` write-back (per-param and
+  batched) and the per-parameter `y` write-back called
+  `_stochastic_rounding.add_stochastic_` directly, so while every other optimizer's bf16
+  write took the one-launch Triton kernel, ScheduleFree stayed on the torch reference —
+  ~7 extra kernels and two parameter-sized temporaries (an fp32 upcast and an int32 noise
+  draw) per call. The `y` case bit hardest on big models: any weight above
+  `foreach_batch_cutoff` falls to the per-parameter path *even under `foreach=True`*, so a
+  UNet/DiT bag paid it on exactly its largest tensors, at every `momentum_dtype`. Two
+  smaller wastes went with it — the increment `z_new - z_stored` is now one promoting
+  kernel instead of `.float().neg_().add_()` (same single temporary, three passes into
+  one, bit-identical), and a one-parameter bucket rounds straight into its own `z`
+  instead of `torch.stack`-ing a copy and copying it back. Paired geometric mean, 80
+  interleaved reps, 95% CI, RTX 3000 Ada, against the pre-fix tree — UNet/DiT bag (8
+  distinct big shapes): `z=bf16` **1.512x [1.488, 1.537]** foreach / **1.584x
+  [1.574, 1.594]** per-param, `z=float32` **1.226x [1.205, 1.247]**, `z=int8` **1.197x
+  [1.170, 1.224]**; 448 → 328 launches and step peak **520.4 → 337.6 MiB** (`z=bf16`),
+  464.1 → 309.4 MiB (`z=float32`). LoRA-shaped bag (200x(256,256) + 100x(512,) + 128
+  scalars), `z=bf16`: **1.261x [1.240, 1.283]**, 297.9 → 198.7 MiB. All six
+  configurations now step **1.05–1.22x faster than 0.7.11**, which did not stochastically
+  round `z` at all. Semantics unchanged: the rounding is still unbiased and still
+  governed by `kaon.reseed_stochastic_rounding()`; on CPU, fp16 or a strided target
+  `_sr_write_` falls back to the same `add_stochastic_` as before.
+- **MSAM's fused-plan pointer witness scans in C.** `_plan_addrs_valid` re-reads
+  `data_ptr` for every weight and every `m` / `m_scale` in the plan, twice per step (the
+  removal and the climb each launch a kernel off the cached device pointer tables), so on
+  a small-tensor bag it is pure Python call overhead in the hot path: 300x(16,8,3,3) +
+  128 scalars measured **114 µs per validation** at `momentum_dtype="4bit"`. The three
+  generator expressions — one of them with a dict subscript per parameter — are now
+  `tuple(map(...))` over module-level accessors (`Tensor.data_ptr`,
+  `operator.itemgetter`), so the per-parameter loop runs inside `map`/`tuple`:
+  **114.4 → 95.2 µs** (4bit) and **89.0 → 61.5 µs** (bf16) per validation on that bag,
+  **134.7 → 113.8** / **113.4 → 71.1 µs** on 200x(256,256) + 100x(512,) + 128 scalars.
+  Step-level, paired, against the pre-fix tree: Nekaon **1.071x [1.029, 1.114]** (bf16)
+  and 1.025x [0.966, 1.088] (4bit) on the conv bag, 1.022x [0.987, 1.058] on the LoRA
+  bag. The witness is deliberately **not** thinned further: it still costs 0.12–0.23 ms
+  per step on a 428-parameter bag, which is why that bag runs at 0.69–0.88x of 0.7.11,
+  where the witness was one pointer per bucket (1.7–2.1 µs) and missed exactly the
+  reassigned-momentum and rebound-weight cases the *Fixed* entry above closes. Dropping
+  either of the two validations per step would leave a window in which the very next
+  fused launch reads or writes freed CUDA memory.
+- **ScheduleFree's one-parameter foreach buckets alias instead of stacking**
+  (`ForeachSpec(single_alias=True)`, the contract AdaMuon has had since 0.7.11). Every
+  bucket of a big-unique-shape model is `N == 1`, and `grad_stack()` / `param_stack()`
+  were calling `torch.stack` on a single tensor — a full same-dtype copy — before the
+  widening `.float()`. They now `unsqueeze` and widen straight from the parameter's
+  storage. Safe because both stacks are read-only in `_factored_bucket` /
+  `_nonfactored_bucket` (the y-update builds its own mutable stack) and because
+  `_param_foreach_eligible` already rejects an `ndim > 2` param whose data or grad is
+  non-contiguous, which is the only case where the matrixizing `view` on the unsqueezed
+  tensor would not be expressible. **Bit-identical**, verified over 162 configurations
+  (5 shape mixes x {fp32, bf16} params x 4 `momentum_dtype` x `inner_momentum`
+  {0, 0.9} x `bf16_method` {none, stochastic_rounding}, plus strided 2-D grads).
+  Deterministically **8 fewer kernel launches per step** on the UNet/DiT bag (316 → 308
+  at `z=float32`); the wall-clock effect is small and mostly inside noise — paired
+  in-process A/B, 80 interleaved reps, 95% CI: 1.025x [1.001, 1.049] at `z=int8`,
+  1.008x [0.997, 1.019] at `z=bf16`, 1.004x [0.990, 1.019] at `z=float32`, and step peak
+  unchanged (the elided copies are transient and the allocator was reusing the blocks).
 
 ### Added
 - **`Adakaon(cautious_wd="masked" | "full")`** — where decoupled `weight_decay`
