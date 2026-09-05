@@ -4,6 +4,275 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+This release is a full correctness and performance audit of the 0.7.11 fused/Triton
+path: memory-safety and compilation fixes across the Adakaon kernels, a uniform
+"propagate" policy for non-finite values, a unified in-place momentum codec, and
+exact resume for bf16/fp16 parameters, plus measured performance gains across the
+fused big-tensor route, stochastic rounding, and several optimizers' foreach paths.
+
+**Behaviour changes** (numeric trajectories or defaults that move as a result of
+this audit):
+- Default bf16 momentum EMA now accumulates in fp32 (shared codec and KProdigy's
+  own EMA).
+- ScheduleFree's bf16 `z` buffer is now stochastically rounded on every write.
+- Stochastic rounding on CUDA defaults to a Triton kernel (a different, still
+  unbiased noise stream than the old torch path; reset with
+  `kaon.reseed_stochastic_rounding()`).
+- `lr` is applied inside the weight-write kernel instead of a separate multiply
+  (sub-ULP reordering).
+- AdaBelief, AdamP, AdaPNM and ADOPT bias-correct each parameter on its own step
+  count, so late gradients are no longer over-corrected.
+- int8 `m_scale` for 1-D parameters is shape `()` instead of `(1,)`.
+
+### Fixed
+- **Hot `gradient_centralization` flip corrupted the fused big path.**
+  `BigPointerCache` aliases `rowmean` onto `rowsum` when GC is off (it saves `N*R`
+  floats and nothing reads it), but a param group is a mutable dict and a scheduler
+  can flip the flag mid-run. The cache was keyed only on the parameter witness, so
+  nothing moved and it was not rebuilt: `_reduce_rowcol` then wrote the per-row
+  means over the row sums and the factored EMA was built from means — measured
+  **1.1e-3** relative divergence from the native path, silently. `gc` is now part
+  of the cache's validity.
+- **Race in the chunked 4-bit requant** (`_chunked_4bit_apply_batched_g`). It stored
+  the per-block absmax scales and then `tl.load`ed them back to quantize — the
+  storing lane and the reading lanes are different lanes of the same program, with
+  no barrier between, so a lane could quantize against the **previous step's** scale.
+  Surfaced by the determinism work above: 4-bit momentum stayed nondeterministic
+  (5.1e-4 relative spread over identical runs) even with the reductions made
+  two-pass. The scale is now kept in registers, which drops 4-bit's default-path
+  spread to **5.1e-8** and removes the per-block loop at the same time.
+- **Fused Triton path (Adakaon): pointer caches validate the WEIGHT storage.** Every
+  fused cache (`PointerArrayCache`, `BigPointerCache`, `OneDimPointerCache`,
+  `AdaPnmCache`, `OneDimPnmCache`) and the routing partition keyed on `id(p)` only, so a
+  `p.data` rebind (external EMA, `.to()`, block-swap offloaders, FSDP reshard) left the
+  kernel writing the retired storage: use-after-free of neighbouring tensors and a
+  parameter that silently stopped training. Caches now witness `(id, data_ptr,
+  is_contiguous)` per step (measured +41 us/step on a 428-tensor bag; the `shape` field
+  was rejected at 2x that cost). A rebind that changes the *shape* of `p.data` is not
+  supported (factored state is shape-bound) and is pinned by an `xfail` test.
+- **`reduction_tile` returned a non-power-of-2 `BR`** and `tl.arange` refused to compile:
+  any bag with >= 2 same-shape tensors of `R in [5, 127]` not a power of 2 (LoRA ranks
+  12/24/48/96 over 640-1280 channels, `(9,640)`, `(96,96)`, or one tensor with
+  `beta1=0`) crashed on the first step. Rounded up; all consumers already mask rows.
+- **`momentum_4bit_block != 128` wrote past `m_scale`** in the one-block kernel (`BLK`
+  hard-coded to 128, unmasked scale store). The one-block route now only takes 4-bit
+  state whose block is 128 (others go native, bit-identical to the per-param path), and
+  `requant_4bit`/`dequant_4bit` mask both the store and the load with the real
+  `m_scale` capacity.
+- **Non-contiguous gradients were read through `data_ptr` ignoring strides** on all
+  three fused routes (the check only existed for `ndim > 2`, and was cached). Grad
+  contiguity is now re-checked every step; offending tensors take the native path for
+  that step without rebuilding the caches (memoised demotion set, 3.8x cheaper than a
+  rebuild-per-step).
+- **Triton specialised an integer argument equal to 1** (`C.to(tl.float32)` on a
+  `(20000, 1)` weight) into a Python `int` and failed to compile; also reached AdaPNM
+  through the shared `_reduce_rowcol`.
+- **`reseed_stochastic_rounding()` now resets every SR noise stream.** With the
+  Triton bf16 write enabled (the new default) it reset only the torch generators,
+  while the kernel's own seed counter kept running — so `torch.manual_seed(s)` +
+  `kaon.reseed_stochastic_rounding()`, the documented recipe for re-seeding to the
+  *same* value inside one process, stopped reproducing a bf16 run. Measured
+  `reproducible: False` on a 5-step Adakaon bf16+SR run with the default, `True`
+  with `SR_TRITON=False`. `kaon._stochastic_rounding` now keeps a `_reseed_hooks`
+  registry that `kaon._fused_triton` appends to on import (no module-level import
+  the other way, so a Triton-less build is unaffected); the kernel reset stays
+  internal, and `kaon.reseed_stochastic_rounding()` remains the single public call.
+  Affected all ten optimizers' weight writes.
+- **Stochastic rounding no longer consumes the global RNG.** Noise comes from a
+  per-device `torch.Generator` owned by the module, seeded from the global initial seed
+  and re-seeded whenever `torch.manual_seed` changes it, so dataloader / dropout streams
+  no longer depend on how many parameters were rounded. Re-seeding to the *same* value
+  inside one process is not observable; call `kaon.reseed_stochastic_rounding()` then.
+- **Stochastic rounding preserves NaN on CUDA.** The int32 bit-trick added noise to the
+  canonical NaN pattern `0x7FFFFFFF`, overflowed the sign bit and wrote `-0.0` instead:
+  a diverging run looked healthy while weights were silently zeroed (CPU kept the NaN,
+  so no CPU test could see it). NaN now propagates like every other PyTorch op; `+-inf`
+  and finite overflow to `inf` behave exactly as before (bit-identical to 0.7.11 with
+  the same noise).
+- **fp16 weights + `bf16_method="stochastic_rounding"` silently fell back to
+  round-to-nearest**; the constructor and `add_param_group` now raise
+  `NotImplementedError` (validated before the group is added).
+- **Non-finite policy is now uniform: propagate.** `sr_round` no longer turns NaN into
+  `-0.0` (int32 overflow) or a low-payload NaN into `+inf`; the seven cautious sites
+  multiply by the mask instead of `tl.where`, so an `inf`/NaN gradient produces the same
+  non-finite tensor on the fused and native paths (the fused path used to freeze the
+  tensor forever in silence).
+- **Lion / AdaBelief / AdamP / KProdigy requantize momentum in place.** Their
+  `_store_one` / `_store_stacked` (and KProdigy's int8 EMA) reassigned
+  `state["m"]` / `state["m_scale"]` on every step. MSAM/Nekaon cache `data_ptr`
+  tables into those buffers for the fused climb, so a reassignment left the plan
+  reading freed memory (measured climb error ≈ 76% of the bound with
+  `MSAM(Lion, momentum_dtype="int8")`). All four now delegate to
+  `_MomentumCodec.store_one` / `store_stacked`, which `copy_` into the existing
+  tensors — the same contract Adakaon's codecs already followed since 0.7.8.
+  Numeric output is bit-identical (same quantizers); only storage identity changes.
+  Note: same int8 `m_scale` shape fix as AdaPNM's above (`()`, not `(1,)`,
+  where the old foreach path had rewritten it via reassignment); old
+  checkpoints with either layout still load.
+- **Resume under bf16/fp16 params is byte-identical again.**
+  `load_state_dict_preserving_dtypes` used to cast state back to the saved dtype
+  *after* torch had already rounded floating buffers through the param dtype
+  (~0.3% relative drift per resume on `m_scale`/`row`/`col`/`v`). It now
+  re-applies the checkpoint tensors (values + dtype), `copy_` when identity can
+  be kept for MSAM's cached pointers, and accepts int/str state keys (JSON drift).
+- **`centralize_grads_` groups by `(shape, device, dtype)`.** A param group mixing CPU
+  and CUDA tensors crashed in `torch.stack` on the first step (default config).
+- **Mixed-device param groups** (CPU + CUDA) crashed in `torch.stack` inside the foreach
+  and fused bucketing; `device` is part of every bucket key and kernels launch under the
+  bucket's device.
+- **Every optimizer's `load_state_dict` now backfills missing `param_groups` keys**
+  (the AdaMuon fix above, applied everywhere else). `torch.optim.Optimizer.load_state_dict`
+  replaces each `param_groups` dict with the checkpoint's (only `params` carries over),
+  so any hyperparameter added since a checkpoint was written vanished from the resumed
+  group and the first `step()` died with `KeyError`. Fixed in ADOPT, AdaBelief, AdamP,
+  KProdigy, AdaPNM, Lion, ScheduleFree (own `defaults`), and SAM / Lookahead (which did
+  not previously carry a `self.defaults` at all — added one for their own per-group keys:
+  SAM's `rho`/`adaptive`, Lookahead's `k`/`alpha`/`slow_dtype`/`slow_4bit_block`/
+  `la_step`/`train_mode`). Values the checkpoint *does* carry are never clobbered. MSAM
+  and Nekaon needed no change: both keep their own hyperparameters (`rho`, `norm`) as
+  instance attributes, not per-group keys, and fully delegate to the inner optimizer's
+  `load_state_dict`. Adakaon's own backfill is out of scope here (concurrent audit batch).
+- **AdaBelief / AdamP bias-correct on a per-parameter step.** Both advanced
+  `group["step"]` on every `step()`, including groups with no gradients, so a
+  param whose first gradient arrives at step 100 was corrected with `bc1 ≈ 1`
+  instead of `1 - beta1` and took a first update ~10x too short. Each param now
+  carries `state["step"]` for `bc1`/`bc2` (foreach buckets by it alongside
+  shape/dtype, 0-D and shape-(1,) params still riding as batched views) while
+  `group["step"]` stays the global clock for schedulers. Trajectories change only
+  for params with late gradients; when every param has a gradient from step 1 the
+  output is bit-identical to before. Checkpoints without `state["step"]` infer the
+  group clock on load.
+- **AdamP projects bf16 weights in fp32 on the per-param path.** `_project_one`
+  normalized the weight in its storage dtype, so a bf16 weight was projected
+  through bf16 norms and dot products while the foreach path (which stacks in
+  fp32) was not: the two diverged by 6e-3 relative on the same inputs. Both paths
+  now share one fp32 working dtype and write back to the parameter dtype only in
+  the final subtract.
+- **AdaMuon `compile=True` no longer recompiles every step.** It wrapped the whole
+  step body, so Dynamo installed a guard per parameter on *whether that parameter has
+  a gradient* and one on the *literal value* of `group["lr"]`. Any LR schedule, or a
+  grad set that varies (MoE routing, CFG dropout, partial gradient accumulation),
+  therefore burned through `recompile_limit` (8) and fell back to eager **silently**;
+  `add_param_group` cost two more recompiles. Measured on a 6-weight bag: 8 compiled
+  graphs and multi-second recompiles in both scenarios, `add_param_group` +8.2 s.
+  The compiled unit is now the pure-tensor bucket math (`_factored_math`,
+  `_nonfactored_pre_math`, `_post_math` and their per-parameter twins), with the grad
+  filter, bucketing, momentum codec and state write-back left in eager Python — so
+  the graphs are guarded on shapes and dtypes only. Same scenarios now compile **1**
+  graph, and `add_param_group` costs 4 ms instead of 8.2 s. Eager output is
+  bit-identical to 0.7.11 (verified over 20 configs x foreach on/off, CPU and CUDA).
+  Trade-off: at *constant* lr with a fixed grad set the old whole-step graph
+  specialized better than the new per-bucket kernels on multi-shape models (12
+  distinct small weights 0.27x -> 0.76x eager-relative; U-Net-like 0.41x -> 0.84x).
+  **With an LR schedule attached that peak does not exist**: the same two sets measured
+  1.03x and 1.00x before the fix (compile did nothing) versus 0.29x and 0.79x after —
+  i.e. in the regime real runs are in, `compile=True` goes from a no-op to a 1.3-3.4x
+  step speedup. Single-slice buckets now stack with a zero-copy `unsqueeze` instead of
+  copying.
+- **AdaMuon resumes from a pre-0.7.12 checkpoint.** `torch.optim.Optimizer.load_state_dict`
+  *replaces* each `param_groups` dict with the checkpoint's (only `params` is carried
+  over), so a checkpoint written before `bias_correction` existed left the live group
+  without that key and the next `step()` died with `KeyError: 'bias_correction'`.
+  `load_state_dict` now backfills any key the checkpoint predates from `self.defaults`
+  (values the checkpoint *does* carry still win, so a resumed run keeps its tuning), and
+  both read sites use `group.get(...)`. Verified bit-identical resume against real 0.7.11
+  checkpoints across bf16/int8/4bit/fp32 momentum with and without weight decay. Any
+  future hyperparameter is covered by the same backfill.
+- **AdaMuon `step()` no longer raises on a gradient-less param group.** A group where
+  nothing has a gradient — MoE routing leaving an expert unrouted for a step, CFG
+  dropout, partial gradient accumulation, or a bare `step()` with nothing backwarded —
+  reached the `foreach` path's `params[0].device` probe with an empty list and raised
+  `IndexError`. Such groups are now skipped and their parameters left untouched.
+- **AdaMuon `clip_threshold` documentation was wrong about when it fires.** The
+  docstring called it "a near no-op in steady state". The factored second moment has
+  no bias correction, so on a real proxy-U-Net run (β₂=0.999) the mean `rms(u)`
+  *before* the clip measures 31.9 at step 1, 11.0 at step 10, 3.56 at 100, 1.20 at
+  1000 and 0.98 at 2999 — i.e. almost exactly `1/√(1-β₂ᵗ)`. The clip is active on 100 %
+  of weight buckets for the first `~1/(1-β₂)` iterations and 70-80 % after, and is what
+  sets the early effective step size; it is in effect the second moment's bias
+  correction. Documented as a first-order hyperparameter, not a safety net.
+- **AdaMuon `ns_steps=2` rationale corrected.** The docstring credited the default to
+  "5 over-orthogonalizes". Measured singular-value spectra say otherwise: the quintic
+  settles into a band ≈[0.67, 1.20] and never leaves it, `ns=2` is already inside it
+  on skinny matrices (mean sv 0.89-1.06 at 4:1-16:1 — LoRA shapes and matrixized
+  convs) but heavily *under*-orthogonalized on square ones (mean sv 0.56 at 256²,
+  0.31 at 1024², with near-zero directions). The default stands as an empirical sweep
+  result on a skinny-weight model; `ns_steps` should be re-swept on models with large
+  square weights. Table in docs/adamuon.md.
+- **AdaPNM handles empty groups and late gradients consistently.** Parameter-local
+  steps retain the correct bias correction and global PNM parity, while the shared
+  momentum codec preserves state-buffer identities required by cached pointers.
+- **AdaPNM int8 1-D scales now use scalar shape `()` instead of `(1,)`.** The value
+  is unchanged; checkpoints have been verified across foreach and per-parameter
+  paths in both directions.
+- **Fused Triton path (AdaPNM): the same five defects, now closed on AdaPNM's own routes.**
+  The batch-A fixes above landed on Adakaon and on the shared caches, but AdaPNM's launchers
+  had not been carried over: `_fused_partition` and the `AdaPnmCache` / `OneDimPnmCache`
+  callers still keyed on `id(p)` alone, so a `p.data` rebind kept the one-block and 1-D
+  kernels writing the *retired* storage (measured: every parameter in the bag scribbled,
+  ~1e-2 divergence from native). The routing key is now
+  `_fused_triton.param_witness` (`id`, `data_ptr`, `is_contiguous`) and each pointer cache
+  is revalidated per step (`built_from` when the lag bucketing hands back the partition's own
+  list, `stale` otherwise). Also fixed on AdaPNM: `_adapnm_tile_kernel` passed `NS = NB` to
+  `requant_4bit`/`dequant_4bit` with a hard-coded 128-element block, so any other
+  `momentum_4bit_block` wrote past *both* momenta's scale buffers (measured with a canary:
+  32 fp32 past a 32-entry `m_pos_scale`/`m_neg_scale` on a `(64,128)` weight at block 256) —
+  the one-block route now requires block 128 and the kernel receives each tensor's real scale
+  capacity; grad contiguity is re-checked every step (it was only checked for `ndim > 2`, and
+  cached, so transposed/strided grads reached all three routes at ~1e-2 from native); the five
+  AdaPNM cautious sites multiply by the survivor mask instead of `tl.where`, so a non-finite
+  update propagates as it does natively instead of freezing the tensor; and `device` joined the
+  native foreach bucket keys and the big-route shape buckets (a CPU + CUDA group took the whole
+  native step down in `torch.stack`).
+  Cost on a 428-parameter bag: witness key 62 us/step (vs 19 us for the old ids-only key),
+  grad-contiguity sweep 68 us/step, cache revalidation 0.3 us/step via `built_from` (a naive
+  per-bucket `stale` would have cost 70 us). Verified bit-identical to the pre-fix build across
+  {fp32, bf16} params x {fp32, bf16, int8, 4bit} momentum x cautious on/off on every
+  atomic-free route (0/976 state tensors differ); the big route's `tl.atomic_add` on `colsum`
+  is not run-to-run reproducible in either build (49/512 tensors differ base-vs-base too).
+- **ADOPT** — per-parameter ``state["step"]`` governs the step-0 ``v`` init and the
+  ``step**0.25`` clip so a param whose first gradient arrives late (or a ``.step()``
+  with no grads) no longer leaves factored ``row``/``col`` at zero and diverges to
+  NaN; ``momentum_dtype`` is resolved per param group (not silently from the
+  constructor kwarg). Checkpoints without per-param ``step`` seed the counter from
+  ``max(1, group["step"] - 1)`` when ``v``/``row`` already exist.
+- **KProdigy's bf16 momentum EMA runs in fp32.** The EMA was computed in bf16
+  (three roundings: gradient cast, product, sum) and was not invariant to
+  batching — CPU bf16 elementwise kernels round the vectorized body and the
+  scalar tail differently, so a `numel % 16 != 0` tensor picked up an ulp of
+  momentum error when it was folded into a stack (1.07e-4 relative on D, 3.4e-2
+  on the weights, with shapes (3,7)/(5,11)/(127,)). Per-param and foreach now
+  both widen to fp32 and round once on write, aligned with this release's change
+  to the shared bf16 codec. bf16 momentum runs differ from previous releases
+  here; the change is a fidelity improvement and the two paths are again
+  bit-identical.
+- **Lion `foreach` no longer silently skips `channels_last` convs.** The batched
+  write flattened via `reshape`, which copies a non-contiguous weight and drops
+  the update (max|Δw| = 0 over many steps). `ndim > 2` params now require
+  contiguity for the foreach path (same gate as Adakaon) and fall back to
+  per-param otherwise.
+- **ScheduleFree stochastically rounds bf16 `z` on every write.** This is independent
+  of `bf16_method` and consumes RNG even when model weights are fp32, so sub-ULP
+  `z` updates remain unbiased without a Kahan/shift buffer.
+- **Lookahead** — ``_sync_foreach`` chunks stacked slow-weight syncs with
+  ``foreach_budget`` instead of materializing an unbounded ``[N, *shape]`` transient.
+- **MSAM fused-plan witnesses cover `m` / `m_scale`.** `_plan_addrs_valid` now
+  re-reads `data_ptr` from the live state dicts (and every weight in the bucket),
+  so a base that still reassigns momentum invalidates the plan instead of climbing
+  on dangling pointers. `MSAM(AdaPNM, …)` with `rho != 0` raises `TypeError`
+  (dual `m_pos`/`m_neg`, no single `m`); `rho=0` remains a passthrough. The
+  inert-lookahead threshold is mode-aware (`none`: per-coordinate `|rho|*lr*clip`;
+  `global`/`tensor`: `|rho|` vs weight L2 norms) so `norm="global", rho=0.3,
+  lr=1e-6` no longer spuriously suggests raising lr.
+- **SAM** — ``second_step`` restores every ``old_p`` snapshot even when the second
+  backward left ``p.grad`` as ``None``; global grad norm and the climb are batched
+  (``torch._foreach_norm``, stacked chunks bounded by ``foreach_budget``). The
+  batched norm accumulates in fp32 so ``scale`` is slightly more accurate on bf16
+  weights than the old per-param bf16 reduction.
+- **ktune** — OOM timings format as ``OOM`` instead of raising ``TypeError``; when
+  CUDA+Triton are available, sweeps ``fused=True`` over ``fused_tile_cap`` and
+  reports the best tile.
+
 ### Changed
 - **Default bf16 momentum EMA now runs in fp32** (then `copy_` into the bf16
   buffer), matching the fused Triton kernels. Previously `_FloatCodec` did
@@ -87,17 +356,6 @@ All notable changes to this project will be documented in this file.
   CUDA event (or a buffer ring) to stop the next step overwriting a copy still in
   flight, and 4.4 µs/bucket is ~30x smaller than what the launch packing below
   removes.
-- **Triton bf16 stochastic-rounding write** (`sr_add_`, used by `subtract_one_` /
-  `subtract_batched_` on CUDA). Replaces `add_stochastic_`'s 7–8-kernel chain and
-  its two parameter-sized temporaries with one kernel and none: **3.43x** (1 M),
-  **4.76x** (4 M), **6.39x** (13 M), 9→1 launches, transient 13/52/162→**0 MiB**.
-  `subtract_batched_` on 200x(256,256) bf16: **4.64x**, 12→4 launches, peak
-  188.5→**26.0 MiB**. End to end on a mixed bag (200x(256,256) + 100x(512,) + 128
-  scalars, native path, bf16): **1.195x [1.143,1.250]**. Different (also unbiased)
-  noise stream than the torch path, and it applies to **every** optimizer's bf16
-  weight write, not only Adakaon's; `kaon.reseed_stochastic_rounding()` resets it
-  along with the torch generators, and `kaon._backend.SR_TRITON = False` pins the
-  reference implementation.
 - **Nine→six launches per big bucket per step.** `colsum`/`rms`/`keep` are adjacent
   slices of one buffer (one `zero_()` instead of three) and the `grid=1`
   `_finish_rms` is folded into every consumer (`inv_rms_clip`). Isolated cost of
@@ -115,12 +373,17 @@ All notable changes to this project will be documented in this file.
   with NB; n.s. at NB=16), taking 4-bit vs bf16 to **0.98x/0.96x/1.16x**.
   Bit-identical — verified on weights, packed codes AND scales (`max` is
   order-independent).
-- **`eps1` on the row/col means instead of the `[N,R,C]` square** in the native
-  factored foreach bucket (`mean(x+eps) == mean(x)+eps`, so a full read-modify-write
-  pass over the bucket disappears). **Bit-identical** in every tested config,
-  including large `eps1` and 1e-10 gradients. Quiet-GPU paired A/B (geometric mean
-  of 150–300 per-rep ratios, 95% CI): +1.4% [-1.1, +3.9] on 200x(256,256), **+2.6%
-  [+0.5, +4.8]** on 50x(512,512), ~0 on 400x(64,64).
+- **Triton bf16 stochastic-rounding write** (`sr_add_`, used by `subtract_one_` /
+  `subtract_batched_` on CUDA). Replaces `add_stochastic_`'s 7–8-kernel chain and
+  its two parameter-sized temporaries with one kernel and none: **3.43x** (1 M),
+  **4.76x** (4 M), **6.39x** (13 M), 9→1 launches, transient 13/52/162→**0 MiB**.
+  `subtract_batched_` on 200x(256,256) bf16: **4.64x**, 12→4 launches, peak
+  188.5→**26.0 MiB**. End to end on a mixed bag (200x(256,256) + 100x(512,) + 128
+  scalars, native path, bf16): **1.195x [1.143,1.250]**. Different (also unbiased)
+  noise stream than the torch path, and it applies to **every** optimizer's bf16
+  weight write, not only Adakaon's; `kaon.reseed_stochastic_rounding()` resets it
+  along with the torch generators, and `kaon._backend.SR_TRITON = False` pins the
+  reference implementation.
 - **`lr` rides the weight write** (`subtract_one_`/`subtract_batched_` take `alpha`)
   instead of a separate `delta.mul_(lr)` pass over the stacked bucket. Applied to
   the per-parameter path AND both foreach buckets, because `Tensor.sub_(d, alpha=lr)`
@@ -170,6 +433,48 @@ All notable changes to this project will be documented in this file.
   removal on int8/4bit `ema_stacked` / 4bit `ema_one` (the strided 4bit dequant
   slice is kept as-is: materialising it changed the `lerp_` kernel and broke the
   per-param/stacked bit-exactness).
+- `add_stochastic_` writes back with `copy_(fp32)` (no bf16 temporary) and draws int32
+  noise directly (4 B/elem transient instead of 10 B/elem).
+- `subtract_batched_` casts the stacked delta once per bucket instead of once per
+  parameter when the stack dtype differs from the params (`aten::_to_copy` no longer
+  scales with bucket size; 5-15x on the cast-heavy bags).
+- **`eps1` on the row/col means instead of the `[N,R,C]` square** in the native
+  factored foreach bucket (`mean(x+eps) == mean(x)+eps`, so a full read-modify-write
+  pass over the bucket disappears). **Bit-identical** in every tested config,
+  including large `eps1` and 1e-10 gradients. Quiet-GPU paired A/B (geometric mean
+  of 150–300 per-rep ratios, 95% CI): +1.4% [-1.1, +3.9] on 200x(256,256), **+2.6%
+  [+0.5, +4.8]** on 50x(512,512), ~0 on 400x(64,64).
+- **AdamP's batched projection removes the radial temporaries.** The stacked path
+  built six `[N, R, C]` tensors (normalized weights, radial components and two
+  `torch.where` results) even though at most one branch fires per slice. It now
+  reduces to one broadcast coefficient per row/tensor applied with `addcmul_`:
+  31.2 -> 20.4 ms isolated (-35%) and 496 -> 369 MB of step peak (-26%). The fp32
+  reassociation makes it differ from the normalized-vector form by ~5e-8
+  relative. The per-param path also dropped its two host synchronizations per
+  param per step (`if cos.max() < ...`) for an on-device mask.
+- **AdaPNM's big (chunked, batched) route caches its pointer arrays** in a new
+  `BigPnmCache`, the AdaPNM counterpart of `BigPointerCache`: grad / weight / both momenta
+  address arrays plus the `rowmean`/`rowsum`/`colsum`/`keep`/`rms` scratch were rebuilt from
+  fresh `torch.tensor([...])` allocations on *every* step, while the one-block and 1-D routes
+  have cached theirs since 0.7.9. Measured on an 8x `(512,512)` bucket, steady state:
+  caching-allocator allocations 22 -> 13-14 per step and the pointer arrays' host-to-device
+  copies 4 -> 0-1 per step (two independent measurements). CUDA **kernel** launches are
+  unchanged — the win is host-side allocation and H2D traffic, not launch count. Same math,
+  same state.
+- **AdaPNM fused caches are keyed by `(group, lag)`.** Stable late-gradient buckets
+  reuse their pointer caches instead of rebuilding them every step, avoiding the
+  measured 3.9 -> 29 ms/step regression and reducing 400 reconstructions to a
+  stable cache set; inactive lags are pruned to keep memory bounded.
+- **KProdigy folds the D statistics on the host in one transfer.** Pass 1 summed
+  2N zero-dim GPU tensors in a Python loop and then called `.item()` twice; the
+  partials are now stacked, copied once, and folded sequentially in
+  `numpy.float32` in the same order (2253 -> 128 kernel launches and 2 -> 0
+  synchronizations per step on a 428-tensor bag; the fold itself 20.4 -> 0.32 ms).
+  Steps that do not update D skip the transfer entirely. The bf16 momentum EMA is
+  batched per bucket (20.44 -> 5.75 ms) and the dead `_flat_full_bucket` wrapper
+  is gone. The per-param/foreach *D trajectory* is no longer bit-identical — the
+  batched `[B, L]` reduction is a different tree, ~3.3e-7 relative at
+  `slice_p=11` on CPU — and the tests now pin it to 1e-6 relative.
 
 ### Added
 - **`Adakaon(cautious_wd="masked" | "full")`** — where decoupled `weight_decay`
@@ -207,169 +512,6 @@ All notable changes to this project will be documented in this file.
   reduce) form the design doc held in reserve. Costs 0–9% and an `N*ceil(R/BR)*C`
   fp32 buffer per bucket (1.4→8.8 MiB on 236x(512,512)); default off. `keep` needs
   nothing — it is an int32 atomic, and integer addition is exact in any order.
-
-### Fixed
-- **`reseed_stochastic_rounding()` now resets every SR noise stream.** With the
-  Triton bf16 write enabled (the new default) it reset only the torch generators,
-  while the kernel's own seed counter kept running — so `torch.manual_seed(s)` +
-  `kaon.reseed_stochastic_rounding()`, the documented recipe for re-seeding to the
-  *same* value inside one process, stopped reproducing a bf16 run. Measured
-  `reproducible: False` on a 5-step Adakaon bf16+SR run with the default, `True`
-  with `SR_TRITON=False`. `kaon._stochastic_rounding` now keeps a `_reseed_hooks`
-  registry that `kaon._fused_triton` appends to on import (no module-level import
-  the other way, so a Triton-less build is unaffected); the kernel reset stays
-  internal, and `kaon.reseed_stochastic_rounding()` remains the single public call.
-  Affected all ten optimizers' weight writes.
-- **Hot `gradient_centralization` flip corrupted the fused big path.**
-  `BigPointerCache` aliases `rowmean` onto `rowsum` when GC is off (it saves `N*R`
-  floats and nothing reads it), but a param group is a mutable dict and a scheduler
-  can flip the flag mid-run. The cache was keyed only on the parameter witness, so
-  nothing moved and it was not rebuilt: `_reduce_rowcol` then wrote the per-row
-  means over the row sums and the factored EMA was built from means — measured
-  **1.1e-3** relative divergence from the native path, silently. `gc` is now part
-  of the cache's validity.
-- **Race in the chunked 4-bit requant** (`_chunked_4bit_apply_batched_g`). It stored
-  the per-block absmax scales and then `tl.load`ed them back to quantize — the
-  storing lane and the reading lanes are different lanes of the same program, with
-  no barrier between, so a lane could quantize against the **previous step's** scale.
-  Surfaced by the determinism work above: 4-bit momentum stayed nondeterministic
-  (5.1e-4 relative spread over identical runs) even with the reductions made
-  two-pass. The scale is now kept in registers, which drops 4-bit's default-path
-  spread to **5.1e-8** and removes the per-block loop at the same time.
-- **Resume under bf16/fp16 params is byte-identical again.**
-  `load_state_dict_preserving_dtypes` used to cast state back to the saved dtype
-  *after* torch had already rounded floating buffers through the param dtype
-  (~0.3% relative drift per resume on `m_scale`/`row`/`col`/`v`). It now
-  re-applies the checkpoint tensors (values + dtype), `copy_` when identity can
-  be kept for MSAM's cached pointers, and accepts int/str state keys (JSON drift).
-- **ScheduleFree stochastically rounds bf16 `z` on every write.** This is independent
-  of `bf16_method` and consumes RNG even when model weights are fp32, so sub-ULP
-  `z` updates remain unbiased without a Kahan/shift buffer.
-- **AdaPNM handles empty groups and late gradients consistently.** Parameter-local
-  steps retain the correct bias correction and global PNM parity, while the shared
-  momentum codec preserves state-buffer identities required by cached pointers.
-- **AdaPNM int8 1-D scales now use scalar shape `()` instead of `(1,)`.** The value
-  is unchanged; checkpoints have been verified across foreach and per-parameter
-  paths in both directions.
-- **Lion / AdaBelief / AdamP / KProdigy requantize momentum in place.** Their
-  `_store_one` / `_store_stacked` (and KProdigy's int8 EMA) reassigned
-  `state["m"]` / `state["m_scale"]` on every step. MSAM/Nekaon cache `data_ptr`
-  tables into those buffers for the fused climb, so a reassignment left the plan
-  reading freed memory (measured climb error ≈ 76% of the bound with
-  `MSAM(Lion, momentum_dtype="int8")`). All four now delegate to
-  `_MomentumCodec.store_one` / `store_stacked`, which `copy_` into the existing
-  tensors — the same contract Adakaon's codecs already followed since 0.7.8.
-  Numeric output is bit-identical (same quantizers); only storage identity changes.
-  Note: int8 `m_scale` for 1-D params stays shape `()` (as allocated); the old
-  foreach path had rewritten it to `(1,)` via reassignment. Values match; old
-  checkpoints with either layout still load.
-- **MSAM fused-plan witnesses cover `m` / `m_scale`.** `_plan_addrs_valid` now
-  re-reads `data_ptr` from the live state dicts (and every weight in the bucket),
-  so a base that still reassigns momentum invalidates the plan instead of climbing
-  on dangling pointers. `MSAM(AdaPNM, …)` with `rho != 0` raises `TypeError`
-  (dual `m_pos`/`m_neg`, no single `m`); `rho=0` remains a passthrough. The
-  inert-lookahead threshold is mode-aware (`none`: per-coordinate `|rho|*lr*clip`;
-  `global`/`tensor`: `|rho|` vs weight L2 norms) so `norm="global", rho=0.3,
-  lr=1e-6` no longer spuriously suggests raising lr.
-- **Lion `foreach` no longer silently skips `channels_last` convs.** The batched
-  write flattened via `reshape`, which copies a non-contiguous weight and drops
-  the update (max|Δw| = 0 over many steps). `ndim > 2` params now require
-  contiguity for the foreach path (same gate as Adakaon) and fall back to
-  per-param otherwise.
-- **ADOPT** — per-parameter ``state["step"]`` governs the step-0 ``v`` init and the
-  ``step**0.25`` clip so a param whose first gradient arrives late (or a ``.step()``
-  with no grads) no longer leaves factored ``row``/``col`` at zero and diverges to
-  NaN; ``momentum_dtype`` is resolved per param group (not silently from the
-  constructor kwarg). Checkpoints without per-param ``step`` seed the counter from
-  ``max(1, group["step"] - 1)`` when ``v``/``row`` already exist.
-- **SAM** — ``second_step`` restores every ``old_p`` snapshot even when the second
-  backward left ``p.grad`` as ``None``; global grad norm and the climb are batched
-  (``torch._foreach_norm``, stacked chunks bounded by ``foreach_budget``). The
-  batched norm accumulates in fp32 so ``scale`` is slightly more accurate on bf16
-  weights than the old per-param bf16 reduction.
-- **Lookahead** — ``_sync_foreach`` chunks stacked slow-weight syncs with
-  ``foreach_budget`` instead of materializing an unbounded ``[N, *shape]`` transient.
-- **ktune** — OOM timings format as ``OOM`` instead of raising ``TypeError``; when
-  CUDA+Triton are available, sweeps ``fused=True`` over ``fused_tile_cap`` and
-  reports the best tile.
-- **Stochastic rounding preserves NaN on CUDA.** The int32 bit-trick added noise to the
-  canonical NaN pattern `0x7FFFFFFF`, overflowed the sign bit and wrote `-0.0` instead:
-  a diverging run looked healthy while weights were silently zeroed (CPU kept the NaN,
-  so no CPU test could see it). NaN now propagates like every other PyTorch op; `+-inf`
-  and finite overflow to `inf` behave exactly as before (bit-identical to 0.7.11 with
-  the same noise).
-- **Stochastic rounding no longer consumes the global RNG.** Noise comes from a
-  per-device `torch.Generator` owned by the module, seeded from the global initial seed
-  and re-seeded whenever `torch.manual_seed` changes it, so dataloader / dropout streams
-  no longer depend on how many parameters were rounded. Re-seeding to the *same* value
-  inside one process is not observable; call `kaon.reseed_stochastic_rounding()` then.
-- **AdaMuon `compile=True` no longer recompiles every step.** It wrapped the whole
-  step body, so Dynamo installed a guard per parameter on *whether that parameter has
-  a gradient* and one on the *literal value* of `group["lr"]`. Any LR schedule, or a
-  grad set that varies (MoE routing, CFG dropout, partial gradient accumulation),
-  therefore burned through `recompile_limit` (8) and fell back to eager **silently**;
-  `add_param_group` cost two more recompiles. Measured on a 6-weight bag: 8 compiled
-  graphs and multi-second recompiles in both scenarios, `add_param_group` +8.2 s.
-  The compiled unit is now the pure-tensor bucket math (`_factored_math`,
-  `_nonfactored_pre_math`, `_post_math` and their per-parameter twins), with the grad
-  filter, bucketing, momentum codec and state write-back left in eager Python — so
-  the graphs are guarded on shapes and dtypes only. Same scenarios now compile **1**
-  graph, and `add_param_group` costs 4 ms instead of 8.2 s. Eager output is
-  bit-identical to 0.7.11 (verified over 20 configs x foreach on/off, CPU and CUDA).
-  Trade-off: at *constant* lr with a fixed grad set the old whole-step graph
-  specialized better than the new per-bucket kernels on multi-shape models (12
-  distinct small weights 0.27x -> 0.76x eager-relative; U-Net-like 0.41x -> 0.84x).
-  **With an LR schedule attached that peak does not exist**: the same two sets measured
-  1.03x and 1.00x before the fix (compile did nothing) versus 0.29x and 0.79x after —
-  i.e. in the regime real runs are in, `compile=True` goes from a no-op to a 1.3-3.4x
-  step speedup. Single-slice buckets now stack with a zero-copy `unsqueeze` instead of
-  copying.
-- **AdaMuon resumes from a pre-0.7.12 checkpoint.** `torch.optim.Optimizer.load_state_dict`
-  *replaces* each `param_groups` dict with the checkpoint's (only `params` is carried
-  over), so a checkpoint written before `bias_correction` existed left the live group
-  without that key and the next `step()` died with `KeyError: 'bias_correction'`.
-  `load_state_dict` now backfills any key the checkpoint predates from `self.defaults`
-  (values the checkpoint *does* carry still win, so a resumed run keeps its tuning), and
-  both read sites use `group.get(...)`. Verified bit-identical resume against real 0.7.11
-  checkpoints across bf16/int8/4bit/fp32 momentum with and without weight decay. Any
-  future hyperparameter is covered by the same backfill.
-- **AdaMuon `step()` no longer raises on a gradient-less param group.** A group where
-  nothing has a gradient — MoE routing leaving an expert unrouted for a step, CFG
-  dropout, partial gradient accumulation, or a bare `step()` with nothing backwarded —
-  reached the `foreach` path's `params[0].device` probe with an empty list and raised
-  `IndexError`. Such groups are now skipped and their parameters left untouched.
-- **AdaMuon `clip_threshold` documentation was wrong about when it fires.** The
-  docstring called it "a near no-op in steady state". The factored second moment has
-  no bias correction, so on a real proxy-U-Net run (β₂=0.999) the mean `rms(u)`
-  *before* the clip measures 31.9 at step 1, 11.0 at step 10, 3.56 at 100, 1.20 at
-  1000 and 0.98 at 2999 — i.e. almost exactly `1/√(1-β₂ᵗ)`. The clip is active on 100 %
-  of weight buckets for the first `~1/(1-β₂)` iterations and 70-80 % after, and is what
-  sets the early effective step size; it is in effect the second moment's bias
-  correction. Documented as a first-order hyperparameter, not a safety net.
-- **AdaMuon `ns_steps=2` rationale corrected.** The docstring credited the default to
-  "5 over-orthogonalizes". Measured singular-value spectra say otherwise: the quintic
-  settles into a band ≈[0.67, 1.20] and never leaves it, `ns=2` is already inside it
-  on skinny matrices (mean sv 0.89-1.06 at 4:1-16:1 — LoRA shapes and matrixized
-  convs) but heavily *under*-orthogonalized on square ones (mean sv 0.56 at 256²,
-  0.31 at 1024², with near-zero directions). The default stands as an empirical sweep
-  result on a skinny-weight model; `ns_steps` should be re-swept on models with large
-  square weights. Table in docs/adamuon.md.
-- **`centralize_grads_` groups by `(shape, device, dtype)`.** A param group mixing CPU
-  and CUDA tensors crashed in `torch.stack` on the first step (default config).
-- **Every optimizer's `load_state_dict` now backfills missing `param_groups` keys**
-  (the AdaMuon fix above, applied everywhere else). `torch.optim.Optimizer.load_state_dict`
-  replaces each `param_groups` dict with the checkpoint's (only `params` carries over),
-  so any hyperparameter added since a checkpoint was written vanished from the resumed
-  group and the first `step()` died with `KeyError`. Fixed in ADOPT, AdaBelief, AdamP,
-  KProdigy, AdaPNM, Lion, ScheduleFree (own `defaults`), and SAM / Lookahead (which did
-  not previously carry a `self.defaults` at all — added one for their own per-group keys:
-  SAM's `rho`/`adaptive`, Lookahead's `k`/`alpha`/`slow_dtype`/`slow_4bit_block`/
-  `la_step`/`train_mode`). Values the checkpoint *does* carry are never clobbered. MSAM
-  and Nekaon needed no change: both keep their own hyperparameters (`rho`, `norm`) as
-  instance attributes, not per-group keys, and fully delegate to the inner optimizer's
-  `load_state_dict`. Adakaon's own backfill is out of scope here (concurrent audit batch).
-
-### Added
 - **AdaMuon `bias_correction`** (default `False`) — divides the factored second moment
   by `1 - β₂ᵗ`, per parameter. The correction cancels out of the row factor (a ratio of
   row statistics) and survives only in the column factor, so it reduces exactly to one
@@ -393,135 +535,6 @@ All notable changes to this project will be documented in this file.
   normalization and the clip is marginally the better one. Turn it on when you
   raise or disable `clip_threshold`, or when composing with a layer that assumes an
   unbiased `1/√v`. Numbers and reasoning in docs/adamuon.md.
-
-### Performance
-- `add_stochastic_` writes back with `copy_(fp32)` (no bf16 temporary) and draws int32
-  noise directly (4 B/elem transient instead of 10 B/elem).
-- `subtract_batched_` casts the stacked delta once per bucket instead of once per
-  parameter when the stack dtype differs from the params (`aten::_to_copy` no longer
-  scales with bucket size; 5-15x on the cast-heavy bags).
-- **AdaPNM's big (chunked, batched) route caches its pointer arrays** in a new
-  `BigPnmCache`, the AdaPNM counterpart of `BigPointerCache`: grad / weight / both momenta
-  address arrays plus the `rowmean`/`rowsum`/`colsum`/`keep`/`rms` scratch were rebuilt from
-  fresh `torch.tensor([...])` allocations on *every* step, while the one-block and 1-D routes
-  have cached theirs since 0.7.9. Measured on an 8x `(512,512)` bucket, steady state:
-  caching-allocator allocations 22 -> 13-14 per step and the pointer arrays' host-to-device
-  copies 4 -> 0-1 per step (two independent measurements). CUDA **kernel** launches are
-  unchanged — the win is host-side allocation and H2D traffic, not launch count. Same math,
-  same state.
-- **Fused Triton path (Adakaon): pointer caches validate the WEIGHT storage.** Every
-  fused cache (`PointerArrayCache`, `BigPointerCache`, `OneDimPointerCache`,
-  `AdaPnmCache`, `OneDimPnmCache`) and the routing partition keyed on `id(p)` only, so a
-  `p.data` rebind (external EMA, `.to()`, block-swap offloaders, FSDP reshard) left the
-  kernel writing the retired storage: use-after-free of neighbouring tensors and a
-  parameter that silently stopped training. Caches now witness `(id, data_ptr,
-  is_contiguous)` per step (measured +41 us/step on a 428-tensor bag; the `shape` field
-  was rejected at 2x that cost). A rebind that changes the *shape* of `p.data` is not
-  supported (factored state is shape-bound) and is pinned by an `xfail` test.
-- **`reduction_tile` returned a non-power-of-2 `BR`** and `tl.arange` refused to compile:
-  any bag with >= 2 same-shape tensors of `R in [5, 127]` not a power of 2 (LoRA ranks
-  12/24/48/96 over 640-1280 channels, `(9,640)`, `(96,96)`, or one tensor with
-  `beta1=0`) crashed on the first step. Rounded up; all consumers already mask rows.
-- **`momentum_4bit_block != 128` wrote past `m_scale`** in the one-block kernel (`BLK`
-  hard-coded to 128, unmasked scale store). The one-block route now only takes 4-bit
-  state whose block is 128 (others go native, bit-identical to the per-param path), and
-  `requant_4bit`/`dequant_4bit` mask both the store and the load with the real
-  `m_scale` capacity.
-- **Non-contiguous gradients were read through `data_ptr` ignoring strides** on all
-  three fused routes (the check only existed for `ndim > 2`, and was cached). Grad
-  contiguity is now re-checked every step; offending tensors take the native path for
-  that step without rebuilding the caches (memoised demotion set, 3.8x cheaper than a
-  rebuild-per-step).
-- **Triton specialised an integer argument equal to 1** (`C.to(tl.float32)` on a
-  `(20000, 1)` weight) into a Python `int` and failed to compile; also reached AdaPNM
-  through the shared `_reduce_rowcol`.
-- **fp16 weights + `bf16_method="stochastic_rounding"` silently fell back to
-  round-to-nearest**; the constructor and `add_param_group` now raise
-  `NotImplementedError` (validated before the group is added).
-- **Non-finite policy is now uniform: propagate.** `sr_round` no longer turns NaN into
-  `-0.0` (int32 overflow) or a low-payload NaN into `+inf`; the seven cautious sites
-  multiply by the mask instead of `tl.where`, so an `inf`/NaN gradient produces the same
-  non-finite tensor on the fused and native paths (the fused path used to freeze the
-  tensor forever in silence).
-- **Mixed-device param groups** (CPU + CUDA) crashed in `torch.stack` inside the foreach
-  and fused bucketing; `device` is part of every bucket key and kernels launch under the
-  bucket's device.
-- **Fused Triton path (AdaPNM): the same five defects, now closed on AdaPNM's own routes.**
-  The batch-A fixes above landed on Adakaon and on the shared caches, but AdaPNM's launchers
-  had not been carried over: `_fused_partition` and the `AdaPnmCache` / `OneDimPnmCache`
-  callers still keyed on `id(p)` alone, so a `p.data` rebind kept the one-block and 1-D
-  kernels writing the *retired* storage (measured: every parameter in the bag scribbled,
-  ~1e-2 divergence from native). The routing key is now
-  `_fused_triton.param_witness` (`id`, `data_ptr`, `is_contiguous`) and each pointer cache
-  is revalidated per step (`built_from` when the lag bucketing hands back the partition's own
-  list, `stale` otherwise). Also fixed on AdaPNM: `_adapnm_tile_kernel` passed `NS = NB` to
-  `requant_4bit`/`dequant_4bit` with a hard-coded 128-element block, so any other
-  `momentum_4bit_block` wrote past *both* momenta's scale buffers (measured with a canary:
-  32 fp32 past a 32-entry `m_pos_scale`/`m_neg_scale` on a `(64,128)` weight at block 256) —
-  the one-block route now requires block 128 and the kernel receives each tensor's real scale
-  capacity; grad contiguity is re-checked every step (it was only checked for `ndim > 2`, and
-  cached, so transposed/strided grads reached all three routes at ~1e-2 from native); the five
-  AdaPNM cautious sites multiply by the survivor mask instead of `tl.where`, so a non-finite
-  update propagates as it does natively instead of freezing the tensor; and `device` joined the
-  native foreach bucket keys and the big-route shape buckets (a CPU + CUDA group took the whole
-  native step down in `torch.stack`).
-  Cost on a 428-parameter bag: witness key 62 us/step (vs 19 us for the old ids-only key),
-  grad-contiguity sweep 68 us/step, cache revalidation 0.3 us/step via `built_from` (a naive
-  per-bucket `stale` would have cost 70 us). Verified bit-identical to the pre-fix build across
-  {fp32, bf16} params x {fp32, bf16, int8, 4bit} momentum x cautious on/off on every
-  atomic-free route (0/976 state tensors differ); the big route's `tl.atomic_add` on `colsum`
-  is not run-to-run reproducible in either build (49/512 tensors differ base-vs-base too).
-- **AdaBelief / AdamP bias-correct on a per-parameter step.** Both advanced
-  `group["step"]` on every `step()`, including groups with no gradients, so a
-  param whose first gradient arrives at step 100 was corrected with `bc1 ≈ 1`
-  instead of `1 - beta1` and took a first update ~10x too short. Each param now
-  carries `state["step"]` for `bc1`/`bc2` (foreach buckets by it alongside
-  shape/dtype, 0-D and shape-(1,) params still riding as batched views) while
-  `group["step"]` stays the global clock for schedulers. Trajectories change only
-  for params with late gradients; when every param has a gradient from step 1 the
-  output is bit-identical to before. Checkpoints without `state["step"]` infer the
-  group clock on load.
-- **AdamP projects bf16 weights in fp32 on the per-param path.** `_project_one`
-  normalized the weight in its storage dtype, so a bf16 weight was projected
-  through bf16 norms and dot products while the foreach path (which stacks in
-  fp32) was not: the two diverged by 6e-3 relative on the same inputs. Both paths
-  now share one fp32 working dtype and write back to the parameter dtype only in
-  the final subtract.
-- **KProdigy's bf16 momentum EMA runs in fp32.** The EMA was computed in bf16
-  (three roundings: gradient cast, product, sum) and was not invariant to
-  batching — CPU bf16 elementwise kernels round the vectorized body and the
-  scalar tail differently, so a `numel % 16 != 0` tensor picked up an ulp of
-  momentum error when it was folded into a stack (1.07e-4 relative on D, 3.4e-2
-  on the weights, with shapes (3,7)/(5,11)/(127,)). Per-param and foreach now
-  both widen to fp32 and round once on write, aligned with this release's change
-  to the shared bf16 codec. bf16 momentum runs differ from previous releases
-  here; the change is a fidelity improvement and the two paths are again
-  bit-identical.
-
-- **KProdigy folds the D statistics on the host in one transfer.** Pass 1 summed
-  2N zero-dim GPU tensors in a Python loop and then called `.item()` twice; the
-  partials are now stacked, copied once, and folded sequentially in
-  `numpy.float32` in the same order (2253 -> 128 kernel launches and 2 -> 0
-  synchronizations per step on a 428-tensor bag; the fold itself 20.4 -> 0.32 ms).
-  Steps that do not update D skip the transfer entirely. The bf16 momentum EMA is
-  batched per bucket (20.44 -> 5.75 ms) and the dead `_flat_full_bucket` wrapper
-  is gone. The per-param/foreach *D trajectory* is no longer bit-identical — the
-  batched `[B, L]` reduction is a different tree, ~3.3e-7 relative at
-  `slice_p=11` on CPU — and the tests now pin it to 1e-6 relative.
-- **AdamP's batched projection removes the radial temporaries.** The stacked path
-  built six `[N, R, C]` tensors (normalized weights, radial components and two
-  `torch.where` results) even though at most one branch fires per slice. It now
-  reduces to one broadcast coefficient per row/tensor applied with `addcmul_`:
-  31.2 -> 20.4 ms isolated (-35%) and 496 -> 369 MB of step peak (-26%). The fp32
-  reassociation makes it differ from the normalized-vector form by ~5e-8
-  relative. The per-param path also dropped its two host synchronizations per
-  param per step (`if cos.max() < ...`) for an on-device mask.
-
-### Performance
-- **AdaPNM fused caches are keyed by `(group, lag)`.** Stable late-gradient buckets
-  reuse their pointer caches instead of rebuilding them every step, avoiding the
-  measured 3.9 -> 29 ms/step regression and reducing 400 reconstructions to a
-  stable cache set; inactive lags are pruned to keep memory bounded.
 
 ## [0.7.11]
 
