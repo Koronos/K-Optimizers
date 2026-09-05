@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from kaon import _backend as bk
 from kaon._backend import centralize_grads_, subtract_batched_
 from kaon._stochastic_rounding import add_stochastic_
 
@@ -75,7 +76,22 @@ def test_centralize_grads_batched_same_device() -> None:
 
 
 def test_subtract_batched_sr_matches_per_param(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Batched SR is bit-identical to per-param SR given the same noise draws."""
+    """Batched SR is bit-identical to per-param SR given the same noise draws.
+
+    Scoped to the TORCH implementation, deliberately. The claim only holds there: it works by
+    replaying a fixed ``torch.randint`` sequence, and ``subtract_batched_`` draws one block of
+    noise for the whole stack while ``add_stochastic_`` draws one per param — identical only
+    because the patch hands out the same stream in the same order. Since 0.7.12 a CUDA bf16
+    write goes through the Triton kernel instead (``kaon._backend.SR_TRITON``), whose noise is
+    Philox-per-lane and shares nothing with ``torch.randint``, so the two would differ. The
+    tensors below are CPU (where the Triton path never applies), but ``SR_TRITON`` is pinned
+    anyway so the test states its assumption instead of relying on the device.
+
+    The Triton path's own guarantees are covered on CUDA in ``tests/test_fused_triton.py``:
+    unbiasedness against this implementation, non-finite propagation, and reproducibility
+    under ``torch.manual_seed`` + ``kaon.reseed_stochastic_rounding()``.
+    """
+    monkeypatch.setattr(bk, "SR_TRITON", False)
     shape = (3, 4)
     n = 2
     numel = n * shape[0] * shape[1]

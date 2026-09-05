@@ -23,6 +23,82 @@ All notable changes to this project will be documented in this file.
   (measured block-128 table in `docs/momentum.md`).
 
 ### Performance
+- **A lone big 2-D weight takes the BATCHED chunked kernel** (`_fused_big`, `N == 1`).
+  The per-tensor `_chunked_step` it replaces blocked the CPU twice per tensor per
+  step (`float(rms)`, `keep.item()`) and materialized fp32 `g` + `g*g`. Measured
+  (RTX 3000 Ada, paired geometric mean, 95% CI): a bag of 12 DISTINCT big shapes —
+  the UNet/DiT case, one tensor per shape bucket — **3.38x [3.01,3.80] fp32 /
+  3.26x [3.04,3.50] bf16**, 337→108 launches, and the step no longer synchronizes
+  *for its own reductions* (see the caveat below). Single tensors 1.21–4.75x; peak
+  transient on `(4096,4096)` **156→0 MiB** (272→0 with 4-bit). **No fidelity cost
+  for any momentum dtype**: over six repeats, both the per-tensor and the batched
+  arm sit at 4.64e-8 relative to native on a (1024,512) 4-bit weight, the same
+  fp32-reduction-order noise the float momenta carry. (A first measurement put
+  4-bit at ~4e-4 here; that was the scale store/reload race fixed under *Fixed*
+  below, not a property of the batched kernel. The `test_chunked_4bit_*` bounds are
+  **1e-6**, tightened from the pre-existing 5e-4.)
+- **Direct in-kernel int8 momentum for the batched big path**
+  (`_chunked_int8_{keep,apply}_batched_g`), the mirror of the 4-bit pair. Replaces
+  `dequant_stacked` → generic kernels → `_quant_int8_stacked`: **120→6 launches**,
+  peak transient **58.5→0 MiB** (100x(256,256)), **2.77–5.81x**, and it drops the
+  `ptr_array` host→device copy the codec path made every step. Conditional on
+  `C <= 1024 and 1024 % C == 0` so a chunk owns whole rows (int8 scales per row);
+  other shapes keep the codec fallback.
+- *Caveat on the "sync-free" claims above.* What the two changes remove is the
+  optimizer's OWN synchronizations — `float(rms)` and `keep.item()` per tensor per
+  step on the lone-big path, and the codec's staging copy on the int8 path. One
+  synchronizing operation remains and is **not** addressed here: the grad
+  pointer-array refresh (`refresh_grads`) does a pageable host→device copy whenever
+  a gradient is reallocated, which with the default `zero_grad(set_to_none=True)`
+  is every step. Verified: with grads reused across steps a big-bucket step probes
+  clean under `set_sync_debug_mode("error")`; with grads reallocated it does not.
+  A pinned staging buffer would make that copy async and was measured at
+  **4.4–4.8 µs per bucket per refresh, flat in N** — not taken, because it needs a
+  CUDA event (or a buffer ring) to stop the next step overwriting a copy still in
+  flight, and 4.4 µs/bucket is ~30x smaller than what the launch packing below
+  removes.
+- **Triton bf16 stochastic-rounding write** (`sr_add_`, used by `subtract_one_` /
+  `subtract_batched_` on CUDA). Replaces `add_stochastic_`'s 7–8-kernel chain and
+  its two parameter-sized temporaries with one kernel and none: **3.43x** (1 M),
+  **4.76x** (4 M), **6.39x** (13 M), 9→1 launches, transient 13/52/162→**0 MiB**.
+  `subtract_batched_` on 200x(256,256) bf16: **4.64x**, 12→4 launches, peak
+  188.5→**26.0 MiB**. End to end on a mixed bag (200x(256,256) + 100x(512,) + 128
+  scalars, native path, bf16): **1.195x [1.143,1.250]**. Different (also unbiased)
+  noise stream than the torch path, and it applies to **every** optimizer's bf16
+  weight write, not only Adakaon's; `kaon.reseed_stochastic_rounding()` resets it
+  along with the torch generators, and `kaon._backend.SR_TRITON = False` pins the
+  reference implementation.
+- **Nine→six launches per big bucket per step.** `colsum`/`rms`/`keep` are adjacent
+  slices of one buffer (one `zero_()` instead of three) and the `grid=1`
+  `_finish_rms` is folded into every consumer (`inv_rms_clip`). Isolated cost of
+  the four removed launches, paired over 500 pairs: **45.6 ± 13.2 µs** at one
+  bucket, **1.76 ms ± 0.04** at ten and **5.01 ms ± 0.29** at forty — a FIXED
+  per-bucket cost, which is what a many-bucket step pays over and over. Reduction
+  scratch also drops: `rfac`/`cfac` are written in
+  place over `rowsum`/`colsum` and `rowmean` is allocated only under GC — 0.98→0.59
+  MiB for 100x(512,512), 9.78→5.87 MiB for 1000x(512,512).
+- **4-bit per-block absmax is one axis reduction** on unpadded tiles
+  (`requant_4bit(EXACT=...)`, bucketed by `PointerArrayCache`). The general path
+  loops `NB` times over the whole tile — O(numel·NB) — which measured 4-bit
+  momentum 1.78x/1.88x/3.15x slower than bf16 on `(64,128)`/`(128,64)`/`(16,512)`
+  (NB=64) but only 1.07x at NB=16. **1.18–1.65x** on the requant (the ratio grows
+  with NB; n.s. at NB=16), taking 4-bit vs bf16 to **0.98x/0.96x/1.16x**.
+  Bit-identical — verified on weights, packed codes AND scales (`max` is
+  order-independent).
+- **`eps1` on the row/col means instead of the `[N,R,C]` square** in the native
+  factored foreach bucket (`mean(x+eps) == mean(x)+eps`, so a full read-modify-write
+  pass over the bucket disappears). **Bit-identical** in every tested config,
+  including large `eps1` and 1e-10 gradients. Quiet-GPU paired A/B (geometric mean
+  of 150–300 per-rep ratios, 95% CI): +1.4% [-1.1, +3.9] on 200x(256,256), **+2.6%
+  [+0.5, +4.8]** on 50x(512,512), ~0 on 400x(64,64).
+- **`lr` rides the weight write** (`subtract_one_`/`subtract_batched_` take `alpha`)
+  instead of a separate `delta.mul_(lr)` pass over the stacked bucket. Applied to
+  the per-parameter path AND both foreach buckets, because `Tensor.sub_(d, alpha=lr)`
+  and `torch._foreach_sub_` with `alpha` are bit-identical — folding it in only one
+  would break `foreach == per-param`. Quiet-GPU paired A/B: **+4.4% [+0.7, +8.1]**
+  on 200x(256,256), **+3.7% [+0.9, +6.6]** on 50x(512,512). Sub-ulp vs the old
+  order (`mul_` then subtract can round differently from a contracted `a - lr*b`);
+  bit-identical on bf16 params.
 - **int8 `ema_one`**: `.float().mul_(scale)` (one temp), drop `delta.clone()`,
   write codes with `(m/scale).round_().clamp_` into `state["m"]` — measured
   13→8 B/elem transient, 14→12 kernels, ~1.29×, bit-identical. Same clone
@@ -30,7 +106,44 @@ All notable changes to this project will be documented in this file.
   slice is kept as-is: materialising it changed the `lerp_` kernel and broke the
   per-param/stacked bit-exactness).
 
+### Added
+- **`Adakaon(deterministic_reductions=True)`** — the fused big-tensor path becomes
+  bit-reproducible run to run. Its batched reductions accumulate `colsum`/`rms` with
+  fp32 atomics, whose completion order the scheduler picks; measured spread over 4
+  identical runs (max|Δp| / weight scale) was 5.1e-8 (fp32 momentum), 3.9e-6 (bf16),
+  8.1e-6 (int8). The flag switches those two to the two-pass (partials → fixed-order
+  reduce) form the design doc held in reserve. Costs 0–9% and an `N*ceil(R/BR)*C`
+  fp32 buffer per bucket (1.4→8.8 MiB on 236x(512,512)); default off. `keep` needs
+  nothing — it is an int32 atomic, and integer addition is exact in any order.
+
 ### Fixed
+- **`reseed_stochastic_rounding()` now resets every SR noise stream.** With the
+  Triton bf16 write enabled (the new default) it reset only the torch generators,
+  while the kernel's own seed counter kept running — so `torch.manual_seed(s)` +
+  `kaon.reseed_stochastic_rounding()`, the documented recipe for re-seeding to the
+  *same* value inside one process, stopped reproducing a bf16 run. Measured
+  `reproducible: False` on a 5-step Adakaon bf16+SR run with the default, `True`
+  with `SR_TRITON=False`. `kaon._stochastic_rounding` now keeps a `_reseed_hooks`
+  registry that `kaon._fused_triton` appends to on import (no module-level import
+  the other way, so a Triton-less build is unaffected); the kernel reset stays
+  internal, and `kaon.reseed_stochastic_rounding()` remains the single public call.
+  Affected all ten optimizers' weight writes.
+- **Hot `gradient_centralization` flip corrupted the fused big path.**
+  `BigPointerCache` aliases `rowmean` onto `rowsum` when GC is off (it saves `N*R`
+  floats and nothing reads it), but a param group is a mutable dict and a scheduler
+  can flip the flag mid-run. The cache was keyed only on the parameter witness, so
+  nothing moved and it was not rebuilt: `_reduce_rowcol` then wrote the per-row
+  means over the row sums and the factored EMA was built from means — measured
+  **1.1e-3** relative divergence from the native path, silently. `gc` is now part
+  of the cache's validity.
+- **Race in the chunked 4-bit requant** (`_chunked_4bit_apply_batched_g`). It stored
+  the per-block absmax scales and then `tl.load`ed them back to quantize — the
+  storing lane and the reading lanes are different lanes of the same program, with
+  no barrier between, so a lane could quantize against the **previous step's** scale.
+  Surfaced by the determinism work above: 4-bit momentum stayed nondeterministic
+  (5.1e-4 relative spread over identical runs) even with the reductions made
+  two-pass. The scale is now kept in registers, which drops 4-bit's default-path
+  spread to **5.1e-8** and removes the per-block loop at the same time.
 - **Resume under bf16/fp16 params is byte-identical again.**
   `load_state_dict_preserving_dtypes` used to cast state back to the saved dtype
   *after* torch had already rounded floating buffers through the param dtype

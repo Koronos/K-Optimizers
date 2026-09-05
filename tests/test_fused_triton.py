@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import kaon
 from kaon import Adakaon, Nekaon
 from kaon._fused_triton import (
     HAS_TRITON,
@@ -382,9 +383,19 @@ def test_chunked_int8_parity():
     assert st["m"].dtype == torch.int8 and st["m"].numel() == _parts(ov)[1][0].numel()  # 1 B/param
 
 
+# 4-BIT BOUND on the single-tensor chunked path: 1e-6, i.e. ~20x margin over the 4.64e-8 that
+# six repeats of each of these cases measure, stably. Routing a lone big tensor to the BATCHED
+# kernel (0.7.12, ``_fused_big_lone_batched``) moved its 4-bit requant from the torch codec into
+# Triton, and the first measurement of that put the deviation at ~4e-4 with a 3.4e-4..6.2e-4
+# run-to-run spread. That spread was a BUG, not a property of the kernel: the in-kernel requant
+# was storing the per-block scales and reloading them across lanes without a barrier (see
+# ``test_chunked_4bit_requant_no_longer_reloads_its_own_scales``). With the scale kept in
+# registers the deviation is 4.64e-8 — the same fp32-reduction-order noise the float momenta
+# carry — and it no longer moves between runs. So these bounds are TIGHT on purpose: they are
+# what would catch that race coming back.
 def test_chunked_4bit_parity():
     d, scale, ov = _run_parity([(1024, 512)], torch.float32, "4bit")
-    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+    assert d / scale < 1e-6, f"rel={d/scale:.2e}"
     assert len(_parts(ov)[1]) == 1
     st = ov.state[_parts(ov)[1][0]]
     assert st["m"].dtype == torch.uint8 and st["m"].numel() == _parts(ov)[1][0].numel() // 2  # 0.5 B/param
@@ -393,20 +404,22 @@ def test_chunked_4bit_parity():
 def test_chunked_4bit_odd_C():
     # the chunked codec packs the flat tensor, so 4bit handles odd C (unlike the one-block path)
     d, scale, ov = _run_parity([(1024, 513)], torch.float32, "4bit")
-    assert d / scale < 5e-4, f"rel={d/scale:.2e}"
+    assert d / scale < 1e-6, f"rel={d/scale:.2e}"
     assert len(_parts(ov)[1]) == 1
 
 
 @pytest.mark.parametrize("mdtype", ["int8", "4bit"])
 def test_chunked_quant_features(mdtype):
     d, scale, _ = _run_parity([(1024, 512)], torch.float32, mdtype, wd=0.05, cautious=True, gc=False)
-    assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
+    limit = 1e-6 if mdtype == "4bit" else 5e-4      # see the 4-bit bound note above
+    assert d / scale < limit, f"{mdtype} rel={d/scale:.2e}"
 
 
 # ------------------------------------------- batched chunked (>=2 same-shape big tensors) parity
-# The Cosmos LoKr regime: many same-shape factors > tile_cap. >=2 same-shape big tensors take the
-# batched chunked kernel (~2 launches for the whole bucket); a lone big tensor keeps the per-tensor
-# chunked kernel. Both must match native exactly (fp32) / within the dtype bound. 512x512 > cap.
+# The Cosmos LoKr regime: many same-shape factors > tile_cap. Every big shape bucket takes the
+# batched chunked kernel (~2 launches for the whole bucket), N == 1 included since 0.7.12 — see
+# ``_fused_big_lone_batched`` and the lone-big tests below. Both must match native exactly (fp32) /
+# within the dtype bound. 512x512 > cap.
 def test_big_batched_routes_and_parity_fp32():
     d, _, ov = _run_parity([(512, 512)] * 3, torch.float32, "float32")
     ob, big, od, nat = _parts(ov)
@@ -797,6 +810,110 @@ def test_big_4bit_partial_chunk_and_block_parity(block):
     for p in _parts(ov)[1]:
         assert p.numel() % 2 == 1
         assert int(ov.state[p]["m"][-1] >> 4) == 0
+
+
+# ------------------------------------------------- lone big tensor -> the batched (N=1) kernel
+# 0.7.12 routes a big shape bucket of ONE tensor through ``_chunked_step_batched`` too. The
+# per-tensor ``_chunked_step`` it replaces is correct but blocks the CPU twice per tensor per step
+# (``float(rms)``, ``keep.item()``) and materializes fp32 ``g`` + ``g*g``; on a bag of DISTINCT big
+# shapes (UNet/DiT, one tensor per bucket) that measured 3.2-3.6x slower and +12 MiB of transient.
+def test_lone_big_batched_is_sync_free_and_per_tensor_is_not():
+    """The routing change's WHY: the per-tensor arm synchronizes, the batched arm does not.
+
+    SCOPE: this holds for the step's OWN synchronizations — ``float(rms)`` and ``keep.item()``
+    in ``_chunked_step``. The grads below are attached once and reused, so ``refresh_grads``
+    finds the same pointers and does not rebuild. It is NOT a claim that a training step is
+    sync-free: with the default ``zero_grad(set_to_none=True)`` every backward allocates fresh
+    gradients, ``refresh_grads`` then rebuilds the pointer array with a pageable host->device
+    copy, and that copy synchronizes on both arms. Measured at 4.4-4.8 us per bucket; a pinned
+    staging buffer would remove it but needs a CUDA event to stop the next step overwriting a
+    copy still in flight, so it is left as follow-up (see the CHANGELOG caveat).
+    """
+    def one_step(lone):
+        ps = _bag([(1024, 1024)], torch.float32, seed=71)
+        for p in ps:
+            p.grad = torch.randn_like(p)
+        opt = _fused(ps, lr=1e-3)
+        opt._fused_big_lone_batched = lone
+        opt.step()                      # warm: JIT + state alloc + pointer caches
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            opt.step()
+            torch.cuda.synchronize()
+            return None
+        except RuntimeError as exc:
+            return str(exc)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+
+    assert one_step(True) is None, "batched lone-big step must be fully device-resident"
+    assert one_step(False) is not None, "per-tensor chunked step is expected to sync (the baseline)"
+
+
+def _lone_big_arms(mdtype, dtype=torch.float32, steps=6):
+    """max|Δp|/scale of (batched N=1, per-tensor chunked) vs NATIVE, plus the two arms' own gap."""
+    cfg = dict(lr=2e-3, weight_decay=0.05, cautious=True, gradient_centralization=True,
+               momentum_dtype=mdtype)
+    pb = _bag([(1024, 512)], dtype, seed=72)
+    pt, pn = _clone(pb), _clone(pb)
+    ob = _fused(pb, **cfg)
+    ot = _fused(pt, **cfg)
+    ot._fused_big_lone_batched = False
+    on = Adakaon(pn, **cfg)
+    gen = torch.Generator(device=DEV).manual_seed(13)
+    for _ in range(steps):
+        gs = [torch.randn(tuple(p.shape), generator=gen, device=DEV, dtype=dtype) for p in pb]
+        for ps in (pb, pt, pn):
+            for p, g in zip(ps, gs):
+                p.grad = g.clone()
+        ob.step()
+        ot.step()
+        on.step()
+    torch.cuda.synchronize()
+
+    def gap(xs, ys):
+        return max((a.detach().float() - b.detach().float()).abs().max().item()
+                   for a, b in zip(xs, ys))
+
+    scale = max(p.detach().float().abs().max().item() for p in pn)
+    return gap(pb, pn) / scale, gap(pt, pn) / scale, gap(pb, pt) / scale
+
+
+@pytest.mark.parametrize("mdtype", ["float32", "bfloat16"])
+def test_lone_big_batched_no_worse_than_per_tensor_vs_native(mdtype):
+    """Float momenta: routing N=1 to the batched kernel does not degrade fidelity vs native.
+
+    NOT bit-identical to the per-tensor kernel, and deliberately not asserted to be: the
+    per-tensor arm computes its reductions in TORCH (``_chunked_reductions``: ``gsq.mean`` +
+    ``bmm`` matvec) while the batched arm uses the Triton reduction kernels (atomic fp32
+    accumulation over row blocks). Different summation orders, so the two differ by fp32 ulps —
+    the same pre-existing deviation the ``_fused_reductions`` toggle carries for N>=2. What must
+    hold is that the batched arm is no FURTHER from native than the per-tensor arm was, plus a
+    ulp allowance. Measured (1024,512) fp32: both 4.6e-8 (float32 momentum) / 3.3e-6 (bf16),
+    with the two arms 4.6e-8 apart.
+    """
+    batched, per_tensor, between = _lone_big_arms(mdtype)
+    assert between < 1e-5, f"arms {between:.2e} apart — more than a reduction-order ulp"
+    assert batched <= max(per_tensor * 1.5, 1e-5), \
+        f"batched rel={batched:.2e} vs per-tensor rel={per_tensor:.2e}"
+
+
+def test_lone_big_4bit_keeps_the_per_tensor_fidelity():
+    """4-bit costs NOTHING in fidelity for routing a lone big tensor to the batched kernel.
+
+    It was expected to: the per-tensor path requantizes with the torch codec (``_quant_4bit``)
+    while the batched path requantizes in kernel, and the first measurement put the batched arm
+    at ~4e-4 relative to native against the per-tensor arm's 4.6e-8. That gap was the scale
+    store/reload race, not the kernel's arithmetic (see
+    ``test_chunked_4bit_requant_no_longer_reloads_its_own_scales``); with it fixed both arms sit
+    at 4.6e-8 — the fp32 reduction-order noise every momentum dtype carries — over six repeats.
+    Asserted for BOTH arms so a regression in either is caught here.
+    """
+    batched, per_tensor, between = _lone_big_arms("4bit")
+    assert per_tensor < 1e-6, f"per-tensor arm rel={per_tensor:.2e}"
+    assert batched < 1e-6, f"batched arm rel={batched:.2e}"
+    assert between < 1e-6, f"arms {between:.2e} apart"
 
 
 def test_big_4bit_direct_path_never_dequantizes_to_stacked_temp(monkeypatch):
@@ -1262,3 +1379,480 @@ def test_refresh_grads_revalidates_every_pointer():
     for p in of.param_groups[0]["params"]:
         st = of.state[p]
         assert torch.isfinite(st["row"]).all() and torch.isfinite(st["col"]).all()
+
+
+# ================================================= 0.7.12 batched-big performance batch
+# Direct in-kernel int8 momentum, the packed reduction scratch, and the Triton bf16
+# stochastic-rounding write. Each has a mechanism assertion (the thing that makes it fast)
+# next to a parity assertion (the thing that must not change).
+
+# ------------------------------------------------------------------- direct int8 momentum
+def test_big_int8_direct_path_never_dequantizes_to_stacked_temp(monkeypatch):
+    """C=512 divides BLOCK=1024, so the bucket requantizes in kernel - no codec, no fp32 temp."""
+    ps = _bag([(512, 512)] * 2, torch.float32, seed=81)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, momentum_dtype="int8")
+    codec = opt._codec(opt.param_groups[0])
+
+    def forbidden(*_a, **_kw):
+        raise AssertionError("direct chunked int8 path allocated the legacy fp32 stack")
+
+    monkeypatch.setattr(codec, "dequant_stacked", forbidden)
+    opt.step()
+
+
+def test_big_int8_direct_path_declines_when_a_row_spans_chunks(monkeypatch):
+    """C=1152 (a matrixized 3x3 conv) does NOT divide 1024, so a row has several writers.
+
+    The per-row absmax would then need a cross-program reduction; the routing must fall back
+    to the codec rather than requantize a partial row. This asserts the guard is REACHED -
+    without it the kernel would silently write a wrong scale for every split row.
+    """
+    ps = _bag([(256, 128, 3, 3)] * 2, torch.float32, seed=82)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, momentum_dtype="int8")
+    codec = opt._codec(opt.param_groups[0])
+    seen = []
+    real = codec.dequant_stacked
+
+    def spy(*a, **k):
+        seen.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(codec, "dequant_stacked", spy)
+    opt.step()
+    assert seen, "a bucket whose rows span chunks must keep the codec fallback"
+
+
+@pytest.mark.parametrize("shape", [(512, 512), (1024, 512), (2048, 64), (300, 1024)])
+def test_big_int8_direct_matches_native(shape):
+    """Every row-aligned shape: the in-kernel int8 codec tracks native within the int8 bound."""
+    d, scale, ov = _run_parity([shape] * 2, torch.float32, "int8", wd=0.05)
+    assert len(_parts(ov)[1]) == 2
+    assert d / scale < 5e-4, f"{shape} rel={d / scale:.2e}"
+
+
+def test_big_int8_direct_equals_codec_fallback():
+    """The two implementations of the same codec agree to fp32-reduction ulps."""
+    cfg = dict(lr=2e-3, weight_decay=0.05, cautious=True, gradient_centralization=True,
+               momentum_dtype="int8")
+    pd = _bag([(512, 512)] * 2, torch.float32, seed=83)
+    pc = _clone(pd)
+    od = _fused(pd, **cfg)
+    oc = _fused(pc, **cfg)
+    oc._direct_int8 = False
+    gen = torch.Generator(device=DEV).manual_seed(17)
+    for _ in range(6):
+        gs = [torch.randn(*p.shape, generator=gen, device=DEV) for p in pd]
+        for ps in (pd, pc):
+            for p, g in zip(ps, gs):
+                p.grad = g.clone()
+        od.step()
+        oc.step()
+    torch.cuda.synchronize()
+    d = max((a - b).abs().max().item() for a, b in zip(pd, pc))
+    scale = max(b.abs().max().item() for b in pc)
+    assert d / scale < 5e-4, f"direct vs codec rel={d / scale:.2e}"
+
+
+# ------------------------------------------------------------------- packed reduction scratch
+def test_big_reduction_scratch_is_one_zeroed_block_with_aliased_factors():
+    """The mechanism behind 9 -> 6 launches per bucket, asserted structurally.
+
+    Timing it in a unit test would be flaky; what the optimization actually IS is the
+    aliasing, so that is what is checked. A regression that re-split the buffers would
+    silently restore the three extra launches with every other test still green.
+    """
+    ps = _bag([(512, 512)] * 3, torch.float32, seed=84)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, gradient_centralization=True)
+    opt.step()
+    cache = next(iter(opt._fused_big_caches.values()))
+    zs = cache._zeros.untyped_storage().data_ptr()
+    for name in ("colsum", "rms", "keep"):
+        buf = getattr(cache, name)
+        assert buf.untyped_storage().data_ptr() == zs, f"{name} is not part of the packed block"
+    assert cache.keep.dtype == torch.int32
+    assert cache.rfac is cache.rowsum and cache.cfac is cache.colsum
+    assert cache.rowmean is not cache.rowsum          # GC on -> its own buffer
+    assert not hasattr(cache, "inv_rms")              # folded into the consumers
+
+
+def test_big_reduction_scratch_drops_rowmean_without_gc():
+    ps = _bag([(512, 512)] * 3, torch.float32, seed=85)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, gradient_centralization=False)
+    opt.step()
+    cache = next(iter(opt._fused_big_caches.values()))
+    assert cache.rowmean is cache.rowsum, "GC off must not pin a rowmean buffer"
+
+
+# ------------------------------------------------------------------- Triton bf16 SR write
+def test_sr_add_is_unbiased_and_matches_the_torch_path_in_expectation():
+    """``sr_add_`` must round stochastically with the SAME expectation as the torch path.
+
+    A single draw cannot be compared (different noise streams by construction), so this
+    compares the MEAN over many independent writes of a delta deliberately chosen to sit
+    between two bf16 grid points - where round-to-nearest would lose it entirely.
+    """
+    import kaon._fused_triton as ft
+    from kaon._stochastic_rounding import add_stochastic_
+    n = 1 << 16
+    # bf16 keeps 7 explicit mantissa bits (8 of precision counting the implicit leading 1),
+    # so the gap between 1.0 and the next representable value is 2^-7. Derived from torch
+    # rather than hardcoded, and cross-checked, so the constant cannot drift out of the
+    # comment: a wrong ulp here would silently make the tolerance meaningless.
+    ulp = (torch.tensor(1.0, dtype=torch.bfloat16).nextafter(
+        torch.tensor(2.0, dtype=torch.bfloat16)).float().item() - 1.0)
+    assert ulp == 2.0 ** -7, ulp
+    tri = torch.ones(n, device=DEV, dtype=torch.bfloat16)
+    tor = torch.ones(n, device=DEV, dtype=torch.bfloat16)
+    delta = torch.full((n,), 0.25 * ulp, device=DEV)     # a quarter ulp: RNE would drop it
+    for _ in range(40):
+        ft.sr_add_(tri, delta, 1.0)
+        add_stochastic_(tor, delta, alpha=1.0)
+    got, ref = tri.float().mean().item(), tor.float().mean().item()
+    exact = 1.0 + 40 * 0.25 * ulp
+    assert abs(got - exact) < 0.05 * ulp, f"triton mean {got} vs exact {exact}"
+    assert abs(got - ref) < 0.05 * ulp, f"triton mean {got} vs torch mean {ref}"
+
+
+def test_sr_add_propagates_non_finite_weights():
+    """NaN/inf must survive the write - the point of ``sr_round``'s finiteness guard."""
+    import kaon._fused_triton as ft
+    p = torch.tensor([float("nan"), float("inf"), float("-inf"), 1.0],
+                     device=DEV, dtype=torch.bfloat16)
+    ft.sr_add_(p, torch.zeros(4, device=DEV), 1.0)
+    assert torch.isnan(p[0]) and p[1] == float("inf") and p[2] == float("-inf")
+    assert torch.isfinite(p[3])
+
+
+def test_sr_add_supported_rejects_what_the_kernel_cannot_index():
+    import kaon._fused_triton as ft
+    good = torch.zeros(64, device=DEV, dtype=torch.bfloat16)
+    assert ft.sr_add_supported(good, torch.zeros(64, device=DEV))
+    assert not ft.sr_add_supported(good.cpu(), torch.zeros(64))            # CPU target
+    assert not ft.sr_add_supported(torch.zeros(64, device=DEV),
+                                   torch.zeros(64, device=DEV))            # fp32 target
+    assert not ft.sr_add_supported(good, torch.zeros(64, device=DEV,
+                                                    dtype=torch.bfloat16))  # bf16 source
+    strided = torch.zeros(128, device=DEV, dtype=torch.bfloat16)[::2]
+    assert not ft.sr_add_supported(strided, torch.zeros(64, device=DEV))   # strided target
+
+
+def test_sr_write_falls_back_to_torch_when_triton_is_off(monkeypatch):
+    """``triton=False`` must reach the torch implementation; ``True`` must not."""
+    from kaon import _backend as bk
+    calls = []
+    real = bk.add_stochastic_
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(bk, "add_stochastic_", spy)
+    p = torch.zeros(64, device=DEV, dtype=torch.bfloat16)
+    bk._sr_write_(p, torch.ones(64, device=DEV), -1.0, triton=False)
+    assert calls, "triton=False must use the torch path"
+    calls.clear()
+    bk._sr_write_(p, torch.ones(64, device=DEV), -1.0, triton=True)
+    assert not calls, "triton=True must use the kernel on a supported pair"
+
+
+def test_sr_write_reaches_both_weight_writers(monkeypatch):
+    """Both public writers route bf16+SR through ``_sr_write_`` (per-param and batched)."""
+    from kaon import _backend as bk
+    seen = []
+    real = bk._sr_write_
+
+    def spy(*a, **k):
+        seen.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(bk, "_sr_write_", spy)
+    p = torch.zeros(8, 8, device=DEV, dtype=torch.bfloat16)
+    bk.subtract_one_(p, torch.ones(8, 8, device=DEV), {}, "stochastic_rounding", alpha=1e-3)
+    bk.subtract_batched_([p, p.clone()], torch.ones(2, 8, 8, device=DEV),
+                         "stochastic_rounding", alpha=1e-3)
+    assert len(seen) == 2
+
+
+# ---------------------------------------------- 4-bit requant: single-axis reduction (item 9a)
+def _fourbit_state(shape, n, exact, steps=6, seed=91):
+    """Step a 4-bit bag with the one-block tile kernel, optionally forcing the general loop."""
+    ps = _bag([shape] * n, torch.float32, seed)
+    opt = _fused(ps, lr=2e-3, weight_decay=0.05, momentum_dtype="4bit")
+    gen = torch.Generator(device=DEV).manual_seed(7)
+    for i in range(steps):
+        for p in ps:
+            p.grad = torch.randn(*p.shape, generator=gen, device=DEV)
+        opt.step()
+        if i == 0 and not exact:            # the pointer caches exist after the first step
+            for cache in opt._fused_ob_caches.values():
+                for bk in cache.buckets:
+                    bk["exact4"] = False
+                    bk["fblk"] = 0
+    torch.cuda.synchronize()
+    return ps, opt
+
+
+@pytest.mark.parametrize("shape", [(64, 128), (128, 64), (16, 512), (64, 64)])
+def test_fourbit_single_axis_reduction_is_bit_identical_to_the_loop(shape):
+    """The rewritten per-block absmax must be BIT-identical, not merely close.
+
+    ``max`` is exact whatever the reduction order, so reshaping the tile into
+    ``(NB, BLK)`` and reducing one axis computes the same value as the NB-iteration loop
+    over the whole tile — weights, packed codes AND scales. Measured 1.19-1.63x faster
+    (the ratio grows with NB), which took 4-bit momentum from 1.8-3.2x slower than bf16
+    on these shapes to 0.82-1.23x.
+    """
+    pa, oa = _fourbit_state(shape, 8, exact=True)
+    pb, ob = _fourbit_state(shape, 8, exact=False)
+    assert all(torch.equal(a, b) for a, b in zip(pa, pb)), "weights differ"
+    assert all(torch.equal(oa.state[a]["m"], ob.state[b]["m"]) for a, b in zip(pa, pb))
+    assert all(torch.equal(oa.state[a]["m_scale"], ob.state[b]["m_scale"])
+               for a, b in zip(pa, pb))
+
+
+def test_fourbit_exact_tile_flag_tracks_the_bucket_shape():
+    """The fast path is claimed only where the tile is unpadded — that is its precondition."""
+    ps = _bag([(64, 128)] * 4, torch.float32, seed=92)          # powers of two -> exact
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, momentum_dtype="4bit")
+    opt.step()
+    bks = _buckets(opt)
+    assert bks and all(b["exact4"] and b["fblk"] == 128 for b in bks)
+
+    ps = _bag([(60, 100)] * 4, torch.float32, seed=93)          # padded tile -> general loop
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, momentum_dtype="4bit")
+    opt.step()
+    bks = _buckets(opt)
+    assert bks and not any(b["exact4"] for b in bks)
+
+
+# ------------------------------------------- deterministic reductions + the requant race (9b)
+def _big_run(mdtype, det, shape=(512, 512), n=3, steps=6):
+    ps = _bag([shape] * n, torch.float32, seed=94)
+    opt = Adakaon(ps, lr=2e-3, weight_decay=0.05, fused=True, momentum_dtype=mdtype,
+                  deterministic_reductions=det)
+    gen = torch.Generator(device=DEV).manual_seed(7)
+    for _ in range(steps):
+        for p in ps:
+            p.grad = torch.randn(*p.shape, generator=gen, device=DEV)
+        opt.step()
+    torch.cuda.synchronize()
+    return ps
+
+
+@pytest.mark.parametrize("mdtype", ["float32", "bfloat16", "int8", "4bit"])
+def test_deterministic_reductions_make_the_big_path_bit_reproducible(mdtype):
+    """``deterministic_reductions=True`` must give the SAME bits on a repeated run.
+
+    The default path accumulates ``colsum``/``rms`` with fp32 atomics whose completion order
+    the scheduler picks, so identical inputs drift run to run: measured max|Δp| / scale over
+    4 runs = 5.1e-8 (fp32), 3.9e-6 (bf16), 8.1e-6 (int8). Two-pass partials remove it.
+    """
+    runs = [_big_run(mdtype, True) for _ in range(3)]
+    assert all(all(torch.equal(a, b) for a, b in zip(runs[0], r)) for r in runs[1:])
+
+
+@pytest.mark.parametrize("shape", [(257, 513), (300, 1024), (1024, 512)])
+def test_deterministic_reductions_cover_partial_chunks(shape):
+    runs = [_big_run("4bit", True, shape=shape, n=2) for _ in range(3)]
+    assert all(all(torch.equal(a, b) for a, b in zip(runs[0], r)) for r in runs[1:])
+
+
+def test_chunked_4bit_requant_no_longer_reloads_its_own_scales():
+    """Regression guard for the in-kernel 4-bit requant RACE.
+
+    ``_chunked_4bit_apply_batched_g`` used to store the per-block scales and then
+    ``tl.load`` them back to quantize — a cross-lane store/load inside one program with no
+    barrier, so a lane could divide by the PREVIOUS step's scale. It made 4-bit momentum
+    nondeterministic (5.1e-4 relative spread over identical runs) *even with* the reductions
+    made two-pass. With the scale kept in registers the spread is 5.1e-8, i.e. the atomics'
+    own noise, so this asserts the default (atomic) path is already ~1e-7 for 4-bit.
+    """
+    runs = [_big_run("4bit", False) for _ in range(4)]
+    scale = max(p.abs().max().item() for p in runs[0])
+    spread = max(max((a - b).abs().max().item() for a, b in zip(runs[0], r)) for r in runs[1:])
+    assert spread / scale < 1e-6, f"4-bit run-to-run spread {spread / scale:.2e} — race back?"
+
+
+def test_deterministic_reductions_agree_with_the_atomic_path():
+    """Same arithmetic, different order: the two must agree to reduction-order ulps."""
+    a = _big_run("float32", False)
+    b = _big_run("float32", True)
+    scale = max(p.abs().max().item() for p in a)
+    d = max((x - y).abs().max().item() for x, y in zip(a, b))
+    assert d / scale < 1e-6, f"det vs atomic rel={d / scale:.2e}"
+
+
+def test_deterministic_reductions_allocate_partials_only_when_on():
+    ps = _bag([(512, 512)] * 2, torch.float32, seed=95)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    off = _fused(ps, lr=1e-3)
+    off.step()
+    assert all(getattr(c, "_partials", None) is None for c in off._fused_big_caches.values())
+    on = Adakaon(ps, lr=1e-3, fused=True, deterministic_reductions=True)
+    on.step()
+    assert all(getattr(c, "_partials", None) is not None
+               for c in on._fused_big_caches.values())
+
+
+# ------------------------------------------- reseeding must reach the Triton SR noise stream
+# The Triton bf16 write has its OWN seed counter, so ``kaon.reseed_stochastic_rounding()`` has
+# to reset it too. When it did not, re-seeding to the SAME value inside one process — the case
+# ``kaon._stochastic_rounding``'s docstring exists to cover — stopped reproducing any bf16 run
+# on a Triton build, for every optimizer, silently. These run a real Adakaon step so both
+# writers are exercised: the foreach bucket goes through ``subtract_batched_`` and the lone
+# 0-D/odd params through ``subtract_one_``.
+def _sr_repro_run(sr_triton, seed=1234, steps=5):
+    from kaon import _backend as bk
+    saved = bk.SR_TRITON
+    bk.SR_TRITON = sr_triton
+    try:
+        torch.manual_seed(seed)                     # the SAME seed every call
+        kaon.reseed_stochastic_rounding()           # the only public reset
+        ps = [torch.randn(64, 64, device=DEV, dtype=torch.bfloat16).requires_grad_(True)
+              for _ in range(4)]
+        ps += [torch.randn((), device=DEV, dtype=torch.bfloat16).requires_grad_(True)]
+        opt = Adakaon(ps, lr=1e-2, weight_decay=0.01, bf16_method="stochastic_rounding")
+        gen = torch.Generator(device=DEV).manual_seed(7)
+        for _ in range(steps):
+            for p in ps:
+                p.grad = torch.randn(tuple(p.shape), generator=gen, device=DEV,
+                                     dtype=torch.bfloat16)
+            opt.step()
+        torch.cuda.synchronize()
+        return [p.detach().clone() for p in ps], torch.rand(4, device=DEV)
+    finally:
+        bk.SR_TRITON = saved
+
+
+@pytest.mark.parametrize("sr_triton", [True, False])
+def test_reseed_reproduces_a_bf16_sr_run_on_both_write_paths(sr_triton):
+    """``torch.manual_seed(s)`` + ``reseed_stochastic_rounding()`` must reproduce the weights."""
+    a, _ = _sr_repro_run(sr_triton)
+    b, _ = _sr_repro_run(sr_triton)
+    assert all(torch.equal(x, y) for x, y in zip(a, b)), (
+        f"SR_TRITON={sr_triton}: re-seeding to the same value did not reproduce the run"
+    )
+
+
+@pytest.mark.parametrize("sr_triton", [True, False])
+def test_sr_noise_stays_isolated_from_the_user_rng(sr_triton):
+    """Stochastic rounding must not consume the global stream: same seed -> same ``torch.rand``."""
+    _, ra = _sr_repro_run(sr_triton)
+    _, rb = _sr_repro_run(sr_triton)
+    assert torch.equal(ra, rb)
+
+
+def test_reseed_hook_is_registered_once_and_stays_internal():
+    """One public reseed entry point, and the kernel counter hangs off it."""
+    import kaon._fused_triton as ft
+    from kaon import _stochastic_rounding as sr
+    assert ft._reseed_sr_kernel in sr._reseed_hooks
+    assert sr._reseed_hooks.count(ft._reseed_sr_kernel) == 1
+    assert not hasattr(ft, "reseed_sr_kernel"), "the kernel reset must not be a second public API"
+    ft._sr_seed_state[0] = [1, 99]
+    kaon.reseed_stochastic_rounding()
+    assert not ft._sr_seed_state, "reseed_stochastic_rounding must clear the kernel counter"
+
+
+# ------------------------------------- gradient_centralization flipped on a live param group
+def _gc_flip_run(fused, start_gc, flip_to, flip_at=3, steps=6):
+    ps = _bag([(512, 512)] * 3, torch.float32, seed=96)
+    opt = Adakaon(ps, lr=2e-3, weight_decay=0.05, cautious=True, fused=fused,
+                  momentum_dtype="float32", gradient_centralization=start_gc)
+    gen = torch.Generator(device=DEV).manual_seed(7)
+    for i in range(steps):
+        if i == flip_at:                       # schedulers do reach into the group dict
+            for group in opt.param_groups:
+                group["gradient_centralization"] = flip_to
+        for p in ps:
+            p.grad = torch.randn(*p.shape, generator=gen, device=DEV)
+        opt.step()
+    torch.cuda.synchronize()
+    return ps
+
+
+@pytest.mark.parametrize(("start_gc", "flip_to"), [(False, True), (True, False)])
+def test_gc_flipped_mid_run_still_matches_native(start_gc, flip_to):
+    """``BigPointerCache`` aliases ``rowmean`` onto ``rowsum`` when GC is off.
+
+    That is only sound while GC STAYS off. A param group is a mutable dict, so a scheduler can
+    flip the flag between steps with no parameter moving — which the witness cannot see. With
+    the alias live under ``GC=True`` the reduction kernel wrote the per-row means over the row
+    sums and the factored EMA came out of means: measured 1.1e-3 relative divergence from
+    native, silently. ``gc`` is part of the cache's validity now.
+    """
+    fused = _gc_flip_run(True, start_gc, flip_to)
+    native = _gc_flip_run(False, start_gc, flip_to)
+    scale = max(p.abs().max().item() for p in native)
+    d = max((a - b).abs().max().item() for a, b in zip(fused, native))
+    assert d / scale < 1e-6, f"gc {start_gc}->{flip_to}: fused vs native rel={d / scale:.2e}"
+
+
+def test_big_cache_records_gc_and_rebuilds_on_a_flip():
+    ps = _bag([(512, 512)] * 2, torch.float32, seed=97)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, gradient_centralization=False)
+    opt.step()
+    first = next(iter(opt._fused_big_caches.values()))
+    assert first.gc is False and first.rowmean is first.rowsum
+    for group in opt.param_groups:
+        group["gradient_centralization"] = True
+    opt.step()
+    second = next(iter(opt._fused_big_caches.values()))
+    assert second is not first, "the cache must be rebuilt when gc flips"
+    assert second.gc is True and second.rowmean is not second.rowsum
+
+
+# ------------------------------------------------- int8 direct-path guard: BOTH halves matter
+@pytest.mark.parametrize(("shape", "direct"), [
+    ((512, 512), True),      # C=512 divides 1024
+    ((300, 1024), True),     # C=1024 divides 1024 (one row per chunk)
+    ((256, 513), False),     # C=513 <= 1024 but does NOT divide it -> rows span chunks
+    ((64, 4096), False),     # C=4096 > 1024 -> a row spans four chunks
+])
+def test_big_int8_guard_routes_on_row_alignment(shape, direct, monkeypatch):
+    """``C <= 1024 and 1024 % C == 0`` — the second half is load-bearing on its own.
+
+    ``(256, 513)`` is under the block size and still splits rows, so the per-row absmax would
+    have several writing programs and the kernel would store a scale computed from part of a
+    row. It must fall back to the codec.
+    """
+    ps = _bag([shape] * 2, torch.float32, seed=98)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, momentum_dtype="int8")
+    codec = opt._codec(opt.param_groups[0])
+    seen = []
+    real = codec.dequant_stacked
+
+    def spy(*a, **k):
+        seen.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(codec, "dequant_stacked", spy)
+    opt.step()
+    assert bool(seen) is (not direct), (
+        f"{shape}: expected {'the in-kernel path' if direct else 'the codec fallback'}"
+    )
+
+
+@pytest.mark.parametrize("shape", [(256, 513), (64, 4096)])
+def test_big_int8_row_split_shapes_still_match_native(shape):
+    """And the fallback they take must be correct, not merely taken."""
+    d, scale, ov = _run_parity([shape] * 2, torch.float32, "int8", wd=0.05)
+    assert len(_parts(ov)[1]) == 2
+    assert d / scale < 5e-4, f"{shape} rel={d / scale:.2e}"

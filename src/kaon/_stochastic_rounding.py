@@ -36,9 +36,23 @@ steps. Limitation: re-seeding to the *same* value inside one process (with no
 different seed in between) is not observable through the global RNG, so the
 module generator keeps its stream; call :func:`kaon.reseed_stochastic_rounding` (alias of :func:`reseed_generators`) after
 ``torch.manual_seed`` in that case (test suites, sweeps in one process).
+
+**This module is not the only SR noise source any more.** On CUDA with Triton
+installed, :mod:`kaon._backend` routes the bf16 weight write to a Triton kernel
+whose noise comes from ``tl.rand`` seeded by its own counter, not from the
+generators here (see ``kaon._fused_triton.sr_add_``). That counter has exactly
+the same same-seed limitation, so it MUST be reset by the same call — otherwise
+``torch.manual_seed(s)`` + :func:`reseed_generators` reproduces a run only while
+the Triton path is off, which is the trap this note exists to prevent.
+:func:`reseed_generators` therefore also runs :data:`_reseed_hooks`, which
+``kaon._fused_triton`` appends to when it is imported. The dependency points that
+way on purpose: this module must keep importing on a build without Triton, so it
+never imports (or names) the Triton module — callers register themselves.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 from torch import Tensor
@@ -48,6 +62,11 @@ __all__ = ["add_stochastic_", "reseed_generators"]
 # Per-device RNG — isolated from the global stream so SR does not perturb dataloader/dropout.
 # Value is (generator, global_initial_seed at last sync).
 _generators: dict[torch.device, tuple[torch.Generator, int]] = {}
+
+# Other SR noise sources that must be reset by ``reseed_generators``. Populated by whoever
+# owns one — today only ``kaon._fused_triton``, which appends on import. A registry rather
+# than an import so this module stays usable (and testable) without Triton.
+_reseed_hooks: list[Callable[[], None]] = []
 
 
 def _global_initial_seed(device: torch.device) -> int:
@@ -59,12 +78,20 @@ def _global_initial_seed(device: torch.device) -> int:
 
 
 def reseed_generators() -> None:
-    """Drop the module generators so the next SR call re-seeds from the global RNG.
+    """Reset EVERY kaon stochastic-rounding noise stream to follow the global RNG again.
 
     Needed only when ``torch.manual_seed`` is called again with the *same* seed in one
     process; a seed change is picked up automatically.
+
+    That means this module's per-device generators AND every registered
+    :data:`_reseed_hooks` callback — currently the Triton weight-write kernel's seed
+    counter, which is what the bf16 write actually uses on CUDA (see the module
+    docstring). Resetting only the generators here left ``torch.manual_seed(s)`` +
+    this call NON-reproducible for any bf16 run on a Triton build.
     """
     _generators.clear()
+    for hook in _reseed_hooks:
+        hook()
 
 
 def _device_generator(device: torch.device) -> torch.Generator:

@@ -10,6 +10,12 @@ cross-cutting pieces that used to be copy-pasted into each optimizer:
 
 All are bit-exact with the per-optimizer copies they replaced (same arithmetic); the
 ``foreach == per-param`` parity tests across every optimizer/dtype are the proof.
+
+ONE EXCEPTION, since 0.7.12: the bf16 stochastic-rounding write prefers a Triton kernel on
+CUDA (:data:`SR_TRITON`), whose noise comes from a different RNG than the torch path's. Both
+are unbiased and the ``foreach == per-param`` invariant still holds within either path, but
+the two do not reproduce each other's draws. ``kaon.reseed_stochastic_rounding()`` resets
+both streams; ``SR_TRITON = False`` pins the torch reference implementation.
 """
 from __future__ import annotations
 
@@ -101,30 +107,77 @@ def foreach_budget(stack_budget: int | None, batch_cutoff: int, bytes_per_elem: 
     return min(DEFAULT_STACK_ELEMS, cap)
 
 
+# ----------------------------- bf16 stochastic-rounding write -----------------------------
+# The bf16 + stochastic-rounding write is the one weight write that is NOT a single torch op:
+# ``add_stochastic_`` upcasts, draws a parameter-sized int32 noise tensor, masks it, adds,
+# masks the mantissa and casts back — ~7-8 kernels and two parameter-sized temporaries per
+# call. A Triton kernel does the whole thing in one launch with no temporary
+# (``kaon._fused_triton.sr_add_``), so this module prefers it whenever the tensors qualify
+# (CUDA, contiguous, bf16 target / fp32 source) and Triton is installed. CPU, fp16, strided
+# views and Triton-less builds keep the torch path, which stays the reference implementation.
+#
+# The two draw from DIFFERENT noise streams. Both are unbiased, which is the only property
+# stochastic rounding is relied on for, but a run is only bit-reproducible against itself —
+# set ``kaon._backend.SR_TRITON = False`` to pin the torch path (also the A/B switch the
+# speedup below is measured with).
+SR_TRITON = True
+
+
+def _sr_write_(target: Tensor, source: Tensor, alpha: float, triton: bool | None = None) -> None:
+    """``target += alpha * source`` with bf16 SR, through Triton when it applies."""
+    use = SR_TRITON if triton is None else triton
+    if use:
+        from kaon import _fused_triton as ft
+        if ft.sr_add_supported(target, source):
+            ft.sr_add_(target, source, alpha)
+            return
+    add_stochastic_(target, source, alpha=alpha)
+
+
 # ----------------------------- weight write: p -= delta -----------------------------
 @torch.no_grad()
-def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str) -> None:
-    """Per-parameter ``p -= delta`` with the configured bf16 handling.
+def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
+                  alpha: float = 1.0, triton: bool | None = None) -> None:
+    """Per-parameter ``p -= alpha * delta`` with the configured bf16 handling.
 
     ``kahan`` keeps a per-param compensation buffer (``state['shift']``); ``stochastic_
     rounding`` does the unbiased bf16 round; otherwise a plain cast-and-subtract.
+
+    ``alpha`` is the learning rate the caller would otherwise have applied with a separate
+    ``delta.mul_(lr)`` pass — see :func:`subtract_batched_`. The two must stay in step:
+    ``Tensor.sub_(d, alpha=lr)`` and ``torch._foreach_sub_([p], [d], alpha=lr)`` are
+    BIT-IDENTICAL (verified on CPU and CUDA), which is what keeps the per-parameter path
+    and the foreach path bit-exact with each other — the invariant
+    ``tests/test_adakaon.py::test_foreach_matches_per_param`` guards. Folding in only one
+    of them breaks it, because ``mul_`` then subtract and ``sub_(alpha=)`` differ by a
+    sub-ulp contraction.
+
+    ``kahan`` is the exception and keeps the explicit fp32 product: its compensation buffer
+    is in the param's dtype, so scaling during the narrowing subtract would round the
+    product to bf16 and defeat the compensation. Kahan never reaches the foreach path
+    (``Adakaon._group_foreach_eligible`` rejects it), so no invariant depends on it.
     """
     low = is_low_precision(p)
     if low and bf16_method == "kahan":
         shift = state["shift"]
-        shift.sub_(delta_fp32.to(p.dtype))
+        shift.sub_((delta_fp32 * alpha if alpha != 1.0 else delta_fp32).to(p.dtype))
         p_before = p.detach().clone()
         p.add_(shift)
         shift.add_(p_before.sub_(p))
     elif low and bf16_method == "stochastic_rounding" and p.dtype == torch.bfloat16:
-        add_stochastic_(p.data, delta_fp32, alpha=-1.0)
-    else:
+        _sr_write_(p.data, delta_fp32, -alpha, triton)
+    elif p.dtype == delta_fp32.dtype:
+        p.data.sub_(delta_fp32, alpha=alpha)
+    elif alpha == 1.0:
         p.data.sub_(delta_fp32.to(p.dtype))
+    else:  # scale in fp32 before the narrowing cast (see subtract_batched_)
+        p.data.sub_((delta_fp32 * alpha).to(p.dtype))
 
 
 @torch.no_grad()
-def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str) -> None:
-    """In-place ``p -= delta`` over a foreach bucket of (matrixized) param views.
+def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
+                      alpha: float = 1.0, triton: bool | None = None) -> None:
+    """In-place ``p -= alpha * delta`` over a foreach bucket of (matrixized) param views.
 
     ``pviews`` is the list of N same-shape param views (each ``[*shape]``); ``delta`` is
     the stacked fp32 step ``[N, *shape]`` (row i applies to ``pviews[i]``).
@@ -134,16 +187,31 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str) -> 
     fp32 regime, including LoRA's many-tiny-tensor buckets — subtracts the delta slices
     straight into the param views with ``_foreach_sub_``, skipping *both* the stack-weights
     allocation and the copy-back, which are pure overhead in the launch-bound regime.
-    """
+
+    ``alpha`` exists so a caller can hand over the learning rate instead of scaling the
+    delta itself: ``delta.mul_(lr)`` is a full read-modify-write pass over the stacked
+    bucket, while every writer below already takes an ``alpha`` and folds the multiply
+    into the pass it was going to make anyway. Both bf16 branches keep the product in
+    **fp32** (``add_stochastic_`` upcasts; the plain-cast branch scales before the cast),
+    so folding never costs precision. Not bit-identical to a separate ``mul_``: an
+    ``a - alpha*b`` kernel may contract to an FMA where a separate multiply rounds. The
+    difference is sub-ulp but NOT zero — measured 2.8e-8 to 5.6e-8 relative on fp32 params
+    over 6 steps, and 0 on bf16 params (the narrowing write absorbs it). What IS bit-identical, and
+    is what the ``foreach == per-param`` invariant rests on, is ``Tensor.sub_(d, alpha=lr)``
+    against ``torch._foreach_sub_([p], [d], alpha=lr)``."""
     p0 = pviews[0]
     if p0.dtype == torch.bfloat16 and bf16_method == "stochastic_rounding":
         weights = torch.stack(pviews)
-        add_stochastic_(weights, delta, alpha=-1.0)
+        _sr_write_(weights, delta, -alpha, triton)
         torch._foreach_copy_(pviews, list(weights.unbind(0)))
     elif p0.dtype == delta.dtype:
-        torch._foreach_sub_(pviews, list(delta.unbind(0)))
-    else:
+        torch._foreach_sub_(pviews, list(delta.unbind(0)), alpha=alpha)
+    elif alpha == 1.0:
         torch._foreach_sub_(pviews, list(delta.to(p0.dtype).unbind(0)))
+    else:
+        # Scale in fp32 BEFORE the narrowing cast: a bf16 ``alpha * delta`` would round
+        # the product to bf16 and lose exactly the small updates this path exists to keep.
+        torch._foreach_sub_(pviews, list((delta * alpha).to(p0.dtype).unbind(0)))
 
 
 # ----------------------------- cautious masking -----------------------------

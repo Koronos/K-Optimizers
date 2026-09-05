@@ -396,6 +396,23 @@ class Adakaon(AutoLRMixin, Optimizer):
             default ``2_000_000`` is the middle of a flat optimum measured on SDXL
             and Cosmos full fine-tunes; raise it only if profiling your GPU shows a
             higher crossover. See ``docs/foreach-batching.md``.
+        deterministic_reductions: make the fused big-tensor path bit-reproducible
+            across runs. The batched reductions accumulate the column sums and the
+            RMS with **fp32 atomics**, whose completion order the scheduler picks, so
+            the same inputs give slightly different results on every run: measured
+            spread over 4 runs of 6 steps on 3x(512,512), max|Δp| / weight scale,
+            5.1e-8 (fp32 momentum), 3.9e-6 (bf16), 8.1e-6 (int8) and **7.0e-4**
+            (4bit — one ulp on the momentum can flip an adjacent 4-bit code). With
+            this on, each row-block writes a partial only it owns and a second pass
+            sums the partials in a fixed order — same arithmetic, one order. Costs an
+            ``N * ceil(R/BR) * C`` fp32 buffer per big bucket (7.7 MB for a
+            236x(512,512) LoKr bucket) plus one extra launch per bucket per
+            reduction. Default ``False``: the nondeterminism is at or below the
+            dtype's own noise for every momentum kind except 4bit, and the flag is
+            not free. Turn it on for run-to-run reproducibility work, to debug a
+            divergence, or with ``momentum_dtype="4bit"`` where the amplification is
+            real. Only affects ``fused=True`` big buckets; nothing else in kaon uses
+            a float atomic.
         foreach_stack_budget: the **memory-safety** ceiling — max elements in a
             single stacked ``foreach`` chunk. ``None`` (default) adapts to
             currently-free VRAM each step (roomy card → bigger chunks, full card →
@@ -430,6 +447,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         foreach_stack_budget: int | None = None,
         fused: bool = False,
         fused_tile_cap: int | None = None,
+        deterministic_reductions: bool = False,
         auto_lr: bool = False,
         auto_lr_scale: float = 1.0,
         auto_lr_fuse_rel: float = DEFAULT_FUSE_REL,
@@ -494,6 +512,15 @@ class Adakaon(AutoLRMixin, Optimizer):
         # Batched-big reductions stay in Triton (grad via pointer arrays, no [N,R,C] stack,
         # GC in-kernel). The toggle remains internal for parity/performance A/B tests.
         self._fused_reductions = True
+        # Two-pass (partials -> reduce) colsum/rms instead of fp32 atomics: same arithmetic in
+        # a FIXED order, so a run reproduces itself bit for bit. Costs an N*RB*C fp32 partial
+        # buffer and one extra launch per bucket per reduction. Default OFF - see the kwarg.
+        self._deterministic_reductions = bool(deterministic_reductions)
+        # A LONE big tensor also takes the batched (N=1) chunked path. The per-tensor
+        # ``_chunked_step`` it replaces costs two CPU<->GPU syncs per tensor per step
+        # (``float(rms)`` and ``keep.item()``) and materializes fp32 g and g² — see
+        # _fused_big. False reverts to the per-tensor kernel (the A/B baseline).
+        self._fused_big_lone_batched = True
         # The momentum buffer stores an LR-INDEPENDENT direction (lr scales the
         # final delta, it is never folded into the EMA). Wrappers that convert
         # momentum back to step units (MSAM/Nekaon's raw-momentum lookahead) key
@@ -510,6 +537,24 @@ class Adakaon(AutoLRMixin, Optimizer):
         # cache's speedup is measured with; it is numerically a no-op either way.
         self._foreach_plans: dict[int, _ForeachPlan] = {}
         self._foreach_cache_enabled = True
+        # --- native factored-bucket work reducers (0.7.12). Each is a separate A/B toggle
+        # so its own contribution stays measurable; see _factored_bucket for the identity
+        # each one relies on and for the exactness each one costs (nothing, at defaults).
+        self._eps1_on_means = True        # eps1 on the [N,R]/[N,C] means, not the [N,R,C] square
+        self._write_fold_lr = True        # lr as the write's alpha, not a delta.mul_(lr) pass
+        # REJECTED BY MEASUREMENT, kept behind the toggle so another GPU can re-test.
+        # RMS-clip via matvec with the clip divisor folded into r_factor removes one
+        # [N,R,C] pass but adds ~12 tiny launches and a batched GEMV. Paired A/B on an
+        # RTX 3000 Ada (geometric mean of 150-300 per-rep ratios, 95% CI, fp32 params /
+        # bf16 momentum): 200x(256,256) 0.964x [0.935, 0.993] — a SIGNIFICANT LOSS —
+        # 50x(512,512) 1.002x [0.989, 1.016], 8x(1024,1024) 0.993x [0.970, 1.016],
+        # 400x(64,64) 0.979x [0.931, 1.030]; not a significant win anywhere. It also
+        # routes the clip divisor through a matmul, so a process with
+        # ``torch.backends.cuda.matmul.allow_tf32`` on would lose mantissa bits there.
+        self._native_rms_matvec = False
+        # Batched-big int8 momentum dequant/EMA/requant entirely in Triton (the mirror of the
+        # 4-bit direct path) instead of the codec's stacked fp32 temp. False = codec fallback.
+        self._direct_int8 = True
         if self._fused:
             from kaon._fused_triton import HAS_TRITON, TILE_CAP
             if not HAS_TRITON:
@@ -695,10 +740,18 @@ class Adakaon(AutoLRMixin, Optimizer):
         """Dispatch the >tile-cap ("big") 2-D weights. The per-tensor fused-chunked kernel is
         launch-bound (~7 kernels/tensor); for the many same-shape big factors a real LoKr run has
         (e.g. 236x 512x512) we run the **batched chunked kernel** (``_chunked_step_batched``) —
-        the whole same-shape bucket in ~2 launches, p/m written in place via a pointer array. A lone
-        big tensor has no batch to amortize, so it keeps the per-tensor fused-chunked kernel. Same
+        the whole same-shape bucket in ~2 launches, p/m written in place via a pointer array. Same
         math + state either way. ``self._fused_big_batched=False`` reverts the multi-tensor case to
-        the batched-native-foreach path (the A/B baseline)."""
+        the batched-native-foreach path (the A/B baseline).
+
+        A LONE big tensor (``N == 1``) takes the same batched kernel since 0.7.12. It has no batch
+        to amortize launches over, but that was never the per-tensor path's problem: the batched
+        route is fully device-resident, while ``_chunked_step`` blocks the CPU TWICE per tensor per
+        step (``float(rms)`` in ``_chunked_reductions`` and ``keep.item()`` for the cautious mean)
+        and materializes an fp32 ``g`` plus a ``g*g`` of the tensor's size. On a bag of DISTINCT big
+        shapes — the UNet/DiT case, where every shape bucket holds exactly one tensor — those syncs
+        serialize the whole step. ``self._fused_big_lone_batched=False`` reverts to the per-tensor
+        kernel (the A/B baseline)."""
         if len(big) >= 2 and not self._fused_big_batched:
             if group["gradient_centralization"]:
                 centralize_grads_(big)
@@ -711,7 +764,8 @@ class Adakaon(AutoLRMixin, Optimizer):
             # _fused_one_block): the bucket's pointer arrays and scratch live on plist[0].device,
             # and a Triton launch targets the CURRENT device. PLAUSIBLE, not verified — one GPU here.
             with torch.cuda.device(plist[0].device):
-                if len(plist) >= 2 or group["betas"][0] == 0.0:
+                if (len(plist) >= 2 or group["betas"][0] == 0.0
+                        or self._fused_big_lone_batched):
                     self._chunked_step_batched(plist, group, ft)
                 else:
                     self._chunked_step(plist[0], group, ft)
@@ -868,7 +922,8 @@ class Adakaon(AutoLRMixin, Optimizer):
                     lr, b1, b2, eps1, clip, wd, self._t,
                     LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0, GC=gc,
                     SR=bk["lowp"], MOMENTUM=bk["momentum"],
-                    BR=bk["BR"], BC=bk["BC"], num_warps=ft.warps_for(lanes),
+                    BR=bk["BR"], BC=bk["BC"], EXACT=bk["exact4"], FBLK=bk["fblk"],
+                    num_warps=ft.warps_for(lanes),
                 )
 
     def _fused_one_dim(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
@@ -990,10 +1045,16 @@ class Adakaon(AutoLRMixin, Optimizer):
 
     @torch.no_grad()
     def _chunked_step_batched(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
-        """A bucket of >=2 same-shape big 2-D tensors via the batched chunked kernels (~2 launches).
-        fp32/bf16 momentum is read/written in place via the m pointer array. Standard 4-bit blocks
-        are dequantized, updated and requantized entirely inside Triton without a momentum-sized
-        fp32 temporary; unusual block sizes and int8 retain the codec fallback."""
+        """A same-shape big 2-D bucket via the batched chunked kernels (~2 launches). ``N == 1``
+        included — see :meth:`_fused_big`.
+
+        fp32/bf16 momentum is read/written in place via the m pointer array. **Every** quantized
+        momentum now has an in-Triton route too, with no momentum-sized fp32 temporary: 4-bit
+        when its absmax blocks tile a chunk (``m_block <= 1024`` and divides it), int8 when a
+        chunk owns whole ROWS (``C <= 1024`` and divides it — int8 scales per row). Only the
+        shapes that fail those alignment conditions keep the codec fallback (dequant to a
+        stacked fp32 temp, generic kernels, requant), which is correct but costs ~15 torch
+        kernels, a host->device pointer copy (a CPU<->GPU sync) and 4 B/param of transient."""
         for p in plist:
             st = self.state[p]
             if not st:
@@ -1010,8 +1071,12 @@ class Adakaon(AutoLRMixin, Optimizer):
         states = [self.state[p] for p in plist]
         cache_key = (id(group), tuple(plist[0].shape), plist[0].dtype, plist[0].device)
         cache = self._fused_big_caches.get(cache_key)
-        if cache is None or cache.stale(plist):
-            cache = ft.BigPointerCache(plist, lambda p: self.state[p], R, C)
+        # ``cache.gc`` is part of the validity, not only the param witness: with GC off the
+        # cache aliases ``rowmean`` onto ``rowsum`` to save N*R floats, and a group dict
+        # flipped mid-run (schedulers do this) would then have the reduction kernel write
+        # the row means over the row sums. Nothing moved, so ``stale()`` cannot see it.
+        if cache is None or cache.stale(plist) or cache.gc != gc:
+            cache = ft.BigPointerCache(plist, lambda p: self.state[p], R, C, gc=gc)
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()
 
@@ -1023,30 +1088,54 @@ class Adakaon(AutoLRMixin, Optimizer):
 
         # Reductions: fused (grad via pointer array, no [N,R,C] stack — candidate #4) or torch.
         fused_red = self._fused_reductions
+        clip = group["clip_threshold"]
         if fused_red:
-            g_addr, rowmean, r, c, inv_rms = self._chunked_reductions_fused(
+            # ``rms`` is the RAW sum-of-squares accumulator; every ``_g`` consumer turns it
+            # into the clip factor itself, and ``zero_accumulators`` has already cleared
+            # ``keep`` along with it (one launch for the three).
+            g_addr, rowmean, r, c, rms = self._chunked_reductions_fused(
                 plist, group, ft, R, C, n, lowp, cache
             )
+            keep = cache.keep
         else:
             g, r, c, inv_rms = self._chunked_reductions_batched(plist, group)
+            keep = cache.keep.zero_()
 
         p_addr = cache.p_addr
-        keep = cache.keep.zero_()
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         direct_4bit = md == "4bit" and states[0]["m_block"] <= 1024 \
             and 1024 % states[0]["m_block"] == 0
+        # int8's scale is per ROW, so a chunk may requantize a row only if it owns the whole
+        # row: C <= BLOCK and BLOCK % C == 0 (see _chunked_int8_apply_batched_g). Otherwise the
+        # per-row absmax would need a cross-program reduction and the codec fallback stands.
+        direct_int8 = (md == "int8" and self._direct_int8
+                       and C <= 1024 and 1024 % C == 0)
+        if direct_int8 and fused_red:
+            if cautious:
+                ft._chunked_int8_keep_batched_g[grid](
+                    g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
+                    keep, rms, clip, wd, b1, R, C, n, K,
+                    LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024,
+                )
+            ft._chunked_int8_apply_batched_g[grid](
+                g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
+                keep, rms, clip, lr, wd, b1, self._t, R, C, n, K,
+                LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr,
+                CSEG=C, RPC=1024 // C, BLOCK=1024,
+            )
+            return
         if direct_4bit and fused_red:
             block = states[0]["m_block"]
             if cautious:
                 ft._chunked_4bit_keep_batched_g[grid](
                     g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
-                    keep, inv_rms, wd, b1, R, C, n, K,
+                    keep, rms, clip, wd, b1, R, C, n, K,
                     LOWP=lowp, GC=gc, WD=wd != 0, FBLOCK=block, BLOCK=1024,
                 )
             ft._chunked_4bit_apply_batched_g[grid](
                 g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
-                keep, inv_rms, lr, wd, b1, self._t, R, C, n, K,
+                keep, rms, clip, lr, wd, b1, self._t, R, C, n, K,
                 LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr,
                 FBLOCK=block, BLOCK=1024,
             )
@@ -1067,7 +1156,7 @@ class Adakaon(AutoLRMixin, Optimizer):
             mom = ft.MOM_BF16 if md == "bfloat16" else ft.MOM_FP32
         if fused_red:
             ft._chunked_mom_batched_g[grid](
-                g_addr, rowmean, m_addr, p_addr, r, c, keep, inv_rms, wd, b1, R, C, n, K,
+                g_addr, rowmean, m_addr, p_addr, r, c, keep, rms, clip, wd, b1, R, C, n, K,
                 LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024,
             )
         else:
@@ -1119,44 +1208,72 @@ class Adakaon(AutoLRMixin, Optimizer):
         lr, wd = group["lr"], group["weight_decay"]
         cautious = group["cautious"]
         gc = group["gradient_centralization"]
-        g_addr, rowmean, r, c, inv_rms = self._chunked_reductions_fused(
+        clip = group["clip_threshold"]
+        g_addr, rowmean, r, c, rms = self._chunked_reductions_fused(
             plist, group, ft, R, C, n, lowp, cache
         )
         p_addr = cache.p_addr
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
-        keep = cache.keep.zero_()
+        keep = cache.keep          # already zeroed with colsum/rms (one launch)
         if cautious:
             ft._chunked_nomom_keep_batched_g[grid](
-                g_addr, rowmean, p_addr, r, c, keep, inv_rms,
+                g_addr, rowmean, p_addr, r, c, keep, rms, clip,
                 wd, R, C, n, K, LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024,
             )
         ft._chunked_nomom_apply_batched_g[grid](
-            g_addr, rowmean, p_addr, r, c, inv_rms, keep,
+            g_addr, rowmean, p_addr, r, c, rms, clip, keep,
             lr, wd, self._t, R, C, n, K, LOWP=lowp, GC=gc,
             CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
         )
 
     @torch.no_grad()
     def _chunked_reductions_fused(self, plist, group, ft, R, C, n, lowp, cache):  # noqa: N803
-        """Candidate #4: row/col EMA factors + inv_rms via Triton reduction kernels reading grad
-        from a pointer array (NO [N,R,C] stack; GC in-kernel). Returns (g_addr, rowmean, r, c,
-        inv_rms) — the mom/apply ``_g`` kernels re-read grad via g_addr and GC via rowmean."""
+        """Candidate #4: row/col EMA factors + the rms accumulator via Triton reduction kernels
+        reading grad from a pointer array (NO [N,R,C] stack; GC in-kernel). Returns
+        ``(g_addr, rowmean, r, c, rms)`` — the mom/apply ``_g`` kernels re-read grad via
+        ``g_addr``, GC via ``rowmean``, and turn ``rms`` into the clip factor themselves
+        (:func:`kaon._fused_triton.inv_rms_clip`).
+
+        Three launches per bucket per step live here that used to be four more (0.7.12):
+
+        * ONE ``zero_()`` for all three atomic accumulators (``colsum``, ``rms``, ``keep``),
+          which :class:`~kaon._fused_triton.BigPointerCache` keeps adjacent for exactly this.
+        * NO ``_finish_rms``: that was a ``grid=1`` kernel — one program for the whole
+          bucket — computing N scalars the consumers then loaded anyway. Each consumer now
+          derives its own from the raw accumulator.
+
+        Those four launches were a FIXED per-bucket cost (measured 62-94 us for the set),
+        which is what dominates a step over many small-ish big buckets: a 40-bucket step
+        paid it 40 times, 1.2-1.9 ms/step of pure launch overhead.
+        """
         b2, eps1 = group["betas"][1], group["eps"][0]
-        clip = group["clip_threshold"]
         gc = group["gradient_centralization"]
         N = len(plist)  # noqa: N806
         g_addr = cache.g_addr
         BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806
         rowmean = cache.rowmean
         rowsum = cache.rowsum
-        colsum = cache.colsum.zero_()  # atomic target
-        ft._reduce_rowcol[(N * RB,)](
-            g_addr, rowmean, rowsum, colsum, R, C, RB,
-            LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
-        )
+        colsum = cache.colsum
+        det = self._deterministic_reductions
+        cache.zero_accumulators()          # colsum + rms + keep, one launch
+        if det:
+            colpart, rmspart = cache.partials(RB)
+            CB = (C + 255) // 256  # noqa: N806
+            ft._reduce_rowcol_det[(N * RB,)](
+                g_addr, rowmean, rowsum, colpart, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+            )
+            ft._reduce_colpart[(N * CB,)](colpart, colsum, C, RB, CB, BCT=256)
+        else:
+            ft._reduce_rowcol[(N * RB,)](
+                g_addr, rowmean, rowsum, colsum, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+            )
         # Update persistent row/col state directly via pointer arrays and emit
-        # factors in one launch (no stack/scatter or eager elementwise chain).
+        # factors in one launch (no stack/scatter or eager elementwise chain). ``r``/``c``
+        # ALIAS ``rowsum``/``colsum``: program t reads and writes the same indices, so the
+        # factor overwrites the sum it came from (see BigPointerCache).
         r = cache.rfac
         c = cache.cfac
         row_addr = cache.row_addr
@@ -1167,15 +1284,19 @@ class Adakaon(AutoLRMixin, Optimizer):
             row_addr, col_addr, rowsum, colsum, r, c, R, C, b2, eps1,
             BR=FR, BC=FC, num_warps=ft.warps_for(max(FR, FC)),
         )
-        rms = cache.rms.zero_()
-        ft._reduce_rms[(N * RB,)](
-            g_addr, rowmean, r, c, rms, R, C, RB,
-            LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
-        )
-        inv_rms = cache.inv_rms
-        FN = ft.triton.next_power_of_2(N)  # noqa: N806
-        ft._finish_rms[(1,)](rms, inv_rms, n, clip, N, BLOCK=FN)
-        return g_addr, rowmean, r, c, inv_rms
+        rms = cache.rms
+        if det:
+            ft._reduce_rms_det[(N * RB,)](
+                g_addr, rowmean, r, c, rmspart, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+            )
+            ft._reduce_rmspart[(N,)](rmspart, rms, RB)
+        else:
+            ft._reduce_rms[(N * RB,)](
+                g_addr, rowmean, r, c, rms, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+            )
+        return g_addr, rowmean, r, c, rms
 
     def state_dict(self) -> dict[str, Any]:
         """Base state + the auto_lr tuner blob (via AutoLRMixin) when auto_lr is on."""
@@ -1373,10 +1494,30 @@ class Adakaon(AutoLRMixin, Optimizer):
 
         # Factored second-moment EMA (HF eps placement: eps1 before the means).
         grad_sq = grad * grad
-        if eps1 > 0:
-            grad_sq = grad_sq.add_(eps1)
-        row.lerp_(grad_sq.mean(dim=-1), omb)
-        col.lerp_(grad_sq.mean(dim=-2), omb)
+        matvec = self._native_rms_matvec
+        if self._eps1_on_means:
+            # eps1 goes on the [N,R]/[N,C] MEANS, not on the [N,R,C] square. ``mean(x +
+            # eps) == mean(x) + eps``, and the elementwise ``add_`` was a whole extra
+            # read-modify-write pass over the bucket (13.1 M elements = ~157 MB of traffic
+            # on 200x(256,256)) to compute R+C numbers. The fused reductions
+            # (``_chunked_reductions``) always did it this way; this is the native path
+            # catching up. Bit-identical at the default ``eps1=1e-30`` with ordinary
+            # gradients — 1e-30 is far below the ulp of a grad^2 near 1, so the
+            # elementwise add was a literal no-op — and differs by fp32 ulps (rel ~1e-7)
+            # only when eps1 is comparable to grad^2 (a large eps1, or gradients ~1e-10),
+            # where summing before and after the add rounds differently.
+            row_mean, col_mean = grad_sq.mean(dim=-1), grad_sq.mean(dim=-2)
+            if eps1 > 0:
+                row_mean = row_mean.add_(eps1)
+                col_mean = col_mean.add_(eps1)
+        else:  # A/B baseline: the pre-0.7.12 eps-on-the-square order.
+            # ``add`` (copy) rather than ``add_`` only when ``grad_sq`` is still needed
+            # raw by the matvec below; the baseline-baseline arm keeps the in-place cost.
+            gsq_eps = (grad_sq + eps1) if (eps1 > 0 and matvec) else (
+                grad_sq.add_(eps1) if eps1 > 0 else grad_sq)
+            row_mean, col_mean = gsq_eps.mean(dim=-1), gsq_eps.mean(dim=-2)
+        row.lerp_(row_mean, omb)
+        col.lerp_(col_mean, omb)
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
@@ -1384,11 +1525,29 @@ class Adakaon(AutoLRMixin, Optimizer):
         # kept in LR-independent direction units; lr scales the complete delta at
         # the end, so a scheduler moves the CURRENT step instead of being baked
         # into the momentum's history.
-        r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
-        c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
-        update = grad.mul(r_factor).mul_(c_factor)                                 # [N, R, C]
-        rms = update.reshape(N, -1).norm(2, dim=1) / math.sqrt(R * C)              # per-slice RMS
-        update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1, 1))
+        r = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_()                       # [N, R]
+        c = col.rsqrt()                                                            # [N, C]
+        if matvec:
+            # RMS-clip WITHOUT materializing the unclipped update: rms^2 per slice ==
+            # sum_i r_i^2 * (gsq @ c^2)_i / n. That is one [N,R,C] READ (the bmm, whose
+            # ``gsq`` we already own) in place of a [N,R,C] mul, a norm pass and a div_
+            # pass; the clip divisor then folds into ``r`` (an [N,R] multiply) so the
+            # reconstruction costs two [N,R,C] passes instead of four. Same identity
+            # ``_chunked_reductions``/``_chunked_reductions_batched`` use on the fused
+            # path. Differs from the norm-of-the-update form by fp32 ulps (rel 1-2e-7):
+            # the two sum the same terms in different orders. NOTE it is a matmul, so a
+            # process that has switched ``torch.backends.cuda.matmul.allow_tf32`` on
+            # trades ~3 mantissa bits of the CLIP DIVISOR (never of the update itself);
+            # the fused path has had that property since 0.7.7.
+            rms = (r * r).mul_(
+                torch.bmm(grad_sq, (c * c).unsqueeze(-1)).squeeze(-1)
+            ).sum(-1).div_(R * C).sqrt_()                                          # [N]
+            r = r.mul_(rms.div_(clip).clamp_(min=1.0).reciprocal_().unsqueeze(-1))
+            update = grad.mul(r.unsqueeze(-1)).mul_(c.unsqueeze(-2))               # [N, R, C]
+        else:  # A/B baseline: build the update, then norm it and divide it down.
+            update = grad.mul(r.unsqueeze(-1)).mul_(c.unsqueeze(-2))               # [N, R, C]
+            rms = update.reshape(N, -1).norm(2, dim=1) / math.sqrt(R * C)          # per-slice RMS
+            update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1, 1))
 
         if beta1 > 0:
             # The codec owns every dtype's dequant → fp32 EMA → requant detail; this
@@ -1404,10 +1563,13 @@ class Adakaon(AutoLRMixin, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        delta.mul_(lr)
-
-        # Subtract delta from the (matrixized) weights, batched.
-        subtract_batched_(chunk.pviews, delta, bf16_method)
+        # lr rides the weight write (``alpha``) instead of a separate ``delta.mul_(lr)``
+        # pass over the stacked bucket - see :func:`kaon._backend.subtract_batched_`.
+        if self._write_fold_lr:
+            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr)
+        else:                                        # A/B baseline (pre-0.7.12 order)
+            delta.mul_(lr)
+            subtract_batched_(chunk.pviews, delta, bf16_method)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -1475,9 +1637,11 @@ class Adakaon(AutoLRMixin, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        delta.mul_(lr)
-
-        subtract_batched_(chunk.pviews, delta, bf16_method)
+        if self._write_fold_lr:                      # see _factored_bucket
+            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr)
+        else:
+            delta.mul_(lr)
+            subtract_batched_(chunk.pviews, delta, bf16_method)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
@@ -1526,8 +1690,12 @@ class Adakaon(AutoLRMixin, Optimizer):
         if cautious:
             delta = cautious_one_(delta, grad_fp32)
 
-        delta.mul_(lr)
-
-        subtract_one_(p, delta, state, bf16_method)
+        # lr rides the write, exactly as the foreach buckets do — the two must fold it the
+        # same way or they stop being bit-exact with each other (see subtract_one_).
+        if self._write_fold_lr:
+            subtract_one_(p, delta, state, bf16_method, alpha=lr)
+        else:                                        # A/B baseline (pre-0.7.12 order)
+            delta.mul_(lr)
+            subtract_one_(p, delta, state, bf16_method)
 
 
