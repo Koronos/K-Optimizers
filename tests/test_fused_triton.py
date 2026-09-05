@@ -149,16 +149,19 @@ def _clone(ps):
 
 def _run_parity(
     shapes, dtype, mdtype, *, cautious=True, gc=True, wd=0.0, steps=6, seed=1, beta1=0.9,
-    momentum_4bit_block=128,
+    momentum_4bit_block=128, cautious_wd="masked", native_foreach=True,
 ):
-    """Step Adakaon(fused=True) and native Adakaon on identical params+grads; return max|Δp| and scale."""
+    """Step Adakaon(fused=True) and native Adakaon on identical params+grads; return max|Δp| and scale.
+
+    ``native_foreach=False`` makes the reference the PER-PARAMETER loop (the semantics of
+    record), instead of the foreach path that merely agrees with it."""
     cfg = dict(lr=2e-3, betas=(beta1, 0.999), weight_decay=wd, cautious=cautious,
                gradient_centralization=gc, momentum_dtype=mdtype,
-               momentum_4bit_block=momentum_4bit_block)
+               momentum_4bit_block=momentum_4bit_block, cautious_wd=cautious_wd)
     pv = _bag(shapes, dtype, seed)
     pn = _clone(pv)
     ov = _fused(pv, **cfg)
-    on = Adakaon(pn, **cfg)
+    on = Adakaon(pn, foreach=native_foreach, **cfg)
     gen = torch.Generator(device=DEV).manual_seed(7)
     for _ in range(steps):
         gs = [torch.randn(tuple(p.shape), generator=gen, device=DEV, dtype=dtype) for p in pv]
@@ -972,6 +975,168 @@ def test_weight_decay_parity_fp32():
 def test_weight_decay_parity_quant(mdtype):
     d, scale, _ = _run_parity([(8, 16)] * 4, torch.float32, mdtype, wd=0.05)
     assert d / scale < 5e-4, f"{mdtype} rel={d/scale:.2e}"
+
+
+# ``cautious_wd="full"`` moves the decay OUTSIDE the cautious mask. It has to be wired into
+# every kernel that folds wd into the delta — the tile kernel, the 1-D kernel, the per-tensor
+# chunked pair, the batched chunked pair (both the stacked-grad and the pointer-array ``_g``
+# variants) and the three direct-momentum chunked pairs (no-momentum, 4-bit, int8). Two
+# complementary guards, because ONE of them is not enough:
+#
+# * a PARITY check against the per-parameter loop, at a threshold ~10x each dtype's measured
+#   fused-vs-per-param floor (fp32 6.0e-8, bf16 2.6e-6, int8 5.3e-6, 4bit 2.7e-5 relative);
+# * a SEMANTIC check, below, that measures the decay each coordinate actually receives.
+#
+# The parity check alone was demonstrably not enough: with a blanket 5e-4 bound, a kernel that
+# ignores ``WDFULL`` (i.e. collapses ``if WD and not WDFULL`` back to ``if WD``) only moves the
+# weights by ~1e-4 relative, so "full" would degrade silently to "masked" in production with the
+# whole suite green. The semantic check separates the two placements by four orders of magnitude.
+_WD_ROUTES = [
+    pytest.param([(8, 16)] * 4, 0.9, "one_block", id="one_block"),
+    pytest.param([(1024,)] * 4, 0.9, "one_dim", id="one_dim"),
+    pytest.param([()] * 4, 0.9, "one_dim", id="zero_dim"),
+    pytest.param([(512, 512)] * 3, 0.9, "big", id="big_batched"),
+    pytest.param([(512, 512)], 0.9, "big", id="big_lone"),
+    pytest.param([(512, 512)] * 2, 0.0, "big", id="big_nomom"),
+]
+
+# ~10x the worst measured fused-vs-per-param relative floor for that momentum storage, across
+# every route in ``_WD_ROUTES`` and both placements. NOT a blanket number: a bound loose enough
+# for 4-bit would be blind to a wiring bug on the fp32 routes.
+_WD_PARITY_TOL = {"float32": 1e-6, "bfloat16": 3e-5, "int8": 6e-5, "4bit": 3e-4}
+
+
+@pytest.mark.parametrize("shapes,beta1,route", _WD_ROUTES)
+@pytest.mark.parametrize("mdtype", ["float32", "bfloat16", "int8", "4bit"])
+@pytest.mark.parametrize("arm", ["masked", "full"])
+def test_cautious_wd_parity_with_the_per_param_loop(shapes, beta1, route, mdtype, arm):
+    """Both placements must match the PER-PARAMETER step on every fused route."""
+    d, scale, opt = _run_parity(shapes, torch.float32, mdtype, wd=0.05, beta1=beta1,
+                                cautious=True, cautious_wd=arm, steps=4, native_foreach=False)
+    one_block, big, one_dim, native = _parts(opt)
+    got = {"one_block": one_block, "big": big, "one_dim": one_dim}
+    assert got[route] and not native, f"expected the {route} route, got native={len(native)}"
+    tol = _WD_PARITY_TOL[mdtype]
+    assert d / max(scale, 1.0) < tol, f"{mdtype}/{route}/{arm} rel={d/scale:.2e} (tol {tol:.0e})"
+
+
+# ----------------------------------------------------------------- the semantic guard
+# WHAT IT MEASURES. Under ``cautious_wd="full"`` the mask is computed on the bare momentum, so
+# it does not depend on ``weight_decay`` at all: running the SAME step twice, once with wd and
+# once with wd=0, must differ by EXACTLY ``lr*wd*p`` on every coordinate — including the ones
+# the mask rejects. That identity IS the definition of the mode, and it is what a kernel
+# ignoring ``WDFULL`` breaks: a rejected coordinate then receives no decay, so the deviation
+# from the identity jumps from ~6e-5 to ~0.8-1.0 (a rejected coordinate's whole ``lr*wd*p``).
+# ``"masked"`` violates the identity BY CONSTRUCTION and is asserted to do so — that contrast
+# is what proves the probe measures the placement and not something else.
+#
+# ``deterministic_reductions=True`` so the two runs share a bit-identical prefix (the big
+# route's fp32-atomic reductions are otherwise run-to-run nondeterministic); the helper
+# asserts that rather than assuming it.
+_WD_SEM_LR, _WD_SEM_WD, _WD_SEM_STEPS = 1e-2, 0.1, 3
+
+
+def _wd_identity_deviation(shapes, beta1, mdtype, arm, toggles=None):
+    """max |(p_no_wd - p_wd) - lr*wd*p_before| / (lr*wd*max|p_before|) for one fused config."""
+    runs = []
+    for last_wd in (_WD_SEM_WD, 0.0):
+        ps = _bag(shapes, torch.float32, seed=101)
+        opt = _fused(ps, lr=_WD_SEM_LR, betas=(beta1, 0.999), weight_decay=_WD_SEM_WD,
+                     cautious=True, momentum_dtype=mdtype, cautious_wd=arm,
+                     deterministic_reductions=True)
+        for k, v in (toggles or {}).items():
+            setattr(opt, k, v)
+        gen = torch.Generator(device=DEV).manual_seed(103)
+        grads = [[torch.randn(tuple(p.shape), generator=gen, device=DEV) for p in ps]
+                 for _ in range(_WD_SEM_STEPS)]
+        for gs in grads[:-1]:
+            for p, g in zip(ps, gs, strict=True):
+                p.grad = g.clone()
+            opt.step()
+        torch.cuda.synchronize()
+        before = [p.detach().clone() for p in ps]
+        opt.param_groups[0]["weight_decay"] = last_wd
+        for p, g in zip(ps, grads[-1], strict=True):
+            p.grad = g.clone()
+        opt.step()
+        torch.cuda.synchronize()
+        runs.append((before, [p.detach().clone() for p in ps]))
+    (before, with_wd), (before2, no_wd) = runs
+    assert all(torch.equal(a, b) for a, b in zip(before, before2, strict=True)), (
+        "the two runs' shared prefix diverged — the probe would compare different states"
+    )
+    step = _WD_SEM_LR * _WD_SEM_WD
+    dev = max(((n - w) - step * b).abs().max().item()
+              for w, n, b in zip(with_wd, no_wd, before, strict=True))
+    return dev / (step * max(b.abs().max().item() for b in before))
+
+
+@pytest.mark.parametrize("shapes,beta1,route", _WD_ROUTES)
+@pytest.mark.parametrize("mdtype", ["float32", "bfloat16", "int8", "4bit"])
+def test_cautious_wd_full_decays_rejected_coordinates_on_every_route(shapes, beta1, route, mdtype):
+    """"full" gives EVERY coordinate its lr*wd*p; "masked" demonstrably does not."""
+    full = _wd_identity_deviation(shapes, beta1, mdtype, "full")
+    assert full < 5e-3, (
+        f"{mdtype}/{route}: cautious_wd='full' withheld the decay from some coordinate "
+        f"(deviation from the identity = {full:.2e}); a kernel is ignoring WDFULL"
+    )
+    masked = _wd_identity_deviation(shapes, beta1, mdtype, "masked")
+    assert masked > 0.5, (
+        f"{mdtype}/{route}: the probe is not sensitive here — 'masked' should violate the "
+        f"identity by ~1.0, measured {masked:.2e}"
+    )
+
+
+# The batched big route has kernel pairs behind internal A/B toggles that the default config
+# never reaches (``_chunked_{mom,apply}_batched`` without the fused reductions, the per-tensor
+# ``_chunked_{mom,apply}``, and the int8 codec fallback). ``cautious_wd`` had to be threaded
+# through all of them too, so each gets BOTH guards.
+_WD_TOGGLES = [
+    pytest.param({"_fused_reductions": False}, "float32", [(512, 512)] * 2, id="chunked_batched"),
+    pytest.param({"_fused_big_lone_batched": False}, "float32", [(512, 512)], id="per_tensor_fp32"),
+    pytest.param({"_fused_big_lone_batched": False}, "4bit", [(512, 512)], id="per_tensor_4bit"),
+    pytest.param({"_direct_int8": False}, "int8", [(512, 512)] * 2, id="int8_codec_fallback"),
+]
+
+
+@pytest.mark.parametrize("toggles,mdtype,shapes", _WD_TOGGLES)
+@pytest.mark.parametrize("arm", ["masked", "full"])
+def test_cautious_wd_parity_on_the_toggled_big_kernels(toggles, mdtype, shapes, arm):
+    cfg = dict(lr=2e-3, betas=(0.9, 0.999), weight_decay=0.05, cautious=True,
+               gradient_centralization=True, momentum_dtype=mdtype, cautious_wd=arm)
+    pv = _bag(shapes, torch.float32, seed=17)
+    pn = _clone(pv)
+    ov, on = _fused(pv, **cfg), Adakaon(pn, foreach=False, **cfg)
+    for k, v in toggles.items():
+        setattr(ov, k, v)
+    gen = torch.Generator(device=DEV).manual_seed(19)
+    for _ in range(4):
+        gs = [torch.randn(tuple(p.shape), generator=gen, device=DEV) for p in pv]
+        for p, g in zip(pv, gs, strict=True):
+            p.grad = g.clone()
+        for p, g in zip(pn, gs, strict=True):
+            p.grad = g.clone()
+        ov.step()
+        on.step()
+    torch.cuda.synchronize()
+    assert _parts(ov)[1], "these shapes are meant to route to the big (chunked) path"
+    d = max((a.detach() - b.detach()).abs().max().item() for a, b in zip(pv, pn, strict=True))
+    scale = max(b.detach().abs().max().item() for b in pn)
+    tol = _WD_PARITY_TOL[mdtype]
+    assert d / scale < tol, f"{toggles}/{mdtype}/{arm} rel={d/scale:.2e} (tol {tol:.0e})"
+
+
+@pytest.mark.parametrize("toggles,mdtype,shapes", _WD_TOGGLES)
+def test_cautious_wd_full_decays_rejected_coordinates_on_the_toggled_kernels(
+    toggles, mdtype, shapes
+):
+    full = _wd_identity_deviation(shapes, 0.9, mdtype, "full", toggles)
+    assert full < 5e-3, (
+        f"{toggles}/{mdtype}: cautious_wd='full' withheld the decay from some coordinate "
+        f"(deviation = {full:.2e}); a kernel is ignoring WDFULL"
+    )
+    masked = _wd_identity_deviation(shapes, 0.9, mdtype, "masked", toggles)
+    assert masked > 0.5, f"{toggles}/{mdtype}: probe not sensitive, masked deviation {masked:.2e}"
 
 
 def test_weight_decay_shrinks_weights():

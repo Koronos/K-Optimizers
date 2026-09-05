@@ -125,3 +125,53 @@ from 7.0e-4 to 5.1e-8. Guarded by
 The same reshape-and-reduce shape is now used by `requant_4bit`'s `EXACT` path (unpadded tiles,
 1.19–1.63× on the one-block requant) and by the new `_chunked_int8_apply_batched_g`, which was
 written this way from the start and never had the round-trip.
+
+## `momentum_4bit_block` as a runtime scalar (0.7.12)
+
+`_adakaon_tile_kernel` used to hardcode its 4-bit absmax block at `BLK = min(R*C, 128)`, for both
+the dequant and the requant. Under any other `momentum_4bit_block` that was not merely "reads the
+wrong scales": the requant writes `ceil(numel/128)` floats into an `m_scale` sized for the **real**
+block count, i.e. past the end of the buffer (a `(64,128)` weight at `block=0` wrote 63 floats out
+of bounds). The fix at the time was a **routing guard** — send those tensors to the native path —
+which is safe but expensive: it gives up the fused route entirely for a legitimate configuration.
+
+The block is now a **runtime kernel argument**, and `PointerArrayCache` buckets by
+`state["m_block"]` (alongside tile / dtype / device) so every tensor in one launch shares it. Three
+consequences:
+
+* **Runtime, not `constexpr`, on purpose.** Triton specializes an integer argument only on `== 1`
+  and `% 16 == 0`, so the kernel *body* does not specialize per block. Measured on a **padded**
+  tile (`EXACT` off, `FBLK == 0`), blocks 128/64/256/0/32 compile to **one shared variant**. What
+  does specialize is `FBLK`, the `EXACT` fast path's `constexpr` block, which must be constant for
+  the `(nb, FBLK)` reshape: on an **unpadded** power-of-two tile each distinct block size costs
+  **+1** variant of `_adakaon_tile_kernel` (measured +1 for each of 64/256/0/32 on top of 128). A
+  training run configures one block size, so in practice that is +0.
+
+  The number to compare across builds is the whole-surface baseline printed by
+  `benchmarks/fused/bench_wd_mblock.py --case jit` — every fused route × every momentum storage ×
+  fp32/bf16 params. With a clean `TRITON_CACHE_DIR` it is **45 variants across 11 kernels before
+  and after**, at a first-step compile cost of 38.6/37.9 s (before) vs 37.2/37.8 s (after): no
+  added JIT cost at the defaults. (`cautious_wd="full"` adds 5 to that baseline; `"masked"`, the
+  default, adds 0.)
+* **`EXACT` generalizes — and its precondition becomes load-bearing.** It now needs the block to
+  divide the tile as well as the tile to be unpadded (`(BR*BC) % blk == 0`); `BR*BC` is a power of
+  two, so a divisor of it is one too and the reshape stays legal. `FBLK` is the bucket's real block
+  instead of a hardcoded 128, so the divisibility that used to be automatic is now something the
+  **host** has to enforce: drop that term from `PointerArrayCache.exact4` and a `(64,128)` weight at
+  `momentum_4bit_block=96` raises a Triton `CompilationError` mid-run. Guarded by
+  `test_exact_requant_rejects_a_block_that_does_not_divide_the_tile` (the probe, showing *why*) and
+  `test_4bit_block_that_does_not_divide_the_tile_still_steps` (the host guard, end to end).
+* **The `NS` capacity masks stay.** They are no longer the routing decision's backstop (the bucket
+  key *is* the block) but they still turn a future routing mistake into dropped stores rather than
+  memory corruption. `fourbit_kernel_blocks(numel, block)` computes the required capacity;
+  `block <= 0` keeps the legacy `min(numel, 128)` for `AdaPnmCache`, whose tile kernel still
+  hardcodes the constant.
+
+**Measured value of the recovered route** (RTX 3000 Ada, paired A/B, 300 one-block tensors,
+`benchmarks/fused/bench_wd_mblock.py --case mblock`): 16.2–20.3× faster than the native
+degradation, 427/436 kernel launches → **2**, 39.5 MiB of per-step transient → **0**. The worst
+case for the new route — a *padded* tile (no `EXACT`, so `requant_4bit`'s general `for b in
+range(NB)` loop is O(numel·NB)) at `block=8`, i.e. 900 blocks over a 64×128 tile — is still
+**1.7–2.5× faster** than going native (`--case mblock_worst`; 1.73 / 1.77 / 2.00× over three
+paired runs here and 2.53× on a second rig — the spread is GPU contention, the sign is not), so no
+residual block-size guard is warranted.

@@ -359,9 +359,10 @@ if _HAS_TRITON:
         addresses: ``NB`` follows from ``BLK``, so such a caller would write ``NB - NS`` floats past
         the end of the buffer and read the missing blocks back out of it. It does NOT make a
         different block LAYOUT correct — a state quantized with a smaller ``momentum_4bit_block``
-        has its scales at other offsets entirely, and the routing guard in
-        ``Adakaon._fused_partition`` diverts that tensor to the native path instead. In practice
-        ``NS == NB`` here; the masks are the second line of defence that turns a future routing
+        has its scales at other offsets entirely. The caller's job is to pass THIS tensor's real
+        block: ``Adakaon`` does it by bucketing :class:`PointerArrayCache` on ``state["m_block"]``
+        and handing the kernel that block as a runtime scalar, so ``NS == NB`` here by
+        construction; the masks are the second line of defence that turns a future bucketing
         mistake into dropped stores and a neutral 1.0 scale instead of memory corruption."""
         blk = idx // BLK
         am = tl.where(m2, tl.abs(m_new), 0.0)
@@ -376,9 +377,16 @@ if _HAS_TRITON:
             # ``BC == C``) — then ``ri*C + ci == ri*BC + ci`` is the tile's own row-major
             # order. That is a per-tensor property and the reshape needs constexpr extents, so
             # the host decides it per BUCKET (``PointerArrayCache``: every tensor in the
-            # bucket has the tile as its exact shape) and passes ``EXACT``/``FBLK``. ``BR`` and
-            # ``BC`` are powers of two and ``FBLK == min(BR*BC, 128)``, so ``FBLK`` always
-            # divides ``BR*BC`` and the reshape is exact.
+            # bucket has the tile as its exact shape) and passes ``EXACT``/``FBLK``.
+            #
+            # ``FBLK`` MUST DIVIDE ``BR*BC`` — the reshape below is otherwise invalid and Triton
+            # raises a ``CompilationError`` at launch (verified:
+            # ``test_exact_requant_rejects_a_block_that_does_not_divide_the_tile``). Since 0.7.12
+            # ``FBLK`` is the bucket's real ``momentum_4bit_block``, not a hardcoded 128, so that
+            # divisibility is no longer automatic: :class:`PointerArrayCache` is what enforces it
+            # (``(BR*BC) % blk == 0`` in its ``exact4`` predicate) and falls back to the general
+            # loop below otherwise. ``BR*BC`` is a power of two, so any divisor of it is one too
+            # and ``nb`` stays a legal Triton extent.
             nb: tl.constexpr = (BR * BC) // FBLK
             seg = tl.max(tl.reshape(am, (nb, FBLK)), axis=1)           # [nb] per-block absmax
             seg = tl.where(seg < 1e-12, 1e-12, seg) / 7.0
@@ -437,15 +445,30 @@ if _HAS_TRITON:
     @triton.jit
     def _adakaon_tile_kernel(
         g_addr, p_addr, m_addr, mscale_addr, row_addr, col_addr, Rs_ptr, Cs_ptr, Ns_ptr,
-        lr, beta1, beta2, eps1, clip, wd, seed,
+        lr, beta1, beta2, eps1, clip, wd, seed, m_blk,
         LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr,
         CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         GC: tl.constexpr, SR: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
         EXACT: tl.constexpr = False, FBLK: tl.constexpr = 0,
+        WDFULL: tl.constexpr = False,
     ):
         """One program == one tensor. Whole factored Adakaon step, in place via pointer-array.
 
         Padded lanes are masked to 0 so the reductions and the 0*inf factor corners stay finite.
+
+        ``m_blk`` is the 4-bit absmax block size (``state["m_block"]``) as a RUNTIME scalar, one
+        per launch: :class:`PointerArrayCache` buckets by it, so every tensor in the launch shares
+        it. It used to be a hardcoded ``min(R*C, 128)``, which forced every other
+        ``momentum_4bit_block`` off this route and onto the native path. Ignored (and never read)
+        for every non-4-bit momentum — the branch is constexpr-elided — where the host passes 0.
+
+        Runtime, not ``constexpr``, so the KERNEL BODY does not specialize per block: Triton
+        keys an int argument only on ``== 1`` and ``% 16 == 0``. Measured on a padded-tile bucket
+        (``EXACT`` off), blocks 128/64/256/0/32 compile to **one** shared variant. What does
+        specialize is the ``EXACT`` fast path's ``FBLK``, which has to be constant for
+        ``requant_4bit``'s ``(nb, FBLK)`` reshape: on an unpadded power-of-two tile each distinct
+        block size costs **+1** variant of this kernel (measured 1 per block over 128/64/256/0/32).
+        A single training run configures one block size, so in practice that is +0.
         """
         t = tl.program_id(0)
         R = tl.load(Rs_ptr + t)
@@ -496,10 +519,11 @@ if _HAS_TRITON:
                 packed_ptr = mi.to(tl.pointer_type(tl.uint8))
                 scale_ptr = tl.load(mscale_addr + t).to(tl.pointer_type(tl.float32))
                 Chalf = C // 2
-                BLK = tl.minimum(R * C, 128)                           # flat elems per 4-bit block
+                BLK = m_blk                                            # flat elems per 4-bit block
                 # Ns_ptr[t] is this tensor's ALLOCATED m_scale length; it bounds the dequant's
-                # scale load and the requant's scale store/reload below, so a layout the routing
-                # guard failed to divert can only lose scales, never touch foreign memory.
+                # scale load and the requant's scale store/reload below. ``m_blk`` comes from the
+                # bucket key, so NS == NB here by construction; the bound is the backstop that
+                # turns a future bucketing mistake into dropped scales, never foreign memory.
                 NS = tl.load(Ns_ptr + t)
                 m_old = dequant_4bit(packed_ptr, scale_ptr, ri, ci, idx, Chalf, m2, BLK, NS)
             elif MOM == 1:  # bf16
@@ -521,10 +545,13 @@ if _HAS_TRITON:
         else:
             m_new = upd
 
-        # --- decoupled weight decay (AdamW-style): folded into delta BEFORE cautious, like native ---
+        # --- decoupled weight decay (AdamW-style), placement per ``cautious_wd`` (like native) ---
+        # WDFULL=False ("masked", the default): folded into delta BEFORE the cautious mask, so a
+        # rejected coordinate decays by ~0 and a survivor by wd/keep. WDFULL=True ("full"): applied
+        # AFTER the mask to every coordinate at the same lr*wd (the Cautious Optimizers placement).
         p_old = tl.load(pp + idx, mask=m2, other=0.0).to(tl.float32)
         delta = m_new
-        if WD:
+        if WD and not WDFULL:
             delta = delta + wd * p_old                 # momentum requant above used m_new (sans wd)
 
         # --- REUSABLE-ish: cautious masking + survivor rescale (operates on delta incl. wd) ---
@@ -542,6 +569,9 @@ if _HAS_TRITON:
             # to +0.0 (they compare equal; the only difference is the sign bit).
             delta = (delta * keepf) / mm
 
+        if WD and WDFULL:
+            delta = delta + wd * p_old
+
         # --- weight write (plain fp32 or bf16 stochastic rounding); lr on the FULL delta ---
         res = p_old - lr * delta
         if SR:
@@ -555,10 +585,12 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_mom(g_ptr, m_ptr, p_ptr, rfac_ptr, cfac_ptr, keep_ptr, C, n, inv_rms, wd, beta1,
-                     CAUTIOUS: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr):
+                     CAUTIOUS: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr,
+                     WDFULL: tl.constexpr = False):
         """Momentum EMA of the normalized (LR-independent) update over a flat chunk; accumulates
-        the cautious keep count (on delta incl. wd, matching native — the mask is invariant to
-        the positive lr scale). m is fp32 or bf16 (EMA runs in fp32)."""
+        the cautious keep count (on delta incl. wd under ``cautious_wd="masked"``, on the bare
+        momentum under ``"full"`` — matching native either way; the mask is invariant to the
+        positive lr scale). m is fp32 or bf16 (EMA runs in fp32)."""
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
@@ -573,28 +605,32 @@ if _HAS_TRITON:
         tl.store(m_ptr + offs, m.to(m_ptr.dtype.element_ty), mask=mask)
         if CAUTIOUS:
             delta = m
-            if WD:
+            if WD and not WDFULL:
                 delta = delta + wd * tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr, tl.sum(keep.to(tl.int32)))
 
     @triton.jit
     def _chunked_apply(g_ptr, m_ptr, p_ptr, n, inv_mean, lr, wd, seed,
-                       CAUTIOUS: tl.constexpr, WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr):
-        """delta = cautious(m + wd*p, g); p -= lr*delta, with bf16 stochastic rounding if SR."""
+                       CAUTIOUS: tl.constexpr, WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
+                       WDFULL: tl.constexpr = False):
+        """delta = cautious(m + wd*p, g) ["masked"] or cautious(m, g) + wd*p ["full"];
+        p -= lr*delta, with bf16 stochastic rounding if SR."""
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
         m = tl.load(m_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         delta = m
-        if WD:
+        if WD and not WDFULL:
             delta = delta + wd * p
         if CAUTIOUS:
             g = tl.load(g_ptr + offs, mask=mask, other=0.0)
             keep = (delta * g) > 0.0
             # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
             delta = delta * tl.where(keep, inv_mean, 0.0)
+        if WD and WDFULL:
+            delta = delta + wd * p
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed, offs)
@@ -623,10 +659,11 @@ if _HAS_TRITON:
         g_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, inv_rms_ptr,
         wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
-        BLOCK: tl.constexpr,
+        BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
     ):
         """Batched pass 1: momentum EMA of the normalized update over a flat chunk of tensor ``t``;
-        accumulates the cautious keep-count (on delta incl. WD, matching native) into ``keep_ptr[t]``."""
+        accumulates the cautious keep-count (on delta incl. WD unless ``WDFULL``, matching native)
+        into ``keep_ptr[t]``."""
         pid = tl.program_id(0)
         t = pid // K
         k = pid % K
@@ -653,7 +690,7 @@ if _HAS_TRITON:
             tl.store(mp + offs, m, mask=mask)
         if CAUTIOUS:
             delta = m
-            if WD:
+            if WD and not WDFULL:
                 pi = tl.load(p_addr + t)
                 if LOWP:
                     pp = pi.to(tl.pointer_type(tl.bfloat16))
@@ -668,9 +705,10 @@ if _HAS_TRITON:
     def _chunked_apply_batched(
         g_ptr, m_addr, p_addr, inv_mean_ptr, lr, wd, seed, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
-        SR: tl.constexpr, BLOCK: tl.constexpr,
+        SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
     ):
-        """Batched pass 2: delta = cautious(m + wd*p, g); p -= lr*delta (bf16 SR if LOWP+SR)."""
+        """Batched pass 2: delta = cautious(m + wd*p, g) ["masked"] or cautious(m, g) + wd*p
+        ["full"]; p -= lr*delta (bf16 SR if LOWP+SR)."""
         pid = tl.program_id(0)
         t = pid // K
         k = pid % K
@@ -685,7 +723,7 @@ if _HAS_TRITON:
         pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         delta = m
-        if WD:
+        if WD and not WDFULL:
             delta = delta + wd * p
         if CAUTIOUS:
             g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)
@@ -693,6 +731,8 @@ if _HAS_TRITON:
             keep = (delta * g) > 0.0
             # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
             delta = delta * tl.where(keep, inv_mean, 0.0)
+        if WD and WDFULL:
+            delta = delta + wd * p
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -912,7 +952,7 @@ if _HAS_TRITON:
         g_addr, rowmean_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, rms_ptr,
         clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
-        WD: tl.constexpr, BLOCK: tl.constexpr,
+        WD: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
     ):
         """As ``_chunked_mom_batched`` but grad comes from the pointer array (GC via rowmean[t, row])."""
         pid = tl.program_id(0)
@@ -944,7 +984,7 @@ if _HAS_TRITON:
             tl.store(mp + offs, m, mask=mask)
         if CAUTIOUS:
             delta = m
-            if WD:
+            if WD and not WDFULL:
                 pi = tl.load(p_addr + t)
                 pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
                 delta = delta + wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
@@ -955,7 +995,7 @@ if _HAS_TRITON:
     def _chunked_apply_batched_g(
         g_addr, rowmean_ptr, m_addr, p_addr, inv_mean_ptr, lr, wd, seed, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
-        WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
+        WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
     ):
         """As ``_chunked_apply_batched`` but grad (for cautious) comes from the pointer array + GC."""
         pid = tl.program_id(0)
@@ -972,7 +1012,7 @@ if _HAS_TRITON:
         pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         delta = m
-        if WD:
+        if WD and not WDFULL:
             delta = delta + wd * p
         if CAUTIOUS:
             i = offs // C
@@ -986,6 +1026,8 @@ if _HAS_TRITON:
             keep = (delta * g) > 0.0
             # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
             delta = delta * tl.where(keep, inv_mean, 0.0)
+        if WD and WDFULL:
+            delta = delta + wd * p
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -1005,6 +1047,7 @@ if _HAS_TRITON:
         lr, beta1, beta2, eps1, clip, wd, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr, FBLOCK: tl.constexpr,
+        WDFULL: tl.constexpr = False,
     ):
         """One program == one 1-D tensor. Whole non-factored Adam step, in place via pointer-array."""
         t = tl.program_id(0)
@@ -1083,7 +1126,7 @@ if _HAS_TRITON:
             delta = update
 
         p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
-        if WD:
+        if WD and not WDFULL:                          # ``cautious_wd`` — see _adakaon_tile_kernel
             delta = delta + wd * p_old
         if CAUTIOUS:
             keep = (delta * g) > 0.0
@@ -1092,6 +1135,8 @@ if _HAS_TRITON:
             mm = tl.where(mm < 1e-8, 1e-8, mm)
             # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
             delta = (delta * keepf) / mm
+        if WD and WDFULL:
+            delta = delta + wd * p_old
         res = p_old - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -1578,7 +1623,7 @@ if _HAS_TRITON:
         g_addr, rowmean_ptr, p_addr, rfac_ptr, cfac_ptr, keep_ptr,
         rms_ptr, clip, wd, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
-        BLOCK: tl.constexpr,
+        BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
     ):
         """Count cautious survivors for a no-momentum chunked update."""
         pid = tl.program_id(0)
@@ -1596,7 +1641,7 @@ if _HAS_TRITON:
         rf = tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
         cf = tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
         delta = g * rf * cf * inv_rms_clip(rms_ptr, t, n, clip)
-        if WD:
+        if WD and not WDFULL:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
             delta += wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
@@ -1609,6 +1654,7 @@ if _HAS_TRITON:
         inv_mean_ptr, lr, wd, seed, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
+        WDFULL: tl.constexpr = False,
     ):
         """Apply a chunked factored update without materializing momentum."""
         pid = tl.program_id(0)
@@ -1629,7 +1675,7 @@ if _HAS_TRITON:
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
-        if WD:
+        if WD and not WDFULL:
             delta += wd * p
         if CAUTIOUS:
             keep = (delta * g) > 0.0
@@ -1637,6 +1683,8 @@ if _HAS_TRITON:
             inv_mean = n.to(tl.float32) / tl.maximum(count, 1.0)
             # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
             delta = delta * tl.where(keep, inv_mean, 0.0)
+        if WD and WDFULL:
+            delta += wd * p
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -1647,7 +1695,7 @@ if _HAS_TRITON:
         g_addr, rowmean_ptr, packed_addr, scale_addr, p_addr, rfac_ptr, cfac_ptr,
         keep_ptr, rms_ptr, clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
-        FBLOCK: tl.constexpr, BLOCK: tl.constexpr,
+        FBLOCK: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
     ):
         """Count cautious survivors from the exact pre-requantized 4-bit EMA.
 
@@ -1678,7 +1726,7 @@ if _HAS_TRITON:
         old = (nib.to(tl.float32) - 8.0) * tl.load(scales + offs // FBLOCK, mask=mask, other=0.0)
         momentum = beta1 * old + (1.0 - beta1) * upd
         delta = momentum
-        if WD:
+        if WD and not WDFULL:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
             delta += wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
@@ -1691,6 +1739,7 @@ if _HAS_TRITON:
         keep_ptr, rms_ptr, clip, lr, wd, beta1, seed, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, FBLOCK: tl.constexpr, BLOCK: tl.constexpr,
+        WDFULL: tl.constexpr = False,
     ):
         """Exact update plus in-kernel 4-bit requantization for a chunked tensor.
 
@@ -1724,13 +1773,15 @@ if _HAS_TRITON:
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         delta = momentum
-        if WD:
+        if WD and not WDFULL:
             delta += wd * p
         if CAUTIOUS:
             count = tl.load(keep_ptr + t).to(tl.float32)
             keep = (delta * g) > 0.0
             # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
             delta = delta * tl.where(keep, n.to(tl.float32) / tl.maximum(count, 1.0), 0.0)
+        if WD and WDFULL:
+            delta += wd * p
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -1789,6 +1840,7 @@ if _HAS_TRITON:
         g_addr, rowmean_ptr, code_addr, scale_addr, p_addr, rfac_ptr, cfac_ptr,
         keep_ptr, rms_ptr, clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr,
+        WDFULL: tl.constexpr = False,
     ):
         """Count cautious survivors from the exact pre-requantized int8 EMA.
 
@@ -1816,7 +1868,7 @@ if _HAS_TRITON:
         old = tl.load(codes + offs, mask=mask, other=0).to(tl.float32)
         old *= tl.load(scales + i, mask=mask, other=0.0)          # per-row dequant
         delta = beta1 * old + (1.0 - beta1) * upd
-        if WD:
+        if WD and not WDFULL:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
             delta += wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
@@ -1829,6 +1881,7 @@ if _HAS_TRITON:
         keep_ptr, rms_ptr, clip, lr, wd, beta1, seed, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         SR: tl.constexpr, CSEG: tl.constexpr, RPC: tl.constexpr, BLOCK: tl.constexpr,
+        WDFULL: tl.constexpr = False,
     ):
         """Exact update plus in-kernel per-row int8 requantization for a chunked tensor.
 
@@ -1860,13 +1913,15 @@ if _HAS_TRITON:
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         delta = momentum
-        if WD:
+        if WD and not WDFULL:
             delta += wd * p
         if CAUTIOUS:
             count = tl.load(keep_ptr + t).to(tl.float32)
             keep = (delta * g) > 0.0
             # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
             delta = delta * tl.where(keep, n.to(tl.float32) / tl.maximum(count, 1.0), 0.0)
+        if WD and WDFULL:
+            delta += wd * p
         res = p - lr * delta
         if SR:
             res = sr_round(res, seed + t, offs)
@@ -2057,13 +2112,15 @@ def sr_add_(target, source, alpha: float = 1.0) -> None:
         )
 
 
-def fourbit_kernel_blocks(numel: int) -> int:
-    """Number of 4-bit absmax blocks the ONE-BLOCK tile kernel writes for an ``numel``-element
-    tensor. The kernel hardcodes ``BLK = min(numel, 128)``, so this is the momentum layout a
-    tensor must already have to be eligible for that route (see ``Adakaon._fused_partition``);
-    ``kaon._momentum_codec.fourbit_block_size`` produces exactly it for the default
-    ``momentum_4bit_block=128``."""
-    return (numel + min(numel, 128) - 1) // max(min(numel, 128), 1)
+def fourbit_kernel_blocks(numel: int, block: int = 0) -> int:
+    """Number of 4-bit absmax blocks a one-block tile kernel writes for an ``numel``-element
+    tensor under ``block``-element absmax blocks — i.e. the ``m_scale`` capacity that layout
+    needs. ``block <= 0`` means the legacy hardcoded ``min(numel, 128)`` (still what
+    :class:`AdaPnmCache` gets, since ``_adapnm_tile_kernel`` keeps the constant); Adakaon's
+    tile kernel takes the block as a runtime scalar and passes the bucket's real
+    ``state["m_block"]`` (see :class:`PointerArrayCache`)."""
+    bs = min(numel, 128) if block <= 0 else block
+    return (numel + max(bs, 1) - 1) // max(bs, 1)
 
 
 class PointerArrayCache(_WitnessedCache):
@@ -2081,12 +2138,18 @@ class PointerArrayCache(_WitnessedCache):
         # The device is part of the bucket key (and every index array is built ON that device):
         # one launch owns one device, and a group holding params on two of them would otherwise
         # hand a kernel a pointer array from the wrong context.
-        groups: dict[tuple[int, int, torch.dtype, torch.device], list] = {}
+        #
+        # ``m_block`` (0 for every non-4-bit momentum, so it never fragments them) joins the key
+        # because the tile kernel takes the 4-bit absmax block as ONE runtime scalar for the whole
+        # launch: two tensors sharing a tile can still carry different block layouts (a non-default
+        # ``momentum_4bit_block``, ``0`` = whole-tensor with different numels, or a checkpoint's
+        # layout), and one launch cannot serve both.
+        groups: dict[tuple[int, int, int, torch.dtype, torch.device], list] = {}
         for p in plist:
             br, bc = next_pow2_tile(*eff_2d(p))
-            groups.setdefault((br, bc, p.dtype, p.device), []).append(p)
+            groups.setdefault((br, bc, state_of(p).get("m_block", 0), p.dtype, p.device), []).append(p)
         self.buckets = []
-        for (BR, BC, _dtype, dev), bl in groups.items():  # noqa: N806
+        for (BR, BC, blk, _dtype, dev), bl in groups.items():  # noqa: N806
             i64 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int64, device=_d)  # noqa: E731
             i32 = lambda xs, _d=dev: torch.tensor(xs, dtype=torch.int32, device=_d)  # noqa: E731
             st = [state_of(p) for p in bl]
@@ -2110,31 +2173,35 @@ class PointerArrayCache(_WitnessedCache):
             mscale_addr = i64([s["m_scale"].data_ptr() for s in st]) if quant else m_addr
             Rs = i32([p.shape[0] for p in bl])  # noqa: N806
             # Per-tensor m_scale CAPACITY for the 4-bit requant's bounded scale store. The tile
-            # kernel writes ``fourbit_kernel_blocks(numel)`` scales (its block size is a hardcoded
-            # 128); a shorter buffer means a non-default ``momentum_4bit_block`` was routed here,
-            # which used to run off the end of ``m_scale``. Float momenta never dereference this
-            # array (the branch is constexpr-elided), so they reuse ``Rs``.
+            # kernel writes ``fourbit_kernel_blocks(numel, blk)`` scales for THIS bucket's runtime
+            # block; a shorter buffer would run off the end of ``m_scale``. In practice the two
+            # coincide by construction (the bucket key IS ``m_block``), so this is the second line
+            # of defence, not the routing decision it used to back. Float momenta never
+            # dereference this array (the branch is constexpr-elided), so they reuse ``Rs``.
             if mom == MOM_4BIT:
                 have = [s["m_scale"].numel() for s in st]
                 short = [(tuple(q.shape), h) for q, h in zip(bl, have, strict=True)
-                         if h < fourbit_kernel_blocks(q.numel())]
+                         if h < fourbit_kernel_blocks(q.numel(), blk)]
                 if short:
                     raise RuntimeError(
-                        "fused one-block 4-bit momentum needs 128-element absmax blocks; these "
-                        f"tensors carry a different layout: {short[:4]} - route them to the "
-                        "native path (see Adakaon._fused_partition)"
+                        f"fused one-block 4-bit momentum: m_scale is shorter than the {blk}-element "
+                        f"absmax block layout needs for {short[:4]} - route them to the native path "
+                        "(see Adakaon._fused_partition)"
                     )
                 mscale_n = i32(have)
             else:
                 mscale_n = Rs
             # 4-bit single-reduction fast path: every tensor in the bucket must fill the
             # padded tile exactly, so the flat block segments line up with a reshape of the
-            # tile (see requant_4bit). Powers of two only, which is the common LoRA/adapter
-            # case AND the one where NB is largest and the general loop hurts most.
-            exact4 = mom == MOM_4BIT and all(eff_2d(p) == (BR, BC) for p in bl)
+            # tile (see requant_4bit), AND the block must divide the tile. ``BR*BC`` is a power
+            # of two, so a divisor of it is one too and ``tl.reshape(am, (nb, FBLK))`` is legal.
+            # Powers of two only, which is the common LoRA/adapter case AND the one where NB is
+            # largest and the general loop hurts most.
+            exact4 = (mom == MOM_4BIT and blk > 0 and (BR * BC) % blk == 0
+                      and all(eff_2d(p) == (BR, BC) for p in bl))
             self.buckets.append(dict(
-                plist=bl, BR=BR, BC=BC, mom=mom, momentum=momentum, dev=dev,
-                exact4=exact4, fblk=min(BR * BC, 128) if exact4 else 0,
+                plist=bl, BR=BR, BC=BC, mom=mom, momentum=momentum, dev=dev, blk=blk,
+                exact4=exact4, fblk=blk if exact4 else 0,
                 p_addr=i64([p.data_ptr() for p in bl]),
                 m_addr=m_addr, mscale_addr=mscale_addr, mscale_n=mscale_n,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
