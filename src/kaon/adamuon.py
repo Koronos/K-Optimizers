@@ -82,6 +82,7 @@ from kaon._momentum_codec import (
     _make_codec,
     _MomentumCodec,
     load_state_dict_preserving_dtypes,
+    warn_if_4bit_high_beta1,
 )
 
 __all__ = ["AdaMuon"]
@@ -536,6 +537,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
             raise ValueError(f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}")
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
+        warn_if_4bit_high_beta1(beta1, momentum_dtype)
         defaults = {
             "lr": lr,
             "betas": (beta1, beta2),

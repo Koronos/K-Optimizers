@@ -137,9 +137,15 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         # state_dict). ``base_optimizer`` stays as a public alias of the bound ``inner``.
         self._bind_inner(base_optimizer(params, **kwargs), state_key="sam")
         self.base_optimizer = self.inner
+        # SAM's OWN per-group hyperparameters (not part of the inner optimizer's
+        # ``defaults``, per the ``eps`` note above). Kept as ``self.defaults`` — mirroring
+        # the attribute every plain ``torch.optim.Optimizer`` carries — purely so
+        # ``load_state_dict`` can backfill a key an older checkpoint predates the same
+        # way every other kaon optimizer does.
+        self.defaults: dict[str, Any] = {"rho": float(rho), "adaptive": bool(adaptive)}
         for group in self.param_groups:
-            group.setdefault("rho", float(rho))
-            group.setdefault("adaptive", bool(adaptive))
+            for key, value in self.defaults.items():
+                group.setdefault(key, value)
 
     # ------------------------------------------------------------------ norm
     @torch.no_grad()
@@ -274,6 +280,15 @@ class SAM(WrapsInnerOptimizer, Optimizer):
 
         WrapsInnerOptimizer's ``state_dict`` already saves the inner optimizer's full
         state (SAM keeps no persistent state of its own), so this round-trips the base
-        optimizer's momentum/factored state — unlike the previous bare ``super()`` call."""
+        optimizer's momentum/factored state — unlike the previous bare ``super()`` call.
+
+        ``inner.load_state_dict`` backfills the INNER optimizer's own defaults (every
+        kaon optimizer's ``load_state_dict`` does this now); backfill SAM's own
+        ``rho``/``adaptive`` here too, since those live in the same shared
+        ``param_groups`` dict but are not part of the inner optimizer's ``defaults``.
+        """
         self._load_wrapped(state_dict, lambda inner, sd: inner.load_state_dict(sd))
         self.base_optimizer = self.inner
+        for group in self.param_groups:
+            for key, value in self.defaults.items():
+                group.setdefault(key, value)
