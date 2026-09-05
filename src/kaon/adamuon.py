@@ -9,8 +9,11 @@ The pipeline (2-D / conv weights) is, in order:
 
 1. **First moment of the RAW gradient** — an EMA ``m = β1·m + (1-β1)·g`` kept in a
    quantized codec (bf16/int8/4bit) exactly like :class:`~kaon.adakaon.Adakaon`.
-2. **Orthogonalize** ``m`` with a 5-step Newton-Schulz iteration → ``O ≈ U·Vᵀ``.
-3. **Factored second moment OF ``O``** (Adafactor row+col EMA) → ``u = O·inv_sqrt(v̂)``.
+2. **Orthogonalize** ``m`` with a Newton-Schulz iteration (``ns_steps``, default 2)
+   → ``O ≈ U·Vᵀ``.
+3. **Factored second moment OF ``O``** (Adafactor row+col EMA) → ``u = O·inv_sqrt(v)``
+   (uncorrected unless ``bias_correction=True``; ``clip_threshold`` absorbs the cold-``v``
+   overshoot otherwise — see its docstring).
 4. **RMS scaling** to a shape-independent target (see below) → apply at ``lr``.
 
 This is the key difference from Adakaon, which factors the second moment of the
@@ -23,9 +26,11 @@ for closing/overtaking AdamW.
 **Update-norm note (why ``0.2``, not ``0.2·√max(R,C)``).** Plain Muon scales the
 orthogonal factor ``O`` (which has RMS ``≈ 1/√max(R,C)``) by ``0.2·√max(R,C)`` to
 get a shape-independent applied RMS of ``0.2``. In AdaMuon the factored
-``inv_sqrt(v̂)`` already rescales ``u`` to RMS ``≈ 1`` (the ``c_factor`` term is
+``inv_sqrt(v)`` already rescales ``u`` to RMS ``≈ 1`` (the ``c_factor`` term is
 ``≈ √max(R,C)``), so reapplying ``√max(R,C)`` would double-count the shape and
-make the update grow with layer size. We therefore scale by the **constant**
+make the update grow with layer size. (``RMS ≈ 1`` is the *asymptotic* statement:
+with no bias correction the actual pre-clip RMS is ``≈ 1/√(1-β₂ᵗ)``, and
+``clip_threshold`` is what pins it to 1 for the first ``~1/(1-β₂)`` steps.) We therefore scale by the **constant**
 ``_UPDATE_RMS`` (0.2) only. Every parameter — 2-D and 1-D alike — is normalized to
 an applied RMS of ``≈ 0.2·lr``, so a single ``lr`` governs the whole model (no
 separate Adam LR for biases/norms, unlike plain Muon).
@@ -62,6 +67,7 @@ from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
     cautious_batched_,
+    cautious_one_,
     centralize_grads_,
     flat_view,
     foreach_budget,
@@ -83,7 +89,7 @@ __all__ = ["AdaMuon"]
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
 # Shape-independent applied-update RMS target (before lr). The factored
-# inv_sqrt(v̂) already brings ``u`` to RMS≈1, so this is the only magnitude scale
+# inv_sqrt(v) already brings ``u`` to RMS≈1, so this is the only magnitude scale
 # applied — equal to Muon's per-element RMS (``0.2``). See the module docstring on
 # why ``√max(R,C)`` is NOT reapplied here.
 _UPDATE_RMS = 0.2
@@ -150,6 +156,224 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
     return x
 
 
+# --------------------------------------------------------------------------- #
+# Pure-tensor step math (the ``torch.compile`` unit).
+#
+# ``compile=True`` compiles THESE functions, not the step body. The step body
+# reads ``p.grad`` / ``self.state[p]`` / ``group[...]`` per parameter, which makes
+# Dynamo install a guard per parameter on *whether that parameter has a gradient*
+# and on the *value* of ``group["lr"]``. Both change during normal training — a
+# MoE / CFG-dropout / partial-accumulation step changes the grad set, and any LR
+# schedule changes ``lr`` every step — so the whole step recompiled until
+# ``recompile_limit`` (8) was hit and compilation silently fell back to eager
+# (measured: 8 graphs in both scenarios; ``add_param_group`` cost 2 more, ~8 s).
+#
+# These functions take *stacked tensors* and *constant* configuration only, so the
+# guards are on shapes/dtypes (which automatic-dynamic generalizes after the second
+# distinct shape) and on config values that do not change during a run. Everything
+# that touches Python containers — the grad filter, the bucketing, the momentum
+# codec, the state write-back — stays outside the graph. Step-varying scalars
+# (``lr``, the bias-correction factor) are passed as 0-D tensors when compiled so
+# Dynamo cannot specialize on their value; a 0-D tensor multiply is bit-identical
+# to the Python-float multiply used in eager.
+# --------------------------------------------------------------------------- #
+
+Scalar = Tensor | float
+
+
+def _stack_fp32(tensors: list[Tensor]) -> Tensor:
+    """``torch.stack(...).float()``, but a zero-copy ``unsqueeze`` for a bucket of one.
+
+    Single-slice buckets are the norm as soon as a model has many distinct weight
+    shapes (each shape is its own bucket), and stacking one tensor copies it for
+    nothing — 16 MB per step on a 4x1024x1024 full fine-tune. Nothing downstream
+    mutates the stacked gradient/weight, so aliasing the parameter's storage is safe.
+    """
+    if len(tensors) == 1:
+        return tensors[0].unsqueeze(0).float()
+    return torch.stack(tensors).float()
+
+
+def _add_scaled_(delta: Tensor, other: Tensor, scale: Scalar) -> Tensor:
+    """``delta += scale * other``. ``scale`` is a Python float in eager (one fused
+    ``add_(alpha=)`` kernel, bit-exact with the pre-refactor code) and a 0-D tensor
+    under ``torch.compile`` (``alpha=`` would specialize the graph on the value);
+    Inductor fuses both forms into the surrounding elementwise chain anyway."""
+    if isinstance(scale, Tensor):
+        return delta.add_(other * scale)
+    return delta.add_(other, alpha=scale)
+
+
+def _factored_math(
+    m: Tensor,
+    grad: Tensor,
+    row: Tensor,
+    col: Tensor,
+    p_fp32: Tensor | None,
+    ns_steps: int,
+    beta2: float,
+    eps1: float,
+    clip: float,
+    bc_scale: Scalar | None,
+    lr_scale: Scalar,
+    wd_scale: Scalar | None,
+    cautious: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Stacked 2-D core: Newton-Schulz -> factored second moment -> clip -> scale.
+
+    ``m`` / ``grad`` / ``p_fp32`` are ``[N, R, C]`` fp32; ``row`` / ``col`` are the
+    ``[N, R]`` / ``[N, C]`` *stacked copies* of the per-param state (mutated here and
+    written back by the caller). Returns ``(row, col, delta)``.
+    """
+    N, R, C = m.shape  # noqa: N806 — matrix dims
+    ortho = zeropower_via_newtonschulz5_stacked(m, ns_steps).float()   # [N, R, C]
+
+    # Factored second moment OF the orthogonalized signal (HF eps placement).
+    omb = 1.0 - beta2
+    ortho_sq = ortho * ortho
+    if eps1 > 0:
+        ortho_sq = ortho_sq.add_(eps1)
+    row.lerp_(ortho_sq.mean(dim=-1), omb)
+    col.lerp_(ortho_sq.mean(dim=-2), omb)
+
+    r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
+    c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
+    update = ortho.mul(r_factor).mul_(c_factor)                               # [N, R, C], RMS≈1
+    if bc_scale is not None:
+        update.mul_(bc_scale)
+
+    # Clip ceiling (RMS≈1 domain) then the constant shape-independent scale.
+    rms_ = update.reshape(N, -1).norm(2, dim=1) / math.sqrt(R * C)
+    update.div_(rms_.div_(clip).clamp_(min=1.0).view(N, 1, 1))
+    update.mul_(lr_scale)
+    delta = update
+
+    if wd_scale is not None:
+        delta = _add_scaled_(delta, p_fp32, wd_scale)
+    if cautious:
+        delta = cautious_batched_(delta, grad)
+    return row, col, delta
+
+
+def _nonfactored_pre_math(
+    grad: Tensor,
+    v: Tensor,
+    beta2: float,
+    eps1: float,
+    clip: float,
+    bc_scale: Scalar | None,
+    lr_scale: Scalar,
+) -> tuple[Tensor, Tensor]:
+    """Stacked ``ndim<=1`` core, part 1: second moment -> normalize -> clip -> scale.
+
+    Split in two because the momentum codec sits between the halves and is
+    Python-container work that must stay out of the graph. ``grad`` / ``v`` are
+    ``[N, L]`` fp32 (``v`` is the stacked copy of the state). Returns ``(v, update)``.
+    """
+    N, length = grad.shape  # noqa: N806
+    omb = 1.0 - beta2
+    grad_sq = grad * grad
+    if eps1 > 0:
+        grad_sq = grad_sq.add_(eps1)
+    v.lerp_(grad_sq, omb)
+
+    update = grad.mul(v.rsqrt())                                      # [N, L], RMS≈1
+    if bc_scale is not None:
+        update.mul_(bc_scale)
+    rms_ = update.norm(2, dim=1) / math.sqrt(length)
+    update.div_(rms_.div_(clip).clamp_(min=1.0).view(N, 1))
+    update.mul_(lr_scale)
+    return v, update
+
+
+def _post_math(
+    delta: Tensor,
+    grad: Tensor,
+    p_fp32: Tensor | None,
+    wd_scale: Scalar | None,
+    cautious: bool,
+) -> Tensor:
+    """Stacked tail of the ``ndim<=1`` bucket: weight decay + cautious mask."""
+    if wd_scale is not None:
+        delta = _add_scaled_(delta, p_fp32, wd_scale)
+    if cautious:
+        delta = cautious_batched_(delta, grad)
+    return delta
+
+
+def _factored_one_math(
+    m: Tensor,
+    grad: Tensor,
+    row: Tensor,
+    col: Tensor,
+    p_fp32: Tensor | None,
+    ns_steps: int,
+    beta2: float,
+    eps1: float,
+    clip: float,
+    bc_scale: Scalar | None,
+    lr_scale: Scalar,
+    wd_scale: Scalar | None,
+    cautious: bool,
+) -> Tensor:
+    """Per-parameter 2-D core. Tensors are ``[R, C]``; ``row`` / ``col`` are the state
+    tensors themselves (updated in place). Returns the ``[R, C]`` delta."""
+    ortho = zeropower_via_newtonschulz5(m, ns_steps).float()          # [R, C]
+    update_factored_state(ortho, row, col, beta2, eps1)
+    r_factor, c_factor = factored_inv_sqrt_factors(row, col)
+    update = ortho.mul(r_factor).mul_(c_factor)                       # [R, C], RMS≈1
+    if bc_scale is not None:
+        update.mul_(bc_scale)
+    if clip > 0:
+        update.div_((rms(update) / clip).clamp_(min=1.0))
+    update.mul_(lr_scale)
+    delta = update
+    if wd_scale is not None:
+        delta = _add_scaled_(delta, p_fp32, wd_scale)
+    if cautious:
+        delta = cautious_one_(delta, grad)
+    return delta
+
+
+def _nonfactored_one_pre_math(
+    grad: Tensor,
+    v: Tensor,
+    beta2: float,
+    eps1: float,
+    clip: float,
+    bc_scale: Scalar | None,
+    lr_scale: Scalar,
+) -> Tensor:
+    """Per-parameter ``ndim<=1`` core, part 1 (see :func:`_nonfactored_pre_math`).
+    ``v`` is the state tensor, updated in place; returns the scaled update."""
+    grad_sq = grad * grad
+    if eps1 > 0:
+        grad_sq.add_(eps1)
+    v.lerp_(grad_sq, 1.0 - beta2)
+    update = grad.mul(v.rsqrt())
+    if bc_scale is not None:
+        update.mul_(bc_scale)
+    if clip > 0:
+        update.div_((rms(update) / clip).clamp_(min=1.0))
+    update.mul_(lr_scale)
+    return update
+
+
+def _post_one_math(
+    delta: Tensor,
+    grad: Tensor,
+    p_fp32: Tensor | None,
+    wd_scale: Scalar | None,
+    cautious: bool,
+) -> Tensor:
+    """Per-parameter tail: decoupled weight decay + cautious mask."""
+    if wd_scale is not None:
+        delta = _add_scaled_(delta, p_fp32, wd_scale)
+    if cautious:
+        delta = cautious_one_(delta, grad)
+    return delta
+
+
 class AdaMuon(AutoLRMixin, Optimizer):
     """Orthogonalized-momentum optimizer with factored quantized variance.
 
@@ -166,15 +390,47 @@ class AdaMuon(AutoLRMixin, Optimizer):
             reductions (HF Adafactor convention). ``eps2`` is reserved/unused.
         weight_decay: decoupled weight decay (folded into the per-step delta).
         ns_steps: Newton-Schulz iteration steps. **Default ``2``** (LLM Muon uses
-            5). On a paired pixel-DDPM sweep, ``5`` *over-orthogonalizes*: flattening
-            the momentum's singular spectrum too hard discards useful curvature, so
-            ``2`` was both faster (~0.9 ms/step per saved iteration) AND lower val
-            than ``5`` — a strict win. ``1`` under-orthogonalizes (loses the edge over
-            Adakaon); ``2`` was the sweet spot. Re-tune per task/model.
-        clip_threshold: RMS ceiling on the normalized update (``rms(u) <= thr``).
-            Applied in the RMS≈1 domain, so ``1.0`` matches Adakaon's semantics
-            and is load-bearing for the first few steps (before the factored second
-            moment warms up). Steady-state it is a near no-op.
+            5). On a paired pixel-DDPM sweep ``2`` was both faster (~0.9 ms/step per
+            saved iteration) AND lower val than ``5``, and ``1`` lost the edge over
+            Adakaon. The mechanism is **aspect-ratio dependent**, not
+            "over-orthogonalization": the quintic settles into a singular-value band
+            ≈[0.67, 1.20] and never leaves it, and on skinny matrices (LoRA shapes,
+            and conv weights matrixized to ``(out, in·kh·kw)``) ``ns=2`` is already
+            inside it (mean sv 0.89-1.06 at 4:1-16:1), so steps 3-5 buy nothing. On
+            *square* matrices ``ns=2`` is heavily **under**-orthogonalized instead
+            (mean sv 0.56 at 256x256, 0.31 at 1024x1024, with near-zero directions),
+            which the diffusion proxy never exercises — re-sweep ``ns_steps`` on a
+            model with large square weights. See docs/adamuon.md for the table.
+        clip_threshold: RMS ceiling on the normalized update (``rms(u) <= thr``),
+            applied in the RMS≈1 domain (so ``1.0`` matches Adakaon's semantics).
+            **A first-order hyperparameter, not a safety net.** The factored second
+            moment has no bias correction by default, so on a real proxy-U-Net run
+            the mean ``rms(u)`` before clipping measures ``31.9`` at step 1, ``3.56``
+            at 100, ``1.20`` at 1000 and ``0.98`` at 2999 (β₂=0.999) — almost exactly
+            ``1/√(1-β₂ᵗ)``. The clip is therefore *active on every weight bucket* for
+            the first ``~1/(1-β₂)`` steps and on 70-80% after, which makes it both the
+            thing that sets the early effective step size AND, in practice, the second
+            moment's bias correction (see ``bias_correction``). docs/adamuon.md has the
+            measured lr/clip coupling.
+        bias_correction: divide the factored second moment by ``1 - β₂ᵗ`` (Adam's
+            bias correction, per parameter — ``state["step"]``, so a weight that only
+            sometimes gets a gradient is corrected by its own update count). Because
+            the row factor is a *ratio* of row stats the correction cancels there and
+            survives only in the column factor, so it reduces exactly to scaling the
+            normalized update by ``√(1 - β₂ᵗ)`` before the clip — one multiply, no
+            state beyond the counter. **Default ``False`` because ``clip_threshold``
+            already does this job, harder.** The uncorrected ``rms(u)`` measures
+            almost exactly ``1/√(1-β₂ᵗ)``, which is what the correction divides out,
+            so while the clip binds both settings emit the *same* update (measured
+            applied RMS in units of ``0.2·lr``: 1.0000 vs 1.0000 at step 1, 1.0000 vs
+            0.9953 at 1000, 1.0000 vs 0.9905 at 3000 — a ≤1% rescale, never more), and
+            the paired pixel-DDPM A/B finds no gain. The two are alternative
+            implementations of the same normalization: with the clip *disabled* the
+            correction recovers 92% of its value (proxy 2-seed mean val 0.0701 with
+            ``clip=1.0`` alone, 0.0870 clip-off uncorrected, 0.0714 clip-off
+            corrected). Turn it on if you raise or disable ``clip_threshold``, or when
+            composing with a layer that assumes an unbiased ``1/√v``. See
+            docs/adamuon.md for the tables.
         momentum_dtype: storage for the first moment when ``beta1>0`` —
             ``"bfloat16"`` (default, ~2 B/param), ``"float32"`` (4 B), ``"int8"``
             (~1 B, per-row absmax), or ``"4bit"`` (~0.5 B, per-block absmax). Newton-
@@ -199,19 +455,41 @@ class AdaMuon(AutoLRMixin, Optimizer):
             instead of stacking (performance knob; default ``2_000_000``).
         foreach_stack_budget: max elements per stacked chunk. ``None`` (default)
             adapts to free VRAM; an int pins a fixed cap.
-        compile: ``torch.compile`` the whole step body (``fullgraph=False``), fusing
-            the step's elementwise chain. **Workload-dependent — benchmark it.** The
-            win scales with how much (fusable) elementwise math the step does, so for
-            AdaMuon (heavy Newton-Schulz + factored + cautious + scale) it helps
-            broadly: measured ~0.34x (-66%) on many small *distinct*-shaped tensors
-            (which defeat ``foreach`` batching), and ~0.6-0.75x on few/tiny/single
-            params. It is ~neutral for compute-bound full fine-tunes and for already-
-            ``foreach``-batched pure-LoRA sets, and a no-op when the model fwd/bwd
-            dominates (SDXL is UNet-bound). One-time warmup; numerically equivalent to
-            eager (bit-exact per step; SR unbiased; no crashes across dtypes/shapes).
-            Not recommended on CPU (inconsistent). NB: compiling *only* the
-            Newton-Schulz does NOT help on LoRA-rank matrices — the win is the
-            whole-step fusion. Default ``False``.
+        compile: ``torch.compile`` the step's tensor math, fusing its elementwise
+            chain. Only the pure-tensor bucket kernels are compiled — the parameter
+            bookkeeping (grad filter, bucketing, momentum codec, state write-back)
+            stays in eager Python, so the compiled graphs are guarded on shapes and
+            dtypes only. Compiling the whole step body instead made Dynamo guard on
+            *which parameters have a gradient* and on the *value* of ``lr``, so a MoE
+            / CFG-dropout / partial-accumulation grad set — or any LR schedule —
+            burned through ``recompile_limit`` (8) and silently fell back to eager
+            (measured: 8 graphs in both scenarios, 1 after the fix).
+            **Workload-dependent — benchmark it.** The win scales with how much
+            (fusable) elementwise math the step does, so for AdaMuon (heavy
+            Newton-Schulz + factored + cautious + scale) it helps broadly. Measured
+            eager->compiled ratios (RTX 3000 Ada, one scenario per process): 0.58x on
+            two 512² weights, 0.71x on a 128-weight LoRA bag and on a single 2048²
+            weight, 0.76x on 12 *distinct*-shaped small weights, 0.84x on a U-Net-like
+            mix, ~1.00x on a 4x1024² full-fine-tune-like set. Trading the old
+            whole-step graph for per-bucket kernels costs peak throughput on
+            multi-shape models when lr is *constant* (many-distinct 7.1 -> 19.2 ms,
+            U-Net-like 6.5 -> 10.4) and gains on the ``foreach``-batched and
+            single-weight cases — but that peak needs a constant lr. *With* an LR
+            schedule the two multi-shape sets measured 1.03x / 1.00x before the fix
+            (compile did nothing at all) versus 0.29x / 0.79x after, so in the regime
+            real runs are in the flag went from a no-op to a 1.3-3.4x step speedup.
+            One-time warmup (~4 s); a no-op when the model fwd/bwd dominates (SDXL is
+            UNet-bound). Numerically equivalent to eager: the 0-D-tensor scalars are
+            bit-identical, and the one place the compiled kernel is *written*
+            differently (weight decay as ``p*(lr·wd)`` rather than
+            ``add_(alpha=lr·wd)``, so Dynamo cannot specialize on the value) is fused
+            away by Inductor — measured bit-identical on the non-orthogonalized
+            buckets with ``wd`` on. The residual compiled-vs-eager difference is
+            Inductor reassociating the **bf16 Newton-Schulz**, so it appears only on
+            ``ndim>=2`` weights at ~1e-5 relative — the same order as the existing
+            foreach-vs-per-param bf16 gap. SR stays unbiased (no host syncs). Not recommended on CPU (inconsistent). NB: compiling
+            *only* the Newton-Schulz does NOT help on LoRA-rank matrices — the win is
+            fusing the whole bucket. Default ``False``.
     """
 
     def __init__(
@@ -224,6 +502,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
         *,
         ns_steps: int = 2,
         clip_threshold: float = 1.0,
+        bias_correction: bool = False,
         momentum_dtype: MomentumDtype = "bfloat16",
         momentum_4bit_block: int = _FOURBIT_BLOCK,
         cautious: bool = True,
@@ -264,6 +543,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
             "weight_decay": weight_decay,
             "ns_steps": ns_steps,
             "clip_threshold": clip_threshold,
+            "bias_correction": bias_correction,
             "momentum_dtype": momentum_dtype,
             "momentum_4bit_block": momentum_4bit_block,
             "cautious": cautious,
@@ -274,19 +554,67 @@ class AdaMuon(AutoLRMixin, Optimizer):
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
-        # Optional torch.compile of the whole step body. fullgraph=False tolerates
-        # the param-group Python loop; fuses the elementwise chain across foreach
-        # buckets. Measured ~16% faster on many-small-tensor (LoRA-shaped) loads
-        # where the optimizer is a real fraction of the step — a no-op win when the
-        # model fwd/bwd dominates (e.g. SDXL is UNet-bound). NB: compiling ONLY the
-        # Newton-Schulz does NOT help on LoRA-rank matrices (too small); the win is
-        # the whole-step fusion. No host syncs in the step, so SR stays unbiased.
-        self._compiled_step = torch.compile(self._run_step, fullgraph=False) if compile else None
+        # Optional torch.compile of the step's tensor math. The compiled unit is the
+        # set of pure-tensor kernels above, NOT the step body: see the comment there
+        # for why compiling the body recompiled on every grad-set / lr change. No
+        # host syncs in the step, so stochastic rounding stays unbiased.
+        self._compile = bool(compile)
+        self._factored_math = torch.compile(_factored_math) if compile else _factored_math
+        self._nonfactored_pre_math = (
+            torch.compile(_nonfactored_pre_math) if compile else _nonfactored_pre_math
+        )
+        self._post_math = torch.compile(_post_math) if compile else _post_math
+        self._factored_one_math = (
+            torch.compile(_factored_one_math) if compile else _factored_one_math
+        )
+        self._nonfactored_one_pre_math = (
+            torch.compile(_nonfactored_one_pre_math) if compile else _nonfactored_one_pre_math
+        )
+        self._post_one_math = torch.compile(_post_one_math) if compile else _post_one_math
+        # 0-D scalar buffers for the step-varying scalars under compile (see _scalar).
+        self._scalars: dict[tuple[str, Any], Tensor] = {}
         # One momentum codec per dtype string (stateless beyond the dtype).
         self._codecs: dict[str, _MomentumCodec] = {}
 
         # Composable parameter-free LR (continuous Mechanic) via AutoLRMixin. off -> zero overhead.
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
+
+    def _scalar(self, name: str, value: float, device: Any) -> Scalar:
+        """A step-varying scalar in the form the math kernels want.
+
+        Eager: the Python float itself. Compiled: a cached 0-D tensor refilled in
+        place, because Dynamo specializes the graph on a float argument's *value* —
+        an ``lr`` schedule (or the per-step bias-correction factor) would otherwise
+        recompile every iteration until ``recompile_limit`` drops us back to eager.
+        The multiply is bit-identical either way; the ``fill_`` is stream-ordered
+        after any kernel still reading the buffer, so reusing it across groups and
+        buckets within a step is safe.
+        """
+        if not self._compile:
+            return value
+        key = (name, device)
+        buf = self._scalars.get(key)
+        if buf is None:
+            buf = self._scalars[key] = torch.empty((), dtype=torch.float32, device=device)
+        return buf.fill_(value)
+
+    def _bc_scale(self, t: int, beta2: float, device: Any) -> Scalar:
+        """``√(1 - β₂ᵗ)`` — the whole of the factored second moment's bias correction.
+
+        Correcting ``v`` means dividing *both* row and col stats by ``1 - β₂ᵗ``. The
+        row factor is ``rsqrt(row / mean(row))``, a ratio, so the correction cancels
+        there and only the column factor ``rsqrt(col)`` keeps it: the net effect on
+        the normalized update is exactly one multiply by ``√(1 - β₂ᵗ)``, applied
+        *before* the clip (that is the point — an uncorrected update is up to ~30x
+        too large on the first steps and the clip is what absorbs it).
+
+        Always a *scalar*: ``t`` is part of the bucket key when ``bias_correction`` is
+        on (see :meth:`_step_foreach`), so every member of a bucket shares it. That
+        keeps this off the H2D path — a per-bucket ``torch.tensor(..., device=cuda)``
+        of per-slice factors would be a pageable host-to-device copy on every bucket
+        of every step, for a value that is one float.
+        """
+        return self._scalar("bc", math.sqrt(1.0 - beta2 ** t), device)
 
     def _codec(self, group: dict[str, Any]) -> _MomentumCodec:
         md = group["momentum_dtype"]
@@ -309,6 +637,12 @@ class AdaMuon(AutoLRMixin, Optimizer):
             state["col"] = torch.zeros(col_shape, dtype=torch.float32, device=p.device)
         else:
             state["v"] = torch.zeros_like(grad, dtype=torch.float32)
+        # Per-parameter update counter for the (optional) second-moment bias
+        # correction. Always maintained — it costs one int and it lets
+        # ``bias_correction`` be turned on mid-run / across a resume without the
+        # correction restarting from a cold t. See _bc_scale on why it is per
+        # parameter rather than per group.
+        state["step"] = 0
         # First moment stores the EMA of the RAW gradient, in the param's original
         # shape (the codec matrixizes it per-step for Newton-Schulz).
         if group["betas"][0] > 0:
@@ -322,13 +656,19 @@ class AdaMuon(AutoLRMixin, Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        (self._compiled_step or self._run_step)()
+        self._run_step()
         return loss
 
     @torch.no_grad()
     def _run_step(self) -> None:
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None]
+            if not params:
+                # A group can be entirely gradient-less on a given step (MoE routing,
+                # CFG dropout, partial gradient accumulation, or a plain step() with
+                # nothing backwarded). Skipping it early also keeps the foreach path's
+                # ``params[0].device`` probe below from indexing an empty list.
+                continue
             for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("AdaMuon does not support sparse gradients")
@@ -363,8 +703,18 @@ class AdaMuon(AutoLRMixin, Optimizer):
         param's dtype (fp32), which would inflate a bf16/int8/4bit momentum back to
         fp32 on resume — losing the memory the codec saves and breaking bit-exact
         resume. Delegate to the shared dtype-preserving helper.
+
+        It also **replaces** each ``param_groups`` dict with the checkpoint's (only
+        ``params`` is carried over), so a checkpoint written by an older kaon has no
+        entry for a hyperparameter added since — reading it would raise ``KeyError``
+        on the first step. Backfill any key the checkpoint predates from
+        ``self.defaults``; keys the checkpoint *does* carry win, so a resumed run
+        keeps its own tuning.
         """
         self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
+        for group in self.param_groups:
+            for key, value in self.defaults.items():
+                group.setdefault(key, value)
 
     # ----------------------------------------------------------------- foreach
 
@@ -402,6 +752,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         ns_steps = group["ns_steps"]
+        bias_correction = group.get("bias_correction", False)
         codec = self._codec(group)
 
         factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
@@ -410,28 +761,50 @@ class AdaMuon(AutoLRMixin, Optimizer):
             state = self.state[p]
             if not state:
                 self._init_state(p, state, group)
+            # With bias_correction on, ``t`` joins the bucket key so every slice in a
+            # bucket shares the correction factor and it stays a Python float (see
+            # _bc_scale). Params that step together keep the same ``t`` and so stay in
+            # one bucket; only intermittent gradients fragment it. ADOPT groups by its
+            # per-param step for the same reason.
+            tkey = state.get("step", 0) if bias_correction else 0
             g = p.grad
             if g.ndim >= 2:
                 matrixize = g.ndim > 2
                 eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+                factored_buckets.setdefault((eff, p.dtype, matrixize, tkey), []).append(p)
             else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
+                flat_buckets.setdefault((g.numel(), p.dtype, tkey), []).append(p)
 
-        for (eff, _dtype, matrixize), plist in factored_buckets.items():
+        for (eff, _dtype, matrixize, _t), plist in factored_buckets.items():
             step = max(1, budget // max(eff[0] * eff[1], 1))
             for i in range(0, len(plist), step):
                 self._factored_bucket(
                     plist[i:i + step], eff, matrixize, ns_steps,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bias_correction,
+                    bf16_method, codec,
                 )
-        for (length, _dtype), plist in flat_buckets.items():
+        for (length, _dtype, _t), plist in flat_buckets.items():
             step = max(1, budget // max(length, 1))
             for i in range(0, len(plist), step):
                 self._nonfactored_bucket(
                     plist[i:i + step], length,
-                    beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec,
+                    beta1, beta2, eps1, lr, clip, wd, cautious, bias_correction,
+                    bf16_method, codec,
                 )
+
+    @staticmethod
+    def _bump_steps(states: list[dict[str, Any]]) -> int:
+        """Advance each parameter's update counter and return the (shared) new value.
+
+        ``.get`` (not ``[]``) so a checkpoint written before the counter existed
+        resumes at ``t=1``. Callers pass one bucket, and buckets are keyed on ``t``
+        when the correction is on, so the values agree; when it is off the return is
+        unused.
+        """
+        t = 0
+        for s in states:
+            t = s["step"] = s.get("step", 0) + 1
+        return t
 
     @torch.no_grad()
     def _factored_bucket(
@@ -447,58 +820,39 @@ class AdaMuon(AutoLRMixin, Optimizer):
         clip: float,
         wd: float,
         cautious: bool,
+        bias_correction: bool,
         bf16_method: str,
         codec: _MomentumCodec,
     ) -> None:
         R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
-        N = len(plist)  # noqa: N806
 
-        def mat(t: Tensor) -> Tensor:
-            return t.view(R, C) if matrixize else t
+        def mat(x: Tensor) -> Tensor:
+            return x.view(R, C) if matrixize else x
 
-        rows = [self.state[p]["row"] for p in plist]
-        cols = [self.state[p]["col"] for p in plist]
+        states = [self.state[p] for p in plist]
+        t = self._bump_steps(states)
+        rows = [s["row"] for s in states]
+        cols = [s["col"] for s in states]
 
-        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
+        grad = _stack_fp32([mat(p.grad) for p in plist])                  # [N, R, C]
 
-        # 1. First moment of the RAW gradient (codec owns dequant→EMA→requant).
-        if beta1 > 0:
-            states = [self.state[p] for p in plist]
-            m = codec.ema_stacked(states, grad, mat, (R, C), beta1)        # [N, R, C]
-        else:
-            m = grad
+        # First moment of the RAW gradient (codec owns dequant→EMA→requant). Stays
+        # in eager: it walks per-param state dicts, exactly the Python-container
+        # work the compiled kernels must not see.
+        m = codec.ema_stacked(states, grad, mat, (R, C), beta1) if beta1 > 0 else grad
 
-        # 2. Orthogonalize the momentum, per slice (batched bmm Newton-Schulz).
-        ortho = zeropower_via_newtonschulz5_stacked(m, ns_steps).float()   # [N, R, C]
-
-        # 3. Factored second moment OF the orthogonalized signal (HF eps placement).
-        row = torch.stack(rows)                                           # [N, R]
-        col = torch.stack(cols)                                           # [N, C]
-        omb = 1.0 - beta2
-        ortho_sq = ortho * ortho
-        if eps1 > 0:
-            ortho_sq = ortho_sq.add_(eps1)
-        row.lerp_(ortho_sq.mean(dim=-1), omb)
-        col.lerp_(ortho_sq.mean(dim=-2), omb)
+        dev = grad.device
+        p_fp32 = _stack_fp32([mat(p.data) for p in plist]) if wd != 0 else None
+        row, col, delta = self._factored_math(
+            m, grad, torch.stack(rows), torch.stack(cols), p_fp32,
+            ns_steps, beta2, eps1, clip,
+            self._bc_scale(t, beta2, dev) if bias_correction else None,
+            self._scalar("lr", _UPDATE_RMS * lr, dev),
+            self._scalar("wd", lr * wd, dev) if wd != 0 else None,
+            cautious,
+        )
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
-
-        r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
-        c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
-        update = ortho.mul(r_factor).mul_(c_factor)                               # [N, R, C], RMS≈1
-
-        # 4. Clip ceiling (RMS≈1 domain) then the constant shape-independent scale.
-        rms = update.reshape(N, -1).norm(2, dim=1) / math.sqrt(R * C)
-        update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1, 1))
-        update.mul_(_UPDATE_RMS * lr)
-        delta = update
-
-        if wd != 0:
-            p_fp32 = torch.stack([mat(p.data) for p in plist]).float()
-            delta = delta.add_(p_fp32, alpha=lr * wd)
-
-        if cautious:
-            delta = cautious_batched_(delta, grad)
 
         subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
 
@@ -514,6 +868,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
         clip: float,
         wd: float,
         cautious: bool,
+        bias_correction: bool,
         bf16_method: str,
         codec: _MomentumCodec,
     ) -> None:
@@ -530,36 +885,31 @@ class AdaMuon(AutoLRMixin, Optimizer):
         ``L == 1`` the per-slice ``norm(dim=1)/sqrt(1)`` is exactly the per-param
         ``rms()`` of a scalar, so the clip is the same op the per-param path applies.
         """
-        N = len(plist)  # noqa: N806
-        vs = [flat_view(self.state[p]["v"]) for p in plist]               # each [L], fp32
+        states = [self.state[p] for p in plist]
+        t = self._bump_steps(states)
+        vs = [flat_view(s["v"]) for s in states]                          # each [L], fp32
 
-        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
-        v = torch.stack(vs)                                               # [N, L]
-
-        omb = 1.0 - beta2
-        grad_sq = grad * grad
-        if eps1 > 0:
-            grad_sq = grad_sq.add_(eps1)
-        v.lerp_(grad_sq, omb)
+        grad = _stack_fp32([flat_view(p.grad) for p in plist])            # [N, L]
+        dev = grad.device
+        v, update = self._nonfactored_pre_math(
+            grad, torch.stack(vs), beta2, eps1, clip,
+            self._bc_scale(t, beta2, dev) if bias_correction else None,
+            self._scalar("lr", _UPDATE_RMS * lr, dev),
+        )
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
-        update = grad.mul(v.rsqrt())                                      # [N, L], RMS≈1
-        rms = update.norm(2, dim=1) / math.sqrt(length)
-        update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1))
-        update.mul_(_UPDATE_RMS * lr)
-
         if beta1 > 0:
-            states = [self.state[p] for p in plist]
             delta = codec.ema_stacked(states, update, flat_view, (length,), beta1)  # [N, L]
         else:
             delta = update
 
-        if wd != 0:
-            p_fp32 = torch.stack([flat_view(p.data) for p in plist]).float()
-            delta = delta.add_(p_fp32, alpha=lr * wd)
-
-        if cautious:
-            delta = cautious_batched_(delta, grad)
+        if wd != 0 or cautious:
+            p_fp32 = _stack_fp32([flat_view(p.data) for p in plist]) if wd != 0 else None
+            delta = self._post_math(
+                delta, grad, p_fp32,
+                self._scalar("wd", lr * wd, dev) if wd != 0 else None,
+                cautious,
+            )
 
         subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method)
 
@@ -575,52 +925,43 @@ class AdaMuon(AutoLRMixin, Optimizer):
         state = self.state[p]
         if not state:
             self._init_state(p, state, group)
+        t = self._bump_steps([state])
 
         grad_fp32 = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
         ndim = grad_fp32.ndim
-        factored = ndim >= 2
+        dev = grad_fp32.device
+        lr_scale = self._scalar("lr", _UPDATE_RMS * lr, dev)
+        wd_scale = self._scalar("wd", lr * wd, dev) if wd != 0 else None
+        bc_scale = (
+            self._scalar("bc", math.sqrt(1.0 - beta2 ** t), dev)
+            if group.get("bias_correction", False) else None
+        )
+        p_fp32 = (p.data if p.dtype == torch.float32 else p.data.float()) if wd != 0 else None
 
-        if factored:
+        if ndim >= 2:
             matrixize = ndim > 2
+
+            def mat(x: Tensor | None) -> Tensor | None:
+                # Weight decay and the cautious mask are elementwise, so running them
+                # on the matrixized view is equivalent to the original shape.
+                return x if x is None or not matrixize else x.reshape(x.shape[0], -1)
+
             # 1. First moment of the raw gradient (original shape).
             m = self._codec(group).ema_one(state, grad_fp32, beta1) if beta1 > 0 else grad_fp32
-            mv = m.reshape(m.shape[0], -1) if matrixize else m
-            # 2. Orthogonalize.
-            ortho = zeropower_via_newtonschulz5(mv, ns_steps).float()         # [R, C]
-            # 3. Factored second moment OF the orthogonalized signal.
-            update_factored_state(ortho, state["row"], state["col"], beta2, eps1)
-            r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
-            update = ortho.mul(r_factor).mul_(c_factor)                       # [R, C], RMS≈1
-            # 4. Clip ceiling then constant scale; reshape back if conv.
-            if clip > 0:
-                update.div_((rms(update) / clip).clamp_(min=1.0))
-            update.mul_(_UPDATE_RMS * lr)
+            # 2-4. Orthogonalize -> factored second moment OF it -> clip -> scale.
+            delta = self._factored_one_math(
+                mat(m), mat(grad_fp32), state["row"], state["col"], mat(p_fp32),
+                ns_steps, beta2, eps1, clip, bc_scale, lr_scale, wd_scale, cautious,
+            )
             if matrixize:
-                update = update.view_as(grad_fp32)
-            delta = update
-            cautious_ref = grad_fp32
+                delta = delta.view_as(grad_fp32)
         else:
             # 1-D: Adam-style (no orthogonalization), RMS-normalized to 0.2·lr.
-            v = state["v"]
-            grad_sq = grad_fp32 * grad_fp32
-            if eps1 > 0:
-                grad_sq.add_(eps1)
-            v.lerp_(grad_sq, 1.0 - beta2)
-            update = grad_fp32.mul(v.rsqrt())
-            if clip > 0:
-                update.div_((rms(update) / clip).clamp_(min=1.0))
-            update.mul_(_UPDATE_RMS * lr)
+            update = self._nonfactored_one_pre_math(
+                grad_fp32, state["v"], beta2, eps1, clip, bc_scale, lr_scale,
+            )
             delta = self._codec(group).ema_one(state, update, beta1) if beta1 > 0 else update
-            cautious_ref = grad_fp32
-
-        if wd != 0:
-            p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
-            delta = delta.add_(p_fp32, alpha=lr * wd)
-
-        if cautious:
-            mask = (delta * cautious_ref > 0).to(delta.dtype)
-            delta = delta.mul_(mask).div_(mask.mean().clamp_(min=1e-8))
+            if wd != 0 or cautious:
+                delta = self._post_one_math(delta, grad_fp32, p_fp32, wd_scale, cautious)
 
         subtract_one_(p, delta, state, bf16_method)
-
-

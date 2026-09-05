@@ -57,8 +57,84 @@ All notable changes to this project will be documented in this file.
   and re-seeded whenever `torch.manual_seed` changes it, so dataloader / dropout streams
   no longer depend on how many parameters were rounded. Re-seeding to the *same* value
   inside one process is not observable; call `kaon.reseed_stochastic_rounding()` then.
+- **AdaMuon `compile=True` no longer recompiles every step.** It wrapped the whole
+  step body, so Dynamo installed a guard per parameter on *whether that parameter has
+  a gradient* and one on the *literal value* of `group["lr"]`. Any LR schedule, or a
+  grad set that varies (MoE routing, CFG dropout, partial gradient accumulation),
+  therefore burned through `recompile_limit` (8) and fell back to eager **silently**;
+  `add_param_group` cost two more recompiles. Measured on a 6-weight bag: 8 compiled
+  graphs and multi-second recompiles in both scenarios, `add_param_group` +8.2 s.
+  The compiled unit is now the pure-tensor bucket math (`_factored_math`,
+  `_nonfactored_pre_math`, `_post_math` and their per-parameter twins), with the grad
+  filter, bucketing, momentum codec and state write-back left in eager Python — so
+  the graphs are guarded on shapes and dtypes only. Same scenarios now compile **1**
+  graph, and `add_param_group` costs 4 ms instead of 8.2 s. Eager output is
+  bit-identical to 0.7.11 (verified over 20 configs x foreach on/off, CPU and CUDA).
+  Trade-off: at *constant* lr with a fixed grad set the old whole-step graph
+  specialized better than the new per-bucket kernels on multi-shape models (12
+  distinct small weights 0.27x -> 0.76x eager-relative; U-Net-like 0.41x -> 0.84x).
+  **With an LR schedule attached that peak does not exist**: the same two sets measured
+  1.03x and 1.00x before the fix (compile did nothing) versus 0.29x and 0.79x after —
+  i.e. in the regime real runs are in, `compile=True` goes from a no-op to a 1.3-3.4x
+  step speedup. Single-slice buckets now stack with a zero-copy `unsqueeze` instead of
+  copying.
+- **AdaMuon resumes from a pre-0.7.12 checkpoint.** `torch.optim.Optimizer.load_state_dict`
+  *replaces* each `param_groups` dict with the checkpoint's (only `params` is carried
+  over), so a checkpoint written before `bias_correction` existed left the live group
+  without that key and the next `step()` died with `KeyError: 'bias_correction'`.
+  `load_state_dict` now backfills any key the checkpoint predates from `self.defaults`
+  (values the checkpoint *does* carry still win, so a resumed run keeps its tuning), and
+  both read sites use `group.get(...)`. Verified bit-identical resume against real 0.7.11
+  checkpoints across bf16/int8/4bit/fp32 momentum with and without weight decay. Any
+  future hyperparameter is covered by the same backfill.
+- **AdaMuon `step()` no longer raises on a gradient-less param group.** A group where
+  nothing has a gradient — MoE routing leaving an expert unrouted for a step, CFG
+  dropout, partial gradient accumulation, or a bare `step()` with nothing backwarded —
+  reached the `foreach` path's `params[0].device` probe with an empty list and raised
+  `IndexError`. Such groups are now skipped and their parameters left untouched.
+- **AdaMuon `clip_threshold` documentation was wrong about when it fires.** The
+  docstring called it "a near no-op in steady state". The factored second moment has
+  no bias correction, so on a real proxy-U-Net run (β₂=0.999) the mean `rms(u)`
+  *before* the clip measures 31.9 at step 1, 11.0 at step 10, 3.56 at 100, 1.20 at
+  1000 and 0.98 at 2999 — i.e. almost exactly `1/√(1-β₂ᵗ)`. The clip is active on 100 %
+  of weight buckets for the first `~1/(1-β₂)` iterations and 70-80 % after, and is what
+  sets the early effective step size; it is in effect the second moment's bias
+  correction. Documented as a first-order hyperparameter, not a safety net.
+- **AdaMuon `ns_steps=2` rationale corrected.** The docstring credited the default to
+  "5 over-orthogonalizes". Measured singular-value spectra say otherwise: the quintic
+  settles into a band ≈[0.67, 1.20] and never leaves it, `ns=2` is already inside it
+  on skinny matrices (mean sv 0.89-1.06 at 4:1-16:1 — LoRA shapes and matrixized
+  convs) but heavily *under*-orthogonalized on square ones (mean sv 0.56 at 256²,
+  0.31 at 1024², with near-zero directions). The default stands as an empirical sweep
+  result on a skinny-weight model; `ns_steps` should be re-swept on models with large
+  square weights. Table in docs/adamuon.md.
 - **`centralize_grads_` groups by `(shape, device, dtype)`.** A param group mixing CPU
   and CUDA tensors crashed in `torch.stack` on the first step (default config).
+
+### Added
+- **AdaMuon `bias_correction`** (default `False`) — divides the factored second moment
+  by `1 - β₂ᵗ`, per parameter. The correction cancels out of the row factor (a ratio of
+  row statistics) and survives only in the column factor, so it reduces exactly to one
+  `√(1-β₂ᵗ)` multiply on the normalized update *before* the clip: no extra state beyond
+  a per-parameter step counter (`state["step"]`, now always maintained and checkpointed;
+  checkpoints written without it resume at `t=1`). `t` is per parameter, not global, so
+  a weight that only sometimes receives a gradient (MoE routing, CFG dropout, partial
+  accumulation) is corrected by its own update count.
+  **Default `False` because `clip_threshold=1.0` already does the same job, harder.**
+  The uncorrected `rms(u)` measures almost exactly `1/√(1-β₂ᵗ)`, which is the factor the
+  correction removes, so while the clip binds both settings emit the *same* update:
+  measured applied RMS (units of `0.2·lr`) 1.0000 vs 1.0000 at step 1, 1.0000 vs 0.9953
+  at step 1000, 1.0000 vs 0.9905 at step 3000 — a ≤1 % per-tensor rescale, never more.
+  The paired pixel-DDPM A/B (3 seeds at the tuned lr + an upward lr sweep) shows no
+  gain: the correction wins on both loss and gap on 1 of 3 seeds and loses on 2, a
+  spread consistent with trajectory noise around a no-op. The configuration where it
+  *does* matter is the clip disabled, where it recovers almost all of the clip's value
+  (2-seed mean val 0.0701 for `clip=1.0` alone, 0.0870 for clip-off with no
+  correction, **0.0714** for clip-off with the correction — it recovers 92 % of the
+  clip's benefit) — i.e. the two are alternative implementations of the same
+  normalization and the clip is marginally the better one. Turn it on when you
+  raise or disable `clip_threshold`, or when composing with a layer that assumes an
+  unbiased `1/√v`. Numbers and reasoning in docs/adamuon.md.
 
 ### Performance
 - `add_stochastic_` writes back with `copy_(fp32)` (no bf16 temporary) and draws int32
