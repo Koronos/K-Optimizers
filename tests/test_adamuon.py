@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import math
 import os
 import shutil
 
@@ -130,6 +131,7 @@ def test_orthogonalized_update_singular_values():
         dict(lr=2e-2, betas=(0.95, 0.999), momentum_dtype="4bit"),      # 4-bit momentum
         dict(lr=2e-2, betas=(0.95, 0.999), weight_decay=0.02),          # weight decay
         dict(lr=2e-2, betas=(0.95, 0.999), cautious=True),             # cautious mask
+        dict(lr=2e-2, betas=(0.95, 0.999), bias_correction=True),      # bias-corrected v
     ],
 )
 def test_foreach_matches_per_param(cfg):
@@ -241,22 +243,40 @@ def test_invalid_args_rejected(kwargs, match):
         AdaMuon([p], **kwargs)
 
 
-def test_compile_step_matches_eager():
-    """``compile=True`` produces a numerically equivalent update and stays finite."""
+@pytest.mark.parametrize("foreach", [True, False])
+@pytest.mark.parametrize("weight_decay", [0.0, 0.02])
+def test_compile_step_matches_eager(foreach, weight_decay):
+    """``compile=True`` produces a numerically equivalent update and stays finite.
+
+    Both routes are covered: ``foreach=True`` compiles the stacked bucket kernels,
+    ``foreach=False`` the per-parameter ones (which mutate ``row``/``col``/``v`` in
+    place *inside* the graph), and ``weight_decay`` exercises the one place where the
+    compiled kernel is written differently from eager (``p*(lr·wd)`` instead of
+    ``add_(alpha=lr·wd)``, so Dynamo cannot specialize on the value).
+
+    That rewrite is numerically free — Inductor fuses both forms into the same kernel,
+    and the non-orthogonalized buckets come out bit-identical with ``wd`` on. What is
+    left is the bf16 Newton-Schulz on ``ndim>=2`` weights, which Inductor reassociates
+    (~1e-5 relative), hence the loose tolerance below.
+    """
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     if dev == "cpu" and os.name == "nt" and shutil.which("cl") is None:
         pytest.skip("torch.compile CPU on Windows requires the MSVC cl compiler")
     torch.manual_seed(0)
-    ps0 = [torch.randn(16, 24, device=dev) for _ in range(3)]
-    gs = [torch.randn(16, 24, device=dev) * 0.1 for _ in range(3)]
+    shapes = [(16, 24), (16, 24), (12,), (4, 3, 3, 3)]
+    ps0 = [torch.randn(s, device=dev) for s in shapes]
+    gs = [torch.randn(s, device=dev) * 0.1 for s in shapes]
 
     def run(compile):
         ps = [torch.nn.Parameter(p.clone()) for p in ps0]
         opt = AdaMuon(ps, lr=1e-3, betas=(0.95, 0.999), ns_steps=2, cautious=True,
-                      momentum_dtype="float32", bf16_method="none", compile=compile)
-        for _ in range(2):
+                      momentum_dtype="float32", bf16_method="none", compile=compile,
+                      foreach=foreach, weight_decay=weight_decay)
+        for it in range(3):
             for p, g in zip(ps, gs, strict=True):
                 p.grad = g.clone()
+            for pg in opt.param_groups:        # an LR schedule, as any real run has
+                pg["lr"] = 1e-3 * (1.0 - 0.1 * it)
             opt.step()
         return [p.detach().clone() for p in ps]
 
@@ -403,3 +423,318 @@ def test_scalar_0d_checkpoint_roundtrip_across_paths():
                 opt.step()
         for a, b in zip(pa, pb, strict=True):
             torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+# ====================================================== second-moment bias correction
+@pytest.mark.parametrize("foreach", [True, False])
+@pytest.mark.parametrize("steps", [1, 3])
+def test_bias_correction_is_a_sqrt_scale_on_the_update(foreach, steps):
+    """``bias_correction`` == dividing the factored second moment by ``1-β₂ᵗ``.
+
+    Correcting ``v`` cancels out of the row factor (a *ratio* of row stats) and
+    survives only in the column factor, so the whole correction is one ``√(1-β₂ᵗ)``
+    scale on the normalized update. Checked against the uncorrected update with the
+    clip pushed out of the way so nothing else touches the magnitude.
+    """
+    beta2 = 0.9
+    shapes = [(16, 24), (16, 24), (12,), (6, 4, 3, 3)]
+    g = torch.Generator().manual_seed(5)
+    p0 = [torch.randn(*s, generator=g) * 0.05 for s in shapes]
+    grads = [[torch.randn(*s, generator=g) * 0.02 for s in shapes] for _ in range(steps)]
+
+    def last_deltas(bias_correction):
+        ps = [torch.nn.Parameter(t.clone()) for t in p0]
+        opt = AdaMuon(ps, lr=1e-2, betas=(0.0, beta2), cautious=False, foreach=foreach,
+                      clip_threshold=1e9, bias_correction=bias_correction)
+        before = None
+        for gs in grads:
+            before = [p.detach().clone() for p in ps]
+            for p, gr in zip(ps, gs, strict=True):
+                p.grad = gr.clone()
+            opt.step()
+        return [p.detach() - b for p, b in zip(ps, before, strict=True)]
+
+    # The residual is the weight subtraction: recovering a ~1e-3 delta by differencing
+    # ~5e-2 weights costs an ulp of the *weight*, i.e. ~4e-9 absolute.
+    scale = math.sqrt(1.0 - beta2 ** steps)
+    for d_off, d_on in zip(last_deltas(False), last_deltas(True), strict=True):
+        torch.testing.assert_close(d_on, d_off * scale, rtol=1e-3, atol=5e-8)
+
+
+def test_bias_correction_tames_the_first_step_update():
+    """Uncorrected, the first update is ~``1/√(1-β₂)`` too large and ``clip_threshold``
+    is what absorbs it; corrected, it lands at RMS≈1 and the clip is inert."""
+    beta2 = 0.999
+    p = torch.nn.Parameter(torch.randn(64, 64, generator=torch.Generator().manual_seed(0)))
+    grad = torch.randn(64, 64, generator=torch.Generator().manual_seed(1)) * 0.02
+    rms_u = {}
+    for bc in (False, True):
+        q = torch.nn.Parameter(p.detach().clone())
+        opt = AdaMuon([q], lr=1.0, betas=(0.0, beta2), cautious=False, foreach=False,
+                      clip_threshold=1e9, bias_correction=bc)
+        q.grad = grad.clone()
+        opt.step()
+        # applied RMS is 0.2·lr·rms(u); recover rms(u) with lr = 1.
+        rms_u[bc] = float((q.detach() - p.detach()).pow(2).mean().sqrt()) / 0.2
+    assert rms_u[False] > 20.0, rms_u          # 1/sqrt(1-beta2) = 31.6
+    assert 0.8 < rms_u[True] < 1.25, rms_u     # RMS≈1 -> clip_threshold=1.0 is inert
+
+
+def test_bias_correction_is_near_inert_under_the_default_clip():
+    """With ``clip_threshold=1.0`` the clip already normalizes ``rms(u)`` to 1 every
+    step, so ``bias_correction`` is a <=2 % per-tensor rescale — this is *why* the
+    default is ``False``, and the claim the docs make.
+
+    The uncorrected ``rms(u)`` is almost exactly ``1/√(1-β₂ᵗ)``, i.e. the very factor
+    the correction divides out, so both settings hit the clip and emit the same update
+    while it binds.
+    """
+    beta2 = 0.999
+    g = torch.Generator().manual_seed(0)
+    base = torch.randn(48, 48, generator=g)
+    grads = [torch.randn(48, 48, generator=g) * 0.02 for _ in range(60)]
+    probes = (1, 10, 60)
+
+    def applied(bias_correction):
+        p = torch.nn.Parameter(base.clone())
+        opt = AdaMuon([p], lr=1.0, betas=(0.0, beta2), cautious=False, foreach=False,
+                      clip_threshold=1.0, bias_correction=bias_correction)
+        out = {}
+        for t, grad in enumerate(grads, 1):
+            before = p.detach().clone()
+            p.grad = grad.clone()
+            opt.step()
+            if t in probes:
+                out[t] = (p.detach() - before) / 0.2      # applied RMS in units of 0.2·lr
+        return out
+
+    off, on = applied(False), applied(True)
+    for t in probes:
+        r_off = float(off[t].pow(2).mean().sqrt())
+        r_on = float(on[t].pow(2).mean().sqrt())
+        assert abs(r_off - 1.0) < 0.01, f"step {t}: clip should pin rms(u) to 1, got {r_off}"
+        ratio = r_on / r_off
+        # <=1 (the correction can only shrink) up to fp noise, and never by much.
+        assert 0.98 <= ratio <= 1.0 + 1e-5, f"step {t}: not a <=2% shrink ({ratio})"
+
+
+def test_bias_correction_step_counter_is_per_parameter():
+    """A parameter that only sometimes gets a gradient (MoE routing, CFG dropout,
+    partial accumulation) is corrected by ITS OWN update count, not the run's."""
+    shapes = [(8, 12), (8, 12)]
+    g = torch.Generator().manual_seed(2)
+    ps = [torch.nn.Parameter(torch.randn(*s, generator=g) * 0.05) for s in shapes]
+    opt = AdaMuon(ps, lr=1e-2, betas=(0.95, 0.999), bias_correction=True)
+    for it in range(5):
+        ps[0].grad = torch.randn(*shapes[0], generator=g) * 0.02
+        ps[1].grad = torch.randn(*shapes[1], generator=g) * 0.02 if it == 4 else None
+        opt.step()
+    assert opt.state[ps[0]]["step"] == 5
+    assert opt.state[ps[1]]["step"] == 1
+    assert all(torch.isfinite(p).all() for p in ps)
+
+
+def test_bias_correction_mixed_step_bucket_matches_per_param():
+    """Parameters at *different* ``t`` must each get their own correction factor.
+
+    With ``bias_correction`` on, ``t`` is part of the bucket key, so a set of weights
+    that share a shape but not an update count (MoE routing, CFG dropout) is split into
+    one bucket per ``t`` rather than corrected with a single shared factor. Pin that
+    against the per-parameter path, which computes each parameter's ``t`` independently.
+    """
+    shapes = [(12, 16), (12, 16), (12, 16), (20,), (20,)]
+    g = torch.Generator().manual_seed(4)
+    p0 = [torch.randn(*sh, generator=g) * 0.05 for sh in shapes]
+    pa = [torch.nn.Parameter(t.clone()) for t in p0]
+    pb = [torch.nn.Parameter(t.clone()) for t in p0]
+    oa = AdaMuon(pa, lr=2e-2, betas=(0.95, 0.999), bias_correction=True, foreach=True)
+    ob = AdaMuon(pb, lr=2e-2, betas=(0.95, 0.999), bias_correction=True, foreach=False)
+
+    for it in range(8):
+        for i, (a, b) in enumerate(zip(pa, pb, strict=True)):
+            # every parameter skips a different subset of steps -> the bucket holds a
+            # mix of update counts from step 2 onwards
+            if (it + i) % 3 == 0 and it > 0:
+                a.grad = b.grad = None
+                continue
+            grad = torch.randn(*a.shape, generator=g) * 0.02
+            a.grad, b.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+
+    counts = {oa.state[a]["step"] for a in pa}
+    assert len(counts) > 1, "the bucket must actually hold mixed update counts"
+    for a, b in zip(pa, pb, strict=True):
+        assert oa.state[a]["step"] == ob.state[b]["step"]
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=2e-2, atol=2e-3)
+
+
+def test_bias_correction_checkpoint_roundtrip():
+    """``state["step"]`` survives save/load, so the correction resumes at the right t."""
+    torch.manual_seed(0)
+    grads = [torch.randn(16, 8) for _ in range(8)]
+    a = torch.nn.Parameter(torch.randn(16, 8))
+    opt_a = AdaMuon([a], lr=2e-2, betas=(0.95, 0.999), bias_correction=True,
+                    momentum_dtype="int8")
+    for g in grads[:4]:
+        a.grad = g.clone()
+        opt_a.step()
+
+    buf = io.BytesIO()
+    torch.save(opt_a.state_dict(), buf)
+    buf.seek(0)
+    b = torch.nn.Parameter(a.detach().clone())
+    opt_b = AdaMuon([b], lr=2e-2, betas=(0.95, 0.999), bias_correction=True,
+                    momentum_dtype="int8")
+    opt_b.load_state_dict(torch.load(buf, weights_only=False))
+    assert opt_b.state[b]["step"] == 4
+
+    for g in grads[4:]:
+        a.grad, b.grad = g.clone(), g.clone()
+        opt_a.step()
+        opt_b.step()
+    torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+def test_resume_from_pre_bias_correction_checkpoint():
+    """A checkpoint from a kaon that predates ``bias_correction`` must resume, exactly.
+
+    ``torch.optim.Optimizer.load_state_dict`` **replaces** each ``param_groups`` dict
+    with the checkpoint's (it only carries ``params`` over), so every hyperparameter
+    added after the checkpoint was written simply vanishes from the live group — the
+    next step then died with ``KeyError: 'bias_correction'``. A 0.7.11 checkpoint also
+    has no per-param ``state["step"]``.
+
+    Reproduce both by stripping the two keys from the state dict, and require not just
+    that the resume runs but that it is **bit-identical** to a run that never
+    checkpointed (with the correction off, the restarted ``t`` must not perturb
+    anything).
+    """
+    torch.manual_seed(0)
+    shapes = [(16, 8), (12,), (4, 3, 3, 3)]
+    base = [torch.randn(*sh) for sh in shapes]
+    grads = [[torch.randn(*sh) * 0.1 for sh in shapes] for _ in range(8)]
+    cfg = dict(lr=2e-2, betas=(0.95, 0.999), momentum_dtype="int8", weight_decay=0.02)
+
+    control = [torch.nn.Parameter(t.clone()) for t in base]
+    opt_c = AdaMuon(control, **cfg)
+    resumed = [torch.nn.Parameter(t.clone()) for t in base]
+    opt_r = AdaMuon(resumed, **cfg)
+
+    for gs in grads[:4]:                       # both run the first half normally
+        for pair in (zip(control, gs, strict=True), zip(resumed, gs, strict=True)):
+            for p, g in pair:
+                p.grad = g.clone()
+        opt_c.step()
+        opt_r.step()
+
+    buf = io.BytesIO()
+    torch.save(opt_r.state_dict(), buf)
+    buf.seek(0)
+    sd = torch.load(buf, weights_only=False)
+    for pg in sd["param_groups"]:              # as written by 0.7.11
+        pg.pop("bias_correction", None)
+    sd["state"] = {k: {kk: vv for kk, vv in v.items() if kk != "step"}
+                   for k, v in sd["state"].items()}
+
+    fresh = [torch.nn.Parameter(p.detach().clone()) for p in resumed]
+    opt_f = AdaMuon(fresh, **cfg)
+    opt_f.load_state_dict(sd)
+    # the missing key is backfilled from the constructor defaults, so param_groups is
+    # complete again and every read site finds it
+    assert opt_f.param_groups[0]["bias_correction"] is False
+    assert "step" not in opt_f.state[fresh[0]]
+
+    for gs in grads[4:]:
+        for pair in (zip(control, gs, strict=True), zip(fresh, gs, strict=True)):
+            for p, g in pair:
+                p.grad = g.clone()
+        opt_c.step()
+        opt_f.step()                            # used to raise KeyError here
+    for c, f in zip(control, fresh, strict=True):
+        torch.testing.assert_close(f.detach(), c.detach(), rtol=0, atol=0)
+    assert opt_f.state[fresh[0]]["step"] == 4   # counter restarts, numerics unaffected
+
+
+def test_load_state_dict_keeps_checkpoint_hyperparameters():
+    """The defaults backfill must not clobber values the checkpoint *does* carry."""
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = AdaMuon([p], lr=2e-2, betas=(0.95, 0.999), bias_correction=True,
+                  clip_threshold=0.5)
+    p.grad = torch.randn(8, 8)
+    opt.step()
+    sd = opt.state_dict()
+
+    q = torch.nn.Parameter(torch.randn(8, 8))
+    opt2 = AdaMuon([q], lr=1e-3, betas=(0.9, 0.99), bias_correction=False,
+                   clip_threshold=1.0)
+    opt2.load_state_dict(sd)
+    g = opt2.param_groups[0]
+    assert g["bias_correction"] is True and g["clip_threshold"] == 0.5
+    assert g["lr"] == 2e-2 and g["betas"] == (0.95, 0.999)
+
+
+def test_step_with_a_gradientless_group_is_a_no_op():
+    """A param group where nothing has a gradient must be skipped, not crash.
+
+    Same scenario as the recompilation test — a grad set that moves — but the extreme
+    of it: MoE routing can leave a whole expert group unrouted for a step, and a bare
+    ``opt.step()`` with nothing backwarded is legal too. Both used to raise
+    ``IndexError`` from the ``foreach`` path's ``params[0].device`` probe.
+    """
+    a = torch.nn.Parameter(torch.randn(8, 8))
+    b = torch.nn.Parameter(torch.randn(8, 8))
+    opt = AdaMuon([{"params": [a]}, {"params": [b]}], lr=1e-3)
+
+    a.grad = torch.randn(8, 8) * 0.1
+    b_before, a_before = b.detach().clone(), a.detach().clone()
+    opt.step()
+    assert torch.equal(b.detach(), b_before), "gradient-less group must not move"
+    assert not torch.equal(a.detach(), a_before), "the group with a gradient must move"
+    assert b not in opt.state or not opt.state[b]
+
+    a.grad = None                                    # nothing anywhere
+    snapshot = [a.detach().clone(), b.detach().clone()]
+    opt.step()
+    for param, before in zip((a, b), snapshot, strict=True):
+        assert torch.equal(param.detach(), before)
+
+
+# ====================================================== torch.compile recompilation
+def test_compile_recompiles_stay_bounded():
+    """``compile=True`` must not recompile when the *set of parameters with a gradient*
+    changes, when ``lr`` moves, or when a param group is added.
+
+    All three used to be per-step guards (``p.grad is None`` per parameter, the literal
+    value of ``group["lr"]``), so a MoE / CFG-dropout / partial-accumulation step or any
+    LR schedule burned through ``recompile_limit`` (8) — measured 8 graphs and a silent
+    fall back to eager. The compiled unit is now the pure-tensor math, guarded on
+    shapes and dtypes only.
+    """
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if dev == "cpu" and os.name == "nt" and shutil.which("cl") is None:
+        pytest.skip("torch.compile CPU on Windows requires the MSVC cl compiler")
+    dynamo = pytest.importorskip("torch._dynamo")
+    from torch._dynamo.utils import counters
+
+    dynamo.reset()
+    counters.clear()
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter(torch.randn(16, 24, device=dev)) for _ in range(4)]
+    extra = [torch.nn.Parameter(torch.randn(16, 24, device=dev))]
+    opt = AdaMuon(ps, lr=1e-3, betas=(0.95, 0.999), ns_steps=2, compile=True)
+    for it in range(12):
+        for i, p in enumerate(ps):
+            p.grad = None if i == it % len(ps) else torch.randn(16, 24, device=dev) * 0.1
+        for pg in opt.param_groups:                     # an LR schedule
+            pg["lr"] = 1e-3 * (1.0 - 0.05 * it)
+        if it == 6:
+            opt.add_param_group({"params": extra})
+        if it >= 6:
+            extra[0].grad = torch.randn(16, 24, device=dev) * 0.1
+        opt.step()
+    graphs = counters["stats"].get("unique_graphs", 0)
+    # HEAD measures 2. Keep the bound tight: at 4 a reintroduced guard on the *value*
+    # of ``lr`` still passes, which is exactly the regression this test exists for.
+    assert graphs <= 2, f"{graphs} compiled graphs — a per-step guard is back"
+    assert all(torch.isfinite(p).all() for p in ps + extra)
