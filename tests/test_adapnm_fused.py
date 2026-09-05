@@ -35,8 +35,10 @@ def _clone(ps):
 
 
 def _parts(opt):
+    """(one_block, big, one_dim, native) from the cached fused partition (after a step)."""
     ob, big, od, nat = [], [], [], []
-    for (_ids, o, b, d, n) in opt._fused_part.values():
+    for entry in opt._fused_part.values():
+        o, b, d, n = entry[-4:]          # the leading witness field is not of interest here
         ob += o
         big += b
         od += d
@@ -576,3 +578,419 @@ def test_fused_mixed_local_steps_use_local_bias_and_global_parity():
     assert opt.state[late]["step"] == 1
     assert torch.count_nonzero(opt.state[late]["m_pos"]) == 0
     assert torch.count_nonzero(opt.state[late]["m_neg"]) > 0
+
+
+# ================================================================= audit 0.7.12 - AdaPNM fused safety
+# Every test below has a confirmed repro against the pre-fix code; none is a performance or a
+# numerics-QUALITY assertion - they guard a way AdaPNM's fused step could corrupt memory, refuse
+# to compile, or silently disagree with the native step:
+#
+#   * ``p.data`` REBIND mid-training. ``_fused_partition`` and the AdaPnmCache/OneDimPnmCache
+#     callers keyed on ``id(p)`` ONLY, so an external EMA / ``.to()`` / block-swap offloader that
+#     rebinds the SAME parameter to fresh storage left the kernels writing the step into the
+#     RETIRED buffer (measured: every param scribbled, ~1e-2 divergence, one-block and 1-D).
+#   * ``momentum_4bit_block != 128`` on a one-block shape: ``_adapnm_tile_kernel`` hardcodes
+#     128-element blocks AND passed ``NS = NB``, so it wrote 32 floats past a 32-entry
+#     ``m_pos_scale``/``m_neg_scale`` (measured with a canary) and read the wrong layout back.
+#   * Non-contiguous GRADS. ``conv_ok`` only checked the grad for ``ndim > 2``, and it was CACHED
+#     in the partition, so a 2-D transposed / 1-D strided grad reached the kernels (which index
+#     row-major off ``data_ptr``) - ~1e-2 divergence on all three routes, silently.
+#   * NON-FINITE PROPAGATION. Policy is propagate: ``tl.where(keep, delta, 0)`` made the fused
+#     cautious mask swallow an inf and FREEZE the tensor while native propagated it.
+#   * A param group holding CPU and CUDA weights: the native foreach buckets were keyed on
+#     ``(shape, dtype, lag)`` with no DEVICE, so ``torch.stack`` took the whole step down.
+
+_SAFE_CFG = dict(lr=2e-3, betas=(0.9, 0.999), beta0=0.5, eps=1e-30, momentum_dtype="float32",
+                 weight_decay=0.02, cautious=True, gradient_centralization=True)
+
+# One representative bag per fused route (the routing is asserted, not assumed). AdaPNM has no
+# 0-D route: its 1-D predicate requires ``ndim == 1``, so scalars go native.
+_SAFE_ROUTES = {
+    "one_block": [(8, 16)] * 4,
+    "one_dim": [(32,)] * 3,
+    "big": [(512, 512)] * 2,
+}
+
+
+def _plain_grads(gen, plist):
+    return [torch.randn(tuple(p.shape), generator=gen, device=DEV, dtype=p.dtype) for p in plist]
+
+
+def _transposed_grads(gen, plist):
+    return [torch.randn((p.shape[1], p.shape[0]), generator=gen, device=DEV, dtype=p.dtype).t()
+            for p in plist]
+
+
+def _strided_grads(gen, plist):
+    return [torch.randn((p.shape[0] * 2,), generator=gen, device=DEV, dtype=p.dtype)[::2]
+            for p in plist]
+
+
+def _drive(pairs, steps, gen, grads_for=_plain_grads, mutate=None):
+    """Step every (params, optimizer) pair on IDENTICAL gradients for ``steps`` steps.
+
+    The grads are re-DRAWN per optimizer from the same seed rather than cloned, so a fixture that
+    returns a non-contiguous grad keeps that layout for every pair (``clone()`` would quietly
+    compact it and defeat the strided-grad tests).
+    """
+    for step in range(steps):
+        if mutate is not None:
+            mutate(step, pairs)
+        seed = int(torch.randint(0, 2 ** 31 - 1, (1,), generator=gen, device=DEV).item())
+        for plist, opt in pairs:
+            draw = torch.Generator(device=DEV).manual_seed(seed)
+            for p, g in zip(plist, grads_for(draw, plist), strict=True):
+                p.grad = g
+            opt.step()
+    torch.cuda.synchronize()
+
+
+def _maxdiff(pa, pb):
+    return max((a.detach().float() - b.detach().float()).abs().max().item()
+               for a, b in zip(pa, pb, strict=True))
+
+
+def _safe_pair(shapes, cfg, dtype=torch.float32, seed=3):
+    pv = _bag(shapes, dtype, seed)
+    pn = _clone(pv)
+    return pv, pn, AdaPNM(pv, fused=True, **cfg), AdaPNM(pn, **cfg)
+
+
+def _assert_safe_route(opt, route):
+    ob, big, od, nat = _parts(opt)
+    assert not nat, f"{route}: {len(nat)} params fell to the native path"
+    if route == "one_block":
+        assert ob and not big and not od
+    elif route == "big":
+        assert big and not ob and not od
+    else:
+        assert od and not ob and not big
+
+
+# ----------------------------------------------------------------- 1. p.data rebind
+@pytest.mark.parametrize("route", list(_SAFE_ROUTES))
+def test_pnm_data_rebind_stops_writing_the_retired_storage(route):
+    """``p.data = p.data.clone()`` mid-training must move the kernels to the NEW buffer.
+
+    The retired tensor is kept alive on purpose: on the pre-fix code the cached pointer arrays
+    still addressed it, so the step landed in memory the optimizer no longer owns - in real
+    training (an EMA, or Rengu-Flow's block-swap offloader) that buffer is freed and reused,
+    which is a silent corruption or an illegal memory access.
+    """
+    pv, pn, ov, on = _safe_pair(_SAFE_ROUTES[route], _SAFE_CFG)
+    retired: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def mutate(step, _pairs):
+        if step != 2:
+            return
+        for plist in (pv, pn):
+            for p in plist:
+                old = p.data
+                p.data = old.clone()
+                if plist is pv:
+                    retired.append((old, old.clone()))
+
+    _drive([(pv, ov), (pn, on)], 5, torch.Generator(device=DEV).manual_seed(11), mutate=mutate)
+    _assert_safe_route(ov, route)
+    assert retired, "the mutation hook never ran"
+    for old, snapshot in retired:
+        assert torch.equal(old, snapshot), f"{route}: the fused step wrote the RETIRED storage"
+    d = _maxdiff(pv, pn)
+    assert d < 1e-5, f"{route}: max|dp| vs native = {d:.2e} after a rebind"
+
+
+@pytest.mark.parametrize("route", list(_SAFE_ROUTES))
+def test_pnm_data_rebind_to_bf16_stays_finite(route):
+    """A rebind that also changes dtype re-buckets the caches (``lowp``/SR flip with it)."""
+    pv = _bag(_SAFE_ROUTES[route], torch.float32, seed=5)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    retired: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def mutate(step, _pairs):
+        if step != 2:
+            return
+        for p in pv:
+            old = p.data
+            p.data = old.to(torch.bfloat16)
+            retired.append((old, old.clone()))
+
+    _drive([(pv, ov)], 5, torch.Generator(device=DEV).manual_seed(13), mutate=mutate)
+    assert all(p.dtype == torch.bfloat16 for p in pv)
+    for old, snapshot in retired:
+        assert torch.equal(old, snapshot), f"{route}: the fused step wrote the RETIRED storage"
+    for p in pv:
+        assert torch.isfinite(p.detach().float()).all(), f"{route}: non-finite after a rebind"
+
+
+# ----------------------------------------------------------------- 2. momentum_4bit_block != 128
+@pytest.mark.parametrize("block", [0, 64, 256, 512])
+def test_pnm_4bit_block_other_than_128_leaves_the_one_block_route(block):
+    """``_adapnm_tile_kernel`` hardcodes ``BLK = min(R*C, 128)`` for BOTH momenta's dequant and
+    the positive's requant, so any other ``momentum_4bit_block`` reads the wrong scale layout -
+    and, when the real block is LARGER than 128, writes past the (shorter) scale buffer.
+    """
+    cfg = dict(_SAFE_CFG, momentum_dtype="4bit", momentum_4bit_block=block)
+    pv, pn, ov, on = _safe_pair([(64, 128)] * 2, cfg, seed=23)   # (64,128) tile == 8192 == TILE_CAP
+    _drive([(pv, ov), (pn, on)], 4, torch.Generator(device=DEV).manual_seed(29))
+    ob, _big, _od, nat = _parts(ov)
+    assert not ob and len(nat) == 2, "a non-128 4-bit block must not take the one-block kernel"
+    per = 64 * 128
+    expect_block = per if block == 0 else block
+    for p in pv:
+        st = ov.state[p]
+        for pref in ("m_pos", "m_neg"):
+            assert st[f"{pref}_block"] == expect_block
+            assert st[f"{pref}_scale"].numel() == (per + expect_block - 1) // expect_block
+    d = _maxdiff(pv, pn)
+    assert d < 1e-5, f"max|dp|={d:.2e}"
+
+
+def test_pnm_4bit_block_256_does_not_scribble_past_the_scale_buffers():
+    """The direct memory-safety canary for the block above.
+
+    ``m_pos_scale`` / ``m_neg_scale`` are re-pointed at the head of a longer sentinel buffer, so
+    a requant that writes ``ceil(numel/128)`` scales into a ``ceil(numel/256)``-entry buffer
+    lands in the tail. Pre-fix: 32 sentinel floats overwritten in EVERY one of the four buffers
+    (both momenta take a turn as "positive" over two steps).
+    """
+    cfg = dict(_SAFE_CFG, momentum_dtype="4bit", momentum_4bit_block=256,
+               cautious=False, gradient_centralization=False)
+    pv = _bag([(64, 128)] * 2, torch.float32, seed=3)
+    ov = AdaPNM(pv, fused=True, **cfg)
+    _drive([(pv, ov)], 1, torch.Generator(device=DEV).manual_seed(4))
+    canaries = []
+    for p in pv:
+        st = ov.state[p]
+        for key in ("m_pos_scale", "m_neg_scale"):
+            n = st[key].numel()
+            buf = torch.full((n + 64,), 1e30, dtype=torch.float32, device=DEV)
+            buf[:n].copy_(st[key])
+            st[key] = buf[:n]                     # same numel, same values, sentinel tail
+            canaries.append((key, buf, n))
+    ov._invalidate_fused_caches()                 # the caches hold the OLD scale pointers
+    _drive([(pv, ov)], 2, torch.Generator(device=DEV).manual_seed(6))
+    scribbled = [(key, int((buf[n:] != 1e30).sum().item())) for key, buf, n in canaries]
+    assert all(count == 0 for _key, count in scribbled), f"wrote past m_*_scale: {scribbled}"
+
+
+def test_pnm_4bit_block_128_still_takes_the_one_block_route():
+    """The guard must not cost the DEFAULT 4-bit configuration its fused route."""
+    cfg = dict(_SAFE_CFG, momentum_dtype="4bit")
+    pv, pn, ov, on = _safe_pair([(64, 128)] * 2, cfg, seed=23)
+    _drive([(pv, ov), (pn, on)], 4, torch.Generator(device=DEV).manual_seed(29))
+    ob, _big, _od, nat = _parts(ov)
+    assert len(ob) == 2 and not nat
+    scale = max(p.detach().abs().max().item() for p in pn)
+    d = _maxdiff(pv, pn)
+    assert d / scale < 8e-4, f"rel={d / scale:.2e}"
+
+
+# ----------------------------------------------------------------- 3. non-contiguous grads
+_NONCONTIG_CASES = [
+    ([(8, 16)] * 3, _transposed_grads, "one_block"),
+    ([(512, 512)] * 2, _transposed_grads, "big"),
+    ([(64,)] * 3, _strided_grads, "one_dim"),
+]
+
+
+@pytest.mark.parametrize("shapes,grads,route", _NONCONTIG_CASES)
+def test_pnm_non_contiguous_grads_match_native(shapes, grads, route):
+    """The kernels read the grad from ``data_ptr()`` row-major - strides are invisible to them,
+    so a non-contiguous grad must not reach them (it steps the transposed numbers instead)."""
+    pv, pn, ov, on = _safe_pair(shapes, _SAFE_CFG, seed=31)
+    gen = torch.Generator(device=DEV).manual_seed(37)
+    assert not any(g.is_contiguous() for g in grads(gen, pv)), "the fixture grads are contiguous"
+    _drive([(pv, ov), (pn, on)], 5, gen, grads_for=grads)
+    d = _maxdiff(pv, pn)
+    assert d < 1e-6, f"{route}: max|dp|={d:.2e} with non-contiguous grads"
+
+
+@pytest.mark.parametrize("shapes,grads,route", _NONCONTIG_CASES)
+def test_pnm_grad_layout_change_is_seen_after_a_contiguous_step(shapes, grads, route):
+    """Contiguity belongs to THIS step's gradient, so it cannot be frozen into the cached routing.
+
+    Step 1 runs contiguous (which is what populates the cached partition); step 2 onwards is
+    strided. Pre-fix the cached routing kept dispatching those to the kernels.
+    """
+    pv, pn, ov, on = _safe_pair(shapes, _SAFE_CFG, seed=33)
+    state = {"warm": True}
+
+    def grads_for(gen, plist):
+        return _plain_grads(gen, plist) if state["warm"] else grads(gen, plist)
+
+    _drive([(pv, ov), (pn, on)], 1, torch.Generator(device=DEV).manual_seed(39),
+           grads_for=grads_for)
+    _assert_safe_route(ov, route)
+    state["warm"] = False
+    _drive([(pv, ov), (pn, on)], 4, torch.Generator(device=DEV).manual_seed(40),
+           grads_for=grads_for)
+    d = _maxdiff(pv, pn)
+    assert d < 1e-6, f"{route}: max|dp|={d:.2e} after the grad layout changed"
+
+
+def test_pnm_non_contiguous_grad_does_not_poison_the_contiguous_neighbours():
+    """One strided grad demotes ONLY its own tensor for that step."""
+    pv, pn, ov, on = _safe_pair([(8, 16)] * 3, _SAFE_CFG, seed=41)
+
+    def grads(gen, plist):
+        gs = _plain_grads(gen, plist)
+        gs[1] = torch.randn((16, 8), generator=gen, device=DEV, dtype=torch.float32).t()
+        return gs
+
+    _drive([(pv, ov), (pn, on)], 5, torch.Generator(device=DEV).manual_seed(43), grads_for=grads)
+    assert len(ov._fused_demoted) == 1, "the demotion memo never fired"
+    (_demoted, _parts_in, out), = ov._fused_demoted.values()
+    assert len(out[0]) == 2 and len(out[3]) == 1, "only the strided tensor should be demoted"
+    d = _maxdiff(pv, pn)
+    assert d < 1e-6, f"max|dp|={d:.2e}"
+
+
+# ----------------------------------------------------------------- 4. non-finite propagation
+@pytest.mark.parametrize("route", list(_SAFE_ROUTES))
+def test_pnm_non_finite_grad_propagates_like_native(route):
+    """Finiteness policy is PROPAGATE, and it has to be the same policy on both paths.
+
+    ``tl.where(keep, delta, 0)`` made the fused cautious mask swallow the inf and FREEZE the
+    tensor, while native's ``delta.mul_(mask)`` (0 * inf == NaN) propagates it. A frozen tensor
+    is a silently dead weight; a NaN one is a training run that stops and gets fixed.
+    """
+    pv, pn, ov, on = _safe_pair(_SAFE_ROUTES[route], _SAFE_CFG, seed=47)
+
+    def grads(gen, plist):
+        gs = _plain_grads(gen, plist)
+        gs[0].reshape(-1)[0] = float("inf")
+        return gs
+
+    _drive([(pv, ov), (pn, on)], 2, torch.Generator(device=DEV).manual_seed(53), grads_for=grads)
+    fused_finite = torch.isfinite(pv[0].detach().float()).all().item()
+    native_finite = torch.isfinite(pn[0].detach().float()).all().item()
+    assert native_finite is False, "the native reference is expected to propagate"
+    assert fused_finite == native_finite, "fused froze the tensor where native propagated"
+
+
+def test_pnm_chunked_non_finite_grad_propagates_on_the_lone_big_tensor():
+    """The per-tensor chunked pair (a LONE big tensor) has its own cautious site."""
+    pv, pn, ov, on = _safe_pair([(512, 512)], _SAFE_CFG, seed=49)
+
+    def grads(gen, plist):
+        gs = _plain_grads(gen, plist)
+        gs[0].reshape(-1)[0] = float("inf")
+        return gs
+
+    _drive([(pv, ov), (pn, on)], 2, torch.Generator(device=DEV).manual_seed(51), grads_for=grads)
+    assert not torch.isfinite(pn[0].detach()).all(), "the native reference must propagate"
+    assert not torch.isfinite(pv[0].detach()).all(), "fused froze the tensor"
+
+
+def test_pnm_torch_reduction_batched_non_finite_grad_propagates():
+    """The fifth cautious site: ``_adapnm_chunked_apply_batched``.
+
+    The batched big route has two variants and only ``_adapnm_chunked_apply_batched_g`` (the
+    default, grad via pointer array) is reached with ``_fused_reductions=True``. The
+    ``_g``-less pair — the A/B baseline that stacks the grad in torch — carries its own
+    cautious mask and would otherwise go untested.
+    """
+    pv, pn, ov, on = _safe_pair([(512, 512)] * 2, _SAFE_CFG, seed=57)
+    ov._fused_reductions = False
+
+    def grads(gen, plist):
+        gs = _plain_grads(gen, plist)
+        gs[0].reshape(-1)[0] = float("inf")
+        return gs
+
+    _drive([(pv, ov), (pn, on)], 2, torch.Generator(device=DEV).manual_seed(59), grads_for=grads)
+    _assert_safe_route(ov, "big")
+    assert not torch.isfinite(pn[0].detach()).all(), "the native reference must propagate"
+    assert not torch.isfinite(pv[0].detach()).all(), "fused froze the tensor"
+    assert torch.isfinite(pv[1].detach()).all(), "the finite neighbour was poisoned"
+
+
+# ----------------------------------------------------------------- 5. device in the bucket keys
+@pytest.mark.parametrize("gc", [False, True])
+@pytest.mark.parametrize("fused", [False, True])
+def test_pnm_multi_device_group_step(fused, gc):
+    """One param group holding CPU and CUDA weights of the same shape must step both.
+
+    The native foreach path stacks a bucket with ``torch.stack`` and the bucket keys were
+    ``(eff, dtype, matrixize, lag)`` / ``(numel, dtype, lag)`` with no device in them, so a CPU
+    and a CUDA weight of the same shape landed in one bucket and the stack raised "Expected all
+    tensors to be on the same device", taking the whole step down.
+
+    ``gradient_centralization`` is parametrized rather than pinned off: the GC pre-pass
+    (``kaon._backend.centralize_grads_``) already keys its stacking bucket on
+    ``(shape, device, dtype)``, so a mixed-device group is safe through it too — this pins that
+    the two bucketings agree instead of assuming one of them is the weak link.
+    """
+    params = [
+        torch.randn(8, 8).requires_grad_(True),
+        torch.randn(8, 8, device=DEV).requires_grad_(True),
+        torch.randn(8).requires_grad_(True),
+        torch.randn(8, device=DEV).requires_grad_(True),
+    ]
+    opt = AdaPNM(params, lr=1e-2, fused=fused, gradient_centralization=gc)
+    before = [p.detach().clone() for p in params]
+    gen = torch.Generator().manual_seed(61)
+    for _ in range(2):
+        for p in params:
+            p.grad = torch.randn(tuple(p.shape), generator=gen).to(p.device)
+        opt.step()
+    torch.cuda.synchronize()
+    for p, b in zip(params, before, strict=True):
+        assert p.device == b.device, "a param changed device"
+        assert torch.isfinite(p.detach()).all()
+        assert not torch.equal(p.detach(), b), f"{tuple(p.shape)} on {p.device} never moved"
+
+
+def test_pnm_big_shape_buckets_split_by_device():
+    """``_fused_big`` groups by shape before handing a list to the big pointer cache, whose index
+    arrays live on ``plist[0].device``. Without the device in that key, two GPUs of the same
+    shape would be launched against pointer arrays built on the first one.
+
+    Exercised on the grouping helper directly: reaching it end-to-end needs two CUDA devices
+    (the big route requires ``p.is_cuda``), and this machine has one.
+    """
+    from kaon.adakaon import _same_shape_device_buckets
+
+    a = torch.zeros(64, 64, device=DEV)
+    b = torch.zeros(64, 64, device=DEV)
+    c = torch.zeros(64, 64)                       # same shape + dtype, different device
+    d = torch.zeros(64, 64, device=DEV, dtype=torch.bfloat16)
+    buckets = _same_shape_device_buckets([a, b, c, d])
+    assert len(buckets) == 3, f"expected shape x dtype x device buckets, got {len(buckets)}"
+    assert sorted(len(v) for v in buckets.values()) == [1, 1, 2]
+    for plist in buckets.values():
+        assert len({p.device for p in plist}) == 1
+
+
+def test_pnm_big_pointer_cache_is_reused_across_steps():
+    """The big batched path rebuilt every pointer array (grad, p, both momenta) from a fresh
+    ``torch.tensor([...])`` on EVERY step - H2D allocations per bucket per step that the
+    one-block and 1-D routes have cached since 0.7.9. Cache it, and revalidate the witness."""
+    pv = _bag([(512, 512)] * 3, torch.float32, seed=63)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(67)
+    _drive([(pv, ov)], 1, gen)
+    assert ov._fused_big_caches, "the big route built no cache"
+    first = tuple(ov._fused_big_caches.values())
+    _drive([(pv, ov)], 3, gen)
+    assert tuple(ov._fused_big_caches.values()) == first, "the big cache is rebuilt every step"
+    # ... and a rebind still invalidates it.
+    for p in pv:
+        p.data = p.data.clone()
+    _drive([(pv, ov)], 1, gen)
+    assert all(new is not old for new in ov._fused_big_caches.values() for old in first), \
+        "a p.data rebind must rebuild the big pointer cache"
+
+
+# ----------------------------------------------------------------- 6. equal_to_1 specialization
+@pytest.mark.parametrize("shapes", [[(20000, 1)] * 2, [(1, 20000)] * 2, [(20000, 1)], [(1, 20000)]])
+def test_pnm_extreme_aspect_shapes_compile_and_match_native(shapes):
+    """``R == 1`` / ``C == 1`` reach a kernel as an argument whose value is 1, which Triton
+    SPECIALIZES into a Python int - no ``.to(tl.float32)`` on it. Regression guard for both the
+    batched (>=2 same-shape) and the lone-tensor chunked routes."""
+    pv, pn, ov, on = _safe_pair(shapes, _SAFE_CFG, seed=71)
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(73))
+    _assert_safe_route(ov, "big")
+    scale = max(p.detach().abs().max().item() for p in pn)
+    d = _maxdiff(pv, pn)
+    assert d / scale < 1e-5, f"{shapes[0]} x{len(shapes)}: rel={d / scale:.2e}"
