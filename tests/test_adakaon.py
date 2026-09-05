@@ -1194,3 +1194,68 @@ def test_adakaon_no_warning_on_int8_high_beta1():
 
 def test_adakaon_no_warning_on_4bit_low_beta1():
     assert not _warns_amplification((0.9, 0.999), "4bit")
+
+
+# ------------------------------------------------------- witness cost (perf regression lock)
+# Every cached fused/foreach plan revalidates itself with a per-parameter
+# ``(id, data_ptr, is_contiguous)`` witness, once or twice per step. On a 428-parameter bag
+# that is ~47 µs of pure Python call overhead — 4-11% of the step — and the ONLY thing
+# keeping it there is that all three copies of the witness scan with ``map`` (the loop runs
+# in C) rather than with generator expressions, which measured 75 µs for the same work.
+# The three copies are deliberate duplicates (see their docstrings); this locks all of them.
+
+def _witness_impls():
+    from kaon._foreach_plan import param_witness as foreach_plan_witness
+    from kaon.adakaon import _param_witness as adakaon_witness
+
+    impls = [("kaon.adakaon._param_witness", adakaon_witness),
+             ("kaon._foreach_plan.param_witness", foreach_plan_witness)]
+    try:
+        from kaon._fused_triton import param_witness as triton_witness
+    except Exception:  # noqa: BLE001 — Triton is optional; the other two still apply
+        pass
+    else:
+        impls.append(("kaon._fused_triton.param_witness", triton_witness))
+    return impls
+
+
+_WITNESS_IMPLS = _witness_impls()
+
+
+@pytest.mark.parametrize("name,witness", _WITNESS_IMPLS,
+                         ids=[n.split(".")[1] for n, _ in _WITNESS_IMPLS])
+def test_param_witness_scans_in_c(name, witness):
+    """The witness must build its three tuples with ``map``, not generator expressions.
+
+    Compared against a genexpr reference timed in the same loop, so the bound tracks the
+    machine rather than an absolute number; the measured margin is ~1.6x, well clear of
+    the 0.90 asserted here.
+    """
+    import time
+
+    plist = [torch.empty(16 * 8 * 3 * 3) for _ in range(300)]
+    plist += [torch.empty(1) for _ in range(128)]
+
+    def genexpr_reference(pl):
+        return (tuple(id(p) for p in pl), tuple(p.data_ptr() for p in pl),
+                tuple(p.is_contiguous() for p in pl))
+
+    assert witness(plist) == genexpr_reference(plist), f"{name} changed the witness fields"
+
+    def best_of(fn, reps=7, inner=20):
+        out = []
+        for _ in range(reps):
+            t0 = time.perf_counter()
+            for _ in range(inner):
+                fn(plist)
+            out.append((time.perf_counter() - t0) / inner)
+        return min(out)
+
+    ref = shipped = float("inf")
+    for _ in range(3):  # interleaved so a scheduling hiccup cannot bias one arm
+        ref = min(ref, best_of(genexpr_reference))
+        shipped = min(shipped, best_of(witness))
+    assert shipped <= 0.90 * ref, (
+        f"{name} costs {shipped * 1e6:.1f} us on 428 params vs {ref * 1e6:.1f} us for plain "
+        "generator expressions — the C-level map scan has been lost"
+    )
