@@ -107,6 +107,15 @@ All notable changes to this project will be documented in this file.
 - `subtract_batched_` casts the stacked delta once per bucket instead of once per
   parameter when the stack dtype differs from the params (`aten::_to_copy` no longer
   scales with bucket size; 5-15x on the cast-heavy bags).
+- **AdaPNM's big (chunked, batched) route caches its pointer arrays** in a new
+  `BigPnmCache`, the AdaPNM counterpart of `BigPointerCache`: grad / weight / both momenta
+  address arrays plus the `rowmean`/`rowsum`/`colsum`/`keep`/`rms` scratch were rebuilt from
+  fresh `torch.tensor([...])` allocations on *every* step, while the one-block and 1-D routes
+  have cached theirs since 0.7.9. Measured on an 8x `(512,512)` bucket, steady state:
+  caching-allocator allocations 22 -> 13-14 per step and the pointer arrays' host-to-device
+  copies 4 -> 0-1 per step (two independent measurements). CUDA **kernel** launches are
+  unchanged — the win is host-side allocation and H2D traffic, not launch count. Same math,
+  same state.
 - **Fused Triton path (Adakaon): pointer caches validate the WEIGHT storage.** Every
   fused cache (`PointerArrayCache`, `BigPointerCache`, `OneDimPointerCache`,
   `AdaPnmCache`, `OneDimPnmCache`) and the routing partition keyed on `id(p)` only, so a
@@ -144,6 +153,31 @@ All notable changes to this project will be documented in this file.
 - **Mixed-device param groups** (CPU + CUDA) crashed in `torch.stack` inside the foreach
   and fused bucketing; `device` is part of every bucket key and kernels launch under the
   bucket's device.
+- **Fused Triton path (AdaPNM): the same five defects, now closed on AdaPNM's own routes.**
+  The batch-A fixes above landed on Adakaon and on the shared caches, but AdaPNM's launchers
+  had not been carried over: `_fused_partition` and the `AdaPnmCache` / `OneDimPnmCache`
+  callers still keyed on `id(p)` alone, so a `p.data` rebind kept the one-block and 1-D
+  kernels writing the *retired* storage (measured: every parameter in the bag scribbled,
+  ~1e-2 divergence from native). The routing key is now
+  `_fused_triton.param_witness` (`id`, `data_ptr`, `is_contiguous`) and each pointer cache
+  is revalidated per step (`built_from` when the lag bucketing hands back the partition's own
+  list, `stale` otherwise). Also fixed on AdaPNM: `_adapnm_tile_kernel` passed `NS = NB` to
+  `requant_4bit`/`dequant_4bit` with a hard-coded 128-element block, so any other
+  `momentum_4bit_block` wrote past *both* momenta's scale buffers (measured with a canary:
+  32 fp32 past a 32-entry `m_pos_scale`/`m_neg_scale` on a `(64,128)` weight at block 256) —
+  the one-block route now requires block 128 and the kernel receives each tensor's real scale
+  capacity; grad contiguity is re-checked every step (it was only checked for `ndim > 2`, and
+  cached, so transposed/strided grads reached all three routes at ~1e-2 from native); the five
+  AdaPNM cautious sites multiply by the survivor mask instead of `tl.where`, so a non-finite
+  update propagates as it does natively instead of freezing the tensor; and `device` joined the
+  native foreach bucket keys and the big-route shape buckets (a CPU + CUDA group took the whole
+  native step down in `torch.stack`).
+  Cost on a 428-parameter bag: witness key 62 us/step (vs 19 us for the old ids-only key),
+  grad-contiguity sweep 68 us/step, cache revalidation 0.3 us/step via `built_from` (a naive
+  per-bucket `stale` would have cost 70 us). Verified bit-identical to the pre-fix build across
+  {fp32, bf16} params x {fp32, bf16, int8, 4bit} momentum x cautious on/off on every
+  atomic-free route (0/976 state tensors differ); the big route's `tl.atomic_add` on `colsum`
+  is not run-to-run reproducible in either build (49/512 tensors differ base-vs-base too).
 - **AdaBelief / AdamP bias-correct on a per-parameter step.** Both advanced
   `group["step"]` on every `step()`, including groups with no gradients, so a
   param whose first gradient arrives at step 100 was corrected with `bc1 ≈ 1`

@@ -951,7 +951,8 @@ if _HAS_TRITON:
 
     @triton.jit
     def _adapnm_tile_kernel(
-        g_addr, p_addr, pos_addr, neg_addr, posc_addr, negc_addr, row_addr, col_addr, Rs_ptr, Cs_ptr,
+        g_addr, p_addr, pos_addr, neg_addr, posc_addr, negc_addr, row_addr, col_addr,
+        Rs_ptr, Cs_ptr, Ns_ptr,
         beta1_sq, beta0, inv_noise, beta2, sc, lrwd, eps1, clip_eff, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         GC: tl.constexpr, SR: tl.constexpr, CLIP: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
@@ -999,9 +1000,13 @@ if _HAS_TRITON:
             negp = negi.to(tl.pointer_type(tl.uint8))
             pscale = tl.load(posc_addr + t).to(tl.pointer_type(tl.float32))
             nscale = tl.load(negc_addr + t).to(tl.pointer_type(tl.float32))
-            # AdaPNM's launcher (kaon/adapnm.py) is outside this change's scope and has no
-            # capacity array to pass: NS == NB keeps today's behaviour exactly.
-            NS = (R * C + BLK - 1) // BLK
+            # ``Ns_ptr[t]`` is this tensor's ALLOCATED scale length (the smaller of the two
+            # momenta's, which the launcher validates are equal) — NOT the block count derived
+            # from ``BLK``. It bounds the dequant loads and the requant's store/reload below, so
+            # a layout the routing guard failed to divert can only lose scales, never touch
+            # foreign memory. The old ``NS = NB`` made the two agree by construction and wrote
+            # ``NB - NS`` floats past a shorter ``m_pos_scale``/``m_neg_scale``.
+            NS = tl.load(Ns_ptr + t)
             m_pos = dequant_4bit(posp, pscale, ri, ci, idx, Chalf, m2, BLK, NS)
             m_neg = dequant_4bit(negp, nscale, ri, ci, idx, Chalf, m2, BLK, NS)
         elif MOM == 1:  # bf16
@@ -1015,7 +1020,7 @@ if _HAS_TRITON:
             requant_int8(m_pos, m2, posp, idx, pscale, rr, R)
         elif MOM == 3:
             NB = (R * C + BLK - 1) // BLK
-            requant_4bit(m_pos, m2, idx, R, C, Chalf, posp, pscale, NB, NB, BLK, BR, BC)
+            requant_4bit(m_pos, m2, idx, R, C, Chalf, posp, pscale, NB, NS, BLK, BR, BC)
         elif MOM == 1:
             tl.store(posi.to(tl.pointer_type(tl.bfloat16)) + idx, m_pos.to(tl.bfloat16), mask=m2)
         else:
@@ -1036,7 +1041,14 @@ if _HAS_TRITON:
             keepf = tl.where(keep, 1.0, 0.0)
             mm = tl.sum(keepf) / (Rf * Cf)
             mm = tl.where(mm < 1e-8, 1e-8, mm)
-            delta = tl.where(keep, upd / mm, 0.0)
+            # MULTIPLY by the 0/1 survivor mask, never ``tl.where``: 0 * NaN == NaN, so a
+            # non-finite update PROPAGATES exactly as native's ``delta.mul_(mask).div_(denom)``
+            # does (_backend.cautious_batched_). ``tl.where`` substituted a hard 0 and FROZE the
+            # tensor for the rest of the run — a silently dead weight instead of a visible NaN.
+            # Finite values are unchanged: x * 1.0 == x. A REJECTED coordinate subtracts -0.0
+            # rather than the old +0.0, which is the same weight except that a stored -0.0 flips
+            # to +0.0 (they compare equal; the only difference is the sign bit).
+            delta = (upd * keepf) / mm
         p_old = tl.load(pp + idx, mask=m2, other=0.0).to(tl.float32)
         if WD:
             p_old = p_old * (1.0 - lrwd)               # decoupled WD BEFORE (kozistr order)
@@ -1089,7 +1101,8 @@ if _HAS_TRITON:
         if CAUTIOUS:
             g = tl.load(g_ptr + offs, mask=mask, other=0.0)
             keep = (delta * g) > 0.0
-            delta = tl.where(keep, delta * inv_mean, 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, inv_mean, 0.0)
         p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         if WD:
             p = p * (1.0 - lrwd)
@@ -1185,7 +1198,8 @@ if _HAS_TRITON:
             g = tl.load(g_ptr + t * n + offs, mask=mask, other=0.0)
             inv_mean = tl.load(inv_mean_ptr + t)
             keep = (delta * g) > 0.0
-            delta = tl.where(keep, delta * inv_mean, 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, inv_mean, 0.0)
         pi = tl.load(p_addr + t)
         pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
@@ -1280,7 +1294,8 @@ if _HAS_TRITON:
                 g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
             inv_mean = tl.load(inv_mean_ptr + t)
             keep = (delta * g) > 0.0
-            delta = tl.where(keep, delta * inv_mean, 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, inv_mean, 0.0)
         pi = tl.load(p_addr + t)
         pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
@@ -1356,7 +1371,8 @@ if _HAS_TRITON:
             keepf = tl.where(keep, 1.0, 0.0)
             mm = tl.sum(keepf) / Lf
             mm = tl.where(mm < 1e-8, 1e-8, mm)
-            delta = tl.where(keep, delta / mm, 0.0)
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = (delta * keepf) / mm
         p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         if WD:
             p_old = p_old * (1.0 - lrwd)
@@ -1839,13 +1855,36 @@ class AdaPnmCache(_WitnessedCache):
             neg_addr = i64([s["m_neg"].data_ptr() for s in st])
             posc = i64([s["m_pos_scale"].data_ptr() for s in st]) if quant else pos_addr
             negc = i64([s["m_neg_scale"].data_ptr() for s in st]) if quant else neg_addr
+            Rs = i32([p.shape[0] for p in bl])  # noqa: N806
+            # Per-tensor scale CAPACITY for the 4-bit requant's bounded scale store, taken as the
+            # SMALLER of the two momenta's buffers (they are allocated identically, so this is a
+            # belt-and-braces min, not a real asymmetry). The tile kernel writes
+            # ``fourbit_kernel_blocks(numel)`` scales (its block size is a hardcoded 128); a
+            # shorter buffer means a non-default ``momentum_4bit_block`` was routed here, which
+            # used to run off the end of ``m_pos_scale``/``m_neg_scale`` — 32 floats past a
+            # 32-entry buffer for a (64,128) weight at block=256. Float momenta never dereference
+            # this array (the branch is constexpr-elided), so they reuse ``Rs``.
+            if mom == MOM_4BIT:
+                have = [min(s["m_pos_scale"].numel(), s["m_neg_scale"].numel()) for s in st]
+                short = [(tuple(q.shape), h) for q, h in zip(bl, have, strict=True)
+                         if h < fourbit_kernel_blocks(q.numel())]
+                if short:
+                    raise RuntimeError(
+                        "fused one-block 4-bit momentum needs 128-element absmax blocks; these "
+                        f"tensors carry a different layout: {short[:4]} - route them to the "
+                        "native path (see AdaPNM._fused_partition)"
+                    )
+                mscale_n = i32(have)
+            else:
+                mscale_n = Rs
             self.buckets.append(dict(
                 plist=bl, BR=BR, BC=BC, mom=mom, dev=dev,
                 p_addr=i64([p.data_ptr() for p in bl]),
                 pos_addr=pos_addr, neg_addr=neg_addr, posc_addr=posc, negc_addr=negc,
+                mscale_n=mscale_n,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
                 col_addr=i64([s["col"].data_ptr() for s in st]),
-                Rs=i32([p.shape[0] for p in bl]), Cs=i32([eff_2d(p)[1] for p in bl]),
+                Rs=Rs, Cs=i32([eff_2d(p)[1] for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
                 g_addr=i64([p.grad.data_ptr() for p in bl]),
                 grad_ptrs=tuple(p.grad.data_ptr() for p in bl),
@@ -1930,3 +1969,41 @@ class OneDimPnmCache(_WitnessedCache):
             ))
 
     refresh_grads = PointerArrayCache.refresh_grads
+
+
+class BigPnmCache(_WitnessedCache):
+    """Stable pointer arrays and reusable reduction scratch for one big AdaPNM shape bucket.
+
+    The AdaPNM counterpart of :class:`BigPointerCache`, with the TWO momenta (``m_pos``/``m_neg``)
+    instead of one. The batched chunked path used to rebuild every one of these arrays from a
+    fresh ``torch.tensor([...])`` on EVERY step — six host-to-device index allocations per bucket
+    per step (grad, p, both momenta, plus the reduction scratch), which the one-block and 1-D
+    routes have cached since 0.7.9. The two momentum arrays hold the PHYSICAL buffers; the
+    optimizer swaps them into (positive, negative) order by step parity, exactly as
+    :class:`AdaPnmCache` does. Quantized momenta step on host-side fp32 temps and therefore keep
+    building their own per-step arrays — only ``p``/``grad``/the scratch are reused there.
+    """
+
+    def __init__(self, plist, state_of, R, C):  # noqa: N803
+        self._witness(plist)
+        self.plist = plist
+        self.N, self.R, self.C = len(plist), R, C  # noqa: N806
+        dev = plist[0].device
+        self.dev = dev
+        states = [state_of(p) for p in plist]
+        self.p_addr = ptr_array(plist, dev)
+        self.pos_addr = ptr_array([s["m_pos"] for s in states], dev)
+        self.neg_addr = ptr_array([s["m_neg"] for s in states], dev)
+        self.g_addr = ptr_array([p.grad for p in plist], dev)
+        self.grad_ptrs = tuple(p.grad.data_ptr() for p in plist)
+        self.rowmean = torch.empty(self.N * R, dtype=torch.float32, device=dev)
+        self.rowsum = torch.empty(self.N * R, dtype=torch.float32, device=dev)
+        self.colsum = torch.empty(self.N * C, dtype=torch.float32, device=dev)
+        self.keep = torch.empty(self.N, dtype=torch.int32, device=dev)
+        self.rms_acc = torch.empty(self.N, dtype=torch.float32, device=dev)
+
+    def momenta(self, pos_first: bool):
+        """The (positive, negative) pointer arrays for this step's parity."""
+        return (self.pos_addr, self.neg_addr) if pos_first else (self.neg_addr, self.pos_addr)
+
+    refresh_grads = BigPointerCache.refresh_grads
