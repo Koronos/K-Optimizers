@@ -357,8 +357,19 @@ class Lion(AutoLRMixin, Optimizer):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state, preserving the quantized momentum's stored dtype (torch's default
         would upcast bf16/int8/4bit momentum to fp32 on resume). The auto_lr tuner blob is
-        peeled off first by AutoLRMixin."""
+        peeled off first by AutoLRMixin.
+
+        It also **replaces** each ``param_groups`` dict with the checkpoint's (only
+        ``params`` is carried over), so a checkpoint written by an older kaon has no
+        entry for a hyperparameter added since — reading it would raise ``KeyError``
+        on the first step. Backfill any key the checkpoint predates from
+        ``self.defaults``; keys the checkpoint *does* carry win, so a resumed run
+        keeps its own tuning.
+        """
         self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
+        for group in self.param_groups:
+            for key, value in self.defaults.items():
+                group.setdefault(key, value)
 
     # ----------------------------------------------------------------- foreach
 

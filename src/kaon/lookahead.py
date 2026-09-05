@@ -121,13 +121,21 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
         # Build the inner (fast) optimizer; WrapsInnerOptimizer shares its param_groups,
         # mirrors its foreach toggles, and owns the wrapper's separate per-param state.
         self._bind_inner(Adakaon(params, lr=lr, **adakaon_kwargs), state_key="lookahead")
+        # Lookahead's OWN per-group keys (not part of the inner Adakaon's ``defaults``).
+        # Kept as ``self.defaults`` — mirroring the attribute every plain
+        # ``torch.optim.Optimizer`` carries — purely so ``load_state_dict`` can backfill
+        # a key an older checkpoint predates the same way every other kaon optimizer does.
+        self.defaults: dict[str, Any] = {
+            "k": k,
+            "alpha": alpha,
+            "slow_dtype": slow_dtype,
+            "slow_4bit_block": slow_4bit_block,
+            "la_step": 0,        # inner steps since last sync
+            "train_mode": True,  # live buffer holds theta
+        }
         for group in self.param_groups:
-            group.setdefault("k", k)
-            group.setdefault("alpha", alpha)
-            group.setdefault("slow_dtype", slow_dtype)
-            group.setdefault("slow_4bit_block", slow_4bit_block)
-            group.setdefault("la_step", 0)        # inner steps since last sync
-            group.setdefault("train_mode", True)  # live buffer holds theta
+            for key, value in self.defaults.items():
+                group.setdefault(key, value)
 
     # ====================================================== train/eval view hooks
     def _to_eval_view(self, p: Tensor, st: dict[str, Any], group: dict[str, Any]) -> None:
@@ -223,5 +231,16 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
 
     # ================================================================= state_dict glue
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Restore the inner optimizer (dtype-preserving) and the phi buffers."""
+        """Restore the inner optimizer (dtype-preserving) and the phi buffers.
+
+        Backfill Lookahead's own per-group keys (``k``/``alpha``/``slow_dtype``/
+        ``slow_4bit_block``/``la_step``/``train_mode``) the checkpoint predates, from
+        ``self.defaults`` — same rationale as every other kaon ``load_state_dict``.
+        ``load_state_dict_preserving_dtypes`` here loads the inner Adakaon directly (not
+        via its own ``load_state_dict``), so this is also the only place its defaults
+        get backfilled through this wrapper's path.
+        """
         self._load_wrapped(state_dict, load_state_dict_preserving_dtypes)
+        for group in self.param_groups:
+            for key, value in self.defaults.items():
+                group.setdefault(key, value)

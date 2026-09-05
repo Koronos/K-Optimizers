@@ -103,6 +103,7 @@ from kaon._momentum_codec import (
     _make_codec,
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
+    warn_if_4bit_high_beta1,
 )
 
 __all__ = ["AdamP"]
@@ -211,6 +212,7 @@ class AdamP(AutoLRMixin, Optimizer):
             )
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
+        warn_if_4bit_high_beta1(beta1, momentum_dtype)
         defaults = {
             "lr": lr,
             "betas": (beta1, beta2),
@@ -523,8 +525,18 @@ class AdamP(AutoLRMixin, Optimizer):
         torch's default ``load_state_dict`` upcasts every state tensor to the
         param's dtype (fp32), which would silently inflate bf16/int8/4bit momentum
         back to fp32 on resume. Delegate to the shared helper.
+
+        It also **replaces** each ``param_groups`` dict with the checkpoint's (only
+        ``params`` is carried over), so a checkpoint written by an older kaon has no
+        entry for a hyperparameter added since — reading it would raise ``KeyError``
+        on the first step. Backfill any key the checkpoint predates from
+        ``self.defaults``; keys the checkpoint *does* carry win, so a resumed run
+        keeps its own tuning.
         """
         self._autolr_load(state_dict, lambda sd: load_state_dict_preserving_dtypes(self, sd))
+        for group in self.param_groups:
+            for key, value in self.defaults.items():
+                group.setdefault(key, value)
 
     # ----------------------------------------------------------------- foreach
     @staticmethod

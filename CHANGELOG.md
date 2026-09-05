@@ -21,6 +21,13 @@ All notable changes to this project will be documented in this file.
 - **`warn_if_4bit_high_beta1`** in `_momentum_codec` (wired from Lion in this
   lot): 4bit + `beta1 >= 0.99` amplifies quant error ~`1/sqrt(1-beta1^2)`
   (measured block-128 table in `docs/momentum.md`).
+- **`warn_if_4bit_high_beta1` wired into every other β1-EMA momentum consumer**:
+  AdaBelief, AdamP, ADOPT, AdaPNM (checked against `betas[0]`, not the unrelated
+  `beta0` negative-momentum mix), KProdigy, AdaMuon. Adakaon is pending (file
+  under a concurrent audit batch). Deliberately **not** wired into ScheduleFree:
+  its quantized `z` buffer is a plain accumulator (`z -= lr_t * d`), not decayed
+  by `beta1`, so the warning's AR(1)-amplification argument does not apply to it
+  (see `docs/momentum.md`).
 
 ### Performance
 - **int8 `ema_one`**: `.float().mul_(scale)` (one temp), drop `delta.clone()`,
@@ -151,6 +158,18 @@ All notable changes to this project will be documented in this file.
   square weights. Table in docs/adamuon.md.
 - **`centralize_grads_` groups by `(shape, device, dtype)`.** A param group mixing CPU
   and CUDA tensors crashed in `torch.stack` on the first step (default config).
+- **Every optimizer's `load_state_dict` now backfills missing `param_groups` keys**
+  (the AdaMuon fix above, applied everywhere else). `torch.optim.Optimizer.load_state_dict`
+  replaces each `param_groups` dict with the checkpoint's (only `params` carries over),
+  so any hyperparameter added since a checkpoint was written vanished from the resumed
+  group and the first `step()` died with `KeyError`. Fixed in ADOPT, AdaBelief, AdamP,
+  KProdigy, AdaPNM, Lion, ScheduleFree (own `defaults`), and SAM / Lookahead (which did
+  not previously carry a `self.defaults` at all — added one for their own per-group keys:
+  SAM's `rho`/`adaptive`, Lookahead's `k`/`alpha`/`slow_dtype`/`slow_4bit_block`/
+  `la_step`/`train_mode`). Values the checkpoint *does* carry are never clobbered. MSAM
+  and Nekaon needed no change: both keep their own hyperparameters (`rho`, `norm`) as
+  instance attributes, not per-group keys, and fully delegate to the inner optimizer's
+  `load_state_dict`. Adakaon's own backfill is out of scope here (concurrent audit batch).
 
 ### Added
 - **AdaMuon `bias_correction`** (default `False`) — divides the factored second moment

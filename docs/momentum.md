@@ -171,3 +171,17 @@ quantization noise. Steady-state error scales roughly as
 This is independent of the Lion-specific sign-flip issue (see [lion.md](lion.md)):
 factored-Adam optimizers still track well at β1=0.9 with 4bit, but high-β1 4bit
 is a fidelity trap for any codec consumer.
+
+**Wired into every optimizer whose quantized buffer is an actual β1-decayed EMA**
+(0.7.11 audit, mechanical batch): Lion, AdaBelief, AdamP, ADOPT, AdaPNM (checked
+against `betas[0]`, not the unrelated `beta0` negative-momentum mix), KProdigy,
+AdaMuon. Adakaon is pending — its file is under a concurrent audit batch; it gets
+the same one-line call when that batch lands.
+
+**Not wired into Schedule-Free**, despite it accepting `momentum_dtype="4bit"`:
+its quantized `z` buffer is a plain accumulator (`z -= lr_t * d`), not decayed by
+`beta1` — there, `beta1` only weights the `y = beta1*x + (1-beta1)*z`
+interpolation point. The warning's `1/sqrt(1-beta1**2)` AR(1)-filter argument
+describes a dequant→EMA→requant loop that `z` does not go through, so wiring it
+in would tie a real-looking warning to a hyperparameter that does not drive `z`'s
+quantization error.

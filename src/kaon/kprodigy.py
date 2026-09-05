@@ -81,6 +81,7 @@ from kaon._momentum_codec import (
     _make_codec,
     _MomentumCodec,
     load_state_dict_preserving_dtypes,
+    warn_if_4bit_high_beta1,
 )
 
 __all__ = ["KProdigy"]
@@ -210,6 +211,7 @@ class KProdigy(Optimizer):
             raise ValueError(f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}")
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
+        warn_if_4bit_high_beta1(beta1, momentum_dtype)
 
         defaults = {
             "lr": lr,
@@ -328,8 +330,18 @@ class KProdigy(Optimizer):
         was chosen to save and breaking bit-exact resume. Delegate to the shared
         helper that restores each tensor to how it was checkpointed. (Prodigy's
         ``d``/``step``/``s``/``p0`` bookkeeping rides along in the same state.)
+
+        It also **replaces** each ``param_groups`` dict with the checkpoint's (only
+        ``params`` is carried over), so a checkpoint written by an older kaon has no
+        entry for a hyperparameter added since — reading it would raise ``KeyError``
+        on the first step. Backfill any key the checkpoint predates from
+        ``self.defaults``; keys the checkpoint *does* carry win, so a resumed run
+        keeps its own tuning.
         """
         load_state_dict_preserving_dtypes(self, state_dict)
+        for group in self.param_groups:
+            for key, value in self.defaults.items():
+                group.setdefault(key, value)
 
     @torch.no_grad()
     def _step_scope(self, groups: list[dict[str, Any]]) -> None:

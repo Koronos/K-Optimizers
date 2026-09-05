@@ -504,8 +504,19 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         return loss
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Restore state, preserving the stored dtype of ``z`` (and ``exp_avg``)."""
+        """Restore state, preserving the stored dtype of ``z`` (and ``exp_avg``).
+
+        It also **replaces** each ``param_groups`` dict with the checkpoint's (only
+        ``params`` is carried over), so a checkpoint written by an older kaon has no
+        entry for a hyperparameter added since — reading it would raise ``KeyError``
+        on the first step. Backfill any key the checkpoint predates from
+        ``self.defaults``; keys the checkpoint *does* carry win, so a resumed run
+        keeps its own tuning.
+        """
         load_state_dict_preserving_dtypes(self, state_dict)
+        for group in self.param_groups:
+            for key, value in self.defaults.items():
+                group.setdefault(key, value)
 
     # ----------------------------------------------------------------- coefficients
     @staticmethod
