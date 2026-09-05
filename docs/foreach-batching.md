@@ -1,8 +1,12 @@
-# Adakaon `foreach` batching — design & tuning
+# `foreach` batching — design & tuning
 
-`Adakaon` steps parameters with multi-tensor (stacked) ops instead of a
+`Adakaon` — and AdaMuon, AdaBelief, AdamP, ADOPT, ScheduleFree, AdaPNM, Lion,
+KProdigy — step parameters with multi-tensor (stacked) ops instead of a
 per-parameter Python loop (`foreach=True`, the default). This note explains how it
-works, the two knobs that control it, and the measurements behind their defaults.
+works, the two knobs that control it, the measurements behind their defaults, and
+the cached bucketing/view plan the batched path runs on. Measurements below are
+Adakaon's unless stated otherwise; the mechanism and the knobs are the same
+everywhere.
 
 ## Why
 
@@ -168,3 +172,80 @@ Equivalent without the console script: `python -m kaon.tune --model …`.
   raise `foreach_batch_cutoff` (the stack cap follows at 4×).
 - **Disable batching entirely**: `foreach=False` (per-parameter loop; e.g.
   gradient-release setups already step one param per optimizer).
+
+## The cached bucketing/view plan
+
+Bucketing is not free. Every step the optimizer has to decide which parameters stack
+together, split each bucket by the current chunk budget, and then — inside each bucket
+body — build the lists of *views* the batched kernels write through: the (matrixized)
+parameter views, the `row`/`col` or `v`/`s` state buffers, the momentum codec's `mat`
+callback. On a bag of many tiny tensors that bookkeeping is a real fraction of the
+step: 0-D scalars alone cost ~5 `flat_view` calls per parameter per step, and each one
+materializes a fresh `aten::view`.
+
+None of it changes between steps. The bucketing is a function of the parameters'
+shapes, dtypes and devices; the views are functions of tensors the optimizer **already
+owns** (`p.data` and its own `self.state` buffers). `kaon._foreach_plan` therefore
+computes them once and caches them per param group:
+
+- `ForeachSpec` — declared once per optimizer class: which state keys the bucket
+  bodies walk, the optimizer-specific extra bucket key (the per-parameter step for
+  AdaBelief / AdamP / ADOPT, `t` for AdaMuon with `bias_correction`), whether to
+  prebuild the codec's `mat` lookup.
+- `ForeachPlan` — one group's bucket list plus the chunk split; re-chunked only when
+  `budget // bucket_size` actually moves (the VRAM-adaptive budget wobbles every step,
+  the chunk length almost never does).
+- `ForeachChunk` — one stacked chunk's cached views.
+
+Caching them **pins no memory**: every cached tensor is a view of something the
+optimizer holds anyway. Gradients are the one deliberate exception — a retained view of
+`p.grad` would keep the previous step's gradient storage alive (`set_to_none=True`
+allocates a fresh grad every backward), adding a whole gradient set to peak memory, for
+an optimizer family whose entire pitch is memory. Instead `ForeachChunk.grad_stack()`
+stacks the **raw** gradients and reshapes the *stack* once: `torch.stack` always writes
+a contiguous output, so that is element-for-element the same buffer as stacking N
+per-parameter reshapes, at one `view` per bucket instead of N.
+
+### Staleness
+
+A cached view of memory the optimizer no longer owns would silently step a detached
+buffer, so the plan is rebuilt or dropped on all of:
+
+| event | detected by |
+|---|---|
+| the param set changes (including the foreach/per-param split moving a param) | `param_witness` — `id` |
+| `p.data = <fresh storage>` (external EMA, `.to(dtype/device)`, an offloader's block swap) | `param_witness` — `data_ptr` |
+| `p.data = p.data.t()` on a square weight (id, pointer and shape all unchanged) | `param_witness` — `is_contiguous` |
+| parameters fall out of lockstep (per-parameter clocks split into several buckets) | the plan's key *partition* signature |
+| the stack budget moves | `ForeachPlan.rechunk` |
+| `load_state_dict` (it **replaces** the state tensors), `add_param_group`, an AutoLR base-state reset, a group falling back to the per-parameter loop | dropped explicitly |
+
+A rebind that changes the *shape* is deliberately not supported (the factored second
+moment is bound to the effective 2-D shape and there is no meaningful migration of an
+EMA onto a different factorization); the stale bucketing raises a size mismatch on the
+next step, which is the intended outcome.
+
+Note that the per-parameter clock's *value* changes every step while the *partition* it
+induces does not — so the plan survives it. Only a parameter that actually skips a step
+splits a bucket, and once split the two halves advance in lockstep again and the plan is
+reused as before.
+
+### Measured
+
+`optimizer._foreach_cache_enabled = False` drops the cross-step cache (numerically a
+no-op) — the A/B arm these were measured against. RTX 3000 Ada Laptop, bf16 params,
+`momentum_dtype="bfloat16"`, 3 interleaved rounds × 40 reps per arm, `min` per-step wall
+time, `aten::view`+`aten::reshape` counted with `torch.profiler`. Ranges span the five
+optimizers (AdaMuon / AdaBelief / AdamP / ADOPT / ScheduleFree):
+
+| bag | Δ view/reshape per step | Δ CPU self | Δ ms/step (min) | Δ ms/step (median) |
+|---|---|---|---|---|
+| 448 × 0-D scalars | −27 … −50 % | −13 … −46 % | **−32 … −50 %** | −36 … −55 % |
+| 300 × conv (16,8,3,3) + 128 × 0-D | −25 … −49 % | −7 … −33 % | **−21 … −38 %** | −27 … −46 % |
+| 200 × (256,256) + 100 × (512,) + 128 × 0-D | −10 … −23 % | −1 … −19 % | −0 … −9 % | −0 … −7 % |
+
+The win scales with how many bucket entries need a *real* view. A `(256,256)` weight is
+already in its effective layout, so its `mat` is the identity and there was never a view
+to cache; a bag dominated by such weights is GPU-bound and the plan only trims host
+work. 0-D scalars and matrixized convs are the opposite extreme — every list entry is a
+real view, and they are exactly the launch-bound bags `foreach` exists for.

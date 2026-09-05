@@ -89,13 +89,13 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
-    flat_view,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -114,7 +114,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class AdamP(AutoLRMixin, Optimizer):
+class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
     """AdamP (AdamW + per-channel radial projection) on kaon's memory backend.
 
     Args:
@@ -508,9 +508,13 @@ class AdamP(AutoLRMixin, Optimizer):
                     for p in slow:
                         self._step_one_param(p, group)
                 else:
+                    self._drop_foreach_plan(group)
                     for p in params:
                         self._step_one_param(p, group)
             else:
+                # Per-parameter fallback for the whole group: drop any cached plan for it,
+                # so a cached plan only ever describes a group the foreach path stepped.
+                self._drop_foreach_plan(group)
                 for p in params:
                     self._step_one_param(p, group)
         return loss
@@ -537,8 +541,30 @@ class AdamP(AutoLRMixin, Optimizer):
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)
+        # The loader REPLACES state["v"] / state["m"] (and every param_groups dict), so a
+        # cached foreach plan would keep stepping detached buffers under a dead group id.
+        self._clear_foreach_plans()
+
+    def _autolr_reset_base_state(self) -> None:
+        """Reset the base optimizer after an AutoLR rollback: the cleared state is
+        reallocated by the next step, so the cached view plan must go with it."""
+        super()._autolr_reset_base_state()
+        self._clear_foreach_plans()
 
     # ----------------------------------------------------------------- foreach
+    # Bucketing, chunking and the cached view plan live in kaon._foreach_plan. ``row`` /
+    # ``col`` (factored) and ``v`` (non-factored) are the state buffers the bucket bodies
+    # stack and write back through; the per-parameter step joins the bucket key so every
+    # slice of a bucket shares one bias correction (and one ``_coeffs`` dict) — and, with
+    # it, the projection's per-channel view dims. The momentum goes through
+    # ``_dequant_stacked`` / ``_store_stacked``, which take ``states`` rather than a
+    # ``mat`` callback, so there is no codec view cache to prebuild here.
+    _FOREACH_SPEC = ForeachSpec(
+        factored_state=("row", "col"),
+        flat_state=("v",),
+        extra_key=lambda state, group: max(state["step"], 1),
+    )
+
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
         return group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
@@ -566,62 +592,38 @@ class AdamP(AutoLRMixin, Optimizer):
         """Batched step. Factored (ndim>=2, projected) and non-factored (ndim<=1) buckets.
 
         0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
-        with real shape-(1,) params."""
+        with real shape-(1,) params. The ``max(step, 1)`` clamp in the bucket key only
+        covers a state allocated by the plan builder itself (step 0), whose bias
+        correction would otherwise be ``1 - beta**0 == 0``; ``_step_impl`` advances every
+        param's step before this runs."""
         md = group["momentum_dtype"]
-
-        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        for p in params:
-            state = self.state[p]
-            if not state:
-                self._init_state(p, state, group)
-            # _step_impl advances every param's step before this runs, so the
-            # clamp only covers a state allocated on the line above (step 0),
-            # whose bias correction would otherwise be 1 - beta**0 == 0.
-            pstep = max(state["step"], 1)
-            g = p.grad
-            if g.ndim >= 2:
-                matrixize = g.ndim > 2
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize, pstep), []).append(p)
-            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype, pstep), []).append(p)
-
-        for (eff, _dtype, matrixize, pstep), plist in factored_buckets.items():
-            c = self._coeffs(group, pstep)
-            stepn = max(1, budget // max(eff[0] * eff[1], 1))
-            for i in range(0, len(plist), stepn):
-                self._factored_bucket(plist[i:i + stepn], eff, matrixize, md, c, group)
-        for (length, _dtype, pstep), plist in flat_buckets.items():
-            c = self._coeffs(group, pstep)
-            stepn = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), stepn):
-                self._nonfactored_bucket(plist[i:i + stepn], length, md, c, group)
+        coeffs: dict[int, dict[str, float]] = {}
+        for chunk in self._foreach_chunks(params, group, budget):
+            c = coeffs.get(chunk.key)
+            if c is None:
+                c = coeffs[chunk.key] = self._coeffs(group, chunk.key)
+            bucket = self._factored_bucket if chunk.eff is not None else self._nonfactored_bucket
+            bucket(chunk, md, c, group)
 
     @torch.no_grad()
     def _factored_bucket(
         self,
-        plist: list[Tensor],
-        eff: tuple[int, int],
-        matrixize: bool,
+        chunk: ForeachChunk,
         md: str,
         c: dict[str, float],
         group: dict[str, Any],
     ) -> None:
-        R, C = eff  # noqa: N806
+        R, C = chunk.eff  # noqa: N806
         eps1 = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         nesterov = group["nesterov"]
 
-        def mat(t: Tensor) -> Tensor:
-            return t.view(R, C) if matrixize else t
+        states = chunk.states
+        rows, cols = chunk.state_views
+        pviews = chunk.pviews
 
-        states = [self.state[p] for p in plist]
-        rows = [s["row"] for s in states]
-        cols = [s["col"] for s in states]
-
-        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
+        grad = chunk.grad_stack()                                         # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -642,7 +644,7 @@ class AdamP(AutoLRMixin, Optimizer):
         # First-moment EMA (raw Adam momentum), read, EMA, store back.
         m = self._dequant_stacked(states, md, (R, C))                             # [N, R, C]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
-        self._store_stacked(states, md, m.reshape((len(plist), R, C)))
+        self._store_stacked(states, md, m.reshape((chunk.n, R, C)))
 
         if nesterov:
             perturb = (m.mul(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])).mul_(inv_denom)
@@ -650,7 +652,7 @@ class AdamP(AutoLRMixin, Optimizer):
             perturb = m.mul(inv_denom)                                            # [N, R, C]
 
         # AdamP projection (per-channel radial removal on the matrixized [R, C] view).
-        p_stack = torch.stack([mat(p.data) for p in plist]).float()               # [N, R, C]
+        p_stack = chunk.param_stack()                                             # [N, R, C]
         perturb, wd_ratio = self._project_stacked(
             p_stack, grad, perturb, group["delta"], group["eps"], group["wd_ratio"]
         )
@@ -658,19 +660,17 @@ class AdamP(AutoLRMixin, Optimizer):
         # Decoupled weight decay (scaled per-slice by wd_ratio), then the step.
         if wd != 0:
             scale = (1.0 - group["lr"] * wd * wd_ratio)                           # [N, 1, 1]
-            pviews = [mat(p.data) for p in plist]
             torch._foreach_mul_(pviews, list(scale.reshape(-1)))
 
         delta = perturb.mul_(c["step_size"])
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method)
 
     @torch.no_grad()
     def _nonfactored_bucket(
         self,
-        plist: list[Tensor],
-        length: int,
+        chunk: ForeachChunk,
         md: str,
         c: dict[str, float],
         group: dict[str, Any],
@@ -679,19 +679,23 @@ class AdamP(AutoLRMixin, Optimizer):
 
         0-D scalars share the ``L == 1`` bucket with shape-``(1,)`` params as length-1
         **views** (:func:`~kaon._backend.flat_view`) of the same storage, so the state
-        write-backs and the weight subtract reach the original 0-D tensors. Like every
-        other param in this bucket they are never projected — which is exactly the
-        official AdamP ``len(p.shape) > 1`` gate the per-param path applies to them.
+        write-backs and the weight subtract reach the original 0-D tensors. Those views
+        are the cached plan's (``chunk.state_views`` / ``chunk.pviews``), not rebuilt per
+        param per step. Like every other param in this bucket they are never projected —
+        which is exactly the official AdamP ``len(p.shape) > 1`` gate the per-param path
+        applies to them.
         """
         eps = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         nesterov = group["nesterov"]
 
-        states = [self.state[p] for p in plist]
-        vs = [flat_view(s["v"]) for s in states]
+        length = chunk.length
+        states = chunk.states
+        (vs,) = chunk.state_views
+        pviews = chunk.pviews
 
-        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
+        grad = chunk.grad_stack()                                         # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
         v.mul_(c["beta2"]).addcmul_(grad, grad, value=1.0 - c["beta2"])
@@ -702,7 +706,7 @@ class AdamP(AutoLRMixin, Optimizer):
 
         m = self._dequant_stacked(states, md, (length,))                  # [N, L]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
-        self._store_stacked(states, md, m.reshape((len(plist), length)))
+        self._store_stacked(states, md, m.reshape((chunk.n, length)))
 
         if nesterov:
             perturb = (m.mul(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])).div_(de_nom)
@@ -711,12 +715,12 @@ class AdamP(AutoLRMixin, Optimizer):
 
         # ndim<=1 params are NEVER projected (official: len(p.shape) > 1 gate). Full WD.
         if wd != 0:
-            torch._foreach_mul_([flat_view(p.data) for p in plist], 1.0 - group["lr"] * wd)
+            torch._foreach_mul_(pviews, 1.0 - group["lr"] * wd)
 
         delta = perturb.mul_(c["step_size"])
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()

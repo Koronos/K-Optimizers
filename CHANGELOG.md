@@ -106,6 +106,41 @@ All notable changes to this project will be documented in this file.
   on 200x(256,256), **+3.7% [+0.9, +6.6]** on 50x(512,512). Sub-ulp vs the old
   order (`mul_` then subtract can round differently from a contracted `a - lr*b`);
   bit-identical on bf16 params.
+- **Shared foreach bucketing + cached view plan (`kaon._foreach_plan`).** AdaMuon,
+  AdaBelief, AdamP, ADOPT and ScheduleFree each carried their own copy of the same
+  bucketing (effective shape / dtype / matrixize / device, plus a per-optimizer key
+  such as the per-parameter step) + budget chunking, and every `*_bucket` body
+  rebuilt its derived view lists (`[mat(p.data) …]`, `[flat_view(state[k]) …]`, the
+  codec's `mat` callback) **on every step**. All five now share one
+  `ForeachPlanMixin`, which caches the bucketing and those views per param group.
+  Bit-identical in every path (per-param and foreach, fp32/bf16 params, all four
+  `momentum_dtype`s, 0-D/(1,)/1-D/2-D/conv, checkpoint round trip), verified against
+  the pre-refactor tree.
+  Measured on an RTX 3000 Ada (bf16 params, 3 interleaved rounds × 40 reps/arm,
+  `min` of the per-step wall time; `aten::view`+`reshape` counted with
+  `torch.profiler`):
+
+  | bag | Δ view/reshape per step | Δ CPU self | Δ ms/step (min) | Δ ms/step (median) |
+  |---|---|---|---|---|
+  | 448 × 0-D scalars | −27 … −50 % | −13 … −46 % | **−32 … −50 %** | −36 … −55 % |
+  | 300 × conv (16,8,3,3) + 128 × 0-D | −25 … −49 % | −7 … −33 % | **−21 … −38 %** | −27 … −46 % |
+  | 200 × (256,256) + 100 × (512,) + 128 × 0-D | −10 … −23 % | −1 … −19 % | −0 … −9 % | −0 … −7 % |
+
+  The win scales with how many bucket entries need a *real* view: it is large on
+  launch-bound bags (0-D scalars, matrixized convs) and inside noise on a bag whose
+  params are mostly already in their effective layout (a `(256,256)` weight's `mat`
+  is the identity, so there was never a view to cache) — that bag is GPU-bound.
+  Caching pins no memory (every cached tensor is a view of a param or a state buffer
+  the optimizer already owns) and gradients are deliberately **never** cached: a
+  retained `p.grad` view would keep the previous step's gradient set alive.
+  `optimizer._foreach_cache_enabled = False` is the A/B switch (numerically a no-op).
+  A stale plan is impossible: it is rebuilt on a param-set change, a `p.data` rebind
+  (fresh storage *or* a transpose that only moves strides — `(ids, data_ptrs,
+  contiguity)` witness), a per-parameter-clock partition change, and a stack-budget
+  re-chunk, and dropped outright by `load_state_dict`, `add_param_group`, an AutoLR
+  base-state reset and any group that falls back to the per-parameter loop.
+  Adakaon keeps its own equivalent plan for now (it is coupled to the fused Triton
+  caches); merging it into the shared one is follow-up work.
 - **int8 `ema_one`**: `.float().mul_(scale)` (one temp), drop `delta.clone()`,
   write codes with `(m/scale).round_().clamp_` into `state["m"]` — measured
   13→8 B/elem transient, 14→12 kernels, ~1.29×, bit-identical. Same clone

@@ -69,7 +69,6 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
-    flat_view,
     foreach_budget,
     is_low_precision,
     rms,
@@ -77,6 +76,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _make_codec,
@@ -180,19 +180,6 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
 # --------------------------------------------------------------------------- #
 
 Scalar = Tensor | float
-
-
-def _stack_fp32(tensors: list[Tensor]) -> Tensor:
-    """``torch.stack(...).float()``, but a zero-copy ``unsqueeze`` for a bucket of one.
-
-    Single-slice buckets are the norm as soon as a model has many distinct weight
-    shapes (each shape is its own bucket), and stacking one tensor copies it for
-    nothing — 16 MB per step on a 4x1024x1024 full fine-tune. Nothing downstream
-    mutates the stacked gradient/weight, so aliasing the parameter's storage is safe.
-    """
-    if len(tensors) == 1:
-        return tensors[0].unsqueeze(0).float()
-    return torch.stack(tensors).float()
 
 
 def _add_scaled_(delta: Tensor, other: Tensor, scale: Scalar) -> Tensor:
@@ -375,7 +362,7 @@ def _post_one_math(
     return delta
 
 
-class AdaMuon(AutoLRMixin, Optimizer):
+class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
     """Orthogonalized-momentum optimizer with factored quantized variance.
 
     Args:
@@ -688,9 +675,13 @@ class AdaMuon(AutoLRMixin, Optimizer):
                     for p in slow:
                         self._step_one_param(p, group)
                 else:
+                    self._drop_foreach_plan(group)
                     for p in params:
                         self._step_one_param(p, group)
             else:
+                # Per-parameter fallback for the whole group: drop any cached plan for it,
+                # so a cached plan only ever describes a group the foreach path stepped.
+                self._drop_foreach_plan(group)
                 for p in params:
                     self._step_one_param(p, group)
 
@@ -717,8 +708,36 @@ class AdaMuon(AutoLRMixin, Optimizer):
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)
+        # The loader REPLACES state["v"] / state["m"] (and every param_groups dict), so a
+        # cached foreach plan would keep stepping detached buffers under a dead group id.
+        self._clear_foreach_plans()
+
+    def _autolr_reset_base_state(self) -> None:
+        """Reset the base optimizer after an AutoLR rollback: the cleared state is
+        reallocated by the next step, so the cached view plan must go with it."""
+        super()._autolr_reset_base_state()
+        self._clear_foreach_plans()
 
     # ----------------------------------------------------------------- foreach
+    # Bucketing, chunking and the cached view plan live in kaon._foreach_plan. ``row`` /
+    # ``col`` (factored) and ``v`` (non-factored) are the state buffers the bucket bodies
+    # stack and write back through. With ``bias_correction`` on, ``t`` joins the bucket key
+    # so every slice in a bucket shares the correction factor and it stays a Python float
+    # (see ``_bc_scale``); params that step together keep the same ``t`` and so stay in one
+    # bucket, and only intermittent gradients fragment it. ADOPT groups by its per-param
+    # step for the same reason. ``single_alias`` is ``_stack_fp32``'s zero-copy
+    # ``unsqueeze`` for a bucket of one, kept on the plan's stacking helpers.
+    _FOREACH_SPEC = ForeachSpec(
+        factored_state=("row", "col"),
+        flat_state=("v",),
+        extra_key=lambda state, group: (
+            state.get("step", 0) if group.get("bias_correction", False) else 0
+        ),
+        momentum_cache=lambda group: (
+            group["betas"][0] > 0 and group["momentum_dtype"] != "4bit"
+        ),
+        single_alias=True,
+    )
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
@@ -757,39 +776,16 @@ class AdaMuon(AutoLRMixin, Optimizer):
         bias_correction = group.get("bias_correction", False)
         codec = self._codec(group)
 
-        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        for p in params:
-            state = self.state[p]
-            if not state:
-                self._init_state(p, state, group)
-            # With bias_correction on, ``t`` joins the bucket key so every slice in a
-            # bucket shares the correction factor and it stays a Python float (see
-            # _bc_scale). Params that step together keep the same ``t`` and so stay in
-            # one bucket; only intermittent gradients fragment it. ADOPT groups by its
-            # per-param step for the same reason.
-            tkey = state.get("step", 0) if bias_correction else 0
-            g = p.grad
-            if g.ndim >= 2:
-                matrixize = g.ndim > 2
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize, tkey), []).append(p)
-            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype, tkey), []).append(p)
-
-        for (eff, _dtype, matrixize, _t), plist in factored_buckets.items():
-            step = max(1, budget // max(eff[0] * eff[1], 1))
-            for i in range(0, len(plist), step):
+        for chunk in self._foreach_chunks(params, group, budget):
+            if chunk.eff is not None:
                 self._factored_bucket(
-                    plist[i:i + step], eff, matrixize, ns_steps,
+                    chunk, ns_steps,
                     beta1, beta2, eps1, lr, clip, wd, cautious, bias_correction,
                     bf16_method, codec,
                 )
-        for (length, _dtype, _t), plist in flat_buckets.items():
-            step = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), step):
+            else:
                 self._nonfactored_bucket(
-                    plist[i:i + step], length,
+                    chunk,
                     beta1, beta2, eps1, lr, clip, wd, cautious, bias_correction,
                     bf16_method, codec,
                 )
@@ -811,9 +807,7 @@ class AdaMuon(AutoLRMixin, Optimizer):
     @torch.no_grad()
     def _factored_bucket(
         self,
-        plist: list[Tensor],
-        eff: tuple[int, int],
-        matrixize: bool,
+        chunk: ForeachChunk,
         ns_steps: int,
         beta1: float,
         beta2: float,
@@ -826,25 +820,22 @@ class AdaMuon(AutoLRMixin, Optimizer):
         bf16_method: str,
         codec: _MomentumCodec,
     ) -> None:
-        R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
+        R, C = chunk.eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
 
-        def mat(x: Tensor) -> Tensor:
-            return x.view(R, C) if matrixize else x
-
-        states = [self.state[p] for p in plist]
+        states = chunk.states
         t = self._bump_steps(states)
-        rows = [s["row"] for s in states]
-        cols = [s["col"] for s in states]
+        rows, cols = chunk.state_views
+        pviews = chunk.pviews
 
-        grad = _stack_fp32([mat(p.grad) for p in plist])                  # [N, R, C]
+        grad = chunk.grad_stack()                                         # [N, R, C]
 
         # First moment of the RAW gradient (codec owns dequant→EMA→requant). Stays
         # in eager: it walks per-param state dicts, exactly the Python-container
         # work the compiled kernels must not see.
-        m = codec.ema_stacked(states, grad, mat, (R, C), beta1) if beta1 > 0 else grad
+        m = codec.ema_stacked(states, grad, chunk.mat, (R, C), beta1) if beta1 > 0 else grad
 
         dev = grad.device
-        p_fp32 = _stack_fp32([mat(p.data) for p in plist]) if wd != 0 else None
+        p_fp32 = chunk.param_stack() if wd != 0 else None
         row, col, delta = self._factored_math(
             m, grad, torch.stack(rows), torch.stack(cols), p_fp32,
             ns_steps, beta2, eps1, clip,
@@ -856,13 +847,12 @@ class AdaMuon(AutoLRMixin, Optimizer):
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
-        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method)
 
     @torch.no_grad()
     def _nonfactored_bucket(
         self,
-        plist: list[Tensor],
-        length: int,
+        chunk: ForeachChunk,
         beta1: float,
         beta2: float,
         eps1: float,
@@ -883,15 +873,18 @@ class AdaMuon(AutoLRMixin, Optimizer):
 
         0-D scalars join the ``L == 1`` bucket as length-1 **views**
         (:func:`~kaon._backend.flat_view`) of the same storage, so ``v``, the codec
-        write-back and the weight subtract all reach the original 0-D tensors. At
-        ``L == 1`` the per-slice ``norm(dim=1)/sqrt(1)`` is exactly the per-param
-        ``rms()`` of a scalar, so the clip is the same op the per-param path applies.
+        write-back and the weight subtract all reach the original 0-D tensors. Those
+        views are the cached plan's (``chunk.state_views`` / ``chunk.pviews``), not
+        rebuilt per param per step. At ``L == 1`` the per-slice ``norm(dim=1)/sqrt(1)``
+        is exactly the per-param ``rms()`` of a scalar, so the clip is the same op the
+        per-param path applies.
         """
-        states = [self.state[p] for p in plist]
+        states = chunk.states
         t = self._bump_steps(states)
-        vs = [flat_view(s["v"]) for s in states]                          # each [L], fp32
+        (vs,) = chunk.state_views                                         # each [L], fp32
+        pviews = chunk.pviews
 
-        grad = _stack_fp32([flat_view(p.grad) for p in plist])            # [N, L]
+        grad = chunk.grad_stack()                                         # [N, L]
         dev = grad.device
         v, update = self._nonfactored_pre_math(
             grad, torch.stack(vs), beta2, eps1, clip,
@@ -901,19 +894,19 @@ class AdaMuon(AutoLRMixin, Optimizer):
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
         if beta1 > 0:
-            delta = codec.ema_stacked(states, update, flat_view, (length,), beta1)  # [N, L]
+            delta = codec.ema_stacked(states, update, chunk.mat, (chunk.length,), beta1)  # [N, L]
         else:
             delta = update
 
         if wd != 0 or cautious:
-            p_fp32 = _stack_fp32([flat_view(p.data) for p in plist]) if wd != 0 else None
+            p_fp32 = chunk.param_stack() if wd != 0 else None
             delta = self._post_math(
                 delta, grad, p_fp32,
                 self._scalar("wd", lr * wd, dev) if wd != 0 else None,
                 cautious,
             )
 
-        subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
