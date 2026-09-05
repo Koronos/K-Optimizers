@@ -69,8 +69,8 @@ from kaon._momentum_codec import (
     _quant_int8,
     _quant_int8_stacked,
     _unpack_nibbles,
-    fourbit_block_size,
     load_state_dict_preserving_dtypes,
+    warn_if_4bit_high_beta1,
 )
 
 __all__ = ["Adakaon"]
@@ -85,6 +85,7 @@ _ = (
 )
 
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
+CautiousWD = Literal["masked", "full"]
 
 # Diagnostic kernel-routing override (env-gated, zero cost when unset): a comma list of
 # fused subsets to force onto the native path — e.g. KAON_FUSED_DISABLE="one_block" or
@@ -353,7 +354,8 @@ class Adakaon(AutoLRMixin, Optimizer):
         eps: ``(eps1, eps2)``. ``eps1`` is added to ``grad**2`` before the
             factored reductions (HF Adafactor convention). ``eps2`` is currently
             unused (reserved).
-        weight_decay: decoupled weight decay (folded into the per-step delta).
+        weight_decay: decoupled weight decay (folded into the per-step delta; see
+            ``cautious_wd`` for its placement relative to the cautious mask).
         clip_threshold: Adafactor RMS update clipping (``rms(update) <= thr``).
         momentum_dtype: storage for the first-moment buffer when ``beta1>0`` —
             ``"bfloat16"`` (default; ~2 B/param), ``"float32"`` (4 B/param),
@@ -372,6 +374,23 @@ class Adakaon(AutoLRMixin, Optimizer):
             it improves convergence when momentum is on (``beta1>0``) and is a
             literal no-op without momentum (the mask is all-ones — verified). Turn
             it off for no-momentum configs to skip the then-useless masking op.
+        cautious_wd: where decoupled ``weight_decay`` sits relative to the cautious
+            mask. ``"masked"`` (default, historical behaviour) folds it into the
+            delta BEFORE the mask, so a coordinate the mask rejects gets **no**
+            decay at all and a survivor gets it multiplied by the survivor rescale
+            ``1/keep``. Measured (fraction of the REQUESTED ``lr*wd*p`` that each
+            coordinate actually receives): at ``keep=0.64``, 1.49x on survivors
+            and 0.005x on rejected coordinates; at ``keep=0.50``, 1.985x and
+            0.0013x. The aggregate shrinkage is preserved; its per-coordinate
+            distribution is not.
+            ``"full"`` applies ``lr*wd*p`` to **every** coordinate, outside the
+            mask, and masks only the momentum/update term — which is what the
+            Cautious Optimizers paper (Liang et al. 2024) does. With
+            ``cautious=False`` the mask is a no-op and the two orders are the same
+            add, so the modes coincide — bit-identically wherever the path itself is
+            deterministic (the fused big bucket's fp32-atomic reductions are
+            run-to-run nondeterministic unless ``deterministic_reductions=True``).
+            No effect when ``weight_decay == 0``.
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
             ``"none"``. No-op on fp32 params.
@@ -440,6 +459,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         momentum_dtype: MomentumDtype = "bfloat16",
         momentum_4bit_block: int = _FOURBIT_BLOCK,
         cautious: bool = True,
+        cautious_wd: CautiousWD = "masked",
         gradient_centralization: bool = True,
         bf16_method: str = "stochastic_rounding",
         foreach: bool = True,
@@ -466,6 +486,12 @@ class Adakaon(AutoLRMixin, Optimizer):
             raise ValueError(
                 f"momentum_dtype must be bfloat16/float32/int8/4bit, got {momentum_dtype!r}"
             )
+        # One shared helper, not a per-optimizer copy: 4-bit momentum under a high beta1 has the
+        # dequant->EMA->requant loop amplify its own quantization error ~1/sqrt(1-beta1^2). Same
+        # one-liner as lion.py / adabelief.py / adamuon.py / ... — see docs/momentum.md.
+        warn_if_4bit_high_beta1(beta1, momentum_dtype)
+        if cautious_wd not in ("masked", "full"):
+            raise ValueError(f"cautious_wd must be 'masked' or 'full', got {cautious_wd!r}")
         if bf16_method not in ("stochastic_rounding", "kahan", "none"):
             raise ValueError(f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}")
         if foreach_batch_cutoff < 1:
@@ -479,6 +505,7 @@ class Adakaon(AutoLRMixin, Optimizer):
             "momentum_dtype": momentum_dtype,
             "momentum_4bit_block": momentum_4bit_block,
             "cautious": cautious,
+            "cautious_wd": cautious_wd,
             "gradient_centralization": gradient_centralization,
             "bf16_method": bf16_method,
         }
@@ -804,20 +831,13 @@ class Adakaon(AutoLRMixin, Optimizer):
             two_d = bf_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous() \
                 and p.dtype in (torch.float32, torch.bfloat16)
             ok = bf_ok and ft.fused_eligible(p, cap)
-            if ok and momentum and md == "4bit":
-                if ft.eff_2d(p)[1] % 2 != 0:
-                    ok = False                              # one-block 4bit needs even C
-                elif self._fourbit_block(p, group) != min(_FOURBIT_BLOCK, p.numel()):
-                    # The one-block tile kernel hardcodes its absmax block at
-                    # ``BLK = min(R*C, 128)`` for dequant AND requant. Under any other
-                    # ``momentum_4bit_block`` that does not merely read the wrong scales: the
-                    # requant writes ceil(numel/128) floats into an ``m_scale`` sized for the
-                    # REAL block count, i.e. past the end of the buffer (a (64,128) weight with
-                    # block=0 wrote 63 floats out of bounds). Route it to the native / chunked
-                    # path, which honours ``state["m_block"]``. Making the block a constexpr
-                    # instead would multiply the JIT variants; the 1-D kernel already buckets by
-                    # block (OneDimPointerCache) and needs no guard.
-                    ok = False
+            if ok and momentum and md == "4bit" and ft.eff_2d(p)[1] % 2 != 0:
+                ok = False                                  # one-block 4bit needs even C
+                # NOTE the block-size guard that used to live here is gone (0.7.12): the tile
+                # kernel takes ``state["m_block"]`` as a RUNTIME scalar and
+                # ``PointerArrayCache`` buckets by it, so every ``momentum_4bit_block`` keeps
+                # this route instead of degrading to native. Only the even-C packing
+                # assumption is still a real constraint.
             if ok:
                 one_block.append(p)
             elif two_d and ft.next_pow2_tile(*ft.eff_2d(p))[0] * ft.next_pow2_tile(*ft.eff_2d(p))[1] > cap:
@@ -880,15 +900,6 @@ class Adakaon(AutoLRMixin, Optimizer):
         self._fused_demoted[gid] = (demoted, parts, out)
         return out
 
-    def _fourbit_block(self, p: Tensor, group: dict[str, Any]) -> int:
-        """This param's 4-bit absmax block size: the one already in state when there is one (a
-        checkpoint can carry a layout the current group setting would not produce), else the one
-        :meth:`_init_state` is about to pick."""
-        st = self.state.get(p)
-        if st and "m_block" in st:
-            return st["m_block"]
-        return fourbit_block_size(p.grad, group)
-
     def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
         """Launch the one-block pointer-array kernel over the eligible small 2-D weights."""
         for p in plist:
@@ -908,6 +919,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         lr, eps1 = group["lr"], group["eps"][0]
         clip, wd = group["clip_threshold"], group["weight_decay"]
         cautious, gc = group["cautious"], group["gradient_centralization"]
+        wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         # A bucket's index arrays live on ITS device (PointerArrayCache buckets by device), and a
         # Triton launch goes to the CURRENT device, not to the one the arguments came from. A group
         # spanning cuda:0 and cuda:1 would otherwise launch every bucket on whichever device
@@ -919,9 +931,9 @@ class Adakaon(AutoLRMixin, Optimizer):
                 ft._adakaon_tile_kernel[(len(bk["plist"]),)](
                     bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["row_addr"],
                     bk["col_addr"], bk["Rs"], bk["Cs"], bk["mscale_n"],
-                    lr, b1, b2, eps1, clip, wd, self._t,
+                    lr, b1, b2, eps1, clip, wd, self._t, bk["blk"],
                     LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0, GC=gc,
-                    SR=bk["lowp"], MOMENTUM=bk["momentum"],
+                    SR=bk["lowp"], MOMENTUM=bk["momentum"], WDFULL=wd_full,
                     BR=bk["BR"], BC=bk["BC"], EXACT=bk["exact4"], FBLK=bk["fblk"],
                     num_warps=ft.warps_for(lanes),
                 )
@@ -944,13 +956,14 @@ class Adakaon(AutoLRMixin, Optimizer):
         lr, eps1 = group["lr"], group["eps"][0]
         clip, wd = group["clip_threshold"], group["weight_decay"]
         cautious = group["cautious"]
+        wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         for bk in cache.buckets:                       # see _fused_one_block on the device scope
             with torch.cuda.device(bk["dev"]):
                 ft._adam_1d_kernel[(len(bk["plist"]),)](
                     bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["v_addr"],
                     bk["Ls"], lr, b1, b2, eps1, clip, wd, self._t,
                     LOWP=bk["lowp"], MOM=bk["mom"], MOMENTUM=bk["momentum"], CAUTIOUS=cautious,
-                    WD=wd != 0, SR=bk["lowp"], BL=bk["BL"], FBLOCK=bk["block"],
+                    WD=wd != 0, SR=bk["lowp"], BL=bk["BL"], FBLOCK=bk["block"], WDFULL=wd_full,
                     num_warps=ft.warps_for(bk["BL"]),
                 )
 
@@ -983,6 +996,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         n = R * C
         md, b1 = group["momentum_dtype"], group["betas"][0]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
+        wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         sr = (p.dtype == torch.bfloat16) and (group["bf16_method"] == "stochastic_rounding")
         g, r, c, inv_rms = self._chunked_reductions(p, group, st)
         quant = md in ("int8", "4bit")
@@ -995,7 +1009,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         gf, pf = g.reshape(-1), p.reshape(-1)
         grid = ((n + 1023) // 1024,)
         ft._chunked_mom[grid](gf, mf, pf, r, c, keep, C, n, inv_rms, wd, b1,
-                              CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024)
+                              CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full)
         if quant:
             # Requant IN PLACE: cached pointer tables (MSAM's fused axpy plan, batched-step
             # plans) hold raw data_ptrs into these buffers — replacing the tensors leaves the
@@ -1010,7 +1024,7 @@ class Adakaon(AutoLRMixin, Optimizer):
                 st["m_scale"].copy_(sc)
         inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
         ft._chunked_apply[grid](gf, mf, pf, n, inv_mean, lr, wd, self._t,
-                                CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024)
+                                CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full)
 
     # ----------------------------------------------- batched chunked (many same-shape big tensors)
     @torch.no_grad()
@@ -1065,6 +1079,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         dev = plist[0].device
         md, b1 = group["momentum_dtype"], group["betas"][0]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
+        wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         gc = group["gradient_centralization"]
         lowp = plist[0].dtype == torch.bfloat16
         sr = lowp and (group["bf16_method"] == "stochastic_rounding")
@@ -1116,13 +1131,13 @@ class Adakaon(AutoLRMixin, Optimizer):
                 ft._chunked_int8_keep_batched_g[grid](
                     g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
                     keep, rms, clip, wd, b1, R, C, n, K,
-                    LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024,
+                    LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
                 )
             ft._chunked_int8_apply_batched_g[grid](
                 g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
                 keep, rms, clip, lr, wd, b1, self._t, R, C, n, K,
                 LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr,
-                CSEG=C, RPC=1024 // C, BLOCK=1024,
+                CSEG=C, RPC=1024 // C, BLOCK=1024, WDFULL=wd_full,
             )
             return
         if direct_4bit and fused_red:
@@ -1131,13 +1146,13 @@ class Adakaon(AutoLRMixin, Optimizer):
                 ft._chunked_4bit_keep_batched_g[grid](
                     g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
                     keep, rms, clip, wd, b1, R, C, n, K,
-                    LOWP=lowp, GC=gc, WD=wd != 0, FBLOCK=block, BLOCK=1024,
+                    LOWP=lowp, GC=gc, WD=wd != 0, FBLOCK=block, BLOCK=1024, WDFULL=wd_full,
                 )
             ft._chunked_4bit_apply_batched_g[grid](
                 g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
                 keep, rms, clip, lr, wd, b1, self._t, R, C, n, K,
                 LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr,
-                FBLOCK=block, BLOCK=1024,
+                FBLOCK=block, BLOCK=1024, WDFULL=wd_full,
             )
             return
 
@@ -1157,12 +1172,12 @@ class Adakaon(AutoLRMixin, Optimizer):
         if fused_red:
             ft._chunked_mom_batched_g[grid](
                 g_addr, rowmean, m_addr, p_addr, r, c, keep, rms, clip, wd, b1, R, C, n, K,
-                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024,
+                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
             )
         else:
             ft._chunked_mom_batched[grid](
                 g, m_addr, p_addr, r, c, keep, inv_rms, wd, b1, R, C, n, K,
-                LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024,
+                LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
             )
         if quant:  # requant the updated fp32 temp back into per-tensor storage (apply reads the temp)
             # Batched requant (same write pattern as ema_stacked: in-place copies keep the
@@ -1183,7 +1198,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         if fused_red:
             ft._chunked_apply_batched_g[grid](
                 g_addr, rowmean, m_addr, p_addr, keep, lr, wd, self._t, R, C, n, K,
-                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
+                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full,
             )
         else:
             inv_mean = (
@@ -1192,7 +1207,7 @@ class Adakaon(AutoLRMixin, Optimizer):
             )
             ft._chunked_apply_batched[grid](
                 g, m_addr, p_addr, inv_mean, lr, wd, self._t, n, K,
-                LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
+                LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full,
             )
 
     def _chunked_step_batched_nomom(
@@ -1207,6 +1222,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         N = len(plist)  # noqa: N806
         lr, wd = group["lr"], group["weight_decay"]
         cautious = group["cautious"]
+        wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         gc = group["gradient_centralization"]
         clip = group["clip_threshold"]
         g_addr, rowmean, r, c, rms = self._chunked_reductions_fused(
@@ -1219,12 +1235,12 @@ class Adakaon(AutoLRMixin, Optimizer):
         if cautious:
             ft._chunked_nomom_keep_batched_g[grid](
                 g_addr, rowmean, p_addr, r, c, keep, rms, clip,
-                wd, R, C, n, K, LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024,
+                wd, R, C, n, K, LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
             )
         ft._chunked_nomom_apply_batched_g[grid](
             g_addr, rowmean, p_addr, r, c, rms, clip, keep,
             lr, wd, self._t, R, C, n, K, LOWP=lowp, GC=gc,
-            CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
+            CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full,
         )
 
     @torch.no_grad()
@@ -1321,6 +1337,11 @@ class Adakaon(AutoLRMixin, Optimizer):
         if fused_step < 0:
             raise ValueError("Adakaon checkpoint has an invalid fused step counter")
         self._autolr_load(copied, lambda sd: load_state_dict_preserving_dtypes(self, sd))
+        # torch restores param_groups from the CHECKPOINT's dicts, so a checkpoint written
+        # before a group key existed comes back without it and the next step raises KeyError.
+        # Back-fill the constructor default (the historical behaviour for ``cautious_wd``).
+        for g in self.param_groups:
+            g.setdefault("cautious_wd", self.defaults.get("cautious_wd", "masked"))
         self._t = fused_step
         if int(meta.get("momentum_units", 1)) < 2:
             self._migrate_momentum_to_direction_units()
@@ -1461,10 +1482,11 @@ class Adakaon(AutoLRMixin, Optimizer):
         lr, clip = group["lr"], group["clip_threshold"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
+        wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         codec = self._codec(group)
         for chunk in self._foreach_plan(params, group, budget):
             bucket = self._factored_bucket if chunk.eff is not None else self._nonfactored_bucket
-            bucket(chunk, beta1, beta2, eps1, lr, clip, wd, cautious, bf16_method, codec)
+            bucket(chunk, beta1, beta2, eps1, lr, clip, wd, cautious, wd_full, bf16_method, codec)
 
     @torch.no_grad()
     def _factored_bucket(
@@ -1477,6 +1499,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         clip: float,
         wd: float,
         cautious: bool,
+        wd_full: bool,
         bf16_method: str,
         codec: _MomentumCodec,
     ) -> None:
@@ -1556,12 +1579,16 @@ class Adakaon(AutoLRMixin, Optimizer):
         else:
             delta = update
 
-        if wd != 0:
+        if wd != 0 and not wd_full:                  # "masked": decay inside the mask
             p_fp32 = torch.stack(chunk.pviews).float()
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
+
+        if wd_full:                                  # "full": decay outside the mask
+            p_fp32 = torch.stack(chunk.pviews).float()
+            delta = delta.add_(p_fp32, alpha=wd)
 
         # lr rides the weight write (``alpha``) instead of a separate ``delta.mul_(lr)``
         # pass over the stacked bucket - see :func:`kaon._backend.subtract_batched_`.
@@ -1582,6 +1609,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         clip: float,
         wd: float,
         cautious: bool,
+        wd_full: bool,
         bf16_method: str,
         codec: _MomentumCodec,
     ) -> None:
@@ -1630,12 +1658,16 @@ class Adakaon(AutoLRMixin, Optimizer):
         else:
             delta = update
 
-        if wd != 0:
+        if wd != 0 and not wd_full:                  # "masked": decay inside the mask
             p_fp32 = torch.stack(chunk.pviews).float()
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
+
+        if wd_full:                                  # "full": decay outside the mask
+            p_fp32 = torch.stack(chunk.pviews).float()
+            delta = delta.add_(p_fp32, alpha=wd)
 
         if self._write_fold_lr:                      # see _factored_bucket
             subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr)
@@ -1683,12 +1715,22 @@ class Adakaon(AutoLRMixin, Optimizer):
         # complete (momentum + weight-decay) delta below.
         delta = self._codec(group).ema_one(state, update, beta1) if beta1 > 0 else update
 
-        if wd != 0:
+        # ``cautious_wd`` decides whether the decay rides INSIDE the cautious mask (historical
+        # "masked": rejected coordinates get no decay, survivors get it rescaled by 1/keep) or
+        # outside it ("full": every coordinate decays by the same lr*wd, only the update is
+        # masked — the Cautious Optimizers paper's own placement). With ``cautious=False`` the
+        # two branches are the same ``add_`` on an untouched delta, hence bit-identical.
+        wd_full = wd != 0 and group["cautious_wd"] == "full"
+        if wd != 0 and not wd_full:
             p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_one_(delta, grad_fp32)
+
+        if wd_full:
+            p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
+            delta = delta.add_(p_fp32, alpha=wd)
 
         # lr rides the write, exactly as the foreach buckets do — the two must fold it the
         # same way or they stop being bit-exact with each other (see subtract_one_).

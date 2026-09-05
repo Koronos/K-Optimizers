@@ -23,13 +23,36 @@ All notable changes to this project will be documented in this file.
   (measured block-128 table in `docs/momentum.md`).
 - **`warn_if_4bit_high_beta1` wired into every other β1-EMA momentum consumer**:
   AdaBelief, AdamP, ADOPT, AdaPNM (checked against `betas[0]`, not the unrelated
-  `beta0` negative-momentum mix), KProdigy, AdaMuon. Adakaon is pending (file
-  under a concurrent audit batch). Deliberately **not** wired into ScheduleFree:
+  `beta0` negative-momentum mix), KProdigy, AdaMuon and **Adakaon** (the last one
+  landed with this batch, once its file was free). Deliberately **not** wired into ScheduleFree:
   its quantized `z` buffer is a plain accumulator (`z -= lr_t * d`), not decayed
   by `beta1`, so the warning's AR(1)-amplification argument does not apply to it
   (see `docs/momentum.md`).
 
 ### Performance
+- **`momentum_4bit_block` is a runtime kernel scalar in Adakaon's one-block tile
+  kernel** (`_adakaon_tile_kernel`), and `PointerArrayCache` buckets by
+  `state["m_block"]` alongside tile/dtype/device. The kernel used to hardcode
+  `BLK = min(R*C, 128)`, so a routing guard diverted **every other block size to the
+  native path** — correct, but it gave up the fused route for a legitimate
+  configuration. Measured cost of that diversion (RTX 3000 Ada, paired geometric
+  mean, 95% CI, 300 one-block tensors): **16.2–20.3x** slower, **427/436 kernel
+  launches → 2**, and **39.5 MiB → 0** of per-step transient, across
+  `block ∈ {64, 256, 0}` × {fp32, bf16}. The new route's own worst case — a padded
+  tile (no `EXACT` single-reduction, so `requant_4bit`'s general loop is O(numel·NB))
+  at `block=8`, 900 blocks over a 64×128 tile — is still **1.7–2.5x** faster than going
+  native, so no residual block-size guard is warranted. `EXACT`/`FBLK` now take the
+  bucket's real block, which **must divide the tile** — a precondition that used to be
+  automatic and is now enforced by `PointerArrayCache.exact4` (without it a `(64,128)`
+  weight at `momentum_4bit_block=96` raises a Triton `CompilationError` mid-run); the
+  `NS` capacity masks stay as the memory-safety backstop. **No added JIT cost at the
+  defaults**: the whole-surface baseline (every fused route × every momentum storage ×
+  fp32/bf16 params, clean `TRITON_CACHE_DIR`) is **45 variants across 11 kernels before
+  and after**, cold-cache first-step compile 38.6/37.9 s (before) vs 37.2/37.8 s (after).
+  Per-block specialization is confined to the `EXACT` path's `FBLK` constexpr (+1 variant
+  per distinct block on an unpadded tile; padded tiles share one variant for all blocks,
+  which is the runtime argument doing its job). New A/B + variant census:
+  `benchmarks/fused/bench_wd_mblock.py` (`--case mblock`, `mblock_worst`, `wd`, `jit`).
 - **A lone big 2-D weight takes the BATCHED chunked kernel** (`_fused_big`, `N == 1`).
   The per-tensor `_chunked_step` it replaces blocked the CPU twice per tensor per
   step (`float(rms)`, `keep.item()`) and materialized fp32 `g` + `g*g`. Measured
@@ -114,6 +137,33 @@ All notable changes to this project will be documented in this file.
   per-param/stacked bit-exactness).
 
 ### Added
+- **`Adakaon(cautious_wd="masked" | "full")`** — where decoupled `weight_decay`
+  sits relative to the cautious mask. Adakaon has always folded it into the delta
+  *before* the mask, on every path, so the decay went through the mask too:
+  measured as the fraction of the requested `lr*wd*p` each coordinate actually
+  receives, **1.49x on survivors / 0.005x on rejected at keep=0.64** (1.985x /
+  0.0013x at keep=0.50) — the aggregate shrinkage is preserved, its per-coordinate
+  distribution is not. `"full"` is the Cautious Optimizers paper's own placement:
+  the mask applies to the momentum/update term only and `lr*wd*p` reaches **every**
+  coordinate. Implemented on all three native paths and all ~13 Triton kernels
+  (per-param == foreach exactly; fused within the path's own noise, in both modes).
+  **`"masked"` stays the default** — the A/B did not promote it: on the diffusion
+  proxy (C=128 U-Net, 2000 steps, REX + progressive curriculum, `wd` ∈ {0.01, 0.05}
+  × lr ×{0.5,1,2} × 3 seeds, arms interleaved), `full − masked` over the 18 paired
+  runs is `+0.00036 [-0.00009,+0.00080]` on held-out loss and
+  `+0.00032 [-0.00013,+0.00078]` on the train–val gap — not resolvable — but at the
+  **tuned lr (×2.0 at both `wd`)** `full` loses 2/3 seeds on both metrics. Full table
+  in `docs/adakaon.md`. Note ×2.0 is the **top of the swept lr grid**, so the optimum is
+  not bracketed from above; a wider sweep could move the tuned point. `"masked"` is
+  **bit-identical to pre-0.7.12 Adakaon** (verified over 24 configurations: 4
+  `momentum_dtype` × {fp32, bf16} params × {per-param, foreach, fused}) and the new
+  `WDFULL` constexpr adds **no** compiled Triton variant at the default (whole-surface
+  baseline 45 before and after; `"full"` adds 5). In the fused path `"full"` is ~9%
+  *faster* per step (the keep-count kernels stop reading the weights). Guarded by a
+  parity check against the **per-parameter** loop at ~10x each dtype's measured floor
+  **and** by a semantic probe that measures the decay each coordinate actually receives
+  — the parity check alone left a kernel ignoring `WDFULL` (i.e. `"full"` silently
+  degrading to `"masked"`) undetected; all 8 such single-kernel mutants are now killed.
 - **`Adakaon(deterministic_reductions=True)`** — the fused big-tensor path becomes
   bit-reproducible run to run. Its batched reductions accumulate `colsum`/`rms` with
   fp32 atomics, whose completion order the scheduler picks; measured spread over 4

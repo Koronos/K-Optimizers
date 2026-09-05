@@ -10,8 +10,10 @@ corrupt memory, refuse to compile, or silently disagree with the native step:
     Covered on all four routes: one-block, 1-D, 0-D and big-batched.
   * ``reduction_tile`` handing a non-power-of-2 ``BR`` to ``tl.arange`` -> ``CompilationError``
     for perfectly ordinary shapes ((96, 96), (9, 640), (12, 1024), (65, 65)).
-  * ``momentum_4bit_block != 128`` on a one-block shape: the tile kernel hardcodes 128-element
-    blocks, so it wrote past the (shorter) ``m_scale`` buffer.
+  * ``momentum_4bit_block != 128`` on a one-block shape: the tile kernel hardcoded 128-element
+    blocks, so it wrote past the (shorter) ``m_scale`` buffer. The block is a runtime kernel
+    scalar since 0.7.12 (and ``PointerArrayCache`` buckets by it), so the route is kept for
+    every block size — the memory-safety property, not the routing, is what is asserted.
   * Non-contiguous GRADS: the kernels index from ``data_ptr()`` with row-major arithmetic and
     ignored strides, so a transposed / strided grad silently stepped the wrong numbers.
   * fp16 params + ``bf16_method="stochastic_rounding"``: unsupported, and silently degraded
@@ -50,6 +52,22 @@ if HAS_TRITON:
         mask = offs < N
         val = tl.load(in_ptr + offs, mask=mask, other=0.0)
         tl.store(out_ptr + offs, sr_round(val, seed, offs), mask=mask)
+
+    @triton.jit
+    def _requant_4bit_exact_probe(m_ptr, packed_ptr, scale_ptr, R, C, Chalf, NB, NS, BLK,
+                                  BR: tl.constexpr, BC: tl.constexpr, FBLK: tl.constexpr):
+        """Drive ``requant_4bit``'s ``EXACT`` single-reduction path with an arbitrary ``FBLK``.
+
+        The path reshapes the tile to ``(BR*BC // FBLK, FBLK)``, so ``FBLK`` must DIVIDE
+        ``BR*BC``. Since 0.7.12 ``FBLK`` is the bucket's real ``momentum_4bit_block`` instead
+        of a hardcoded 128, and it is ``PointerArrayCache`` that keeps the invariant."""
+        ri = tl.arange(0, BR)[:, None]
+        ci = tl.arange(0, BC)[None, :]
+        mask = (ri < R) & (ci < C)
+        idx = ri * C + ci
+        m = tl.load(m_ptr + idx, mask=mask, other=0.0)
+        requant_4bit(m, mask, idx, R, C, Chalf, packed_ptr, scale_ptr, NB, NS, BLK,
+                     BR, BC, True, FBLK)
 
     @triton.jit
     def _requant_4bit_probe(m_ptr, packed_ptr, scale_ptr, R, C, Chalf, NB, NS, BLK,
@@ -232,35 +250,137 @@ def test_awkward_row_counts_compile_and_match_native(shapes, beta1):
 
 
 # ----------------------------------------------------------------- 3. momentum_4bit_block
-@pytest.mark.parametrize("block", [64, 0])
-def test_4bit_block_other_than_128_leaves_the_one_block_route(block):
-    """The one-block tile kernel hardcodes 128-element 4-bit blocks.
+# The tile kernel took its 4-bit absmax block from a hardcoded ``BLK = min(R*C, 128)``, so any
+# other ``momentum_4bit_block`` wrote ceil(numel/128) scales into an ``m_scale`` sized for the
+# REAL block count — past the end of the buffer (a (64,128) weight at block=0 wrote 63 floats
+# out of bounds). That was fixed by a ROUTING GUARD that sent those tensors to the native path.
+# Since 0.7.12 the block is a RUNTIME kernel scalar and ``PointerArrayCache`` buckets by it, so
+# every block size keeps the fused route; the memory-safety property is unchanged and is what
+# these tests assert (plus the ``NS`` canary below, which is the second line of defence).
+@pytest.mark.parametrize("block", [64, 256, 32, 0])
+def test_4bit_block_other_than_128_keeps_the_one_block_route(block):
+    """Every ``momentum_4bit_block`` now takes the one-block kernel and matches native.
 
-    ``momentum_4bit_block=0`` means "one block over the whole tensor", 64 means 128 blocks
-    for a (64, 128) weight — either way ``m_scale`` is not the 64 entries the kernel writes,
-    so before the routing guard the kernel scribbled past the end of that buffer.
+    ``momentum_4bit_block=0`` means "one block over the whole tensor", 64 means 128 blocks for
+    a (64, 128) weight. The stored layout (``m_block`` / ``m_scale`` length) must be exactly
+    what the codec would produce — the kernel adapts to it, never the other way round.
     """
     cfg = dict(_FP32_CFG, momentum_dtype="4bit", momentum_4bit_block=block)
     pv, pn, ov, on = _pair([(64, 128)] * 2, cfg, seed=23)   # (64,128) == TILE_CAP -> one-block
     _drive([(pv, ov), (pn, on)], 4, torch.Generator(device=DEV).manual_seed(29))
     ob, _big, _od, nat = _parts(ov)
-    assert not ob and len(nat) == 2, "a non-128 4-bit block must not take the one-block kernel"
+    assert len(ob) == 2 and not nat, "every 4-bit block size must take the one-block kernel"
     per = 64 * 128
     expect_block = per if block == 0 else block
     for p in pv:
         st = ov.state[p]
         assert st["m_block"] == expect_block
         assert st["m_scale"].numel() == (per + expect_block - 1) // expect_block
+    # Same strict bound the pre-0.7.12 (native-routed) version of this test used: the runtime
+    # block reproduces the codec exactly, so the measured gap is 2.4e-7 absolute for every
+    # block size here. A looser bound would hide a genuine block-indexing bug.
     d = _maxdiff(pv, pn)
     assert d < 1e-5, f"max|Δp|={d:.2e}"
 
 
 def test_4bit_block_128_still_takes_the_one_block_route():
-    """The guard must not cost the DEFAULT 4-bit configuration its fused route."""
+    """The DEFAULT 4-bit configuration keeps its fused route (and its numbers)."""
     pv, pn, ov, on = _pair([(64, 128)] * 2, dict(_FP32_CFG, momentum_dtype="4bit"), seed=23)
     _drive([(pv, ov), (pn, on)], 4, torch.Generator(device=DEV).manual_seed(29))
     ob, _big, _od, nat = _parts(ov)
     assert len(ob) == 2 and not nat
+    scale = max(p.detach().abs().max().item() for p in pn)
+    d = _maxdiff(pv, pn)
+    assert d / scale < 8e-4, f"rel={d / scale:.2e}"
+
+
+def test_4bit_blocks_of_different_sizes_get_their_own_launch():
+    """One launch carries ONE runtime block, so a group mixing layouts must bucket by it.
+
+    Two same-tile tensors whose ``m_block`` differs (here: a checkpoint-style layout planted
+    into one tensor's state) would otherwise share a launch and one of them would be
+    dequantized against the other's block size.
+
+    The native reference runs ``foreach=False`` on purpose: the codec's stacked path
+    (``_FourBitCodec.ema_stacked``) stacks ``m_scale`` across the bucket and cannot represent a
+    group whose members carry different block layouts at all. That is a pre-existing native
+    limitation, orthogonal to the routing property under test here.
+    """
+    cfg = dict(_FP32_CFG, momentum_dtype="4bit", momentum_4bit_block=64)
+    pv = _bag([(64, 128)] * 2, torch.float32, 41)
+    pn = _clone(pv)
+    ov, on = Adakaon(pv, fused=True, **cfg), Adakaon(pn, foreach=False, **cfg)
+    _drive([(pv, ov), (pn, on)], 1, torch.Generator(device=DEV).manual_seed(43))
+    # Re-init one tensor's momentum with a DIFFERENT block layout, as a resumed checkpoint would.
+    for opt, plist in ((ov, pv), (on, pn)):
+        st = opt.state[plist[0]]
+        st["m_block"] = 128
+        st["m_scale"] = torch.ones(64 * 128 // 128, dtype=torch.float32, device=DEV)
+        st["m"].fill_(0x88)
+    ov._invalidate_fused_caches()
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(47))
+    buckets = ov._fused_ob_caches[id(ov.param_groups[0])].buckets
+    assert len(buckets) == 2, f"mixed m_block must give 2 buckets, got {len(buckets)}"
+    assert sorted(b["blk"] for b in buckets) == [64, 128]
+    # 1.2e-7 measured; a tensor dequantized against the OTHER bucket's block would be off by
+    # the difference between two absmax scales, orders of magnitude above this.
+    d = _maxdiff(pv, pn)
+    assert d < 1e-6, f"max|Δp|={d:.2e}"
+
+
+def test_exact_requant_rejects_a_block_that_does_not_divide_the_tile():
+    """Why ``PointerArrayCache.exact4`` has to test divisibility: Triton refuses to compile.
+
+    ``requant_4bit``'s ``EXACT`` path reshapes the ``[BR, BC]`` tile to ``(BR*BC // FBLK, FBLK)``.
+    That is only a reshape when ``FBLK`` divides ``BR*BC``; otherwise it is a ``CompilationError``
+    at launch, i.e. a hard crash in the middle of a training run. Before 0.7.12 the invariant was
+    free (``FBLK`` was a hardcoded ``min(BR*BC, 128)`` against a power-of-two tile); now the block
+    comes from ``state["m_block"]`` and the host has to enforce it.
+    """
+    R = C = BR = BC = 16  # noqa: N806
+    m = torch.randn(R * C, device=DEV)
+    packed = torch.zeros(R * C // 2, dtype=torch.uint8, device=DEV)
+
+    def drive(fblk):
+        nb = (R * C + fblk - 1) // fblk
+        scale = torch.ones(max(nb, 1), dtype=torch.float32, device=DEV)
+        _requant_4bit_exact_probe[(1,)](m, packed, scale, R, C, C // 2, nb, scale.numel(),
+                                        fblk, BR=BR, BC=BC, FBLK=fblk)
+        torch.cuda.synchronize()
+
+    drive(64)                       # divides 256 -> compiles and runs
+    for fblk in (96, 48, 24):       # do NOT divide 256
+        with pytest.raises(triton.compiler.errors.CompilationError):
+            drive(fblk)
+
+
+def test_4bit_block_that_does_not_divide_the_tile_still_steps():
+    """The host guard in action, end to end.
+
+    A (64,128) weight at ``momentum_4bit_block=96`` has ``8192 % 96 != 0``, so ``exact4`` must
+    stay False and the general segmented-absmax loop must be used. Drop the divisibility term
+    from ``PointerArrayCache``'s ``exact4`` predicate and this raises ``CompilationError``.
+    """
+    cfg = dict(_FP32_CFG, momentum_dtype="4bit", momentum_4bit_block=96)
+    pv, pn, ov, on = _pair([(64, 128)] * 2, cfg, seed=61)
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(67))
+    ob, _big, _od, nat = _parts(ov)
+    assert len(ob) == 2 and not nat, "a non-dividing block still belongs on the one-block route"
+    bucket = ov._fused_ob_caches[id(ov.param_groups[0])].buckets[0]
+    assert bucket["blk"] == 96
+    assert not bucket["exact4"], "96 does not divide the 64x128 tile — EXACT must be off"
+    assert bucket["fblk"] == 0
+    d = _maxdiff(pv, pn)
+    assert d < 1e-5, f"max|Δp|={d:.2e}"
+
+
+def test_4bit_odd_column_count_still_leaves_the_one_block_route():
+    """The nibble packing assumes an even column count; odd C keeps going native."""
+    cfg = dict(_FP32_CFG, momentum_dtype="4bit", momentum_4bit_block=64)
+    pv, pn, ov, on = _pair([(8, 15)] * 2, cfg, seed=53)
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(59))
+    ob, _big, _od, nat = _parts(ov)
+    assert not ob and len(nat) == 2, "odd C must not take the one-block 4-bit kernel"
     scale = max(p.detach().abs().max().item() for p in pn)
     d = _maxdiff(pv, pn)
     assert d / scale < 8e-4, f"rel={d / scale:.2e}"

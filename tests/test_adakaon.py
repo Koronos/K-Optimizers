@@ -1061,3 +1061,136 @@ def test_two_optimizers_over_same_params_do_not_share_cache():
     assert set(map(id, a1._foreach_plans.values())).isdisjoint(map(id, a2._foreach_plans.values()))
     _assert_same(pa, pb, a1, b1)
     _assert_same(pa, pb, a2, b2)
+
+
+# --------------------------------------------------------------------- cautious_wd
+# Decoupled weight decay used to be folded into the delta BEFORE the cautious mask on every
+# path, so a masked-out coordinate got essentially NO decay and a survivor got it multiplied
+# by the survivor rescale 1/keep (measured, as a fraction of the REQUESTED lr*wd*p: 1.49x on
+# survivors / 0.005x on rejected at keep=0.64, and 1.985x / 0.0013x at keep=0.50 — the
+# aggregate shrinkage is preserved, its per-coordinate distribution is not).
+# ``cautious_wd="full"`` applies the same lr*wd to every coordinate and masks only the update,
+# which is the Cautious Optimizers paper's own placement.
+_WD_CFG = dict(lr=5e-3, betas=(0.9, 0.999), weight_decay=0.1, cautious=True)
+
+
+def _wd_bag(seed: int = 71):
+    g = torch.Generator().manual_seed(seed)
+    shapes = [(), (1,), (7,), (16, 32), (8, 4, 3, 3)]
+    return [torch.nn.Parameter(torch.randn(s, generator=g) * 0.05) for s in shapes]
+
+
+def test_cautious_wd_rejects_unknown_placement():
+    p = [torch.nn.Parameter(torch.randn(4, 4))]
+    with pytest.raises(ValueError, match="cautious_wd"):
+        Adakaon(p, lr=1e-3, cautious_wd="outside")
+
+
+def test_cautious_wd_defaults_to_masked():
+    p = [torch.nn.Parameter(torch.randn(4, 4))]
+    assert Adakaon(p, lr=1e-3).param_groups[0]["cautious_wd"] == "masked"
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_cautious_wd_full_decays_every_coordinate(foreach):
+    """The mode's whole point: under "full" the decay reaches the masked-out coordinates too.
+
+    One step from a known state, with the momentum forced to a value whose sign disagrees with
+    the gradient on exactly half the coordinates. Under "masked" those coordinates move by ~0;
+    under "full" they move by exactly ``lr * wd * p``.
+    """
+    lr, wd = 5e-3, 0.1
+    out = {}
+    for arm in ("masked", "full"):
+        p = torch.nn.Parameter(torch.full((2, 8), 0.5))
+        opt = Adakaon([p], lr=lr, betas=(0.9, 0.999), weight_decay=wd, cautious=True,
+                      cautious_wd=arm, momentum_dtype="float32", foreach=foreach,
+                      gradient_centralization=False)
+        # Grad alternates sign; a positive momentum then disagrees on every odd column.
+        g = torch.ones(2, 8)
+        g[:, 1::2] = -1.0
+        p.grad = g.clone()
+        opt.step()                                     # step 1 builds the state
+        before = p.detach().clone()
+        opt.state[p]["m"].fill_(1.0)                   # momentum positive everywhere
+        p.grad = g.clone()
+        opt.step()
+        out[arm] = (before - p.detach())               # the applied -lr*delta, sign flipped
+    rejected = slice(1, None, 2)                       # grad<0, momentum>0 -> masked out
+    assert out["masked"][:, rejected].abs().max() < 1e-6, "masked: rejected coords should not move"
+    expected = lr * wd * 0.5
+    torch.testing.assert_close(out["full"][:, rejected],
+                               torch.full((2, 4), expected), rtol=2e-3, atol=1e-9)
+
+
+@pytest.mark.parametrize("md", ["bfloat16", "float32", "int8", "4bit"])
+def test_cautious_wd_per_param_matches_foreach(md):
+    """Both placements must be element-for-element identical across the two native paths."""
+    for arm in ("masked", "full"):
+        cfg = dict(_WD_CFG, momentum_dtype=md, cautious_wd=arm)
+        pa, pb = _wd_bag(), _wd_bag()
+        oa, ob = Adakaon(pa, **cfg, foreach=True), Adakaon(pb, **cfg, foreach=False)
+        _drive([(pa, oa), (pb, ob)], 6, torch.Generator().manual_seed(73))
+        _assert_same(pa, pb, oa, ob)
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_cautious_wd_is_a_no_op_without_cautious_masking(foreach):
+    """With ``cautious=False`` the mask is the identity, so the two orders are the same add."""
+    cfg = dict(_WD_CFG, cautious=False, momentum_dtype="float32", foreach=foreach)
+    pa, pb = _wd_bag(), _wd_bag()
+    oa = Adakaon(pa, **cfg, cautious_wd="masked")
+    ob = Adakaon(pb, **cfg, cautious_wd="full")
+    _drive([(pa, oa), (pb, ob)], 6, torch.Generator().manual_seed(79))
+    _assert_same(pa, pb, oa, ob)
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_cautious_wd_is_a_no_op_without_weight_decay(foreach):
+    cfg = dict(_WD_CFG, weight_decay=0.0, momentum_dtype="float32", foreach=foreach)
+    pa, pb = _wd_bag(), _wd_bag()
+    oa = Adakaon(pa, **cfg, cautious_wd="masked")
+    ob = Adakaon(pb, **cfg, cautious_wd="full")
+    _drive([(pa, oa), (pb, ob)], 6, torch.Generator().manual_seed(83))
+    _assert_same(pa, pb, oa, ob)
+
+
+def test_cautious_wd_survives_a_checkpoint_without_the_key():
+    """A checkpoint written before the key existed must not KeyError on the next step."""
+    pa = _wd_bag()
+    oa = Adakaon(pa, **_WD_CFG)
+    _drive([(pa, oa)], 2, torch.Generator().manual_seed(89))
+    sd = copy.deepcopy(oa.state_dict())
+    for g in sd["param_groups"]:
+        g.pop("cautious_wd")
+    pb = _wd_bag()
+    ob = Adakaon(pb, **_WD_CFG)
+    ob.load_state_dict(sd)
+    assert ob.param_groups[0]["cautious_wd"] == "masked"
+    _drive([(pb, ob)], 1, torch.Generator().manual_seed(97))
+
+
+# --------------------------------------------------------------------- 4bit + high beta1
+# ``kaon._momentum_codec.warn_if_4bit_high_beta1`` (see tests/test_4bit_high_beta1_warning.py
+# for the rest of the family; Adakaon lives here because that file was written while this one
+# was locked by a concurrent audit batch).
+def _warns_amplification(betas, momentum_dtype):
+    import warnings
+    p = [torch.nn.Parameter(torch.randn(4, 4))]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        Adakaon(p, momentum_dtype=momentum_dtype, betas=betas)
+    return any("amplif" in str(w.message).lower() or "1/sqrt" in str(w.message)
+               for w in caught if issubclass(w.category, UserWarning))
+
+
+def test_adakaon_warns_on_4bit_high_beta1():
+    assert _warns_amplification((0.995, 0.999), "4bit")
+
+
+def test_adakaon_no_warning_on_int8_high_beta1():
+    assert not _warns_amplification((0.995, 0.999), "int8")
+
+
+def test_adakaon_no_warning_on_4bit_low_beta1():
+    assert not _warns_amplification((0.9, 0.999), "4bit")

@@ -175,8 +175,9 @@ is a fidelity trap for any codec consumer.
 **Wired into every optimizer whose quantized buffer is an actual β1-decayed EMA**
 (0.7.11 audit, mechanical batch): Lion, AdaBelief, AdamP, ADOPT, AdaPNM (checked
 against `betas[0]`, not the unrelated `beta0` negative-momentum mix), KProdigy,
-AdaMuon. Adakaon is pending — its file is under a concurrent audit batch; it gets
-the same one-line call when that batch lands.
+AdaMuon and **Adakaon** (0.7.12 — its file was locked by a concurrent audit batch
+when the rest were wired; its test lives in `tests/test_adakaon.py` rather than in
+`tests/test_4bit_high_beta1_warning.py` for the same reason).
 
 **Not wired into Schedule-Free**, despite it accepting `momentum_dtype="4bit"`:
 its quantized `z` buffer is a plain accumulator (`z -= lr_t * d`), not decayed by
