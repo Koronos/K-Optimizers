@@ -738,3 +738,43 @@ def test_compile_recompiles_stay_bounded():
     # of ``lr`` still passes, which is exactly the regression this test exists for.
     assert graphs <= 2, f"{graphs} compiled graphs — a per-step guard is back"
     assert all(torch.isfinite(p).all() for p in ps + extra)
+
+# --------------------------------------------------------------- foreach view plan
+def _plan_run_adamuon(cache: bool) -> list[torch.Tensor]:
+    """Five steps over a 0-D / 1-D / 2-D / conv bag, with a ``p.data`` rebind at step 3."""
+    torch.manual_seed(0x5EED)
+    shapes = [(), (), (1,), (5,), (5,), (4, 3), (4, 3), (2, 2, 3, 3), (2, 2, 3, 3)]
+    g = torch.Generator().manual_seed(7)
+    params = [torch.nn.Parameter(torch.randn(s, generator=g)) for s in shapes]
+    opt = AdaMuon(params, lr=1e-2, weight_decay=0.01, momentum_dtype="int8", bias_correction=True)
+    opt._foreach_cache_enabled = cache
+    for step in range(1, 6):
+        gg = torch.Generator().manual_seed(100 + step)
+        for p in params:
+            p.grad = torch.randn(p.shape, generator=gg) * 0.05
+        if step == 3:                       # fresh storage: only the witness catches it
+            params[5].data = params[5].data.clone()
+        opt.step()
+    # The cached arm must actually have cached something: without this the whole test
+    # passes on a tree where ``_foreach_cache_enabled`` is an inert attribute.
+    assert not cache or opt._foreach_plans, "the cached arm cached no plan"
+    out = []
+    for p in params:
+        out.append(p.detach().clone())
+        out += [v.clone() for _, v in sorted(opt.state[p].items())
+                if isinstance(v, torch.Tensor)]
+    return out
+
+
+def test_foreach_plan_cache_is_numerically_invisible():
+    """The cached bucketing/view plan (``kaon._foreach_plan``) is a host-side
+    optimization only: bit-identical weights and state with it on and off, including
+    across a mid-run ``p.data`` rebind that only the plan's witness can see.
+
+    Cross-optimizer coverage of the plan's six invalidation paths lives in
+    ``tests/test_foreach_plan.py``; this is AdaMuon's own tripwire.
+    """
+    on = _plan_run_adamuon(cache=True)
+    off = _plan_run_adamuon(cache=False)
+    for i, (a, b) in enumerate(zip(on, off, strict=True)):
+        assert torch.equal(a, b), f"tensor {i} differs"

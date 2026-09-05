@@ -122,12 +122,12 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
-    flat_view,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _quant_4bit,
@@ -147,7 +147,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class ScheduleFree(TrainEvalWeights, Optimizer):
+class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
     """Schedule-Free AdamW (Defazio et al. 2024) on kaon's memory backend.
 
     The model's parameter buffer holds ``y`` (the interpolation point) in **train**
@@ -495,9 +495,13 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
                     for p in slow:
                         self._step_one_param(p, group, c)
                 else:
+                    self._drop_foreach_plan(group)
                     for p in params:
                         self._step_one_param(p, group, c)
             else:
+                # Per-parameter fallback for the whole group: drop any cached plan for it,
+                # so a cached plan only ever describes a group the foreach path stepped.
+                self._drop_foreach_plan(group)
                 for p in params:
                     self._step_one_param(p, group, c)
             group["step"] += 1
@@ -517,6 +521,9 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)
+        # The loader REPLACES state["v"] / state["z"] (and every param_groups dict), so a
+        # cached foreach plan would keep stepping detached buffers under a dead group id.
+        self._clear_foreach_plans()
 
     # ----------------------------------------------------------------- coefficients
     @staticmethod
@@ -588,6 +595,15 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         return grad.mul(inv_denom)
 
     # ============================================================== foreach eligibility
+    # Bucketing, chunking and the cached view plan live in kaon._foreach_plan. ``row`` /
+    # ``col`` (factored) and ``v`` (non-factored) are the state buffers the bucket bodies
+    # stack and write back through. No extra bucket key: ``_coeffs`` is computed ONCE per
+    # group per step in ``_step_impl`` (it advances ``lr_max`` / ``weight_sum``) and
+    # threaded through every bucket, so nothing here depends on a per-parameter clock. ``z``
+    # and ``exp_avg`` go through the codec-buffer helpers, which take ``states`` rather than
+    # a ``mat`` callback, so there is no codec view cache to prebuild.
+    _FOREACH_SPEC = ForeachSpec(factored_state=("row", "col"), flat_state=("v",))
+
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
         return group["bf16_method"] != "kahan"  # kahan needs per-param shift buffers
@@ -615,48 +631,23 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         self, params: list[Tensor], group: dict[str, Any], c: dict[str, float], budget: int
     ) -> None:
         md = group["momentum_dtype"]
-
-        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        for p in params:
-            state = self.state[p]
-            if not state:
-                self._init_state(p, state, group)
-            g = p.grad
-            if g.ndim >= 2:
-                matrixize = g.ndim > 2
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
-            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype), []).append(p)
-
-        for (eff, _dtype, matrixize), plist in factored_buckets.items():
-            stepn = max(1, budget // max(eff[0] * eff[1], 1))
-            for i in range(0, len(plist), stepn):
-                self._factored_bucket(plist[i:i + stepn], eff, matrixize, md, c, group)
-        for (length, _dtype), plist in flat_buckets.items():
-            stepn = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), stepn):
-                self._nonfactored_bucket(plist[i:i + stepn], length, md, c, group)
+        for chunk in self._foreach_chunks(params, group, budget):
+            bucket = self._factored_bucket if chunk.eff is not None else self._nonfactored_bucket
+            bucket(chunk, md, c, group)
 
     @torch.no_grad()
     def _factored_bucket(
-        self, plist: list[Tensor], eff: tuple[int, int], matrixize: bool,
-        md: str, c: dict[str, float], group: dict[str, Any],
+        self, chunk: ForeachChunk, md: str, c: dict[str, float], group: dict[str, Any],
     ) -> None:
-        R, C = eff  # noqa: N806
+        R, C = chunk.eff  # noqa: N806
         eps1 = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
 
-        def mat(t: Tensor) -> Tensor:
-            return t.view(R, C) if matrixize else t
+        states = chunk.states
+        rows, cols = chunk.state_views
 
-        states = [self.state[p] for p in plist]
-        rows = [s["row"] for s in states]
-        cols = [s["col"] for s in states]
-
-        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
+        grad = chunk.grad_stack()                                         # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -677,13 +668,13 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         d = self._normalized_d_stacked(states, md, grad, inv_denom, (R, C), c)     # [N, R, C]
 
         if wd != 0:
-            d.add_(torch.stack([mat(p.data) for p in plist]).float(), alpha=wd)    # at y
+            d.add_(chunk.param_stack(), alpha=wd)                                  # at y
 
         if cautious:
             d = cautious_batched_(d, grad)
 
         z = self._dequant_full_stacked(states, "z", md, (R, C))                    # [N, R, C]
-        ys = [mat(p.data) for p in plist]
+        ys = chunk.pviews
 
         # y <- (1-ckp1)*y + ckp1*z, then y += d * y_d_coef ; z -= lr_t*d
         self._lerp_then_add_batched(ys, z, d, c["ckp1"], c["y_d_coef"], bf16_method)
@@ -692,24 +683,25 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
 
     @torch.no_grad()
     def _nonfactored_bucket(
-        self, plist: list[Tensor], length: int, md: str,
-        c: dict[str, float], group: dict[str, Any],
+        self, chunk: ForeachChunk, md: str, c: dict[str, float], group: dict[str, Any],
     ) -> None:
         """Non-factored (full per-coordinate ``v``) update for ``ndim <= 1`` params.
 
         0-D scalars share the ``L == 1`` bucket with shape-``(1,)`` params as length-1
         **views** (:func:`~kaon._backend.flat_view`) of the same storage, so ``v``, the
         ``z`` / ``exp_avg`` codec write-backs and the y write all reach the original
-        0-D tensors and the persisted state keeps its per-param shape.
+        0-D tensors. Those views are the cached plan's (``chunk.state_views`` /
+        ``chunk.pviews``), not rebuilt per param per step.
         """
         eps1 = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
 
-        states = [self.state[p] for p in plist]
-        vs = [flat_view(s["v"]) for s in states]
+        length = chunk.length
+        states = chunk.states
+        (vs,) = chunk.state_views
 
-        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
+        grad = chunk.grad_stack()                                         # [N, L]
         v = torch.stack(vs)
 
         v.mul_(c["beta2"]).addcmul_(grad, grad, value=1.0 - c["beta2"])
@@ -721,13 +713,13 @@ class ScheduleFree(TrainEvalWeights, Optimizer):
         d = self._normalized_d_stacked(states, md, grad, inv_denom, (length,), c)  # [N, L]
 
         if wd != 0:
-            d.add_(torch.stack([flat_view(p.data) for p in plist]).float(), alpha=wd)
+            d.add_(chunk.param_stack(), alpha=wd)
 
         if cautious:
             d = cautious_batched_(d, grad)
 
         z = self._dequant_full_stacked(states, "z", md, (length,))
-        ys = [flat_view(p.data) for p in plist]
+        ys = chunk.pviews
         self._lerp_then_add_batched(ys, z, d, c["ckp1"], c["y_d_coef"], bf16_method)
         z.sub_(d, alpha=c["lr_t"])
         self._store_z_stacked(states, md, z)

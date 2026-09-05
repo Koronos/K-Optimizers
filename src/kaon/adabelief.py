@@ -97,13 +97,13 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
-    flat_view,
     foreach_budget,
     is_low_precision,
     subtract_batched_,
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -123,7 +123,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class AdaBelief(AutoLRMixin, Optimizer):
+class AdaBelief(AutoLRMixin, ForeachPlanMixin, Optimizer):
     """AdaBelief (belief-in-observed-gradients) on Adakaon's memory backend.
 
     Args:
@@ -373,9 +373,13 @@ class AdaBelief(AutoLRMixin, Optimizer):
                     for p in slow:
                         self._step_one_param(p, group)
                 else:
+                    self._drop_foreach_plan(group)
                     for p in params:
                         self._step_one_param(p, group)
             else:
+                # Per-parameter fallback for the whole group: drop any cached plan for it,
+                # so a cached plan only ever describes a group the foreach path stepped.
+                self._drop_foreach_plan(group)
                 for p in params:
                     self._step_one_param(p, group)
         return loss
@@ -403,6 +407,15 @@ class AdaBelief(AutoLRMixin, Optimizer):
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)
+        # The loader REPLACES state["s"] / state["m"] (and every param_groups dict), so a
+        # cached foreach plan would keep stepping detached buffers under a dead group id.
+        self._clear_foreach_plans()
+
+    def _autolr_reset_base_state(self) -> None:
+        """Reset the base optimizer after an AutoLR rollback: the cleared state is
+        reallocated by the next step, so the cached view plan must go with it."""
+        super()._autolr_reset_base_state()
+        self._clear_foreach_plans()
 
     # ----------------------------------------------------------- coefficients
     @staticmethod
@@ -434,6 +447,18 @@ class AdaBelief(AutoLRMixin, Optimizer):
             state["step"] += 1
 
     # ----------------------------------------------------------------- foreach
+    # Bucketing, chunking and the cached view plan live in kaon._foreach_plan. ``row`` /
+    # ``col`` (factored) and ``s`` (non-factored) are the state buffers the bucket bodies
+    # stack and write back through; the per-parameter step joins the bucket key so every
+    # slice of a bucket shares one bias correction (and one ``_coeffs`` dict). The momentum
+    # goes through ``_dequant_stacked`` / ``_store_stacked``, which take ``states`` rather
+    # than a ``mat`` callback, so there is no codec view cache to prebuild here.
+    _FOREACH_SPEC = ForeachSpec(
+        factored_state=("row", "col"),
+        flat_state=("s",),
+        extra_key=lambda state, group: max(state["step"], 1),
+    )
+
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
         return group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
@@ -461,73 +486,49 @@ class AdaBelief(AutoLRMixin, Optimizer):
         """Batched step. Factored (ndim>=2) and non-factored (ndim<=1) buckets, by shape.
 
         0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
-        with real shape-(1,) params."""
+        with real shape-(1,) params. The ``max(step, 1)`` clamp in the bucket key only
+        covers a state allocated by the plan builder itself (step 0), whose bias
+        correction would otherwise be ``1 - beta**0 == 0``; ``_step_impl`` advances every
+        param's step before this runs."""
         md = group["momentum_dtype"]
-
-        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        for p in params:
-            state = self.state[p]
-            if not state:
-                self._init_state(p, state, group)
-            # _step_impl advances every param's step before this runs, so the
-            # clamp only covers a state allocated on the line above (step 0),
-            # whose bias correction would otherwise be 1 - beta**0 == 0.
-            pstep = max(state["step"], 1)
-            g = p.grad
-            if g.ndim >= 2:
-                matrixize = g.ndim > 2
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize, pstep), []).append(p)
-            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                flat_buckets.setdefault((g.numel(), p.dtype, pstep), []).append(p)
-
-        for (eff, _dtype, matrixize, pstep), plist in factored_buckets.items():
-            c = self._coeffs(group, pstep)
-            stepn = max(1, budget // max(eff[0] * eff[1], 1))
-            for i in range(0, len(plist), stepn):
-                self._factored_bucket(plist[i:i + stepn], eff, matrixize, md, c, group)
-        for (length, _dtype, pstep), plist in flat_buckets.items():
-            c = self._coeffs(group, pstep)
-            stepn = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), stepn):
-                self._nonfactored_bucket(plist[i:i + stepn], length, md, c, group)
+        coeffs: dict[int, dict[str, float]] = {}
+        for chunk in self._foreach_chunks(params, group, budget):
+            c = coeffs.get(chunk.key)
+            if c is None:
+                c = coeffs[chunk.key] = self._coeffs(group, chunk.key)
+            bucket = self._factored_bucket if chunk.eff is not None else self._nonfactored_bucket
+            bucket(chunk, md, c, group)
 
     @torch.no_grad()
     def _factored_bucket(
         self,
-        plist: list[Tensor],
-        eff: tuple[int, int],
-        matrixize: bool,
+        chunk: ForeachChunk,
         md: str,
         c: dict[str, float],
         group: dict[str, Any],
     ) -> None:
-        R, C = eff  # noqa: N806
+        R, C = chunk.eff  # noqa: N806
         eps1 = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
 
-        def mat(t: Tensor) -> Tensor:
-            return t.view(R, C) if matrixize else t
+        states = chunk.states
+        rows, cols = chunk.state_views
+        pviews = chunk.pviews
 
-        states = [self.state[p] for p in plist]
-        rows = [s["row"] for s in states]
-        cols = [s["col"] for s in states]
-
-        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
+        grad = chunk.grad_stack()                                         # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
         # Decoupled weight decay BEFORE moment updates (kozistr order): p *= (1 - lr*wd).
         if wd != 0:
-            self._apply_decoupled_wd_batched(plist, mat, group["lr"] * wd)
+            self._apply_decoupled_wd_batched(pviews, group["lr"] * wd)
 
         # First-moment EMA (read both, mutate, store). m must update BEFORE the
         # residual second moment so the residual (g - m) uses the *new* m.
         m = self._dequant_stacked(states, md, (R, C))                     # [N, R, C]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
-        self._store_stacked(states, md, m.reshape((len(plist), R, C)))
+        self._store_stacked(states, md, m.reshape((chunk.n, R, C)))
 
         # Factored "belief" second moment of the residual (g - m). HF eps1 placement:
         # update_factored_state squares its input and adds eps1 to the square.
@@ -550,13 +551,12 @@ class AdaBelief(AutoLRMixin, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method)
 
     @torch.no_grad()
     def _nonfactored_bucket(
         self,
-        plist: list[Tensor],
-        length: int,
+        chunk: ForeachChunk,
         md: str,
         c: dict[str, float],
         group: dict[str, Any],
@@ -566,27 +566,30 @@ class AdaBelief(AutoLRMixin, Optimizer):
         0-D scalars share the ``L == 1`` bucket with shape-``(1,)`` params as length-1
         **views** (:func:`~kaon._backend.flat_view`) of the same storage, so the state
         write-backs and the weight subtract reach the original 0-D tensors and the
-        persisted state keeps its per-param shape. The cautious mask's per-slice mean
-        over one element is the scalar mask itself, so the math is element-for-element
-        :meth:`_step_one_param`'s.
+        persisted state keeps its per-param shape. Those views are the cached plan's
+        (``chunk.state_views`` / ``chunk.pviews``), not rebuilt per param per step. The
+        cautious mask's per-slice mean over one element is the scalar mask itself, so the
+        math is element-for-element :meth:`_step_one_param`'s.
         """
         eps = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
 
-        states = [self.state[p] for p in plist]
-        ss = [flat_view(s["s"]) for s in states]
+        length = chunk.length
+        states = chunk.states
+        (ss,) = chunk.state_views
+        pviews = chunk.pviews
 
-        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
+        grad = chunk.grad_stack()                                         # [N, L]
         s = torch.stack(ss)                                               # [N, L]
 
         if wd != 0:
-            self._apply_decoupled_wd_batched(plist, flat_view, group["lr"] * wd)
+            self._apply_decoupled_wd_batched(pviews, group["lr"] * wd)
 
         # First-moment EMA before the residual second moment.
         m = self._dequant_stacked(states, md, (length,))                  # [N, L]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
-        self._store_stacked(states, md, m.reshape((len(plist), length)))
+        self._store_stacked(states, md, m.reshape((chunk.n, length)))
 
         # Full per-coordinate "belief" second moment of (g - m), kozistr 1-D:
         # s = beta2*s + (1-beta2)*(g-m)^2 + eps; de_nom = (sqrt(s) + eps) / bc2_sq.
@@ -600,13 +603,13 @@ class AdaBelief(AutoLRMixin, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method)
 
+    @staticmethod
     @torch.no_grad()
-    def _apply_decoupled_wd_batched(self, plist: list[Tensor], mat: Any, factor: float) -> None:
-        """In-place decoupled WD ``p *= (1 - factor)`` on the (matrixized) weights."""
-        scale = 1.0 - factor
-        torch._foreach_mul_([mat(p.data) for p in plist], scale)
+    def _apply_decoupled_wd_batched(pviews: list[Tensor], factor: float) -> None:
+        """In-place decoupled WD ``p *= (1 - factor)`` on the cached (matrixized) views."""
+        torch._foreach_mul_(pviews, 1.0 - factor)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
