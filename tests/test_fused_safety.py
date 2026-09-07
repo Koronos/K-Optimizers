@@ -643,7 +643,8 @@ def test_shape_changing_rebind_is_caught_on_the_native_path():
 
     Such a rebind keeps the id, the ``data_ptr`` AND contiguity, so no witness field short of
     collecting ``torch.Size`` per param every step sees it — and that field was measured at 123 µs
-    of a 254 µs witness on a 1633 µs step (see ``_param_witness``), which is not a price worth
+    of a 254 µs witness on a 1633 µs step (see ``kaon._foreach_plan.param_witness`` and
+    ``Adakaon._fused_partition``), which is not a price worth
     paying for an unsupported operation. Watching it would not even fix the case: the factored
     ``row``/``col`` state is bound to the OLD effective 2-D shape and cannot be migrated, so
     rebuilding the plan just points the new R/C at the old buffers and writes past them.
