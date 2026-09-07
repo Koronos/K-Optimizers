@@ -236,7 +236,8 @@ reused as before.
 no-op) — the A/B arm these were measured against. RTX 3000 Ada Laptop, bf16 params,
 `momentum_dtype="bfloat16"`, 3 interleaved rounds × 40 reps per arm, `min` per-step wall
 time, `aten::view`+`aten::reshape` counted with `torch.profiler`. Ranges span the five
-optimizers (AdaMuon / AdaBelief / AdamP / ADOPT / ScheduleFree):
+optimizers that adopted the shared module at extraction time (AdaMuon / AdaBelief /
+AdamP / ADOPT / ScheduleFree):
 
 | bag | Δ view/reshape per step | Δ CPU self | Δ ms/step (min) | Δ ms/step (median) |
 |---|---|---|---|---|
@@ -249,3 +250,31 @@ already in its effective layout, so its `mat` is the identity and there was neve
 to cache; a bag dominated by such weights is GPU-bound and the plan only trims host
 work. 0-D scalars and matrixized convs are the opposite extreme — every list entry is a
 real view, and they are exactly the launch-bound bags `foreach` exists for.
+
+### Adakaon's migration onto the shared module
+
+Adakaon reached this design first and carried its own copy of it (`_ForeachPlan`,
+`_ForeachChunk`, `_param_witness`) until the copy was retired. The numbers above are
+therefore the shared implementation's, measured on the other five. Folding Adakaon's copy
+into `kaon._foreach_plan` had to be **neutral**, which is the only acceptable outcome for
+a plumbing move, and neutrality was measured three ways — hardest evidence first:
+
+1. **Contention-immune counters.** The CUDA launch count and the
+   `aten::view`/`reshape`/`select`/`as_strided`/`unbind`/`flatten` count for one step are
+   *identical* between the two implementations, on every bag and in both kernel modes:
+   428 LoRA adapters 194 / 4328, 448 0-D scalars 77 / 3150, 300 matrixized convs + 128
+   scalars 167 / 3935, 200×(256,256)+100×(512,)+128×0-D 296 / 3570, 24×(320,320,3,3)
+   259 / 311, 128×(512,512)+64×(1024,) 486 / 1790. Same kernels, same dispatch, same
+   order.
+2. **The host-side call itself.** One cached-plan retrieval on CPU
+   (`_foreach_chunks` vs the old `_foreach_plan`), paired and order-alternating,
+   n=1500 pairs: **+0.15 … +0.8 %** of a 57–96 µs call, i.e. **≤ 0.6 µs per step** on a
+   4.5–35 ms step. The same harness run against the reference tree *twice* (a null A/B)
+   produced −0.5 … +0.4 %, so that is its own bias floor.
+3. **Paired GPU wall clock**, both trees loaded into one process over *shared* parameter
+   bags (so allocation order cannot favour an arm), 5 interleaved repeats × 100 pairs per
+   bag per mode: every bag/mode inside ±1.8 %, none significant except a 1.0 % *win* on
+   the 128×(512,512) bag's foreach path. This one comes with a caveat that is the point of
+   running a control: the same harness, with the reference tree as *both* arms, reported a
+   "significant" +3.1 % on one bag. On a shared laptop GPU this design resolves ~3 %, not
+   2 %, so the counters above — not the clock — are what actually rules out a regression.

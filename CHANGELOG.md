@@ -2,6 +2,57 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Adakaon's foreach bucketing/view plan is now the shared one** (`kaon._foreach_plan`).
+  `ForeachPlanMixin` plus a five-line `ForeachSpec` (`factored_state=("row", "col")`,
+  `flat_state=("v",)`, `momentum_cache=beta1 > 0 and momentum_dtype != "4bit"`) replace
+  `kaon.adakaon._ForeachPlan` / `_ForeachChunk` / `_identity` / `_foreach_buckets` /
+  `_foreach_plan` / `_param_witness` — **−175 lines** of duplicated machinery. Adakaon is
+  the optimizer this design was extracted *from* and the last one still carrying its own
+  copy; all six batched optimizers now share one implementation, one staleness witness and
+  one test file. **Bit-identical to 0.7.12**: 650 configurations × 3 device/kernel modes
+  (1950 runs, 7 steps each, every weight and every state buffer hashed) — fp32/bf16 params
+  × momentum `float32`/`bfloat16`/`int8`/`4bit` × plain / `cautious_wd="full"` /
+  `betas[0]=0` / `cautious=False` × nine interference scenarios (intermittent
+  `p.grad=None`, param-set growth, `p.data` rebind to fresh storage, in-place transpose of
+  a square weight, `load_state_dict`, `add_param_group`, a whole-group per-parameter
+  fallback step, a stack-budget re-chunk) on CPU, CUDA-native and CUDA-fused. All 1950
+  hashes match.
+- `Adakaon._fused_partition` keys on `kaon._foreach_plan.param_witness` instead of its own
+  duplicate. The witness now has **two** copies instead of three (the shared one, which
+  guards the native path in a build without Triton, and the one inside `_fused_triton`);
+  the shape-rebind limit and the witness cost measurements moved onto `_fused_partition`,
+  where the fused-specific consequence (pointer arrays carrying the new R/C against the
+  old `row`/`col` buffers) actually lives.
+- `Adakaon.add_param_group` now drops the cached foreach plans, which is the mixin's
+  behaviour and the safer one: `id(group)` is the cache key and CPython reuses the ids of
+  dead objects, so a group added after one was dropped could previously land on a stale
+  plan. Numerically a no-op (covered by the `add_param_group` bit-identity scenario above).
+
+### Performance
+- No measurable change on any path, which is the intended result: the migration moves
+  host-side bookkeeping between modules and changes no kernel and no dispatch. Verified
+  contention-immune first — the CUDA launch count and the
+  `aten::view`/`reshape`/`select`/`as_strided`/`unbind`/`flatten` count for one step are
+  **identical** between 0.7.12 and this branch on every bag and both kernel modes (e.g.
+  428 LoRA-shaped adapters 194 launches / 4328 view-ops, 448 0-D scalars 77 / 3150,
+  300 matrixized convs + 128 scalars 167 / 3935, 128×(512,512)+64×(1024,) 486 / 1790).
+- The host-side call the two implementations actually disagree about — one cached-plan
+  retrieval — costs **+0.15 … +0.8%** of a 57–96 µs call (paired, order-alternating,
+  n=1500 pairs on CPU), i.e. **≤ 0.6 µs per step** on a 4.5–35 ms step. The same harness
+  run against the reference tree twice (a null A/B) reports −0.5 … +0.4%, its own bias
+  floor.
+- Paired GPU wall clock (both trees in one process over *shared* parameter bags, 5
+  interleaved repeats × 100 pairs per bag per mode, RTX 3000 Ada Laptop, bf16 params /
+  bf16 momentum): every bag and both kernel modes inside ±1.8%, none significant except a
+  1.0% *win* on 128×(512,512)+64×(1024,) foreach. Caveat, and the reason the control
+  matters: the same harness with the reference tree as BOTH arms reported a "significant"
+  +3.1% on one bag, so on a shared laptop GPU this design resolves ~3% and not 2% — the
+  identical counters above, not the clock, are what rules out a regression.
+  See `docs/foreach-batching.md` ("Adakaon's migration onto the shared module").
+
 ## [0.7.12]
 
 This release is a full correctness and performance audit of the 0.7.11 fused/Triton

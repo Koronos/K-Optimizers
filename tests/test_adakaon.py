@@ -1200,19 +1200,18 @@ def test_adakaon_no_warning_on_4bit_low_beta1():
 # Every cached fused/foreach plan revalidates itself with a per-parameter
 # ``(id, data_ptr, is_contiguous)`` witness, once or twice per step. On a 428-parameter bag
 # that is ~47 µs of pure Python call overhead — 4-11% of the step — and the ONLY thing
-# keeping it there is that all three copies of the witness scan with ``map`` (the loop runs
-# in C) rather than with generator expressions, which measured 75 µs for the same work.
-# The three copies are deliberate duplicates (see their docstrings); this locks all of them.
+# keeping it there is that both copies of the witness scan with ``map`` (the loop runs in C)
+# rather than with generator expressions, which measured 75 µs for the same work. The two
+# copies are deliberate duplicates (see their docstrings: one guards the native path in a
+# build without Triton, the other lives inside the Triton module); this locks both.
 
 def _witness_impls():
     from kaon._foreach_plan import param_witness as foreach_plan_witness
-    from kaon.adakaon import _param_witness as adakaon_witness
 
-    impls = [("kaon.adakaon._param_witness", adakaon_witness),
-             ("kaon._foreach_plan.param_witness", foreach_plan_witness)]
+    impls = [("kaon._foreach_plan.param_witness", foreach_plan_witness)]
     try:
         from kaon._fused_triton import param_witness as triton_witness
-    except Exception:  # noqa: BLE001 — Triton is optional; the other two still apply
+    except Exception:  # noqa: BLE001 — Triton is optional; the shared one still applies
         pass
     else:
         impls.append(("kaon._fused_triton.param_witness", triton_witness))

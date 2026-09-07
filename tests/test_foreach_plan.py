@@ -29,6 +29,7 @@ import torch
 from kaon import (
     ADOPT,
     AdaBelief,
+    Adakaon,
     AdamP,
     AdaMuon,
     ScheduleFree,
@@ -37,6 +38,7 @@ from kaon import (
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, param_witness
 
 OPTIMIZERS = {
+    "Adakaon": (Adakaon, {}),
     "AdaMuon": (AdaMuon, {"bias_correction": True}),
     "AdaBelief": (AdaBelief, {}),
     "AdamP": (AdamP, {}),
@@ -44,7 +46,9 @@ OPTIMIZERS = {
     "ScheduleFree": (ScheduleFree, {}),
 }
 NAMES = list(OPTIMIZERS)
-AUTOLR = ["AdaMuon", "AdaBelief", "AdamP", "ADOPT"]  # ScheduleFree has no AutoLR mixin
+AUTOLR = ["Adakaon", "AdaMuon", "AdaBelief", "AdamP", "ADOPT"]  # ScheduleFree: no AutoLR mixin
+NO_EXTRA_KEY = ["Adakaon", "ScheduleFree"]        # coefficients are per group, not per param
+EXTRA_KEY = [n for n in NAMES if n not in NO_EXTRA_KEY]
 
 
 def make_bag(dtype=torch.float32, *, seed=0):
@@ -410,7 +414,7 @@ def test_chunks_hold_no_grad_attribute(name):
 
 
 # ------------------------------------------------------- the extra key's partition
-@pytest.mark.parametrize("name", ["AdaMuon", "AdaBelief", "AdamP", "ADOPT"])
+@pytest.mark.parametrize("name", EXTRA_KEY)
 def test_extra_key_partition_change_rebuilds_the_plan(name):
     """Params that fall out of lockstep must land in separate buckets.
 
@@ -442,10 +446,12 @@ def test_extra_key_partition_change_rebuilds_the_plan(name):
     assert len({c.key for c in split.chunks}) == 2
 
 
-def test_schedulefree_has_no_extra_key():
-    """ScheduleFree's coefficients are computed once per group per step, so its
-    bucketing must not depend on any per-parameter clock."""
-    assert ScheduleFree._FOREACH_SPEC.extra_key is None
+@pytest.mark.parametrize("name", NO_EXTRA_KEY)
+def test_no_extra_key_optimizers_bucket_without_a_clock(name):
+    """ScheduleFree and Adakaon compute their coefficients once per group per step
+    (neither carries a bias correction), so their bucketing must not depend on any
+    per-parameter clock."""
+    assert OPTIMIZERS[name][0]._FOREACH_SPEC.extra_key is None
 
 
 # ------------------------------------------------------------------ plumbing bits
@@ -505,7 +511,7 @@ def test_device_is_part_of_the_bucket_key(name):
 # disjoint state — but it decides the order the stochastic-rounding draws are consumed
 # in, so it is part of the wire-visible contract for bf16+SR weights. ADOPT stepped one
 # per-parameter clock at a time before the refactor (``ForeachSpec(key_major=True)``
-# reproduces that); the other four stepped all factored buckets first, then all flat.
+# reproduces that); the others stepped all factored buckets first, then all flat.
 # Nothing else in the suite pins that down, so these two tests do.
 def _fragmented(name, *, steps=4):
     """A bag whose per-parameter clocks split: params 0 and 2 skip one gradient."""
@@ -519,7 +525,7 @@ def _fragmented(name, *, steps=4):
     return bag, opt
 
 
-@pytest.mark.parametrize("name", ["AdaMuon", "AdaBelief", "AdamP", "ADOPT"])
+@pytest.mark.parametrize("name", EXTRA_KEY)
 def test_bucket_order_is_anchored(name):
     """The exact ``(key, factored?)`` sequence of the chunk list, per optimizer."""
     _bag, opt = _fragmented(name)
@@ -539,9 +545,10 @@ def test_bucket_order_is_anchored(name):
         assert keys[0] < keys[1]
 
 
-def test_bucket_order_is_anchored_schedulefree():
+@pytest.mark.parametrize("name", NO_EXTRA_KEY)
+def test_bucket_order_is_anchored_without_an_extra_key(name):
     """No per-parameter clock at all: one bucket per shape, factored before flat."""
-    _bag, opt = _fragmented("ScheduleFree")
+    _bag, opt = _fragmented(name)
     chunks = only_plan(opt).chunks
     assert [(c.key, c.eff is not None) for c in chunks] == [(None, True), (None, False)]
 
@@ -582,6 +589,11 @@ _FROZEN_SR_BITS = {
     "AdaMuon": [49194, 15733, 16297, 49039, 15981, 16009, 48993, 16245, 49041, 16305,
                 48802, 48907, 15910, 48798, 49036, 16315, 48871, 16204, 48698, 49024,
                 16064, 16150, 49209, 48648, 48830, 49108],
+    # captured from 54bd887 (kaon 0.7.12), i.e. from Adakaon's own pre-migration
+    # ``_ForeachPlan``: this vector is the wire-visible half of the shared-plan migration.
+    "Adakaon": [49194, 15723, 16296, 49039, 15981, 16007, 48992, 16244, 49040, 16304,
+                48803, 48908, 15915, 48796, 49036, 16315, 48870, 16204, 48710, 49024,
+                16060, 16154, 49209, 48638, 48829, 49108],
 }
 
 
@@ -611,7 +623,7 @@ def _frozen_sr_run(cls, *, cache=True, **kwargs):
             for b in p.detach().view(torch.uint16).reshape(-1).tolist()]
 
 
-@pytest.mark.parametrize("name", ["ADOPT", "AdaBelief", "AdaMuon"])
+@pytest.mark.parametrize("name", ["ADOPT", "AdaBelief", "AdaMuon", "Adakaon"])
 @pytest.mark.parametrize("cache", [True, False])
 def test_frozen_bf16_sr_vector_matches_the_pre_refactor_tree(name, cache):
     """bf16 weights, bit for bit, against values captured from ee8f871 — with the

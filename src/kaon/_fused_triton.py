@@ -137,7 +137,8 @@ def param_witness(plist) -> tuple:
 
     NOT observed: ``p.shape``. A rebind that changes the shape while keeping the storage
     (``p.data = p.data.view(...)``) is UNSUPPORTED — see the limit documented on
-    :func:`kaon.adakaon._param_witness` — and collecting a ``torch.Size`` per param roughly
+    :func:`kaon._foreach_plan.param_witness` and, for the fused side, on
+    ``Adakaon._fused_partition`` — and collecting a ``torch.Size`` per param roughly
     DOUBLES the witness, for an operation that stays broken either way. Cost on a 428-param
     LoRA-shaped bag: the review's run measured 80 µs for main's ``(ids, data_ptr)``, 131 µs
     (8.0% of a 1633 µs step) for the three fields kept here and 254 µs (15.6%) with shapes; a
@@ -2001,9 +2002,9 @@ class _WitnessedCache:
     still mapped, an illegal memory access once the allocator hands it back. Confirmed on
     all four routes (one-block, 1-D, 0-D, big batched). Contiguity closes the one SUPPORTED
     rebind that keeps the pointer (``p.data.t()``); the other one (``view``, which changes the
-    shape) is an unsupported operation, documented on ``Adakaon._param_witness``. Same guard the
-    native plan uses (``Adakaon._foreach_plan``) and MSAM's ``p_witness``; the grad side is
-    already covered per step by ``refresh_grads``.
+    shape) is an unsupported operation, documented on ``Adakaon._fused_partition``. Same guard
+    the native plan uses (``kaon._foreach_plan.param_witness``) and MSAM's ``p_witness``; the
+    grad side is already covered per step by ``refresh_grads``.
     """
 
     def _witness(self, plist) -> None:

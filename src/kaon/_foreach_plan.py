@@ -19,8 +19,11 @@ Caching views pins **no memory**: every cached tensor is a view of a param or of
 buffer the optimizer holds anyway. Gradients are the deliberate exception — see
 :meth:`ForeachChunk.grad_stack`.
 
-Adakaon has its own copy of this design (``kaon.adakaon._ForeachPlan``), predating the
-extraction and coupled to its fused Triton caches; migrating it here is follow-up work.
+Every batched optimizer in kaon now shares this module, Adakaon included: this design was
+extracted FROM Adakaon and folded back into it once the shared version had settled. Adakaon
+is also the only user whose fused Triton routing sits next to the native plan; the two stay
+consistent because ``Adakaon._fused_partition`` keys on :func:`param_witness` from here and
+``Adakaon._invalidate_fused_caches`` drops both sets of caches in one call.
 """
 
 from __future__ import annotations
@@ -59,9 +62,11 @@ def param_witness(plist: list[Tensor]) -> tuple:
     supported and deliberately not watched: the factored second moment is bound to the
     effective 2-D shape, and there is no meaningful migration of an EMA onto a different
     factorization. The stale bucketing makes the next step raise a size mismatch, which
-    is the intended outcome. Same contract as ``kaon.adakaon._param_witness`` and
-    ``kaon._fused_triton.param_witness``; kept separate from the latter because this one
-    guards the NATIVE path, which must work in a build without Triton.
+    is the intended outcome. Same contract as ``kaon._fused_triton.param_witness``, kept
+    separate from it because this one guards the NATIVE path, which must work in a build
+    without Triton and must not import the Triton module at module scope. Adakaon's fused
+    ROUTING (``_fused_partition``) calls this one for that reason; the pointer-array caches
+    inside ``_fused_triton`` use their own copy.
     """
     return (tuple(map(id, plist)), tuple(map(_DATA_PTR, plist)), tuple(map(_IS_CONTIG, plist)))
 
@@ -195,6 +200,15 @@ class ForeachChunk:
                 and spec.momentum_cache(group)):
             self.mat = {s["m"]: self.view(s["m"]) for s in states}.__getitem__
 
+    # KNOWN CEILING (measured on a 448x 0-D bag, after this cache): the residue is three
+    # ``stack`` + three ``unbind`` per step (~1344 ``aten::select``). Only ONE of each pair
+    # lives here (the flat state stack and its write-back); the other two are inside
+    # ``_momentum_codec.ema_stacked`` and ``_backend.subtract_batched_``. Persistent
+    # ``cat(out=)`` scratch buffers with cached unbind slices would therefore buy only the
+    # local pair (~10% of the remaining step) while pinning a stacked fp32 buffer per bucket
+    # for the process's lifetime — a bad trade for optimizers whose pitch is memory, and it
+    # would feed back into the free-VRAM-adaptive chunk budget. Removing the other two needs
+    # the codec to hand back a reusable buffer: follow-up work.
     def grad_stack(self) -> Tensor:
         """This step's stacked fp32 gradient ``[N, *eff]``. Never cached — see the class
         docstring.

@@ -46,7 +46,6 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
-    flat_view,
     foreach_budget,
     is_low_precision,
     rms,
@@ -54,6 +53,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec, param_witness
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -126,181 +126,6 @@ _STACK_BYTES_PER_ELEM = 48
 # plateau. See docs/foreach-batching.md.
 
 
-def _identity(t: Tensor) -> Tensor:
-    """``mat`` for buckets whose effective layout *is* the tensor (no view needed)."""
-    return t
-
-
-# Unbound, so the per-step staleness guard is a C-level ``map()`` instead of a genexpr.
-_DATA_PTR = Tensor.data_ptr
-_IS_CONTIG = Tensor.is_contiguous
-
-
-class _ForeachChunk:
-    """Cached derived views for ONE stacked chunk of the native foreach path.
-
-    Rebuilding these lists every step is what made a bag of 0-D scalars slow: with 448
-    params the non-factored bucket calls :func:`~kaon._backend.flat_view` ~5x per param per
-    step (the ``v`` stack, the codec's ``mat`` callback, the weight-decay stack, the final
-    subtract) and every one of those calls on a 0-D tensor materializes a fresh
-    ``aten::view`` TensorImpl. They are all pure functions of tensors the optimizer
-    **already owns** — the params and their ``self.state`` buffers — so caching them pins
-    no memory at all.
-
-    Gradient views are deliberately **not** cached: a retained view of ``p.grad`` keeps the
-    previous step's gradient storage alive (``set_to_none=True`` allocates a fresh grad
-    every backward), which would add a whole gradient set to peak memory — an unacceptable
-    trade for an optimizer whose entire pitch is memory. :meth:`grad_stack` avoids them a
-    different way instead: ``torch.stack`` always writes a contiguous output, so stacking
-    the **raw** grads and reshaping the *stack* once is element-for-element the same buffer
-    as stacking N per-param reshapes — one ``view`` per step instead of N. That covers every
-    bucket whose params share an ``ndim`` (all convs, all 1-D, all 0-D); only a bucket that
-    genuinely mixes 0-D with shape-``(1,)`` params still builds per-param views.
-
-    Staleness is the caller's job (:meth:`Adakaon._foreach_plan`): the plan is rebuilt when
-    the group's param identities or ``p.data`` pointers change, and dropped outright by
-    :meth:`Adakaon._invalidate_fused_caches` (state reset / checkpoint load) and by any step
-    that falls back to the per-parameter path.
-    """
-
-    __slots__ = ("cols", "eff", "grad_reshape", "grad_uniform", "length", "mat", "plist",
-                 "pviews", "rows", "states", "view", "vs")
-
-    def __init__(
-        self,
-        plist: list[Tensor],
-        states: list[dict[str, Any]],
-        group: dict[str, Any],
-        eff: tuple[int, int] | None,
-        matrixize: bool,
-        length: int,
-        cached: bool = True,
-    ) -> None:
-        self.plist, self.states, self.eff, self.length = plist, states, eff, length
-        n = len(plist)
-        # ``grad_uniform``: the bucket's grads all share an ndim, so they stack raw and the
-        # STACK gets reshaped (``grad_reshape``, ``None`` when it is already [N, *eff]).
-        self.grad_uniform = cached
-        self.grad_reshape: tuple[int, ...] | None = None
-        if eff is not None:                                   # factored bucket
-            R, C = eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
-            self.view = (lambda t: t.view(R, C)) if matrixize else _identity
-            self.rows = [s["row"] for s in states]
-            self.cols = [s["col"] for s in states]
-            self.vs = None
-            if matrixize:                                     # conv [N,O,I,kh,kw] -> [N,R,C]
-                self.grad_reshape = (n, R, C)
-        else:                                                 # non-factored bucket
-            self.rows = self.cols = None
-            ndims = {p.ndim for p in plist}
-            self.view = _identity if ndims == {1} else flat_view
-            self.grad_uniform = cached and len(ndims) == 1
-            if ndims == {0}:                                  # 0-D bag: [N] -> [N, 1]
-                self.grad_reshape = (n, 1)
-            self.vs = [self.view(s["v"]) for s in states]
-        self.pviews = [self.view(p.data) for p in plist]
-        # The codec calls ``mat(state["m"])`` once (float) or twice (int8) per param per
-        # step; when that call would build a view, an identity-keyed lookup of prebuilt
-        # views is cheaper. Only then — ``Tensor.__hash__`` is a Python-level call in
-        # torch, so a dict hit is *more* expensive than ``_identity`` when there is no view
-        # to save. 4bit is excluded too: its ``m`` is a packed byte string, not a momentum
-        # in the effective layout (``view`` would raise), and its codec never calls ``mat``.
-        self.mat = self.view
-        if (cached and self.view is not _identity and group["betas"][0] > 0
-                and group["momentum_dtype"] != "4bit"):
-            self.mat = {s["m"]: self.view(s["m"]) for s in states}.__getitem__
-
-    # ponytail: known ceiling. Profiling a 448x 0-D bag after this cache shows the residue is
-    # three ``stack`` + three ``unbind`` per step (~1344 ``aten::select``). Only ONE of each
-    # pair lives here (the ``v`` stack and its write-back); the other two are inside
-    # ``_momentum_codec.ema_stacked`` and ``_backend.subtract_batched_``, which this change is
-    # scoped out of. Persistent ``cat(out=)`` scratch buffers with cached unbind slices would
-    # therefore buy only the local pair (~10% of the remaining step) while pinning a stacked
-    # fp32 buffer per bucket for the process's lifetime — a bad trade for an optimizer whose
-    # pitch is memory, and it would feed back into the free-VRAM-adaptive chunk budget.
-    # Removing the other two needs the codec to hand back a reusable buffer: follow-up work.
-    def grad_stack(self) -> Tensor:
-        """This step's stacked fp32 gradient ``[N, *eff]``. Never cached — see the class
-        docstring; the reshape-the-stack trick keeps it to one ``view`` per bucket."""
-        if self.grad_uniform:
-            g = torch.stack([p.grad for p in self.plist])
-            if self.grad_reshape is not None:
-                g = g.view(self.grad_reshape)
-            return g.float()
-        view = self.view
-        return torch.stack([view(p.grad) for p in self.plist]).float()
-
-
-class _ForeachPlan:
-    """One param group's foreach bucketing plus the per-chunk view caches.
-
-    ``buckets`` preserves the order the uncached code stepped in (factored buckets first,
-    then non-factored, each in first-seen param order). ``chunks`` is that bucketing split
-    by the current memory budget; the split is re-derived only when a bucket's chunk length
-    actually changes, because the adaptive VRAM budget wobbles every step while
-    ``budget // length`` almost never does.
-
-    ``cached=False`` (the ``_foreach_cache_enabled`` A/B switch) makes every chunk rebuild
-    its lists per param per step exactly as the pre-cache code did, so the two arms differ
-    only in this optimization and nothing else.
-    """
-
-    __slots__ = ("buckets", "chunks", "steps", "witness")
-
-    def __init__(self, witness: tuple, buckets: list[tuple]) -> None:
-        self.witness, self.buckets = witness, buckets
-        self.chunks: list[_ForeachChunk] | None = None
-        self.steps: tuple[int, ...] = ()
-
-    def rechunk(self, budget: int, group: dict[str, Any],
-                cached: bool = True) -> list[_ForeachChunk]:
-        steps = tuple(max(1, budget // size) for size, *_ in self.buckets)
-        if self.chunks is not None and steps == self.steps:
-            return self.chunks
-        self.steps = steps
-        self.chunks = [
-            _ForeachChunk(plist[i:i + n], states[i:i + n], group, eff, matrixize, length, cached)
-            for n, (_size, plist, states, eff, matrixize, length) in zip(steps, self.buckets, strict=True)
-            for i in range(0, len(plist), n)
-        ]
-        return self.chunks
-
-
-def _param_witness(plist: list[Tensor]) -> tuple:
-    """Per-step staleness witness for a cached plan over ``plist``: ``(ids, data_ptrs,
-    contiguity)``, one flat tuple each.
-
-    Deliberately duplicated from :func:`kaon._fused_triton.param_witness` (same three fields, same
-    order) rather than imported: this one guards the NATIVE foreach plan, which has to work in a
-    build without Triton, and ``kaon.adakaon`` never imports the Triton module at module scope.
-
-    Each field is load-bearing and none implies another. ``id`` catches a changed param set.
-    ``data_ptr`` catches ``p.data = <fresh storage>`` — an external EMA, a ``.to(dtype/device)``,
-    Rengu-Flow's block-swap offloader — and, through it, every dtype and device change.
-    Contiguity catches ``p.data = p.data.t()``, which on a SQUARE weight keeps id, pointer AND
-    shape and moves only the strides, while every kernel indexes row-major off ``data_ptr``.
-
-    LIMIT — a rebind that CHANGES THE SHAPE (``p.data = p.data.view(...)`` / ``reshape``) is not
-    supported and is deliberately not watched here. The factored second moment is bound to the
-    effective 2-D shape: ``state["row"]``/``state["col"]`` were allocated with the old lengths and
-    there is no meaningful migration of an EMA onto a different factorization. Rebuilding the plan
-    on such a rebind does not fix it, it makes it worse — the fused pointer arrays would then carry
-    the NEW R/C against the OLD row/col buffers and write past them. As it stands the native path
-    raises a size mismatch on the next step and the fused path silently keeps stepping the
-    pre-rebind geometry; validating ``row``/``col`` against ``p`` (or migrating the state) is
-    follow-up work, tracked in ``tests/test_fused_safety.py`` next to the routing tests.
-
-    COST on a 428-param LoRA-shaped bag. The review's run: 80 µs for main's ``(ids, data_ptr)``,
-    131 µs (8.0% of a 1633 µs fused step) for the three fields kept here, 254 µs (15.6%) with
-    ``torch.Size`` added — which is why shapes are out. A re-run here, on a differently-composed
-    bag of the same size, measured 48 / 66 / 112 µs against a ~640 µs step; the ratios agree.
-    The witness runs once per group in :meth:`_fused_partition` (the route caches then revalidate
-    by list identity — see ``_WitnessedCache.built_from``) plus once per big shape bucket, and the
-    per-step grad contiguity sweep in :meth:`_fused_demote` adds ~60 µs on the same bag.
-    """
-    return (tuple(map(id, plist)), tuple(map(_DATA_PTR, plist)), tuple(map(_IS_CONTIG, plist)))
-
-
 def _same_shape_device_buckets(plist: list[Tensor]) -> dict[tuple, list[Tensor]]:
     """Group big 2-D tensors for the batched chunked kernel: EXACT shape, dtype AND device.
 
@@ -343,7 +168,7 @@ def _demote_non_contiguous_grads(
     return kept[0], kept[1], kept[2], native + demoted
 
 
-class Adakaon(AutoLRMixin, Optimizer):
+class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
     """Conv-aware factored optimizer with optional bf16 momentum.
 
     Args:
@@ -559,11 +384,9 @@ class Adakaon(AutoLRMixin, Optimizer):
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
         self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPointerCache (1-D)
         self._fused_big_caches: dict[tuple[int, tuple[int, ...], Any], Any] = {}
-        # Native foreach path: group id -> _ForeachPlan (bucketing + per-chunk views). Set
-        # ``_foreach_cache_enabled = False`` to rebuild every step — the A/B switch the
-        # cache's speedup is measured with; it is numerically a no-op either way.
-        self._foreach_plans: dict[int, _ForeachPlan] = {}
-        self._foreach_cache_enabled = True
+        # The native foreach path's own cache — the bucketing + per-chunk view plan — is NOT
+        # allocated here: it lives in ForeachPlanMixin as the lazy ``_foreach_plans``
+        # property, keyed by group id (see _FOREACH_SPEC below).
         # --- native factored-bucket work reducers (0.7.12). Each is a separate A/B toggle
         # so its own contribution stays measurable; see _factored_bucket for the identity
         # each one relies on and for the exactness each one costs (nothing, at defaults).
@@ -648,7 +471,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         self._fused_ob_caches.clear()
         self._fused_od_caches.clear()
         self._fused_big_caches.clear()
-        self._foreach_plans.clear()
+        self._clear_foreach_plans()
 
     def _autolr_reset_base_state(self) -> None:
         """Reset Adakaon's base optimizer after an AutoLR rollback/contact."""
@@ -730,7 +553,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         # per-param has no use for a plan anyway, and dropping it keeps the invariant
         # "a cached plan only ever describes a group the foreach path actually stepped".
         # The ids/ptrs guard cannot see a fallback: the param set is unchanged.
-        self._foreach_plans.pop(id(group), None)
+        self._drop_foreach_plan(group)
         for p in params:
             self._step_one_param(p, group)
 
@@ -800,18 +623,38 @@ class Adakaon(AutoLRMixin, Optimizer):
     def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
         """Split a group's params into (one-block, chunked-big, one-dim, native), cached per param-set.
 
-        Keyed on :func:`_param_witness` — ids, ``data_ptr``s and contiguity — because each is a
-        routing input the partition (and the pointer arrays derived from it) bakes in, and
-        ``p.data = ...`` can change any of them while the Parameter object stays the same. An
-        id-only key kept dispatching a stale plan at memory the optimizer no longer owns. Same
-        guard as :meth:`_foreach_plan`, including its shape-rebind limit.
+        Keyed on :func:`kaon._foreach_plan.param_witness` — ids, ``data_ptr``s and
+        contiguity — because each is a routing input the partition (and the pointer arrays
+        derived from it) bakes in, and ``p.data = ...`` can change any of them while the
+        Parameter object stays the same. An id-only key kept dispatching a stale plan at
+        memory the optimizer no longer owns. The native foreach plan
+        (:meth:`_step_foreach`) and ``_fused_triton._WitnessedCache`` guard themselves with
+        the same three fields, so all three caches rebuild on the same events.
+
+        SHAPE-REBIND LIMIT (the witness's, spelled out for the fused side). ``p.data =
+        p.data.view(...)`` is unsupported and deliberately unwatched. The factored second
+        moment is bound to the effective 2-D shape: ``state["row"]``/``state["col"]`` were
+        allocated with the old lengths and there is no meaningful migration of an EMA onto a
+        different factorization. Rebuilding on such a rebind does not fix it, it makes it
+        worse — the fused pointer arrays would then carry the NEW R/C against the OLD
+        row/col buffers and write past them. As it stands the native path raises a size
+        mismatch on the next step and the fused path silently keeps stepping the pre-rebind
+        geometry; validating ``row``/``col`` against ``p`` (or migrating the state) is
+        follow-up work, tracked in ``tests/test_fused_safety.py`` next to the routing tests.
+
+        COST on a 428-param LoRA-shaped bag: 80 µs for an ``(ids, data_ptr)`` witness,
+        131 µs (8.0% of a 1633 µs fused step) for the three fields kept, 254 µs (15.6%) with
+        a ``torch.Size`` added — which is why shapes are out. It runs once per group here
+        (the route caches then revalidate by list identity — see
+        ``_WitnessedCache.built_from``) plus once per big shape bucket, and the per-step grad
+        contiguity sweep in :meth:`_fused_demote` adds ~60 µs on the same bag.
 
         Grad properties deliberately stay OUT of this key: a gradient is a new tensor every
         backward, so its contiguity is re-checked per step in :func:`_demote_non_contiguous_grads`
         rather than frozen into the routing.
         """
         gid = id(group)
-        witness = _param_witness(params)
+        witness = param_witness(params)
         cached = self._fused_part.get(gid)
         if cached is not None and cached[0] == witness:
             return cached[1], cached[2], cached[3], cached[4]
@@ -1408,66 +1251,28 @@ class Adakaon(AutoLRMixin, Optimizer):
             return p.data.is_contiguous() and p.grad.is_contiguous()
         return True
 
-    def _foreach_buckets(self, params: list[Tensor], group: dict[str, Any]) -> list[tuple]:
-        """Bucket ``params`` so each bucket stacks into one tensor, and init their state.
-
-        * ``ndim >= 2`` -> factored bucket, keyed by effective 2-D shape ``[N, R, C]``.
-        * ``ndim <= 1`` (biases/norms, 0-D scalars) -> non-factored bucket, keyed
-          by element count ``[N, L]`` (a 0-D scalar is a length-1 row, sharing the
-          ``L == 1`` bucket with shape-``(1,)`` params).
-
-        Returns ``(chunk_size, plist, states, eff, matrixize, length)`` per bucket —
-        factored buckets first, then non-factored, each in first-seen param order (the
-        order the pre-cache code stepped them in).
-        """
-        factored: dict[tuple[Any, ...], tuple[list, list]] = {}
-        flat: dict[tuple[Any, ...], tuple[list, list]] = {}
-        for p in params:
-            state = self.state[p]
-            if not state:
-                self._init_state(p, state, group)
-            g = p.grad
-            # DEVICE is part of every bucket key: a bucket is stacked with ``torch.stack``,
-            # which refuses to mix devices ("Expected all tensors to be on the same device"),
-            # so a group holding a CPU and a CUDA weight of the same shape used to crash the
-            # whole step rather than step each on its own device.
-            if g.ndim >= 2:
-                matrixize = g.ndim > 2  # conv kernels always reshape to 2-D before factoring
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                bucket = factored.setdefault((eff, p.dtype, p.device, matrixize), ([], []))
-            else:  # ndim <= 1 — 0-D scalars ride as length 1 (g.numel() == g.shape[0] for 1-D)
-                bucket = flat.setdefault((g.numel(), p.dtype, p.device), ([], []))
-            bucket[0].append(p)
-            bucket[1].append(state)
-        buckets = [(max(eff[0] * eff[1], 1), pl, st, eff, matrixize, 0)
-                   for (eff, _dtype, _device, matrixize), (pl, st) in factored.items()]
-        buckets += [(max(length, 1), pl, st, None, False, length)
-                    for (length, _dtype, _device), (pl, st) in flat.items()]
-        return buckets
-
-    def _foreach_plan(self, params: list[Tensor], group: dict[str, Any],
-                      budget: int) -> list[_ForeachChunk]:
-        """This step's chunks for ``group``, from the cached plan when it is still valid.
-
-        The plan is rebuilt whenever :func:`_param_witness` moves: the param set (``id``), the
-        storage a param points at (``data_ptr``, which also covers dtype and device), or its
-        contiguity. Contiguity matters because the plan caches ``p.data`` VIEWS: ``p.data =
-        p.data.t()`` on a square weight keeps both id and pointer while moving the strides, and
-        the cached view would keep stepping the pre-transpose layout. A SHAPE-changing rebind is
-        an unsupported operation (see :func:`_param_witness`); the stale bucketing makes the next
-        step raise a size mismatch, which is the intended outcome. Everything else that can
-        invalidate the plan is event-driven: see :meth:`_invalidate_fused_caches` and the
-        per-parameter fallback in :meth:`_native_dispatch`.
-        """
-        gid = id(group)
-        cached = self._foreach_cache_enabled
-        witness = _param_witness(params)
-        plan = self._foreach_plans.get(gid) if cached else None
-        if plan is None or plan.witness != witness:
-            plan = _ForeachPlan(witness, self._foreach_buckets(params, group))
-            if cached:
-                self._foreach_plans[gid] = plan
-        return plan.rechunk(budget, group, cached)
+    # Bucketing, chunking and the cached view plan live in kaon._foreach_plan, shared with
+    # AdaBelief / AdamP / AdaMuon / ADOPT / ScheduleFree. ``row``/``col`` (factored) and
+    # ``v`` (non-factored) are the state buffers the bucket bodies stack and write back
+    # through; ``v`` goes through ``flat_view``, which is what admits 0-D params into the
+    # ``L == 1`` bucket as length-1 views. There is no ``extra_key``: every coefficient here
+    # is per group per step (fixed beta2, no bias correction), so nothing per-parameter
+    # enters the bucket key and the plan survives every step that keeps the param set.
+    # ``momentum_cache`` asks the chunk to prebuild the ``mat`` lookup the codec calls once
+    # (float) or twice (int8) per param per step — worth it only when the bucket's view is a
+    # real reshape AND the momentum is a tensor in that layout, so beta1 == 0 (no ``m`` at
+    # all) and 4bit (``m`` is a packed byte string) opt out. Invalidation is the mixin's
+    # witness plus :meth:`_invalidate_fused_caches` (state reset / checkpoint load) and the
+    # per-parameter fallback in :meth:`_native_dispatch`. Set ``_foreach_cache_enabled =
+    # False`` on an instance to rebuild the plan every step — the A/B switch the cache's
+    # speedup is measured with; it is numerically a no-op either way.
+    _FOREACH_SPEC = ForeachSpec(
+        factored_state=("row", "col"),
+        flat_state=("v",),
+        momentum_cache=lambda group: (
+            group["betas"][0] > 0 and group["momentum_dtype"] != "4bit"
+        ),
+    )
 
     @torch.no_grad()
     def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
@@ -1475,7 +1280,8 @@ class Adakaon(AutoLRMixin, Optimizer):
 
         Each bucket is stacked into a single tensor and stepped with a handful of kernels —
         element-for-element the same math as :meth:`_step_one_param`. The bucketing and
-        every view it derives come from the cached :class:`_ForeachPlan`.
+        every view it derives come from the cached
+        :class:`~kaon._foreach_plan.ForeachPlan`.
         """
         beta1, beta2 = group["betas"]
         eps1, _eps2 = group["eps"]
@@ -1484,14 +1290,14 @@ class Adakaon(AutoLRMixin, Optimizer):
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         codec = self._codec(group)
-        for chunk in self._foreach_plan(params, group, budget):
+        for chunk in self._foreach_chunks(params, group, budget):
             bucket = self._factored_bucket if chunk.eff is not None else self._nonfactored_bucket
             bucket(chunk, beta1, beta2, eps1, lr, clip, wd, cautious, wd_full, bf16_method, codec)
 
     @torch.no_grad()
     def _factored_bucket(
         self,
-        chunk: _ForeachChunk,
+        chunk: ForeachChunk,
         beta1: float,
         beta2: float,
         eps1: float,
@@ -1504,8 +1310,8 @@ class Adakaon(AutoLRMixin, Optimizer):
         codec: _MomentumCodec,
     ) -> None:
         R, C = chunk.eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
-        N = len(chunk.plist)  # noqa: N806
-        rows, cols = chunk.rows, chunk.cols
+        N = chunk.n  # noqa: N806
+        rows, cols = chunk.state_views
 
         grad = chunk.grad_stack()                                         # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
@@ -1580,14 +1386,14 @@ class Adakaon(AutoLRMixin, Optimizer):
             delta = update
 
         if wd != 0 and not wd_full:                  # "masked": decay inside the mask
-            p_fp32 = torch.stack(chunk.pviews).float()
+            p_fp32 = chunk.param_stack()
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
         if wd_full:                                  # "full": decay outside the mask
-            p_fp32 = torch.stack(chunk.pviews).float()
+            p_fp32 = chunk.param_stack()
             delta = delta.add_(p_fp32, alpha=wd)
 
         # lr rides the weight write (``alpha``) instead of a separate ``delta.mul_(lr)``
@@ -1601,7 +1407,7 @@ class Adakaon(AutoLRMixin, Optimizer):
     @torch.no_grad()
     def _nonfactored_bucket(
         self,
-        chunk: _ForeachChunk,
+        chunk: ForeachChunk,
         beta1: float,
         beta2: float,
         eps1: float,
@@ -1629,9 +1435,9 @@ class Adakaon(AutoLRMixin, Optimizer):
         cautious mask's per-slice mean is the scalar mask itself — element-for-
         element the same math as :meth:`_step_one_param`.
         """
-        N = len(chunk.plist)  # noqa: N806 — matrix dim (stacked tensor is [N, L])
+        N = chunk.n  # noqa: N806 — matrix dim (stacked tensor is [N, L])
         length = chunk.length
-        vs = chunk.vs                                                     # each [L], fp32
+        (vs,) = chunk.state_views                                         # each [L], fp32
 
         grad = chunk.grad_stack()                                         # [N, L]
         v = torch.stack(vs)                                               # [N, L]
@@ -1659,14 +1465,14 @@ class Adakaon(AutoLRMixin, Optimizer):
             delta = update
 
         if wd != 0 and not wd_full:                  # "masked": decay inside the mask
-            p_fp32 = torch.stack(chunk.pviews).float()
+            p_fp32 = chunk.param_stack()
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
         if wd_full:                                  # "full": decay outside the mask
-            p_fp32 = torch.stack(chunk.pviews).float()
+            p_fp32 = chunk.param_stack()
             delta = delta.add_(p_fp32, alpha=wd)
 
         if self._write_fold_lr:                      # see _factored_bucket
