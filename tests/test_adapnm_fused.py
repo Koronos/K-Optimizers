@@ -994,3 +994,80 @@ def test_pnm_extreme_aspect_shapes_compile_and_match_native(shapes):
     scale = max(p.detach().abs().max().item() for p in pn)
     d = _maxdiff(pv, pn)
     assert d / scale < 1e-5, f"{shapes[0]} x{len(shapes)}: rel={d / scale:.2e}"
+
+
+# ----------------------------------------------------------------- 7. shape-changing rebind
+_PNM_SHAPE_REBINDS = [
+    ([(16, 64)] * 2, lambda t: t.view(64, 16), (64, 16)),          # one-block, row/col swap
+    ([(16, 64)] * 2, lambda t: t.reshape(1024), (1024,)),          # 2-D -> the 1-D route
+    ([(1024,)] * 2, lambda t: t.view(16, 64), (16, 64)),           # 1-D -> the factored route
+    ([(256, 1024)] * 2, lambda t: t.view(1024, 256), (1024, 256)),  # big / chunked route
+]
+_PNM_IDS = ["one_block", "to_1d", "from_1d", "big"]
+
+
+def _pnm_shape_rebind(shapes, rebind, want, *, fresh_storage, witness):
+    """Two steps, a shape-changing ``p.data`` rebind on ``ps[0]``, one more step.
+
+    Returns the exception the last step raised, or None. ``fresh_storage`` clones the rebound
+    view so the ``data_ptr`` moves too, which is what makes the case visible with no shape
+    witness; ``witness`` sets ``ft.SHAPE_WITNESS`` for the run.
+    """
+    old = ft.SHAPE_WITNESS
+    ft.SHAPE_WITNESS = witness
+    try:
+        ps = _bag(shapes, torch.float32, seed=73)
+        opt = AdaPNM(ps, fused=True, **_SAFE_CFG)
+        _drive([(ps, opt)], 2, torch.Generator(device=DEV).manual_seed(79))
+        ptr = ps[0].data_ptr()
+        ps[0].data = rebind(ps[0].data).clone() if fresh_storage else rebind(ps[0].data)
+        assert tuple(ps[0].shape) == want and ps[0].is_contiguous()
+        assert (ps[0].data_ptr() != ptr) is fresh_storage
+        for p in ps:
+            p.grad = torch.randn(tuple(p.shape), device=DEV)
+        try:
+            opt.step()
+            torch.cuda.synchronize()
+        except RuntimeError as exc:
+            return exc
+        return None
+    finally:
+        ft.SHAPE_WITNESS = old
+
+
+@pytest.mark.parametrize(("shapes", "rebind", "want"), _PNM_SHAPE_REBINDS, ids=_PNM_IDS)
+@pytest.mark.parametrize("witness", [False, True], ids=["default", "shape_witness"])
+def test_shape_rebind_with_fresh_storage_is_refused(shapes, rebind, want, witness):
+    """AdaPNM shares ``_fused_triton``'s pointer caches, so it shares the 0.7.13 shape guard.
+
+    Storage AND shape both move here, so the witness moves without any shape field and the plan
+    rebuilds — which is precisely when the old code was dangerous, pointing the rebuilt
+    ``R``/``C`` at the old ``row``/``col``. Asserted under both witness settings because
+    ``check_state_geometry`` is what refuses, and it is on unconditionally.
+
+    AdaPNM's LONE big tensor takes the per-tensor chunked route, which never builds a
+    ``BigPnmCache``; it fails on the state arithmetic instead, with a plain size mismatch. Either
+    way the contract asserted is the one that was broken: REFUSE, never step stale geometry.
+    """
+    exc = _pnm_shape_rebind(shapes, rebind, want, fresh_storage=True, witness=witness)
+    assert exc is not None, "the fused path stepped a plan that disagreed with the state"
+    assert ("shape" in str(exc).lower() and "rebind" in str(exc).lower()) \
+        or "size of tensor" in str(exc).lower(), str(exc)
+
+
+@pytest.mark.parametrize(("shapes", "rebind", "want"), _PNM_SHAPE_REBINDS, ids=_PNM_IDS)
+def test_pointer_preserving_shape_rebind_needs_the_shape_witness(shapes, rebind, want):
+    """The view-only rebind: invisible by default, refused under ``ft.SHAPE_WITNESS``.
+
+    A ``view`` keeps the id, the ``data_ptr`` and contiguity, so nothing in the default witness
+    moves and the cached partition keeps stepping the pre-rebind geometry — see the flag for why
+    detecting that is opt-in (a host sweep per param per step, up to 10% of a launch-bound step).
+    The ``big`` case is the exception: AdaPNM's lone-big route recomputes ``R``/``C`` from the
+    parameter every step and touches ``st["row"]`` directly, so it raises either way.
+    """
+    lone_big = shapes[0] == (256, 1024)
+    off = _pnm_shape_rebind(shapes, rebind, want, fresh_storage=False, witness=False)
+    assert (off is not None) is lone_big, \
+        f"default detection changed for {shapes[0]}: {off}"
+    on = _pnm_shape_rebind(shapes, rebind, want, fresh_storage=False, witness=True)
+    assert on is not None, "SHAPE_WITNESS did not catch a pointer-preserving reshape"

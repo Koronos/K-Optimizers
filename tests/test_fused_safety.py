@@ -619,15 +619,63 @@ def test_transpose_rebind_keeps_the_same_pointer_but_must_reroute():
     assert d < 1e-6, f"max|Delta p|={d:.2e} after a transpose rebind"
 
 
-def _shape_rebind_step(fused):
-    """Two normal steps, then ``p.data = p.data.view(...)`` and one more. Returns the exception
-    the last step raised, or None."""
-    ps = _bag([(16, 64)] * 2, torch.float32, seed=73)
+# The rebinds a shape guard has to catch, as (starting shapes, rebind, new shape). Each one
+# keeps the storage — same ``data_ptr``, still contiguous — and changes the geometry the factored
+# state is bound to, so NOTHING in the default witness moves.
+_SHAPE_REBINDS = {
+    # (16,64) -> (64,16): the reported case. numel, pointer and contiguity all survive; only
+    # the row/col split moves, so ``row`` (16 entries) is asked to serve 64 rows.
+    "view_transposed_shape": ([(16, 64)] * 2, lambda t: t.view(64, 16), (64, 16)),
+    # 2-D -> 1-D changes the ROUTE too: the param now belongs on the non-factored 1-D kernel,
+    # whose state key is ``v`` — which a factored state does not have.
+    "reshape_to_1d": ([(16, 64)] * 2, lambda t: t.reshape(1024), (1024,)),
+    # 1-D -> 2-D, the mirror: a flat ``v`` state asked to serve the factored kernel.
+    "reshape_1d_to_2d": ([(1024,)] * 2, lambda t: t.view(16, 64), (16, 64)),
+    # A big (>tile-cap) weight takes the chunked route, whose bucket is keyed on the CURRENT
+    # exact shape while row/col still carry the old one.
+    "big_view_transposed": ([(256, 1024)] * 2, lambda t: t.view(1024, 256), (1024, 256)),
+}
+
+
+@pytest.fixture
+def shape_witness():
+    """Turn ``ft.SHAPE_WITNESS`` on for one test and put it back afterwards.
+
+    It is a module flag rather than a constructor kwarg because the pointer caches it guards are
+    optimizer-agnostic plumbing shared by every fused optimizer; see the flag's own comment for
+    why it is opt-in at all (it cannot be made cheap - one more host sweep per param per step,
+    and on the launch-bound 0-D bag that is 10% of the step).
+    """
+    import kaon._fused_triton as ftm
+    old = ftm.SHAPE_WITNESS
+    ftm.SHAPE_WITNESS = True
+    try:
+        yield
+    finally:
+        ftm.SHAPE_WITNESS = old
+
+
+def _shape_rebind_step(fused, case="view_transposed_shape", rebind_all=False,
+                       fresh_storage=False):
+    """Two normal steps, then a shape-changing ``p.data`` rebind, then one more step.
+
+    Returns ``(opt, ps, exc)`` with ``exc`` the exception the last step raised, or None. Only
+    ``ps[0]`` is rebound unless ``rebind_all``, so the tests also cover the mixed case: one
+    reshaped weight must not be stepped, and it must not be stepped SILENTLY because the rest of
+    its bucket is still fine. ``fresh_storage`` additionally clones the rebound view, which is
+    what makes the case detectable with no shape witness at all — the ``data_ptr`` moves.
+    """
+    shapes, rebind, want = _SHAPE_REBINDS[case]
+    ps = _bag(shapes, torch.float32, seed=73)
     opt = Adakaon(ps, fused=fused, **_FP32_CFG)
     _drive([(ps, opt)], 2, torch.Generator(device=DEV).manual_seed(79))
-    ptr = ps[0].data_ptr()
-    ps[0].data = ps[0].data.view(64, 16)
-    assert ps[0].data_ptr() == ptr and ps[0].is_contiguous(), "the rebind moved more than shape"
+    for p in (ps if rebind_all else ps[:1]):
+        ptr = p.data_ptr()
+        p.data = rebind(p.data).clone() if fresh_storage else rebind(p.data)
+        assert tuple(p.shape) == want
+        assert p.is_contiguous()
+        moved = p.data_ptr() != ptr
+        assert moved is fresh_storage, "the rebind did not move exactly what this case is about"
     for p in ps:
         p.grad = torch.randn(tuple(p.shape), device=DEV)
     try:
@@ -641,35 +689,118 @@ def _shape_rebind_step(fused):
 def test_shape_changing_rebind_is_caught_on_the_native_path():
     """DOCUMENTED LIMIT: ``p.data = p.data.view(...)`` mid-training is NOT supported.
 
-    Such a rebind keeps the id, the ``data_ptr`` AND contiguity, so no witness field short of
-    collecting ``torch.Size`` per param every step sees it — and that field was measured at 123 µs
-    of a 254 µs witness on a 1633 µs step (see ``_param_witness``), which is not a price worth
-    paying for an unsupported operation. Watching it would not even fix the case: the factored
-    ``row``/``col`` state is bound to the OLD effective 2-D shape and cannot be migrated, so
-    rebuilding the plan just points the new R/C at the old buffers and writes past them.
-
-    What IS guaranteed is that the native path refuses rather than steps: its bucketing stacks by
-    the effective shape and the stack raises. See the companion xfail for the fused path.
+    The factored second moment is bound to the effective 2-D shape — ``state["row"]`` /
+    ``state["col"]`` were allocated with the old lengths and an EMA has no meaningful migration
+    onto a different factorization — so the contract is REFUSE, not adapt. This is the native
+    half, and it needs no witness field to hold: the plan re-stacks by effective shape every
+    step, so the stack itself raises.
     """
     _opt, _ps, exc = _shape_rebind_step(fused=False)
     assert exc is not None, "the native path silently stepped a reshaped weight"
     assert "size" in str(exc).lower()
 
 
+@pytest.mark.parametrize("case", list(_SHAPE_REBINDS))
+@pytest.mark.parametrize("rebind_all", [False, True], ids=["one_param", "whole_bag"])
+def test_shape_rebind_with_fresh_storage_is_caught_by_default(case, rebind_all):
+    """THE MEMORY-SAFETY HALF, on by default and free: shape changed AND storage moved.
+
+    Here the ``data_ptr`` moves, so the witness moves with no shape field needed and the plan
+    rebuilds — and a rebuilt plan is exactly what used to be dangerous. Main computed the NEW
+    ``R``/``C`` for the new shape and pointed them at the OLD ``row``/``col`` buffers: on
+    ``(16,64) -> (64,16)`` the kernel indexed 64 entries of a 16-element ``row``, reading and
+    writing past it, with no error raised and finite weights out. Confirmed silent on main.
+
+    ``check_state_geometry`` runs at cache BUILD, so it catches this at zero per-step cost —
+    which is why this half needs no flag.
+    """
+    _opt, _ps, exc = _shape_rebind_step(fused=True, case=case, rebind_all=rebind_all,
+                                        fresh_storage=True)
+    assert exc is not None, "the fused path stepped a plan that disagreed with the state"
+    assert "shape" in str(exc).lower() and "rebind" in str(exc).lower(), str(exc)
+
+
+@pytest.mark.parametrize("case", list(_SHAPE_REBINDS))
+@pytest.mark.parametrize("rebind_all", [False, True], ids=["one_param", "whole_bag"])
+def test_shape_changing_rebind_is_caught_on_the_fused_path(shape_witness, case, rebind_all):
+    """THE DETECTION HALF, under ``ft.SHAPE_WITNESS``: shape changed and nothing else.
+
+    A ``view`` keeps the id, the ``data_ptr`` AND contiguity, so the default witness cannot see
+    it: ``_fused_partition`` hands back the cached partition, the pointer caches keep their
+    PRE-rebind ``Rs``/``Cs``, and the weight goes on being optimized as the shape it used to
+    have — in bounds and unflagged (the companion xfail below pins that default). The strides
+    field is what moves; that rebuilds the plan, and the rebuild refuses.
+    """
+    _opt, _ps, exc = _shape_rebind_step(fused=True, case=case, rebind_all=rebind_all)
+    assert exc is not None, "the fused path silently stepped a reshaped weight"
+    assert "shape" in str(exc).lower() and "rebind" in str(exc).lower(), str(exc)
+
+
 @pytest.mark.xfail(
-    reason="documented limit: a shape-changing p.data rebind is unsupported and the fused path "
-           "does not detect it — the cached partition keeps stepping the PRE-rebind geometry "
-           "(R=16, C=64), which stays inside the row/col buffers so nothing faults, but the "
-           "weight is no longer being optimized as the shape the caller now sees. Follow-up: "
-           "validate row/col lengths against p in the fused plan, or migrate the state.",
+    reason="documented limit, and a DELIBERATE default: a p.data rebind that changes the shape "
+           "and nothing else moves no witness field, so the plan is never rebuilt and never "
+           "revalidated, and the weight keeps being stepped as its pre-rebind geometry. It stays "
+           "in bounds (a view shares the whole storage), so this degrades quality rather than "
+           "corrupting memory - the corrupting variant (shape + fresh storage) IS caught by "
+           "default, see test_shape_rebind_with_fresh_storage_is_caught_by_default. Detecting "
+           "this one costs a per-param host sweep per step, measured at 3.2-3.6% of the "
+           "428-param LoRA step and 10-18% of the launch-bound 0-D step (even Tensor.dim, which "
+           "cannot see it, is already >4% there), so it is opt-in as ft.SHAPE_WITNESS - which "
+           "the test above exercises.",
     strict=True,
 )
-def test_shape_changing_rebind_is_caught_on_the_fused_path():
-    """The fused mirror of the test above — expected to fail until the follow-up lands."""
+def test_pointer_preserving_shape_rebind_is_undetected_by_default():
+    """The default-configuration mirror of the test above."""
     opt, ps, exc = _shape_rebind_step(fused=True)
     st = opt.state[ps[0]]
-    assert st["row"].numel() == 16 and st["col"].numel() == 64   # state kept the old geometry
+    assert (st["row"].numel(), st["col"].numel()) == (16, 64)   # state kept the old geometry
     assert exc is not None, "the fused path silently stepped a reshaped weight"
+
+
+def test_dropping_the_state_is_a_working_recovery_from_a_shape_rebind():
+    """The error message tells the caller to ``del opt.state[p]``; that has to actually work.
+
+    A refusal with no way out would just move the dead end. Dropping the entry leaves
+    ``self.state`` (a ``defaultdict``) handing back an empty dict, which every fused route
+    re-initialises against the shape the param has NOW — so the parameter resumes with a second
+    moment for its new geometry and its neighbours keep theirs.
+    """
+    opt, ps, exc = _shape_rebind_step(fused=True, fresh_storage=True)
+    assert exc is not None
+    del opt.state[ps[0]]
+    for p in ps:
+        p.grad = torch.randn(tuple(p.shape), device=DEV)
+    opt.step()
+    torch.cuda.synchronize()
+    st = opt.state[ps[0]]
+    assert (st["row"].numel(), st["col"].numel()) == (64, 16), "state was not rebuilt for (64,16)"
+    assert torch.isfinite(ps[0]).all() and torch.isfinite(ps[1]).all()
+
+
+@pytest.mark.parametrize("witness_on", [False, True], ids=["default", "shape_witness"])
+def test_benign_rebind_to_fresh_storage_of_the_same_shape_still_steps(witness_on, monkeypatch):
+    """The guard must not catch the SUPPORTED rebind: same shape, new storage.
+
+    An external EMA writing weights back, a ``.to(device)``, Rengu-Flow's block-swap offloader —
+    all rebind ``p.data`` to a fresh buffer of the SAME shape, which the plan is meant to absorb
+    by rebuilding, not to reject. Asserted against a twin that was never rebound: the step has to
+    be numerically identical, not merely exception-free. Both witness settings, because the whole
+    point of ``check_state_geometry`` is that it fires on a MISMATCH, not on a rebuild.
+    """
+    monkeypatch.setattr("kaon._fused_triton.SHAPE_WITNESS", witness_on)
+    ref = _bag([(16, 64)] * 2, torch.float32, seed=73)
+    ps = _clone(ref)
+    ro = Adakaon(ref, fused=True, **_FP32_CFG)
+    opt = Adakaon(ps, fused=True, **_FP32_CFG)
+    _drive([(ref, ro), (ps, opt)], 2, torch.Generator(device=DEV).manual_seed(79))
+    before = [id(c) for c in opt._fused_ob_caches.values()]
+    for p in ps:
+        p.data = p.data.clone()                      # fresh storage, identical shape
+    _drive([(ref, ro), (ps, opt)], 1, torch.Generator(device=DEV).manual_seed(11))
+    d = _maxdiff(ps, ref)
+    assert d < 1e-6, f"max|Delta p|={d:.2e} after a same-shape rebind"
+    after = [id(c) for c in opt._fused_ob_caches.values()]
+    assert before != after, "the pointer cache was not rebuilt after the rebind"
 
 
 # ----------------------------------------------------------------- 11. sr_round bit fidelity

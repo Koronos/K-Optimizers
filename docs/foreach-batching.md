@@ -222,8 +222,28 @@ buffer, so the plan is rebuilt or dropped on all of:
 
 A rebind that changes the *shape* is deliberately not supported (the factored second
 moment is bound to the effective 2-D shape and there is no meaningful migration of an
-EMA onto a different factorization); the stale bucketing raises a size mismatch on the
-next step, which is the intended outcome.
+EMA onto a different factorization). On the **native** plan the stale bucketing raises a
+size mismatch on the next step, which is the intended outcome — that is why the native
+witness carries no shape field. The **fused** path cannot rely on that (it freezes
+`Rs`/`Cs` and the row/col pointer arrays into the plan), so since 0.7.13 every fused
+pointer cache validates the state geometry against the parameter whenever it is built:
+
+- shape changed **and** something else moved too (fresh storage, dtype, device,
+  contiguity) → the witness moves, the plan rebuilds, and
+  `check_state_geometry` raises a message naming the parameter and what its `row`/`col`
+  no longer fit. Free: build-time only. Before 0.7.13 this rebuilt the plan with the
+  *new* `R`/`C` against the *old* buffers and stepped straight through them.
+- shape changed and **nothing else** → no field moves, so the plan is never rebuilt and
+  the weight keeps being stepped as its pre-rebind geometry. It stays in bounds (a view
+  shares the whole storage), so this costs quality, not memory safety. Detecting it needs
+  a per-param host sweep per step — measured at 3.2-3.6% of a 428-parameter LoRA step and
+  10-18% of a launch-bound 0-D step — so it is opt-in:
+  `kaon._fused_triton.SHAPE_WITNESS = True` adds per-param strides to the fused witness.
+  See `benchmarks/fused/bench_shape_witness.py` for the full table and why strides beat
+  `torch.Size`.
+
+Either way the recovery is the same: reshape *before* constructing the optimizer, or
+`del opt.state[p]` to restart that parameter's second moment at its new shape.
 
 Note that the per-parameter clock's *value* changes every step while the *partition* it
 induces does not — so the plan survives it. Only a parameter that actually skips a step

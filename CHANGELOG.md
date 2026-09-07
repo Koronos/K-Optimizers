@@ -2,6 +2,68 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Fused path: a `p.data` rebind that changes the SHAPE can no longer step a plan that
+  disagrees with the optimizer state.** Every fused pointer cache
+  (`PointerArrayCache`, `BigPointerCache`, `AdaPnmCache`, `OneDimPointerCache`,
+  `OneDimPnmCache`, `BigPnmCache`) now validates the state geometry against each
+  parameter when it is built — `row`/`col` against the effective 2-D shape on the
+  factored routes, `v` against `numel` on the 1-D/0-D route — and raises a
+  `RuntimeError` naming the parameter, the mismatch and the recovery (reshape before
+  constructing the optimizer, or `del opt.state[p]`). Affects Adakaon and AdaPNM.
+
+  The case this closes is a real out-of-bounds path, not a hypothetical one: when a
+  rebind changed both the storage and the shape (`p.data = p.data.view(64, 16).clone()`),
+  the witness moved, the plan was rebuilt with the *new* `R`/`C`, and the kernel indexed
+  64 entries of a 16-element `row` buffer — reading and writing past it, with no error
+  raised and finite weights out. Confirmed silent on 0.7.12.
+
+  **Cost: zero per step.** The check runs only when a cache is built, so a steady-state
+  step does not execute it. Verified bit-identical to 0.7.12 across 32 configurations
+  (Adakaon/AdaPNM x fused/native x fp32/bf16 parameters x fp32/bf16/int8/4bit momentum,
+  on a bag covering the one-block, chunked-big, 1-D, 0-D and conv routes), 1528 state
+  and parameter buffers digested.
+
+- The native foreach plan already refused such a rebind (it re-stacks by effective shape
+  every step, so `torch.stack` raises); its witness is deliberately unchanged, and
+  `Adakaon._fused_partition` now keys on `ft.param_witness` so the fused key is exactly
+  as strong as the pointer caches' own — which is what the caches' O(1) `built_from`
+  revalidation assumes.
+
+### Added
+
+- `kaon._fused_triton.SHAPE_WITNESS` (default `False`) adds per-parameter strides to the
+  fused staleness witness, which makes the remaining case detectable: a rebind that
+  changes the shape and **nothing else** moves no witness field today, so the plan is
+  never rebuilt, never revalidated, and the weight goes on being optimized as the shape
+  it used to have. That variant stays in bounds (a view shares the whole storage), so it
+  degrades quality rather than corrupting memory — which is why it is opt-in while the
+  fix above is not.
+
+  It is opt-in because it **cannot be made cheap**: the witness is a host sweep over every
+  parameter in the group, run once per group per step plus once per big shape bucket, and a
+  shape field is one more sweep. Measured (`benchmarks/fused/bench_shape_witness.py`,
+  paired and interleaved, against each bag's minimum step). Ranges are across repeat runs
+  on a GPU shared with other jobs — the ordering was stable in every run, the absolutes
+  were not:
+
+  | bag | witness calls/step | added host | % of step |
+  |---|---|---|---|
+  | 428 LoRA-ish (200x(256,256) + 100x(512,) + 128x 0-D) | 2 (428p + 200p) | +61..65 µs | 3.2..3.6% |
+  | 448x 0-D (launch-bound) | 1 (448p) | +35..55 µs | 10..18% |
+  | UNet/DiT-ish, 80 params | 5 (80p + 4 buckets) | +14..17 µs | 1.6..1.7% |
+
+  `Tensor.stride` is the cheapest field measured that can see the bug (+42..65 µs on the
+  428-parameter bag, against +65..104 for `Tensor.size`); `Tensor.dim` is the floor for any
+  per-parameter field at +13..25 µs and cannot see it at all — already ~1% of that step and
+  >4% of the 0-D one, where the three existing fields are themselves ~20-25% of the step. So
+  no per-step shape witness fits a 1%-of-step budget, and the launch-bound 0-D regime is
+  where it hurts most. Turning it on is numerically inert (bit-identical to 0.7.12 across the
+  same 32 configurations); flipping it mid-run is safe and rebuilds every plan once.
+
 ## [0.7.12]
 
 This release is a full correctness and performance audit of the 0.7.11 fused/Triton

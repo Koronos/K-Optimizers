@@ -1225,20 +1225,31 @@ _WITNESS_IMPLS = _witness_impls()
 @pytest.mark.parametrize("name,witness", _WITNESS_IMPLS,
                          ids=[n.split(".")[1] for n, _ in _WITNESS_IMPLS])
 def test_param_witness_scans_in_c(name, witness):
-    """The witness must build its three tuples with ``map``, not generator expressions.
+    """The witness must build its tuples with ``map``, not generator expressions.
 
     Compared against a genexpr reference timed in the same loop, so the bound tracks the
     machine rather than an absolute number; the measured margin is ~1.6x, well clear of
     the 0.90 asserted here.
+
+    The reference follows ``ft.SHAPE_WITNESS``: with that flag on, the FUSED witness carries a
+    fourth per-param field (strides) and the other two implementations still do not — the native
+    plan re-stacks by effective shape every step and needs no shape field. So this also pins
+    which witness grows the field.
     """
     import time
+
+    strides = False
+    if "_fused_triton" in name:
+        import kaon._fused_triton as ftm
+        strides = ftm.SHAPE_WITNESS
 
     plist = [torch.empty(16 * 8 * 3 * 3) for _ in range(300)]
     plist += [torch.empty(1) for _ in range(128)]
 
     def genexpr_reference(pl):
-        return (tuple(id(p) for p in pl), tuple(p.data_ptr() for p in pl),
+        base = (tuple(id(p) for p in pl), tuple(p.data_ptr() for p in pl),
                 tuple(p.is_contiguous() for p in pl))
+        return (*base, tuple(p.stride() for p in pl)) if strides else base
 
     assert witness(plist) == genexpr_reference(plist), f"{name} changed the witness fields"
 
