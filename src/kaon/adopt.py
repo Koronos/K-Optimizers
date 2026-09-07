@@ -386,13 +386,15 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
     # one clip factor and one coefficient dict. ``key_major`` keeps the pre-refactor
     # bucket order (one pstep group at a time, factored before flat) — bucket order is
     # numerically inert on its own, but it decides the order the stochastic-rounding
-    # draws are consumed in, so reordering would move bf16+SR weights.
+    # draws are consumed in, so reordering would move bf16+SR weights. ``momentum_cache``
+    # (the identity-keyed ``mat`` lookup) stays off: the codec's stacked path reads its
+    # per-param view lists from ``chunk.momentum_views``, so it never calls ``mat``, and
+    # a dict keyed on ``Tensor.__hash__`` is a strictly worse cache of the same views.
     _FOREACH_SPEC = ForeachSpec(
         factored_state=("row", "col"),
         flat_state=("v",),
         extra_key=lambda state, group: ADOPT._pstep(state, group),
         key_major=True,
-        momentum_cache=lambda group: group["momentum_dtype"] != "4bit",
     )
 
     @staticmethod
@@ -475,7 +477,9 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
             normed.clamp_(-c["clip"], c["clip"])
 
         # --- momentum EMA of the NORMALIZED grad, then p -= lr * m ---
-        m = self._codec(group).ema_stacked(states, normed, chunk.mat, (R, C), c["beta1"])  # [N, R, C]
+        codec = self._codec(group)
+        m = codec.ema_stacked(states, normed, chunk.mat, (R, C), c["beta1"],
+                              views=chunk.momentum_views(codec))          # [N, R, C]
         delta = m.mul_(c["lr"])
 
         if cautious:
@@ -529,7 +533,9 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
         if c["clip"] is not None:
             normed.clamp_(-c["clip"], c["clip"])
 
-        m = self._codec(group).ema_stacked(states, normed, chunk.mat, (chunk.length,), c["beta1"])
+        codec = self._codec(group)
+        m = codec.ema_stacked(states, normed, chunk.mat, (chunk.length,), c["beta1"],
+                              views=chunk.momentum_views(codec))
         delta = m.mul_(c["lr"])
 
         if cautious:

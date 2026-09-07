@@ -34,6 +34,11 @@ All notable changes to this project will be documented in this file.
   dead objects, so a group added after one was dropped could previously land on a stale
   plan. Numerically a no-op (covered by the `add_param_group` bit-identity scenario above).
 
+- AdaBelief and AdamP dropped their private `_dequant_stacked` / `_store_stacked`
+  reimplementations of the codec's stacked read/write and call the shared codec
+  directly (same values; one fewer copy of the int8 row-scale and 4-bit block
+  layouts to keep in step).
+
 ### Performance
 - No measurable change on any path, which is the intended result: the migration moves
   host-side bookkeeping between modules and changes no kernel and no dispatch. Verified
@@ -55,6 +60,32 @@ All notable changes to this project will be documented in this file.
   +3.1% on one bag, so on a shared laptop GPU this design resolves ~3% and not 2% — the
   identical counters above, not the clock, are what rules out a regression.
   See `docs/foreach-batching.md` ("Adakaon's migration onto the shared module").
+
+- **The momentum codec's stacked paths take cached view lists.** `ema_stacked`,
+  `store_stacked` and `dequant_stacked` rebuilt, on **every step**, lists that are
+  pure functions of tensors the optimizer already owns — `[mat(state["m"]) …]`, the
+  per-row `[state["m_scale"].view(rowshape) …]`, the write-back targets. Each codec
+  now exposes `stacked_views(states, view, eff)`, a `ForeachChunk` builds it once
+  (`chunk.momentum_views(codec)`), and AdaBelief, AdamP, ADOPT and AdaMuon hand it
+  back through the new optional `views=` argument. The per-parameter `m_scale`
+  write-back loop becomes a single `_foreach_copy_` at the same time. Measured per
+  step (RTX 3000 Ada Laptop, bf16 params + SR, `torch.profiler`):
+
+  | bag | `aten::view` | `aten::reshape` | `aten::copy_` |
+  |---|---|---|---|
+  | AdaBelief, 448 × 0-D, int8 | 1802 → **10** | 1348 → **3** | 452 → **4** |
+  | AdaBelief, 428-tensor LoRA, bf16 | 874 → **18** | 432 → **4** | 6 → 6 |
+  | ADOPT, 428-tensor LoRA, int8 | 874 → **18** | 2 → 2 | 436 → **8** |
+  | AdamP, 448 × 0-D, 4-bit | 19 → 19 | 10 → 10 | 453 → **5** |
+
+  Wall time on an idle card follows the host work it removes (−30 … −60 % on the
+  quantized codecs' launch-bound bags); it is neutral where the bucket never needed
+  a real view. Peak allocated memory is unchanged — the cache holds only *views*
+  of `state["m"]` / `state["m_scale"]`, never a stacked scratch buffer.
+- Numerically invisible: bit-identical to 0.7.12 for AdaBelief, AdamP, ADOPT,
+  AdaMuon, KProdigy and Lion over fp32/bf16 parameters × fp32/bf16/int8/4-bit
+  momentum, mixed 0-D/1-D/2-D/conv bags, multi-chunk buckets and a mid-run
+  checkpoint reload.
 
 ## [0.7.12]
 

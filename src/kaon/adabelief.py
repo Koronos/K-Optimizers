@@ -107,7 +107,6 @@ from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
-    _dequant_4bit_stacked,
     _make_codec,
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
@@ -315,30 +314,6 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, Optimizer):
         """
         self._codec(md).store_one(state, m_fp32)
 
-    @staticmethod
-    def _dequant_stacked(
-        states: list[dict[str, Any]], md: str, shape: tuple[int, ...]
-    ) -> Tensor:
-        """Stacked fp32 momentum ``[N, *shape]`` from per-param storage (see AdaPNM)."""
-        n = len(states)
-        per = math.prod(shape)
-        if md in ("bfloat16", "float32"):
-            return torch.stack([s["m"].reshape(shape) for s in states]).float()
-        if md == "int8":
-            row = shape[0] if len(shape) >= 2 else 1
-            rest = max(per // row, 1)
-            m = torch.stack([s["m"].reshape(row, rest) for s in states]).float()  # [N, R, rest]
-            scale = torch.stack([s["m_scale"].reshape(row, 1) for s in states])   # [N, R, 1]
-            return m.mul_(scale).reshape((n, *shape))
-        packed = torch.stack([s["m"] for s in states])
-        sc = torch.stack([s["m_scale"] for s in states])
-        bs = states[0]["m_block"]
-        return _dequant_4bit_stacked(packed, sc, per, bs).reshape((n, *shape))
-
-    def _store_stacked(self, states: list[dict[str, Any]], md: str, m_fp32: Tensor) -> None:
-        """Write stacked fp32 momentum ``[N, *shape]`` back into per-param storage."""
-        self._codec(md).store_stacked(states, m_fp32)
-
     # -------------------------------------------------------------------- step
     @torch.no_grad()
     def _step_impl(self, closure: Any = None) -> Any:
@@ -451,8 +426,9 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, Optimizer):
     # ``col`` (factored) and ``s`` (non-factored) are the state buffers the bucket bodies
     # stack and write back through; the per-parameter step joins the bucket key so every
     # slice of a bucket shares one bias correction (and one ``_coeffs`` dict). The momentum
-    # goes through ``_dequant_stacked`` / ``_store_stacked``, which take ``states`` rather
-    # than a ``mat`` callback, so there is no codec view cache to prebuild here.
+    # goes through the shared codec's stacked read/write, whose own per-param view lists
+    # come from ``chunk.momentum_views`` — so ``momentum_cache`` (the identity-keyed
+    # ``mat`` lookup, a strictly worse cache of the same views) stays off here.
     _FOREACH_SPEC = ForeachSpec(
         factored_state=("row", "col"),
         flat_state=("s",),
@@ -526,9 +502,11 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, Optimizer):
 
         # First-moment EMA (read both, mutate, store). m must update BEFORE the
         # residual second moment so the residual (g - m) uses the *new* m.
-        m = self._dequant_stacked(states, md, (R, C))                     # [N, R, C]
+        codec = self._codec(md)
+        views = chunk.momentum_views(codec)
+        m = codec.dequant_stacked(states, chunk.mat, (R, C), views=views)  # [N, R, C]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
-        self._store_stacked(states, md, m.reshape((chunk.n, R, C)))
+        codec.store_stacked(states, m.reshape((chunk.n, R, C)), views=views)
 
         # Factored "belief" second moment of the residual (g - m). HF eps1 placement:
         # update_factored_state squares its input and adds eps1 to the square.
@@ -587,9 +565,11 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, Optimizer):
             self._apply_decoupled_wd_batched(pviews, group["lr"] * wd)
 
         # First-moment EMA before the residual second moment.
-        m = self._dequant_stacked(states, md, (length,))                  # [N, L]
+        codec = self._codec(md)
+        views = chunk.momentum_views(codec)
+        m = codec.dequant_stacked(states, chunk.mat, (length,), views=views)  # [N, L]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
-        self._store_stacked(states, md, m.reshape((chunk.n, length)))
+        codec.store_stacked(states, m.reshape((chunk.n, length)), views=views)
 
         # Full per-coordinate "belief" second moment of (g - m), kozistr 1-D:
         # s = beta2*s + (1-beta2)*(g-m)^2 + eps; de_nom = (sqrt(s) + eps) / bc2_sq.

@@ -727,14 +727,15 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
     # bucket, and only intermittent gradients fragment it. ADOPT groups by its per-param
     # step for the same reason. ``single_alias`` is ``_stack_fp32``'s zero-copy
     # ``unsqueeze`` for a bucket of one, kept on the plan's stacking helpers.
+    # ``momentum_cache`` (the identity-keyed ``mat`` lookup) stays off: the codec's
+    # stacked path reads its per-param view lists from ``chunk.momentum_views``, so it
+    # never calls ``mat``, and a dict keyed on ``Tensor.__hash__`` is a strictly worse
+    # cache of the same views.
     _FOREACH_SPEC = ForeachSpec(
         factored_state=("row", "col"),
         flat_state=("v",),
         extra_key=lambda state, group: (
             state.get("step", 0) if group.get("bias_correction", False) else 0
-        ),
-        momentum_cache=lambda group: (
-            group["betas"][0] > 0 and group["momentum_dtype"] != "4bit"
         ),
         single_alias=True,
     )
@@ -832,7 +833,11 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         # First moment of the RAW gradient (codec owns dequant→EMA→requant). Stays
         # in eager: it walks per-param state dicts, exactly the Python-container
         # work the compiled kernels must not see.
-        m = codec.ema_stacked(states, grad, chunk.mat, (R, C), beta1) if beta1 > 0 else grad
+        m = (
+            codec.ema_stacked(states, grad, chunk.mat, (R, C), beta1,
+                              views=chunk.momentum_views(codec))
+            if beta1 > 0 else grad
+        )
 
         dev = grad.device
         p_fp32 = chunk.param_stack() if wd != 0 else None
@@ -894,7 +899,8 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
         if beta1 > 0:
-            delta = codec.ema_stacked(states, update, chunk.mat, (chunk.length,), beta1)  # [N, L]
+            delta = codec.ema_stacked(states, update, chunk.mat, (chunk.length,), beta1,
+                                      views=chunk.momentum_views(codec))    # [N, L]
         else:
             delta = update
 

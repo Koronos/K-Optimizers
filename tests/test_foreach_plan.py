@@ -1,8 +1,9 @@
 """Tests for the shared foreach bucketing/view plan (``kaon._foreach_plan``).
 
 The plan caches, per param group, the bucketing AND every derived view a bucket body
-walks (param views, factored ``row``/``col``, the non-factored state view, the codec's
-``mat`` lookup). Two properties have to hold for that to be safe:
+walks (param views, factored ``row``/``col``, the non-factored state view, and — via
+``ForeachChunk.momentum_views``, covered in ``test_codec_stacked_views.py`` — the
+momentum codec's stacked view lists). Two properties have to hold for that to be safe:
 
 * **Numerically invisible.** The cache is a pure host-side optimization: a run with
   ``_foreach_cache_enabled = False`` must land on bit-identical weights and state.

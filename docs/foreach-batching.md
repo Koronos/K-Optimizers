@@ -197,14 +197,61 @@ computes them once and caches them per param group:
   the chunk length almost never does).
 - `ForeachChunk` — one stacked chunk's cached views.
 
-Caching them **pins no memory**: every cached tensor is a view of something the
-optimizer holds anyway. Gradients are the one deliberate exception — a retained view of
-`p.grad` would keep the previous step's gradient storage alive (`set_to_none=True`
-allocates a fresh grad every backward), adding a whole gradient set to peak memory, for
-an optimizer family whose entire pitch is memory. Instead `ForeachChunk.grad_stack()`
-stacks the **raw** gradients and reshapes the *stack* once: `torch.stack` always writes
-a contiguous output, so that is element-for-element the same buffer as stacking N
-per-parameter reshapes, at one `view` per bucket instead of N.
+### The momentum codec's own view lists
+
+The first-moment codec (`kaon._momentum_codec`) is the other half of the same problem.
+Its stacked entry points — `ema_stacked` / `store_stacked` / `dequant_stacked` — walk
+per-parameter lists of exactly the same kind (`[mat(state["m"]) …]`, the per-row
+`[state["m_scale"].view(rowshape) …]`, the requant's write-back targets) and rebuilt
+them on every step, once per *use site*: an int8 bucket cost four such lists per step.
+
+Each codec therefore exposes `stacked_views(states, view, eff) -> _StackedViews | None`,
+built **once per chunk** by `ForeachChunk.momentum_views(codec)` and handed to every
+stacked call as `views=`. **AdaBelief, AdamP, ADOPT and AdaMuon pass them; nobody else
+does** — `views=None` runs the original code, so Lion, KProdigy and AdaPNM (which do
+their own bucketing, not this plan) and **Adakaon** (which has its own plan and is
+being migrated onto this one separately) are unaffected, and the argument is
+bit-identical either way. The gains measured below are therefore those four
+optimizers' only; Adakaon is not in the table.
+
+`stacked_views` returns `None` for a layout it cannot alias — a
+non-contiguous `m` or `m_scale`, where a `reshape` would hand back a detached copy —
+and the codec's existing per-parameter fallbacks take over. Passing a views object
+built for another bucket is *ignored*, not misread: every consumer checks its `eff`.
+That check is defense in depth — the four callers always pass the `eff` they built the
+views with, and a re-chunk hands out fresh chunks — but the failure it prevents (a read
+in another bucket's shape, a write into another bucket's buffers) would be silent.
+
+Two things follow from the lists being views:
+
+- **No memory is pinned** (the same argument as the rest of the plan). This is why
+  the codec caches *view lists* and not a stacked `cat(out=)` scratch buffer: a
+  persistent fp32 buffer per bucket would pin real memory for the process's lifetime
+  and feed back into the free-VRAM-adaptive chunk budget, for an optimizer family
+  whose pitch is memory.
+- **The storage-identity contract is preserved.** Writes through the cached lists land
+  in the very buffers MSAM/Nekaon cached `data_ptr` of, and an in-place requant
+  (4-bit's included) leaves the cache valid. They go stale only when those buffers are
+  *replaced* — `load_state_dict` — which is the plan-level invalidation the chunk
+  already performs.
+
+Measured per step (RTX 3000 Ada Laptop, bf16 params + `stochastic_rounding`, counted
+with `torch.profiler`; `aten::select` is the stack/unbind residue below and does not
+move):
+
+| bag | codec | `aten::view` | `aten::reshape` | `aten::copy_` |
+|---|---|---|---|---|
+| AdaBelief, 448 × 0-D | int8 | 1802 → **10** | 1348 → **3** | 452 → **4** |
+| AdaBelief, 448 × 0-D | bf16 | 903 → **7** | 450 → **2** | 3 → 3 |
+| AdaBelief, 428-tensor LoRA | bf16 | 874 → **18** | 432 → **4** | 6 → 6 |
+| ADOPT, 428-tensor LoRA | int8 | 874 → **18** | 2 → 2 | 436 → **8** |
+| AdaMuon, 448 × 0-D | 4-bit | 20 → 20 | 8 → 8 | 454 → **6** |
+
+The `copy_` column is the second half of the change: the quantized codecs wrote each
+parameter's new `m_scale` with its own `copy_` (the scale shapes differ per parameter
+layout), which the cached scale views collapse into one `_foreach_copy_`. 4-bit gains
+only that — its `m` is a packed byte string with no effective layout, so it never had
+per-parameter views to cache.
 
 ### Staleness
 
@@ -224,6 +271,11 @@ A rebind that changes the *shape* is deliberately not supported (the factored se
 moment is bound to the effective 2-D shape and there is no meaningful migration of an
 EMA onto a different factorization); the stale bucketing raises a size mismatch on the
 next step, which is the intended outcome.
+
+The codec's cached view lists ride the same table: they live on the chunk, so every row
+that rebuilds or drops the plan rebuilds them too. On top of that they are keyed on the
+codec *instance*, so a group whose `momentum_dtype` changes cannot read another codec's
+storage layout.
 
 Note that the per-parameter clock's *value* changes every step while the *partition* it
 induces does not — so the plan survives it. Only a parameter that actually skips a step
@@ -278,3 +330,12 @@ a plumbing move, and neutrality was measured three ways — hardest evidence fir
    running a control: the same harness, with the reference tree as *both* arms, reported a
    "significant" +3.1 % on one bag. On a shared laptop GPU this design resolves ~3 %, not
    2 %, so the counters above — not the clock — are what actually rules out a regression.
+
+### Known ceiling: the `stack` / `unbind` residue
+
+What the view caches do **not** remove is `aten::select`: a 448-scalar bag still costs
+~1344 of them, three `torch.stack` + three `unbind` per step (the state stack and its
+write-back, the codec's, and `subtract_batched_`'s delta slices). Those operate on
+tensors that are *freshly allocated every step* — the stacked update, the delta — so
+there are no cross-step views to cache. Removing them needs a persistent stacked
+buffer, which is the trade rejected above.
