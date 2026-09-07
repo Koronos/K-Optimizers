@@ -19,7 +19,10 @@ All notable changes to this project will be documented in this file.
   `p.grad=None`, param-set growth, `p.data` rebind to fresh storage, in-place transpose of
   a square weight, `load_state_dict`, `add_param_group`, a whole-group per-parameter
   fallback step, a stack-budget re-chunk) on CPU, CUDA-native and CUDA-fused. All 1950
-  hashes match.
+  hashes match. The sweep stops short of the chunked-big fused route (weights above the
+  lone-big cutoff); that route is bit-identical too, but only under
+  `deterministic_reductions=True`, because its atomics are not reproducible run to run
+  on either tree (16 extra configurations checked that way).
 - `Adakaon._fused_partition` keys on `kaon._foreach_plan.param_witness` instead of its own
   duplicate. The witness now has **two** copies instead of three (the shared one, which
   guards the native path in a build without Triton, and the one inside `_fused_triton`);

@@ -1427,7 +1427,7 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         kernels. Mirrors the ``not factored`` branch of :meth:`_step_one_param`.
 
         0-D scalars (LyCORIS ``use_scalar`` gates and friends) join the ``L == 1``
-        bucket as length-1 **views** of the same storage (:func:`flat_view`): stacking,
+        bucket as length-1 **views** of the same storage (:func:`~kaon._backend.flat_view`): stacking,
         the codec's write-back and the final subtract all go through the views, so
         the persisted state keeps its original 0-D shape (checkpoint-compatible
         with the per-param path). For ``L == 1`` the RMS clip
