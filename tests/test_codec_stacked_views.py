@@ -186,28 +186,78 @@ def test_non_contiguous_scale_declines_the_cache(md):
     assert codec.stacked_views(states, lambda t: t, (4, 3)) is None
 
 
+def exercise_all_three(codec, states, ref_codec, ref_states, eff, stale, *, rounds=3):
+    """Run every stacked entry point with ``stale`` views and demand the plain,
+    view-less reference — same deltas, same reads, same state.
+
+    The *read* is checked first on purpose: it is the assertion that discriminates by
+    **value** rather than by exception, so the guard's removal is caught even where the
+    write-back happens to be shape-compatible.
+    """
+    g = torch.Generator().manual_seed(6)
+    for _ in range(rounds):
+        assert torch.equal(
+            codec.dequant_stacked(states, lambda t: t, eff, views=stale),
+            ref_codec.dequant_stacked(ref_states, lambda t: t, eff),
+        ), "dequant_stacked used the stale views"
+        m = torch.randn((3, *eff), generator=g)
+        codec.store_stacked(states, m.clone(), views=stale)
+        ref_codec.store_stacked(ref_states, m.clone())
+        assert_states_equal(state_snapshot(states), state_snapshot(ref_states))
+        upd = torch.randn((3, *eff), generator=g)
+        da = codec.ema_stacked(states, upd.clone(), lambda t: t, eff, 0.9, views=stale)
+        db = ref_codec.ema_stacked(ref_states, upd.clone(), lambda t: t, eff, 0.9)
+        assert torch.equal(da, db), "ema_stacked used the stale views"
+        assert_states_equal(state_snapshot(states), state_snapshot(ref_states))
+
+
 @pytest.mark.parametrize("md", MDS)
-def test_views_built_for_another_eff_are_ignored(md):
-    """The ``eff`` guard: a views object whose layout is not this call's must be
-    ignored, so a stale hand-off degrades to the uncached path instead of corrupting."""
+def test_views_from_another_bucket_are_ignored(md):
+    """The hand-off the ``eff`` guard exists for: views built by a **different** chunk.
+
+    ``other_states`` holds the same element count in a different effective layout
+    (``(2, 6)`` vs ``(4, 3)``), so its cached lists are shape-compatible enough to be
+    used by accident. Without the guard the layout-bearing codecs read back the wrong
+    shape and every codec *writes into the other bucket's buffers*, leaving these
+    states untouched — which is what the state assertions catch for 4-bit, whose view
+    lists are the raw packed buffers and carry no layout of their own.
+    """
+    codec, states = make_states(md, (4, 3))
+    _other_codec, other_states = make_states(md, (2, 6), seed=1)
+    stale = codec.stacked_views(other_states, lambda t: t.view(2, 6), (2, 6))
+    assert stale is not None and stale.eff == (2, 6)
+    ref_codec, ref_states = make_states(md, (4, 3))
+    exercise_all_three(codec, states, ref_codec, ref_states, (4, 3), stale)
+
+
+# 4-bit is absent on purpose: its cached lists are the raw packed ``m`` / ``m_scale``
+# with no effective layout, and ``per`` comes from the ``eff`` ARGUMENT, so views built
+# for another ``eff`` of the SAME buffers are indistinguishable from the right ones.
+# The cross-bucket case above is what covers 4-bit's guard.
+@pytest.mark.parametrize("md", ["float32", "bfloat16", "int8"])
+def test_views_built_for_another_eff_of_the_same_states_are_ignored(md):
+    """A views object over the same buffers in a different effective layout.
+
+    Nothing can be written to the wrong *place* here, so the kill is purely by value:
+    the cached lists are ``[1, 1]`` views where the call works in ``[1]``, and without
+    the guard the read comes back ``[N, 1, 1]`` instead of ``[N, 1]``.
+    """
+    codec, states = make_states(md, (1,))
+    stale = codec.stacked_views(states, lambda t: t.view(1, 1), (1, 1))
+    assert stale is not None and stale.eff == (1, 1)
+    ref_codec, ref_states = make_states(md, (1,))
+    exercise_all_three(codec, states, ref_codec, ref_states, (1,), stale)
+
+
+@pytest.mark.parametrize("md", MDS)
+def test_hand_crafted_eff_mismatch_is_ignored(md):
+    """The guard is a plain tuple compare, so a bogus ``eff`` alone must disable the
+    cache even when the lists themselves are the right ones (defense in depth)."""
     codec, states = make_states(md, (4, 3))
     real = codec.stacked_views(states, lambda t: t, (4, 3))
     stale = _StackedViews((9, 9), real.m, real.scale, real.store)
     ref_codec, ref_states = make_states(md, (4, 3))
-    g = torch.Generator().manual_seed(6)
-    for _ in range(3):
-        m = torch.randn(3, 4, 3, generator=g)
-        codec.store_stacked(states, m.clone(), views=stale)
-        ref_codec.store_stacked(ref_states, m.clone())
-        upd = torch.randn(3, 4, 3, generator=g)
-        da = codec.ema_stacked(states, upd.clone(), lambda t: t, (4, 3), 0.9, views=stale)
-        db = ref_codec.ema_stacked(ref_states, upd.clone(), lambda t: t, (4, 3), 0.9)
-        assert torch.equal(da, db)
-        assert torch.equal(
-            codec.dequant_stacked(states, lambda t: t, (4, 3), views=stale),
-            ref_codec.dequant_stacked(ref_states, lambda t: t, (4, 3)),
-        )
-        assert_states_equal(state_snapshot(states), state_snapshot(ref_states))
+    exercise_all_three(codec, states, ref_codec, ref_states, (4, 3), stale)
 
 
 # -------------------------------------------------------- ForeachChunk cache

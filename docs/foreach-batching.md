@@ -207,12 +207,20 @@ them on every step, once per *use site*: an int8 bucket cost four such lists per
 
 Each codec therefore exposes `stacked_views(states, view, eff) -> _StackedViews | None`,
 built **once per chunk** by `ForeachChunk.momentum_views(codec)` and handed to every
-stacked call as `views=`. `views=None` runs the original code, so a caller without a
-cached plan (Lion, KProdigy, AdaPNM) is unaffected and the argument is bit-identical
-either way. `stacked_views` returns `None` for a layout it cannot alias — a
+stacked call as `views=`. **AdaBelief, AdamP, ADOPT and AdaMuon pass them; nobody else
+does** — `views=None` runs the original code, so Lion, KProdigy and AdaPNM (which do
+their own bucketing, not this plan) and **Adakaon** (which has its own plan and is
+being migrated onto this one separately) are unaffected, and the argument is
+bit-identical either way. The gains measured below are therefore those four
+optimizers' only; Adakaon is not in the table.
+
+`stacked_views` returns `None` for a layout it cannot alias — a
 non-contiguous `m` or `m_scale`, where a `reshape` would hand back a detached copy —
 and the codec's existing per-parameter fallbacks take over. Passing a views object
 built for another bucket is *ignored*, not misread: every consumer checks its `eff`.
+That check is defense in depth — the four callers always pass the `eff` they built the
+views with, and a re-chunk hands out fresh chunks — but the failure it prevents (a read
+in another bucket's shape, a write into another bucket's buffers) would be silent.
 
 Two things follow from the lists being views:
 

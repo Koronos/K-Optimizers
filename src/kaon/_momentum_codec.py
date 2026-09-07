@@ -240,6 +240,14 @@ class _StackedViews:
 
     * :attr:`eff` — the effective per-param shape the lists were built for, checked by
       every consumer so a views object from another bucket is *ignored*, not misread.
+      That check is **defense in depth**, not a live code path: all four callers pass
+      the same ``chunk.eff`` / ``(chunk.length,)`` they built the views with, and
+      :meth:`~kaon._foreach_plan.ForeachPlan.rechunk` hands out *new* chunks (with
+      empty caches) whenever the split moves, so nothing today can produce a
+      mismatched hand-off. It is here because the failure it prevents is silent — the
+      layout-bearing codecs would read back another bucket's shape and the write-backs
+      would land in another bucket's buffers — and the check is one tuple compare per
+      bucket per step.
     * :attr:`m` — the momentum in the effective layout: ``mat(s["m"])`` for the float
       and int8 codecs, the raw packed ``s["m"]`` for 4-bit (it has no such layout).
       Also the write-back target of ``ema_stacked``.

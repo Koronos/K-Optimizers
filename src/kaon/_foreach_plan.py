@@ -26,12 +26,17 @@ extraction and coupled to its fused Triton caches; migrating it here is follow-u
 from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import Tensor
 
 from kaon._backend import flat_view
+
+if TYPE_CHECKING:  # annotations only — ``_momentum_codec`` does not import this module,
+    # so a runtime import would not cycle either; it is deferred to keep the import
+    # graph of the NATIVE path free of the codec.
+    from kaon._momentum_codec import _MomentumCodec, _StackedViews
 
 # Unbound, so the per-step staleness witness is a C-level ``map()`` instead of a genexpr.
 _DATA_PTR = Tensor.data_ptr
@@ -90,7 +95,12 @@ class ForeachSpec:
 
     ``momentum_cache(group)`` says whether a chunk should prebuild the ``mat`` lookup the
     momentum codec calls per param per step; ``None`` for optimizers that do not hand a
-    ``mat`` callback to the codec.
+    ``mat`` callback to the codec. **No shared-plan optimizer sets it any more**: the
+    codec's stacked path takes its per-param view lists from
+    :meth:`ForeachChunk.momentum_views`, so it never calls ``mat``, and a dict keyed on
+    ``Tensor.__hash__`` is a strictly worse cache of the same views. It is kept for
+    Adakaon, which still hands the codec a bare ``mat`` and is being migrated onto this
+    plan separately.
 
     ``single_alias`` reproduces AdaMuon's ``_stack_fp32``: a one-element bucket is
     ``unsqueeze``d instead of stacked, aliasing the param's storage rather than copying it.
@@ -197,9 +207,9 @@ class ForeachChunk:
         if (cached and self.view is not _identity and spec.momentum_cache is not None
                 and spec.momentum_cache(group)):
             self.mat = {s["m"]: self.view(s["m"]) for s in states}.__getitem__
-        self.momentum_view_cache: tuple[Any, Any] | None = None
+        self.momentum_view_cache: tuple[_MomentumCodec, _StackedViews | None] | None = None
 
-    def momentum_views(self, codec: Any) -> Any:
+    def momentum_views(self, codec: _MomentumCodec) -> _StackedViews | None:
         """This chunk's cached view lists for ``codec``'s stacked path, or ``None``.
 
         The momentum codec's stacked entry points (``ema_stacked`` / ``store_stacked``

@@ -727,14 +727,15 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
     # bucket, and only intermittent gradients fragment it. ADOPT groups by its per-param
     # step for the same reason. ``single_alias`` is ``_stack_fp32``'s zero-copy
     # ``unsqueeze`` for a bucket of one, kept on the plan's stacking helpers.
+    # ``momentum_cache`` (the identity-keyed ``mat`` lookup) stays off: the codec's
+    # stacked path reads its per-param view lists from ``chunk.momentum_views``, so it
+    # never calls ``mat``, and a dict keyed on ``Tensor.__hash__`` is a strictly worse
+    # cache of the same views.
     _FOREACH_SPEC = ForeachSpec(
         factored_state=("row", "col"),
         flat_state=("v",),
         extra_key=lambda state, group: (
             state.get("step", 0) if group.get("bias_correction", False) else 0
-        ),
-        momentum_cache=lambda group: (
-            group["betas"][0] > 0 and group["momentum_dtype"] != "4bit"
         ),
         single_alias=True,
     )
