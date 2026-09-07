@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.7.12]
 
 This release is a full correctness and performance audit of the 0.7.11 fused/Triton
 path: memory-safety and compilation fixes across the Adakaon kernels, a uniform
