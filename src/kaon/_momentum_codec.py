@@ -35,6 +35,7 @@ __all__ = [
     "MomentumDtype",
     "_FOURBIT_BLOCK",
     "_MomentumCodec",
+    "_StackedViews",
     "_FloatCodec",
     "_Int8Codec",
     "_FourBitCodec",
@@ -225,6 +226,65 @@ def fourbit_block_size(grad: Tensor, group: dict[str, Any]) -> int:
 # --------------------------------------------------------------------- codecs
 
 
+class _StackedViews:
+    """One foreach chunk's precomputed view lists for a codec's stacked path.
+
+    The stacked entry points walk lists that are pure functions of tensors the
+    optimizer already owns — ``[mat(s["m"]) for s in states]``, the per-row
+    ``[s["m_scale"].view(rowshape) ...]``, the write-back targets — and used to rebuild
+    them on **every step**, one ``aten::view`` per param per list. This holds them
+    once; the caller (a :class:`~kaon._foreach_plan.ForeachChunk`) keeps it alive for
+    as long as it keeps its own view caches and hands it back through ``views=``.
+
+    Fields (content is codec-specific; only the owning codec reads them):
+
+    * :attr:`eff` — the effective per-param shape the lists were built for, checked by
+      every consumer so a views object from another bucket is *ignored*, not misread.
+    * :attr:`m` — the momentum in the effective layout: ``mat(s["m"])`` for the float
+      and int8 codecs, the raw packed ``s["m"]`` for 4-bit (it has no such layout).
+      Also the write-back target of ``ema_stacked``.
+    * :attr:`scale` — the per-row / per-block scale views, ``None`` for the float codec.
+    * :attr:`store` — ``store_stacked``'s write-back targets, which for int8 are the
+      ``[row, rest]`` views the batched requant produces (the float and 4-bit codecs
+      write through :attr:`m`).
+
+    Like every other cache in the foreach plan this pins **no memory**: each entry is a
+    *view* of a live ``state["m"]`` / ``state["m_scale"]``. That is also what keeps the
+    storage-identity contract intact — writes through these lists land in the buffers
+    MSAM/Nekaon cached ``data_ptr`` of. It follows that they go stale exactly when
+    those buffers are *replaced* (``load_state_dict``), which is the plan-level
+    invalidation the chunk already performs; a codec whose layout cannot be aliased
+    declines the cache by returning ``None`` from :meth:`_MomentumCodec.stacked_views`.
+    """
+
+    __slots__ = ("eff", "m", "scale", "store")
+
+    def __init__(
+        self,
+        eff: tuple[int, ...],
+        m: list[Tensor],
+        scale: list[Tensor] | None = None,
+        store: list[Tensor] | None = None,
+    ) -> None:
+        self.eff = eff
+        self.m = m
+        self.scale = scale
+        self.store = m if store is None else store
+
+
+def _stacked_cacheable(states: list[dict[str, Any]], scale: bool) -> bool:
+    """Whether ``states``' momentum buffers can be aliased by cached views.
+
+    A non-contiguous buffer cannot be ``view``'d into the effective layout (and
+    ``reshape`` would hand back a detached COPY, which the stacked write-backs would
+    then write into instead of the state) — those states keep the uncached / per-param
+    fallbacks the stacked entry points already carry.
+    """
+    if scale:
+        return all(s["m"].is_contiguous() and s["m_scale"].is_contiguous() for s in states)
+    return all(s["m"].is_contiguous() for s in states)
+
+
 class _MomentumCodec:
     """Base momentum codec. Subclasses own one ``momentum_dtype``'s storage AND the
     full dequant -> fp32 EMA -> requant cycle.
@@ -253,16 +313,40 @@ class _MomentumCodec:
     buffers — never reassign. MSAM (and Nekaon) cache ``data_ptr`` tables into
     both for the fused climb; a reassignment leaves those tables addressing
     freed memory.
+
+    **Cached views.** Every stacked entry point takes an optional ``views``
+    (:class:`_StackedViews`, built by :meth:`stacked_views`) so a caller with a cached
+    foreach plan can hand over the per-param view lists instead of having the codec
+    rebuild them each step. It is a pure host-side optimization: ``views=None`` runs the
+    original code, and passing one is bit-identical.
     """
 
     def init_state(self, state: dict[str, Any], grad: Tensor, group: dict[str, Any]) -> None:
         raise NotImplementedError
 
+    def stacked_views(
+        self, states: list[dict[str, Any]], view: Any, eff: tuple[int, ...]
+    ) -> _StackedViews | None:
+        """Precompute this bucket's stacked-path view lists, or ``None`` to decline.
+
+        ``view`` is the bucket's effective-layout callback (``t.view(R, C)`` for a
+        matrixized conv bucket, :func:`~kaon._backend.flat_view` for one that admits
+        0-D params, identity otherwise) and ``eff`` the effective per-param shape —
+        ``(R, C)`` factored, ``(L,)`` non-factored. Call it **once per chunk**, not per
+        step, and hand the result back as ``views=``.
+
+        ``None`` means "no cache for this layout": a buffer that cannot be aliased into
+        the effective layout, or an ``eff`` this codec does not batch. The caller just
+        keeps passing ``views=None`` and gets the uncached path.
+        """
+        return None
+
     def ema_one(self, state: dict[str, Any], update: Tensor, beta1: float) -> Tensor:
         raise NotImplementedError
 
     def ema_stacked(
-        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
+        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...],
+        beta1: float, views: _StackedViews | None = None,
     ) -> Tensor:
         raise NotImplementedError
 
@@ -275,7 +359,10 @@ class _MomentumCodec:
         """
         raise NotImplementedError
 
-    def store_stacked(self, states: list[dict[str, Any]], m_fp32: Tensor) -> None:
+    def store_stacked(
+        self, states: list[dict[str, Any]], m_fp32: Tensor,
+        views: _StackedViews | None = None,
+    ) -> None:
         """Write stacked fp32 momentum ``[N, *shape]`` into per-param storage in place.
 
         Same storage-identity contract as :meth:`store_one`: codes and scales are
@@ -288,7 +375,8 @@ class _MomentumCodec:
         raise NotImplementedError
 
     def dequant_stacked(
-        self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...]
+        self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...],
+        views: _StackedViews | None = None,
     ) -> Tensor:
         """Return the stacked fp32 momentum ``[N, *eff]`` (no mutation)."""
         raise NotImplementedError
@@ -329,10 +417,23 @@ class _FloatCodec(_MomentumCodec):
         m.copy_(m_fp)
         return m_fp
 
+    def stacked_views(
+        self, states: list[dict[str, Any]], view: Any, eff: tuple[int, ...]
+    ) -> _StackedViews | None:
+        """``mat(s["m"])`` per param — the read source *and* the write-back target.
+
+        ``store_stacked``'s target is ``s["m"].view(eff)``, the same storage with the
+        same shape as ``view(s["m"])``, so one list serves both.
+        """
+        if not _stacked_cacheable(states, scale=False):
+            return None
+        return _StackedViews(tuple(eff), [view(s["m"]) for s in states])
+
     def ema_stacked(
-        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
+        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...],
+        beta1: float, views: _StackedViews | None = None,
     ) -> Tensor:
-        ms = [mat(s["m"]) for s in states]
+        ms = views.m if views is not None and views.eff == eff else [mat(s["m"]) for s in states]
         mom = torch.stack(ms)                                        # [N, …], momentum dtype
         if mom.dtype == torch.float32:
             mom.lerp_(update, 1.0 - beta1)
@@ -346,9 +447,15 @@ class _FloatCodec(_MomentumCodec):
     def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
         state["m"].copy_(m_fp32.reshape(state["m"].shape))
 
-    def store_stacked(self, states: list[dict[str, Any]], m_fp32: Tensor) -> None:
+    def store_stacked(
+        self, states: list[dict[str, Any]], m_fp32: Tensor,
+        views: _StackedViews | None = None,
+    ) -> None:
         shape = tuple(m_fp32.shape[1:])
         vals = list(m_fp32.unbind(0))
+        if views is not None and views.eff == shape:
+            torch._foreach_copy_(views.store, vals)
+            return
         # ``reshape`` of a non-contiguous ``m`` returns a COPY; ``_foreach_copy_``
         # would then write the copy and leave state untouched. ``view`` fails loud
         # when the layout cannot alias; otherwise fall back to per-param ``copy_``.
@@ -363,9 +470,11 @@ class _FloatCodec(_MomentumCodec):
         return m.float() if m.dtype != torch.float32 else m.clone()
 
     def dequant_stacked(
-        self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...]
+        self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...],
+        views: _StackedViews | None = None,
     ) -> Tensor:
-        return torch.stack([mat(s["m"]) for s in states]).float()
+        ms = views.m if views is not None and views.eff == eff else [mat(s["m"]) for s in states]
+        return torch.stack(ms).float()
 
     def scale_(self, state: dict[str, Any], factor: float) -> None:
         state["m"].mul_(factor)  # in stored dtype; exact for fp32, rounded for bf16
@@ -394,18 +503,55 @@ class _Int8Codec(_MomentumCodec):
         state["m_scale"].copy_(scale.reshape_as(state["m_scale"]))
         return m
 
-    def ema_stacked(
-        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
-    ) -> Tensor:
+    def stacked_views(
+        self, states: list[dict[str, Any]], view: Any, eff: tuple[int, ...]
+    ) -> _StackedViews | None:
+        """``mat(s["m"])`` and the per-row scale views, plus the requant's own targets.
+
+        The batched requant reduces a ``[N, row, rest]`` view, so ``store_stacked``
+        writes ``[row, rest]`` slices: that is :attr:`~_StackedViews.m`'s own shape for
+        a factored bucket but ``[1, L]`` for a non-factored one, hence the separate
+        :attr:`~_StackedViews.store` list. The scale views must ALIAS (a ``reshape``
+        copy would freeze the scale at its build-time value), which is why a
+        non-contiguous ``m_scale`` declines the cache.
+        """
+        eff = tuple(eff)
+        if len(eff) not in (1, 2) or not _stacked_cacheable(states, scale=True):
+            return None
         rowshape = (eff[0], 1) if len(eff) == 2 else (1,)
-        scale = torch.stack([s["m_scale"].view(*rowshape) for s in states])
-        m = torch.stack([mat(s["m"]) for s in states]).float().mul_(scale)  # dequant
+        row = eff[0] if len(eff) == 2 else 1
+        rest = max(math.prod(eff) // row, 1)
+        return _StackedViews(
+            eff,
+            [view(s["m"]) for s in states],
+            scale=[s["m_scale"].view(rowshape) for s in states],
+            store=[s["m"].view(row, rest) for s in states],
+        )
+
+    def ema_stacked(
+        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...],
+        beta1: float, views: _StackedViews | None = None,
+    ) -> Tensor:
+        cached = views is not None and views.eff == eff
+        if cached:
+            ms = views.m
+            scale = torch.stack(views.scale)
+        else:
+            rowshape = (eff[0], 1) if len(eff) == 2 else (1,)
+            scale = torch.stack([s["m_scale"].view(*rowshape) for s in states])
+            ms = [mat(s["m"]) for s in states]
+        m = torch.stack(ms).float().mul_(scale)                      # dequant
         m.lerp_(update, 1.0 - beta1)
         # No clone: ``_quant_int8_stacked`` does not mutate ``m``.
         q, new_scale = _quant_int8_stacked(m)                        # requant
-        torch._foreach_copy_([mat(s["m"]) for s in states], list(q.unbind(0)))
-        for s, sc in zip(states, new_scale.unbind(0), strict=True):
-            s["m_scale"].copy_(sc.view_as(s["m_scale"]))
+        # ``_quant_int8_stacked`` reduces the trailing axis of ``[N, *eff]``, so
+        # ``new_scale`` is already ``[N, *rowshape]`` — the cached scale views' shape.
+        torch._foreach_copy_(ms, list(q.unbind(0)))
+        if cached:
+            torch._foreach_copy_(views.scale, list(new_scale.unbind(0)))
+        else:
+            for s, sc in zip(states, new_scale.unbind(0), strict=True):
+                s["m_scale"].copy_(sc.view_as(s["m_scale"]))
         return m
 
     def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
@@ -413,7 +559,10 @@ class _Int8Codec(_MomentumCodec):
         state["m"].copy_(q)
         state["m_scale"].copy_(scale.reshape_as(state["m_scale"]))
 
-    def store_stacked(self, states: list[dict[str, Any]], m_fp32: Tensor) -> None:
+    def store_stacked(
+        self, states: list[dict[str, Any]], m_fp32: Tensor,
+        views: _StackedViews | None = None,
+    ) -> None:
         n = m_fp32.shape[0]
         shape = tuple(m_fp32.shape[1:])
         per = math.prod(shape) if shape else 1
@@ -421,6 +570,13 @@ class _Int8Codec(_MomentumCodec):
         rest = max(per // row, 1)
         q, new_scale = _quant_int8_stacked(m_fp32.reshape(n, row, rest))
         qs = list(q.unbind(0))
+        if views is not None and views.eff == shape:
+            rowshape = (row, 1) if len(shape) >= 2 else (1,)
+            torch._foreach_copy_(views.store, qs)
+            # ``new_scale`` is [N, row, 1]; the cached views carry the per-param scale
+            # layout (see int8_scale_shape), which for a flat bucket is [1], not [1, 1].
+            torch._foreach_copy_(views.scale, list(new_scale.view((n, *rowshape)).unbind(0)))
+            return
         # ``reshape`` of a non-contiguous ndim>2 buffer is a COPY; writing it would
         # leave ``state["m"]`` unchanged. Prefer ``view`` (aliases storage) and fall
         # back to a per-param ``copy_`` into the original shape when needed.
@@ -438,8 +594,11 @@ class _Int8Codec(_MomentumCodec):
         return state["m"].float().mul_(state["m_scale"])
 
     def dequant_stacked(
-        self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...]
+        self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...],
+        views: _StackedViews | None = None,
     ) -> Tensor:
+        if views is not None and views.eff == eff:
+            return torch.stack(views.m).float().mul_(torch.stack(views.scale))
         m = torch.stack([mat(s["m"]) for s in states]).float()       # [N, *mview]
         # Per-row int8 scale: leading axis = dim-0 of the *matrixized* momentum,
         # the rest broadcast (1s). For a 1-D / scalar-scale param this is all 1s.
@@ -485,14 +644,35 @@ class _FourBitCodec(_MomentumCodec):
         state["m_scale"].copy_(scale)
         return m
 
+    def stacked_views(
+        self, states: list[dict[str, Any]], view: Any, eff: tuple[int, ...]
+    ) -> _StackedViews | None:
+        """The raw packed buffers and per-block scales — 4-bit has no effective layout.
+
+        ``m`` is a nibble-packed byte string, so ``view`` is never applied (and the
+        codec never calls ``mat``); the cache saves the per-step *list* rebuilds and
+        turns the per-param scale write-back into one ``_foreach_copy_``. Buckets mix
+        no block sizes: the stacked path already reads ``states[0]["m_block"]``.
+        """
+        if not _stacked_cacheable(states, scale=True):
+            return None
+        return _StackedViews(
+            tuple(eff),
+            [s["m"] for s in states],
+            scale=[s["m_scale"] for s in states],
+        )
+
     def ema_stacked(
-        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...], beta1: float
+        self, states: list[dict[str, Any]], update: Tensor, mat: Any, eff: tuple[int, ...],
+        beta1: float, views: _StackedViews | None = None,
     ) -> Tensor:
         n = update.shape[0]
         per = math.prod(eff)
         bs = states[0]["m_block"]
-        packed = torch.stack([s["m"] for s in states])              # [N, ceil(per/2)]
-        sc = torch.stack([s["m_scale"] for s in states])            # [N, nblocks]
+        cached = views is not None and views.eff == eff
+        ms = views.m if cached else [s["m"] for s in states]
+        packed = torch.stack(ms)                                    # [N, ceil(per/2)]
+        sc = torch.stack(views.scale if cached else [s["m_scale"] for s in states])  # [N, nblk]
         # ``_dequant_4bit_stacked`` returns a fresh tensor (never a view of the state).
         # When ``per`` is not a block multiple the ``[:, :per]`` slice is non-contiguous;
         # do NOT materialise it: ``lerp_`` picks a different kernel on a contiguous copy
@@ -501,9 +681,12 @@ class _FourBitCodec(_MomentumCodec):
         m = _dequant_4bit_stacked(packed, sc, per, bs).view_as(update)
         m.lerp_(update, 1.0 - beta1)
         new_packed, new_scale = _quant_4bit_stacked(m.reshape(n, per), bs)  # requant
-        torch._foreach_copy_([s["m"] for s in states], list(new_packed.unbind(0)))
-        for s, sc_i in zip(states, new_scale.unbind(0), strict=True):
-            s["m_scale"].copy_(sc_i)
+        torch._foreach_copy_(ms, list(new_packed.unbind(0)))
+        if cached:
+            torch._foreach_copy_(views.scale, list(new_scale.unbind(0)))
+        else:
+            for s, sc_i in zip(states, new_scale.unbind(0), strict=True):
+                s["m_scale"].copy_(sc_i)
         return m
 
     def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
@@ -511,12 +694,20 @@ class _FourBitCodec(_MomentumCodec):
         state["m"].copy_(packed)
         state["m_scale"].copy_(scale)
 
-    def store_stacked(self, states: list[dict[str, Any]], m_fp32: Tensor) -> None:
+    def store_stacked(
+        self, states: list[dict[str, Any]], m_fp32: Tensor,
+        views: _StackedViews | None = None,
+    ) -> None:
         n = m_fp32.shape[0]
-        per = math.prod(tuple(m_fp32.shape[1:])) if m_fp32.ndim > 1 else 1
+        shape = tuple(m_fp32.shape[1:])
+        per = math.prod(shape) if m_fp32.ndim > 1 else 1
         bs = states[0]["m_block"]
         new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs)
         packs = list(new_packed.unbind(0))
+        if views is not None and views.eff == shape:
+            torch._foreach_copy_(views.store, packs)
+            torch._foreach_copy_(views.scale, list(new_scale.unbind(0)))
+            return
         # Packed buffers are 1-D; still guard non-contiguous storage the same way.
         if all(s["m"].is_contiguous() for s in states):
             torch._foreach_copy_([s["m"] for s in states], packs)
@@ -532,12 +723,14 @@ class _FourBitCodec(_MomentumCodec):
         return m.view_as(like)
 
     def dequant_stacked(
-        self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...]
+        self, states: list[dict[str, Any]], mat: Any, eff: tuple[int, ...],
+        views: _StackedViews | None = None,
     ) -> Tensor:
         per = math.prod(eff)
         bs = states[0]["m_block"]
-        packed = torch.stack([s["m"] for s in states])
-        sc = torch.stack([s["m_scale"] for s in states])
+        cached = views is not None and views.eff == eff
+        packed = torch.stack(views.m if cached else [s["m"] for s in states])
+        sc = torch.stack(views.scale if cached else [s["m_scale"] for s in states])
         n = packed.shape[0]
         return _dequant_4bit_stacked(packed, sc, per, bs).reshape((n, *eff))
 

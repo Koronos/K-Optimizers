@@ -99,7 +99,6 @@ from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
-    _dequant_4bit_stacked,
     _make_codec,
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
@@ -321,30 +320,6 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
         """
         self._codec(md).store_one(state, m_fp32)
 
-    @staticmethod
-    def _dequant_stacked(
-        states: list[dict[str, Any]], md: str, shape: tuple[int, ...]
-    ) -> Tensor:
-        """Stacked fp32 first moment ``[N, *shape]`` from per-param storage."""
-        n = len(states)
-        per = math.prod(shape)
-        if md in ("bfloat16", "float32"):
-            return torch.stack([s["m"].reshape(shape) for s in states]).float()
-        if md == "int8":
-            row = shape[0] if len(shape) >= 2 else 1
-            rest = max(per // row, 1)
-            m = torch.stack([s["m"].reshape(row, rest) for s in states]).float()  # [N, R, rest]
-            scale = torch.stack([s["m_scale"].reshape(row, 1) for s in states])   # [N, R, 1]
-            return m.mul_(scale).reshape((n, *shape))
-        packed = torch.stack([s["m"] for s in states])
-        sc = torch.stack([s["m_scale"] for s in states])
-        bs = states[0]["m_block"]
-        return _dequant_4bit_stacked(packed, sc, per, bs).reshape((n, *shape))
-
-    def _store_stacked(self, states: list[dict[str, Any]], md: str, m_fp32: Tensor) -> None:
-        """Write stacked fp32 first moment ``[N, *shape]`` back into per-param storage."""
-        self._codec(md).store_stacked(states, m_fp32)
-
     # ----------------------------------------------------------- coefficients
     @staticmethod
     def _coeffs(group: dict[str, Any], step: int) -> dict[str, float]:
@@ -556,9 +531,10 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
     # ``col`` (factored) and ``v`` (non-factored) are the state buffers the bucket bodies
     # stack and write back through; the per-parameter step joins the bucket key so every
     # slice of a bucket shares one bias correction (and one ``_coeffs`` dict) — and, with
-    # it, the projection's per-channel view dims. The momentum goes through
-    # ``_dequant_stacked`` / ``_store_stacked``, which take ``states`` rather than a
-    # ``mat`` callback, so there is no codec view cache to prebuild here.
+    # it, the projection's per-channel view dims. The momentum goes through the shared
+    # codec's stacked read/write, whose own per-param view lists come from
+    # ``chunk.momentum_views`` — so ``momentum_cache`` (the identity-keyed ``mat``
+    # lookup, a strictly worse cache of the same views) stays off here.
     _FOREACH_SPEC = ForeachSpec(
         factored_state=("row", "col"),
         flat_state=("v",),
@@ -642,9 +618,11 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
         inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])                        # 1/sqrt(v_hat)
 
         # First-moment EMA (raw Adam momentum), read, EMA, store back.
-        m = self._dequant_stacked(states, md, (R, C))                             # [N, R, C]
+        codec = self._codec(md)
+        views = chunk.momentum_views(codec)
+        m = codec.dequant_stacked(states, chunk.mat, (R, C), views=views)         # [N, R, C]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
-        self._store_stacked(states, md, m.reshape((chunk.n, R, C)))
+        codec.store_stacked(states, m.reshape((chunk.n, R, C)), views=views)
 
         if nesterov:
             perturb = (m.mul(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])).mul_(inv_denom)
@@ -704,9 +682,11 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
         # Official 1-D denom: sqrt(v)/sqrt(bc2) + eps.
         de_nom = v.sqrt().div_(c["bc2_sq"]).add_(eps)
 
-        m = self._dequant_stacked(states, md, (length,))                  # [N, L]
+        codec = self._codec(md)
+        views = chunk.momentum_views(codec)
+        m = codec.dequant_stacked(states, chunk.mat, (length,), views=views)  # [N, L]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
-        self._store_stacked(states, md, m.reshape((chunk.n, length)))
+        codec.store_stacked(states, m.reshape((chunk.n, length)), views=views)
 
         if nesterov:
             perturb = (m.mul(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])).div_(de_nom)

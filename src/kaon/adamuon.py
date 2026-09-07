@@ -832,7 +832,11 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         # First moment of the RAW gradient (codec owns dequant→EMA→requant). Stays
         # in eager: it walks per-param state dicts, exactly the Python-container
         # work the compiled kernels must not see.
-        m = codec.ema_stacked(states, grad, chunk.mat, (R, C), beta1) if beta1 > 0 else grad
+        m = (
+            codec.ema_stacked(states, grad, chunk.mat, (R, C), beta1,
+                              views=chunk.momentum_views(codec))
+            if beta1 > 0 else grad
+        )
 
         dev = grad.device
         p_fp32 = chunk.param_stack() if wd != 0 else None
@@ -894,7 +898,8 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
         if beta1 > 0:
-            delta = codec.ema_stacked(states, update, chunk.mat, (chunk.length,), beta1)  # [N, L]
+            delta = codec.ema_stacked(states, update, chunk.mat, (chunk.length,), beta1,
+                                      views=chunk.momentum_views(codec))    # [N, L]
         else:
             delta = update
 

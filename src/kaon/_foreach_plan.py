@@ -131,7 +131,10 @@ class ForeachChunk:
     * :attr:`state_views` — one list per key named in the spec, in spec order.
     * :attr:`mat` — what to hand the momentum codec. Usually :attr:`view`; when the view
       is a real reshape, an identity-keyed lookup of prebuilt momentum views is cheaper,
-      because the codec calls it once (float) or twice (int8) per param per step.
+      because the codec calls it once (float) or twice (int8) per param per step. Only
+      the *uncached* codec path calls it — see :meth:`momentum_views`.
+    * :meth:`momentum_views` — the codec's own stacked-path view lists, built on first
+      use and kept for the chunk's lifetime.
 
     Gradient views are deliberately **not** cached: a retained view of ``p.grad`` keeps
     the previous step's gradient storage alive (``set_to_none=True`` allocates a fresh
@@ -143,8 +146,8 @@ class ForeachChunk:
     """
 
     __slots__ = ("eff", "grad_reshape", "grad_uniform", "key", "key_index", "length",
-                 "mat", "matrixize", "n", "plist", "pviews", "single_alias",
-                 "state_views", "states", "view")
+                 "mat", "matrixize", "momentum_view_cache", "n", "plist", "pviews",
+                 "single_alias", "state_views", "states", "view")
 
     def __init__(
         self,
@@ -194,6 +197,35 @@ class ForeachChunk:
         if (cached and self.view is not _identity and spec.momentum_cache is not None
                 and spec.momentum_cache(group)):
             self.mat = {s["m"]: self.view(s["m"]) for s in states}.__getitem__
+        self.momentum_view_cache: tuple[Any, Any] | None = None
+
+    def momentum_views(self, codec: Any) -> Any:
+        """This chunk's cached view lists for ``codec``'s stacked path, or ``None``.
+
+        The momentum codec's stacked entry points (``ema_stacked`` / ``store_stacked``
+        / ``dequant_stacked``) walk the same per-param lists as the rest of a bucket
+        body — ``mat(state["m"])``, the per-row ``state["m_scale"]`` views, the
+        write-back targets — and rebuilt them on every step. This asks the codec to
+        build them ONCE (``codec.stacked_views``) and hands the result to every call as
+        ``views=``; ``None`` means the codec declined the layout (a non-contiguous
+        buffer) and the caller keeps its uncached path.
+
+        Keyed on the codec *instance*, so a group whose ``momentum_dtype`` changes
+        cannot read another codec's layout (optimizers memoize one codec per dtype).
+        Otherwise the lifetime is the chunk's: the lists alias ``state["m"]`` /
+        ``state["m_scale"]`` exactly as :attr:`state_views` aliases ``row``/``col``/``v``,
+        so they go stale on the same events and are dropped by the same plan
+        invalidation (:meth:`ForeachPlanMixin._foreach_chunks` and
+        :meth:`ForeachPlanMixin._clear_foreach_plans` — ``load_state_dict`` *replaces*
+        the state tensors). An in-place requant, 4-bit's included, keeps them valid.
+        """
+        cache = self.momentum_view_cache
+        if cache is None or cache[0] is not codec:
+            eff = self.eff if self.eff is not None else (self.length,)
+            self.momentum_view_cache = cache = (
+                codec, codec.stacked_views(self.states, self.view, eff)
+            )
+        return cache[1]
 
     def grad_stack(self) -> Tensor:
         """This step's stacked fp32 gradient ``[N, *eff]``. Never cached — see the class

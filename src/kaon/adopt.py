@@ -475,7 +475,9 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
             normed.clamp_(-c["clip"], c["clip"])
 
         # --- momentum EMA of the NORMALIZED grad, then p -= lr * m ---
-        m = self._codec(group).ema_stacked(states, normed, chunk.mat, (R, C), c["beta1"])  # [N, R, C]
+        codec = self._codec(group)
+        m = codec.ema_stacked(states, normed, chunk.mat, (R, C), c["beta1"],
+                              views=chunk.momentum_views(codec))          # [N, R, C]
         delta = m.mul_(c["lr"])
 
         if cautious:
@@ -529,7 +531,9 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
         if c["clip"] is not None:
             normed.clamp_(-c["clip"], c["clip"])
 
-        m = self._codec(group).ema_stacked(states, normed, chunk.mat, (chunk.length,), c["beta1"])
+        codec = self._codec(group)
+        m = codec.ema_stacked(states, normed, chunk.mat, (chunk.length,), c["beta1"],
+                              views=chunk.momentum_views(codec))
         delta = m.mul_(c["lr"])
 
         if cautious:
