@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **`Lookahead.load_state_dict` bypassed the inner Adakaon's own loader.** It handed
+  `load_state_dict_preserving_dtypes` straight to the wrapper mixin, so
+  `Adakaon.load_state_dict` never ran for the inner optimizer and a resume through
+  Lookahead was *not* equivalent to a resume on a bare Adakaon. Three consequences,
+  all fixed by delegating to `inner.load_state_dict` (what `SAM`/`MSAM`/`Nekaon`
+  already did):
+  - **The fused path's stochastic-rounding seed counter was lost.** `_adakaon_meta`
+    (`fused_step`) was silently dropped by torch's loader, so `Adakaon._t` restarted at
+    `0` on every resume and the bf16 weight-write noise stream desynchronised: measured
+    on CUDA (64×64 bf16 params, `fused=True`, bf16 momentum, 4+4 steps) a resumed run
+    diverged from an uninterrupted one by up to **4.7e-2** absolute. Now bit-identical.
+  - **Adakaon's host-side caches survived the load.** `_invalidate_fused_caches` never
+    ran, so the foreach plan and the fused pointer tables stayed cached under an
+    `id(group)` the loader had already replaced — one orphaned entry leaked per load,
+    aliasing state tensors that no longer belonged to the optimizer, and a reused
+    CPython `id(group)` could have handed a live group a stale plan.
+  - **The inner's group-key back-fill never ran**, so a checkpoint predating an Adakaon
+    group key (e.g. `cautious_wd`) resumed through Lookahead without it and the next
+    `step()` died with `KeyError` — the very failure the 0.7.12 back-fill batch fixed
+    everywhere else. A pre-0.7.11 checkpoint's lr-scaled momentum was also left
+    unmigrated (it is now rescaled to direction units, as on a direct load).
+
+  The dtype-exact resume the old call was there for is unchanged:
+  `Adakaon.load_state_dict` delegates to the same
+  `load_state_dict_preserving_dtypes`. `_load_wrapped` now documents the contract, and
+  new structural tests pin it for `Lookahead`, `SAM` and `MSAM`. Step path untouched:
+  86 CPU + 102 CUDA A/B cases (every optimizer × momentum dtype × param dtype ×
+  foreach/fused, plus the direct non-wrapper load) hash bit-identically to 0.7.12.
+
 ## [0.7.12]
 
 This release is a full correctness and performance audit of the 0.7.11 fused/Triton
