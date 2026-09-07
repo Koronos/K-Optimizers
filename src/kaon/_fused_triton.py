@@ -128,15 +128,15 @@ _STRIDE = torch.Tensor.stride
 # OFF by default because it cannot be made cheap enough. The witness is a host sweep over every
 # param in the group, once per step per group plus once per big shape bucket, and a shape field is
 # one more sweep. Measured with ``benchmarks/fused/bench_shape_witness.py`` (paired and
-# interleaved) against the step's MIN wall time on the same bag. Ranges are across repeat runs on
-# a laptop GPU shared with other jobs — the ORDERING was stable in every run, the absolutes were
-# not, so both are given:
+# interleaved) against the step's MIN wall time on the same bag. Ranges span repeat runs on TWO
+# machines, both laptop GPUs shared with other jobs — the ORDERING of the candidate fields was
+# stable in every run, the absolutes were not, so the spread is given:
 #
 #     bag                          witness calls/step   added host    % of the min step
 #     428 LoRA-ish (200x(256,256)
-#       + 100x(512,) + 128x 0-D)   2 (428p + 200p)      +61..65 µs       3.2..3.6%
-#     448x 0-D (launch-bound)      1 (448p)             +35..55 µs        10..18%
-#     UNet/DiT-ish, 80 params      5 (80p + 4 buckets)  +14..17 µs       1.6..1.7%
+#       + 100x(512,) + 128x 0-D)   2 (428p + 200p)      +61..65 µs       3.0..3.6%
+#     448x 0-D (launch-bound)      1 (448p)             +35..55 µs         8..18%
+#     UNet/DiT-ish, 80 params      5 (80p + 4 buckets)  +14..17 µs       1.1..1.7%
 #
 # Nothing about the FIELD is what makes that expensive — it is the sweep. ``Tensor.stride`` is
 # the cheapest form measured on the 428-param bag (+42..65 µs, against +65..104 for
@@ -150,9 +150,23 @@ _STRIDE = torch.Tensor.stride
 # (main's three fields alone are already ~20-25% of that step).
 #
 # What is always on instead is :func:`check_state_geometry`, which costs nothing per step and
-# closes the case that actually corrupts memory (see its docstring). This flag adds detection of
-# the one remaining case: a rebind that changes the shape and NOTHING else, so no other field
-# moves. Set it when something in the training loop rebinds ``p.data`` (an external EMA, an
+# closes the cases that actually corrupt memory (see its docstring). This flag adds detection of
+# a rebind that changes the shape and NOTHING else, so no other field moves — MOST of it, not all:
+#
+# BLIND SPOT, with the flag on. Strides do NOT see a truncation along dim 0 of a contiguous
+# tensor. ``(16,64) -> p.data[:8]`` keeps the strides ``(64, 1)``, the pointer and contiguity, and
+# a 1-D ``[:256]`` keeps ``(1,)`` — only ``numel`` moves, and numel is not a field here. Such a
+# param keeps being stepped at its PRE-narrowing extent, which means the optimizer writes past the
+# param's current ``numel`` *inside the original storage*: measured 324 of the 512 elements beyond
+# a narrowed ``(16,64)`` modified, max delta 1.5e-3. So a SIBLING VIEW of the same storage — a
+# split QKV, anything from ``chunk()``/``split()`` — is silently rewritten. Neither this flag nor
+# ``check_state_geometry`` closes that (the guard never runs, because nothing triggers a rebuild);
+# what closes it is the narrowing also moving the storage, which is the common case and is caught.
+# ``numel`` is the complementary field and is CHEAPER than strides (+22..32 µs vs +32..65 on the
+# 428-param bag) but blind to the reported ``view`` case, which preserves numel. Only
+# ``strides + numel`` is complete, at the sum of both costs.
+#
+# Set the flag when something in the training loop rebinds ``p.data`` (an external EMA, an
 # offloader, a resolution-switching harness) and you want a loud failure instead of a weight
 # quietly optimized as the shape it used to have::
 #
@@ -179,9 +193,11 @@ def param_witness(plist) -> tuple:
       only the strides move, and the kernels index row-major from ``data_ptr``.
 
     Plus a FOURTH, ``strides``, when :data:`SHAPE_WITNESS` is on — see that flag for what it
-    detects and what it costs. It is the shape proxy: for a contiguous tensor ``stride(0)`` IS
-    the ``C`` of :func:`eff_2d` and the rest of the tuple pins every inner dim, so every change
-    to the matrix the factored state describes moves it.
+    detects, what it costs, and the one geometry change it does NOT see. It is a shape PROXY, not
+    the shape: for a contiguous tensor ``stride(0)`` is the ``C`` of :func:`eff_2d` and the rest
+    of the tuple pins every inner dim, so a change to ``C`` or to the dim count moves it — but a
+    change to ``R`` alone does not. ``(16,64) -> p.data[:8]`` keeps ``(64, 1)``, and a 1-D
+    ``[:256]`` keeps ``(1,)``; catching those needs ``numel`` as well.
 
     Detection is only half of it either way. Moving the witness REBUILDS the plan, and a rebuilt
     plan would otherwise point the new ``R``/``C`` at the old ``row``/``col`` buffers — so every
@@ -210,6 +226,12 @@ def check_state_geometry(plist, state_of, factored: bool) -> None:
     ``factored`` picks which invariant applies, i.e. which route the caller built the cache for.
     An EMPTY state is skipped: on a param's first step the caller's ``_init_state`` allocates
     against the shape the param has now, so there is nothing stale to catch.
+
+    Not only rebinds. ``load_state_dict`` reaches here too: a checkpoint saved from ``(512, 16)``
+    weights loads onto ``(16, 512)`` ones without complaint (same param count, same numel), and
+    the factored state then arrives with ``row=512``/``col=16`` against an effective shape of
+    ``(16, 512)`` — 2048 bytes written into a 64-byte ``col``, which left ``p`` non-finite with no
+    exception before this check existed.
     """
     bad = []
     for p in plist:
@@ -236,12 +258,16 @@ def check_state_geometry(plist, state_of, factored: bool) -> None:
     if bad:
         detail = "; ".join(f"{sh}: {why}" for sh, why in bad[:4])
         raise RuntimeError(
-            f"kaon fused step: {len(bad)} parameter(s) changed SHAPE while keeping their optimizer "
-            f"state -- {detail}. A shape-changing ``p.data`` rebind (view/reshape/narrow) "
-            "mid-training is not supported: the second moment is allocated for the old geometry "
-            "and an EMA cannot be migrated onto a different factorization. Reshape before "
-            "constructing the optimizer, or drop that parameter's state (``del opt.state[p]``) to "
-            "restart its second moment from the new shape."
+            f"kaon fused step: {len(bad)} parameter(s) have an optimizer state that does not "
+            f"describe their current SHAPE -- {detail}. Either a shape-changing ``p.data`` rebind "
+            "(view/reshape/narrow) mid-training, or a ``load_state_dict`` from a checkpoint whose "
+            "shapes differ; neither is supported, because the second moment is allocated for the "
+            "old geometry and an EMA cannot be migrated onto a different factorization. "
+            "RECOVERY: reshape before constructing the optimizer, or drop that parameter's state "
+            "(``del opt.state[p]``) to restart its second moment from the new shape. NOTE this "
+            "step may be PARTIALLY APPLIED: the fused subsets are dispatched in order "
+            "(native, one-block, big, 1-D) and the ones before this one already launched, so do "
+            "not retry the step -- fix the state and carry on from the next one."
         )
 
 # Momentum storage kinds (passed to the kernel as a constexpr so the unused branches compile away).
@@ -2107,7 +2133,7 @@ class _WitnessedCache:
     subclass calls at build right after the witness. That is what makes a witness MOVE safe: a
     rebuilt plan would otherwise carry the new ``R``/``C`` against the old ``row``/``col``
     buffers and read past them. Same guard the native plan uses (``Adakaon._foreach_plan``) and
-    MSAM's ``p_witness``; the grad side is already covered per step by ``refresh_grads``.
+    MSAM's ``_plan_addrs_valid``; the grad side is already covered per step by ``refresh_grads``.
     """
 
     def _witness(self, plist) -> None:

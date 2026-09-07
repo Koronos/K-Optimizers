@@ -619,22 +619,33 @@ def test_transpose_rebind_keeps_the_same_pointer_but_must_reroute():
     assert d < 1e-6, f"max|Delta p|={d:.2e} after a transpose rebind"
 
 
-# The rebinds a shape guard has to catch, as (starting shapes, rebind, new shape). Each one
-# keeps the storage — same ``data_ptr``, still contiguous — and changes the geometry the factored
-# state is bound to, so NOTHING in the default witness moves.
+# The rebinds a shape guard has to catch, as (starting shapes, rebind, new shape, blind). Each
+# one keeps the storage — same ``data_ptr``, still contiguous — and changes the geometry the
+# factored state is bound to, so NOTHING in the default witness moves. ``blind`` marks the ones
+# ``ft.SHAPE_WITNESS`` cannot see either: strides are a proxy for the shape and a truncation
+# along dim 0 does not move them.
 _SHAPE_REBINDS = {
     # (16,64) -> (64,16): the reported case. numel, pointer and contiguity all survive; only
     # the row/col split moves, so ``row`` (16 entries) is asked to serve 64 rows.
-    "view_transposed_shape": ([(16, 64)] * 2, lambda t: t.view(64, 16), (64, 16)),
+    "view_transposed_shape": ([(16, 64)] * 2, lambda t: t.view(64, 16), (64, 16), False),
     # 2-D -> 1-D changes the ROUTE too: the param now belongs on the non-factored 1-D kernel,
     # whose state key is ``v`` — which a factored state does not have.
-    "reshape_to_1d": ([(16, 64)] * 2, lambda t: t.reshape(1024), (1024,)),
+    "reshape_to_1d": ([(16, 64)] * 2, lambda t: t.reshape(1024), (1024,), False),
     # 1-D -> 2-D, the mirror: a flat ``v`` state asked to serve the factored kernel.
-    "reshape_1d_to_2d": ([(1024,)] * 2, lambda t: t.view(16, 64), (16, 64)),
+    "reshape_1d_to_2d": ([(1024,)] * 2, lambda t: t.view(16, 64), (16, 64), False),
     # A big (>tile-cap) weight takes the chunked route, whose bucket is keyed on the CURRENT
     # exact shape while row/col still carry the old one.
-    "big_view_transposed": ([(256, 1024)] * 2, lambda t: t.view(1024, 256), (1024, 256)),
+    "big_view_transposed": ([(256, 1024)] * 2, lambda t: t.view(1024, 256), (1024, 256), False),
+    # R shrinks, C does not: ``row`` is now too LONG while ``col`` still fits exactly, so this is
+    # the case a guard that only checked ``col`` would wave through. Strides stay (64,1), so the
+    # shape witness is blind to it too — only ``numel`` moves. See ``check_state_geometry``.
+    "narrow_rows": ([(16, 64)] * 2, lambda t: t[:8], (8, 64), True),
+    # The 1-D mirror: ``v`` is too long and the strides stay (1,). This is the case a guard that
+    # dropped the ``v.numel() != p.numel()`` arm would wave through.
+    "narrow_1d": ([(1024,)] * 2, lambda t: t[:256], (256,), True),
 }
+_BLIND = [k for k, v in _SHAPE_REBINDS.items() if v[3]]
+_SEEN = [k for k, v in _SHAPE_REBINDS.items() if not v[3]]
 
 
 @pytest.fixture
@@ -665,7 +676,7 @@ def _shape_rebind_step(fused, case="view_transposed_shape", rebind_all=False,
     its bucket is still fine. ``fresh_storage`` additionally clones the rebound view, which is
     what makes the case detectable with no shape witness at all — the ``data_ptr`` moves.
     """
-    shapes, rebind, want = _SHAPE_REBINDS[case]
+    shapes, rebind, want, _blind = _SHAPE_REBINDS[case]
     ps = _bag(shapes, torch.float32, seed=73)
     opt = Adakaon(ps, fused=fused, **_FP32_CFG)
     _drive([(ps, opt)], 2, torch.Generator(device=DEV).manual_seed(79))
@@ -720,7 +731,7 @@ def test_shape_rebind_with_fresh_storage_is_caught_by_default(case, rebind_all):
     assert "shape" in str(exc).lower() and "rebind" in str(exc).lower(), str(exc)
 
 
-@pytest.mark.parametrize("case", list(_SHAPE_REBINDS))
+@pytest.mark.parametrize("case", _SEEN)
 @pytest.mark.parametrize("rebind_all", [False, True], ids=["one_param", "whole_bag"])
 def test_shape_changing_rebind_is_caught_on_the_fused_path(shape_witness, case, rebind_all):
     """THE DETECTION HALF, under ``ft.SHAPE_WITNESS``: shape changed and nothing else.
@@ -743,14 +754,20 @@ def test_shape_changing_rebind_is_caught_on_the_fused_path(shape_witness, case, 
            "in bounds (a view shares the whole storage), so this degrades quality rather than "
            "corrupting memory - the corrupting variant (shape + fresh storage) IS caught by "
            "default, see test_shape_rebind_with_fresh_storage_is_caught_by_default. Detecting "
-           "this one costs a per-param host sweep per step, measured at 3.2-3.6% of the "
-           "428-param LoRA step and 10-18% of the launch-bound 0-D step (even Tensor.dim, which "
+           "this one costs a per-param host sweep per step, measured at 3.0-3.6% of the "
+           "428-param LoRA step and 8-18% of the launch-bound 0-D step (even Tensor.dim, which "
            "cannot see it, is already >4% there), so it is opt-in as ft.SHAPE_WITNESS - which "
            "the test above exercises.",
     strict=True,
 )
-def test_pointer_preserving_shape_rebind_is_undetected_by_default():
-    """The default-configuration mirror of the test above."""
+def test_pointer_preserving_shape_rebind_is_undetected_by_default(monkeypatch):
+    """The default-configuration mirror of the test above.
+
+    The flag is PINNED off rather than read from the module: this test asserts what the shipped
+    default does, so a session that turned ``SHAPE_WITNESS`` on globally (the suite is run both
+    ways) must not turn a strict xfail into an XPASS.
+    """
+    monkeypatch.setattr("kaon._fused_triton.SHAPE_WITNESS", False)
     opt, ps, exc = _shape_rebind_step(fused=True)
     st = opt.state[ps[0]]
     assert (st["row"].numel(), st["col"].numel()) == (16, 64)   # state kept the old geometry
@@ -801,6 +818,81 @@ def test_benign_rebind_to_fresh_storage_of_the_same_shape_still_steps(witness_on
     assert d < 1e-6, f"max|Delta p|={d:.2e} after a same-shape rebind"
     after = [id(c) for c in opt._fused_ob_caches.values()]
     assert before != after, "the pointer cache was not rebuilt after the rebind"
+@pytest.mark.parametrize("case", _BLIND)
+def test_narrowing_rebind_is_blind_even_to_the_shape_witness(shape_witness, case):
+    """DOCUMENTED BLIND SPOT of ``ft.SHAPE_WITNESS``, pinned so it cannot change unnoticed.
+
+    Strides are a PROXY for the shape, and a truncation along dim 0 of a contiguous tensor does
+    not move them: ``(16,64) -> p.data[:8]`` keeps ``(64, 1)`` and ``(1024,) -> [:256]`` keeps
+    ``(1,)``. Only ``numel`` moves, and numel is not a witness field (it is the complementary
+    one — cheaper than strides, but blind to the ``view`` case that preserves numel; only both
+    together are complete).
+
+    The consequence is worse than a stale factorization, which is why it is written down here:
+    the param keeps being stepped at its PRE-narrowing extent, so the optimizer writes past the
+    param's current ``numel`` INSIDE the original storage. Measured on ``(16,64) -> [:8]``: 324
+    of the 512 elements beyond the narrowed param modified, max delta 1.5e-3 — so a sibling view
+    of the same storage (a split QKV, anything out of ``chunk()``/``split()``) is silently
+    rewritten. What closes it in practice is the narrowing ALSO moving the storage, which is the
+    ordinary case and is caught by default — see
+    ``test_shape_rebind_with_fresh_storage_is_caught_by_default``.
+    """
+    _opt, _ps, exc = _shape_rebind_step(fused=True, case=case)
+    assert exc is None, f"{case} is now detected — good news, but update the docs and this test"
+
+
+def test_narrowing_rebind_writes_past_the_param_into_the_shared_storage(shape_witness):
+    """The measurement behind the blind spot above: the write really does leave the param.
+
+    A raw alias over the full pre-narrowing storage is snapshotted, the param is narrowed to its
+    first 8 rows with the pointer preserved, and one step is taken. Elements beyond the narrowed
+    param must be seen to move — that is the corruption a sibling view would suffer. Asserted
+    rather than described so that a future fix (a ``numel`` field, say) fails here loudly instead
+    of leaving a stale docstring behind.
+    """
+    ps = _bag([(16, 64)] * 2, torch.float32, seed=73)
+    opt = Adakaon(ps, fused=True, **_FP32_CFG)
+    _drive([(ps, opt)], 2, torch.Generator(device=DEV).manual_seed(79))
+    full = ps[0].data.reshape(-1)                 # alias over all 1024 elements
+    snap = full.clone()
+    ptr = ps[0].data_ptr()
+    ps[0].data = ps[0].data[:8]
+    assert ps[0].data_ptr() == ptr and ps[0].is_contiguous() and ps[0].numel() == 512
+    for p in ps:
+        p.grad = torch.randn(tuple(p.shape), device=DEV)
+    opt.step()
+    torch.cuda.synchronize()
+    beyond = (full[512:] - snap[512:]).abs()
+    assert int((beyond > 0).sum()) > 0, (
+        "the narrowed param no longer writes past its numel — the blind spot is closed, so "
+        "update test_narrowing_rebind_is_blind_even_to_the_shape_witness and the docs"
+    )
+
+
+def test_load_state_dict_with_transposed_shapes_is_refused():
+    """The guard is not only about rebinds: ``load_state_dict`` reaches the same mismatch.
+
+    A checkpoint saved from ``(512,16)`` weights loads onto ``(16,512)`` ones without complaint —
+    same param count, same numel, and ``load_state_dict`` does not compare shapes — after which
+    the factored state carries ``row=512``/``col=16`` against an effective shape of ``(16,512)``.
+    On 0.7.12 the step then wrote 2048 bytes into a 64-byte ``col`` and left ``p`` non-finite,
+    with no exception. Nothing about the parameters was rebound, so no witness field is involved:
+    what catches it is the cache rebuild that ``load_state_dict`` already forces, plus
+    ``check_state_geometry``.
+    """
+    src = _bag([(512, 16)], torch.float32, seed=11)
+    osrc = Adakaon(src, fused=True, **_FP32_CFG)
+    _drive([(src, osrc)], 2, torch.Generator(device=DEV).manual_seed(5))
+    dst = _bag([(16, 512)], torch.float32, seed=12)
+    odst = Adakaon(dst, fused=True, **_FP32_CFG)
+    odst.load_state_dict(osrc.state_dict())
+    st = odst.state[dst[0]]
+    assert (st["row"].numel(), st["col"].numel()) == (512, 16), "the transposed state did not load"
+    for p in dst:
+        p.grad = torch.randn(tuple(p.shape), device=DEV)
+    with pytest.raises(RuntimeError, match="(?i)shape"):
+        odst.step()
+        torch.cuda.synchronize()
 
 
 # ----------------------------------------------------------------- 11. sr_round bit fidelity

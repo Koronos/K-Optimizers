@@ -1006,12 +1006,15 @@ _PNM_SHAPE_REBINDS = [
 _PNM_IDS = ["one_block", "to_1d", "from_1d", "big"]
 
 
-def _pnm_shape_rebind(shapes, rebind, want, *, fresh_storage, witness):
-    """Two steps, a shape-changing ``p.data`` rebind on ``ps[0]``, one more step.
+def _pnm_shape_rebind(shapes, rebind, want, *, fresh_storage, witness, rebind_all=False):
+    """Two steps, a shape-changing ``p.data`` rebind, one more step.
 
     Returns the exception the last step raised, or None. ``fresh_storage`` clones the rebound
     view so the ``data_ptr`` moves too, which is what makes the case visible with no shape
-    witness; ``witness`` sets ``ft.SHAPE_WITNESS`` for the run.
+    witness; ``witness`` sets ``ft.SHAPE_WITNESS`` for the run. Only ``ps[0]`` is rebound
+    unless ``rebind_all`` — which matters on the big route, where rebinding the whole bag is
+    what keeps the tensors in ONE same-shape bucket and so reaches the batched kernel's
+    ``BigPnmCache`` instead of the lone-tensor path.
     """
     old = ft.SHAPE_WITNESS
     ft.SHAPE_WITNESS = witness
@@ -1019,10 +1022,11 @@ def _pnm_shape_rebind(shapes, rebind, want, *, fresh_storage, witness):
         ps = _bag(shapes, torch.float32, seed=73)
         opt = AdaPNM(ps, fused=True, **_SAFE_CFG)
         _drive([(ps, opt)], 2, torch.Generator(device=DEV).manual_seed(79))
-        ptr = ps[0].data_ptr()
-        ps[0].data = rebind(ps[0].data).clone() if fresh_storage else rebind(ps[0].data)
-        assert tuple(ps[0].shape) == want and ps[0].is_contiguous()
-        assert (ps[0].data_ptr() != ptr) is fresh_storage
+        for q in (ps if rebind_all else ps[:1]):
+            ptr = q.data_ptr()
+            q.data = rebind(q.data).clone() if fresh_storage else rebind(q.data)
+            assert tuple(q.shape) == want and q.is_contiguous()
+            assert (q.data_ptr() != ptr) is fresh_storage
         for p in ps:
             p.grad = torch.randn(tuple(p.shape), device=DEV)
         try:
@@ -1071,3 +1075,20 @@ def test_pointer_preserving_shape_rebind_needs_the_shape_witness(shapes, rebind,
         f"default detection changed for {shapes[0]}: {off}"
     on = _pnm_shape_rebind(shapes, rebind, want, fresh_storage=False, witness=True)
     assert on is not None, "SHAPE_WITNESS did not catch a pointer-preserving reshape"
+
+
+def test_big_batched_shape_rebind_hits_the_bigpnmcache_guard():
+    """The ``BigPnmCache`` arm of the guard, which the per-tensor big route does not exercise.
+
+    AdaPNM sends a LONE big tensor down ``_chunked_step``, which recomputes ``R``/``C`` from the
+    parameter every step and dies on the state arithmetic with a plain size mismatch — so the
+    other big test never reaches ``BigPnmCache`` at all. Rebinding BOTH tensors to the same new
+    shape keeps them in one same-shape bucket, which is what routes them to the batched kernel
+    and builds the cache; the assertion is on the GUARD's own message, not merely on some
+    RuntimeError, since a size mismatch would satisfy the latter.
+    """
+    exc = _pnm_shape_rebind([(256, 1024)] * 2, lambda t: t.view(1024, 256), (1024, 256),
+                            fresh_storage=True, witness=False, rebind_all=True)
+    assert exc is not None, "the batched big route stepped a plan that disagreed with the state"
+    msg = str(exc)
+    assert "shape" in msg.lower() and "row/col are 256/1024" in msg, msg

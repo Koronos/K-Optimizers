@@ -304,9 +304,12 @@ def _param_witness(plist: list[Tensor]) -> tuple:
 
     Left over, and the reason ``SHAPE_WITNESS`` exists: a rebind that changes the shape and
     NOTHING else moves no field, so the plan is never rebuilt and never revalidated. That weight
-    keeps being stepped as the shape it used to have. It stays in bounds (a view shares the whole
-    storage) so it degrades quality rather than corrupting memory, which is why detecting it is
-    opt-in and closing the corruption path is not.
+    keeps being stepped as the shape it used to have. For a plain ``view`` it stays in bounds (the
+    storage is the same size), so it degrades quality rather than corrupting memory, which is why
+    detecting it is opt-in and closing the corruption paths is not. A NARROWING rebind
+    (``p.data[:8]``) is the sharper version and the flag does not see it either — strides do not
+    move when only ``R`` shrinks; see ``SHAPE_WITNESS`` for what that costs a sibling view of the
+    same storage.
 
     COST on the 428-param LoRA-shaped bag (200x(256,256) + 100x(512,) + 128x 0-D),
     ``benchmarks/fused/bench_shape_witness.py``, paired against the 3-field base: 67 µs for the

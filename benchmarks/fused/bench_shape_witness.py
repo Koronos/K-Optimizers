@@ -292,10 +292,12 @@ def case_budget(args: argparse.Namespace) -> None:
     wrapping ``ft.param_witness``), and the paired host cost of the field at each of those sizes.
 
     The count is not 1. ``_fused_partition`` calls it once over the whole group, and every big
-    shape bucket calls ``BigPointerCache.stale()`` once more over ITS params — because
-    ``_fused_big`` rebuilds its bucket lists every step, so the O(1) ``built_from`` shortcut
-    always misses. On the reference LoRA bag that is 2 calls (428 params + the 200-param
-    (256,256) bucket), which is most of why the field costs what it does there.
+    shape bucket calls ``stale()`` once more over ITS params — because ``_fused_big`` rebuilds
+    its bucket lists every step, so nothing can shortcut it: Adakaon's
+    ``_chunked_step_batched`` (``adakaon.py``) calls ``stale()`` unconditionally, having no
+    ``built_from`` call at all, and AdaPNM's does call ``built_from`` first but it returns False
+    every step for the same reason. On the reference LoRA bag that is 2 calls (428 params + the
+    200-param (256,256) bucket), which is most of why the field costs what it does there.
     """
     print("\n## budget accounting for the shipped +strides field")
     real = ft.param_witness

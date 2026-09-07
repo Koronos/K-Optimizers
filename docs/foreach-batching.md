@@ -232,18 +232,40 @@ pointer cache validates the state geometry against the parameter whenever it is 
   contiguity) → the witness moves, the plan rebuilds, and
   `check_state_geometry` raises a message naming the parameter and what its `row`/`col`
   no longer fit. Free: build-time only. Before 0.7.13 this rebuilt the plan with the
-  *new* `R`/`C` against the *old* buffers and stepped straight through them.
+  *new* `R`/`C` against the *old* buffers and **wrote** through them — measured as the
+  neighbouring allocation (`state[p]["col"]`, 512 B past `row`) being modified, with no
+  exception raised.
+- **`load_state_dict` from a checkpoint whose shapes differ** → the same mismatch with no
+  rebind at all. A checkpoint saved from `(512,16)` weights loads onto `(16,512)` ones
+  without complaint (same param count, same numel, and shapes are not compared), after
+  which `row=512`/`col=16` face an effective shape of `(16,512)`: 2048 B into a 64-byte
+  `col`, and `p` came out non-finite on 0.7.12. `load_state_dict` already drops the
+  caches, so the rebuild runs the check.
 - shape changed and **nothing else** → no field moves, so the plan is never rebuilt and
-  the weight keeps being stepped as its pre-rebind geometry. It stays in bounds (a view
-  shares the whole storage), so this costs quality, not memory safety. Detecting it needs
-  a per-param host sweep per step — measured at 3.2-3.6% of a 428-parameter LoRA step and
-  10-18% of a launch-bound 0-D step — so it is opt-in:
-  `kaon._fused_triton.SHAPE_WITNESS = True` adds per-param strides to the fused witness.
-  See `benchmarks/fused/bench_shape_witness.py` for the full table and why strides beat
-  `torch.Size`.
+  the weight keeps being stepped as its pre-rebind geometry. For a plain `view` that stays
+  in bounds (the storage is the same size), so it costs quality, not memory safety.
+  Detecting it needs a per-param host sweep per step — measured at 3.0-3.6% of a
+  428-parameter LoRA step and 8-18% of a launch-bound 0-D step (two machines, both shared)
+  — so it is opt-in: `kaon._fused_triton.SHAPE_WITNESS = True` adds per-param strides to
+  the fused witness. See `benchmarks/fused/bench_shape_witness.py` for the full table and
+  why strides beat `torch.Size`.
 
-Either way the recovery is the same: reshape *before* constructing the optimizer, or
-`del opt.state[p]` to restart that parameter's second moment at its new shape.
+The opt-in field has a blind spot worth knowing about: strides are a *proxy* for the
+shape, and truncating dim 0 of a contiguous tensor does not move them — `(16,64) ->
+p.data[:8]` keeps `(64,1)`, a 1-D `[:256]` keeps `(1,)`. Only `numel` moves, and `numel`
+is the complementary field (cheaper, but blind to the `view` case that preserves numel;
+only both together are complete). Such a parameter keeps being stepped at its
+pre-narrowing extent, which means the optimizer writes past the parameter's current
+`numel` *inside the original storage* — so a sibling view of that storage (a split QKV,
+anything from `chunk()`/`split()`) is silently rewritten. Neither the flag nor the
+build-time check closes that; what does in practice is the narrowing also moving the
+storage, which is the ordinary case and is caught by default.
+
+The recovery is always the same: reshape *before* constructing the optimizer, or
+`del opt.state[p]` to restart that parameter's second moment at its new shape. Note the
+refusing step may be **partially applied** — the fused subsets dispatch in order (native,
+one-block, big, 1-D) and the ones ahead of the failing one already launched — so carry on
+from the next step rather than retrying it.
 
 Note that the per-parameter clock's *value* changes every step while the *partition* it
 induces does not — so the plan survives it. Only a parameter that actually skips a step

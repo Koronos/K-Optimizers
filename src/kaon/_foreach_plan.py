@@ -59,9 +59,11 @@ def param_witness(plist: list[Tensor]) -> tuple:
     supported and deliberately not watched: the factored second moment is bound to the
     effective 2-D shape, and there is no meaningful migration of an EMA onto a different
     factorization. The stale bucketing makes the next step raise a size mismatch, which
-    is the intended outcome. Same contract as ``kaon.adakaon._param_witness`` and
-    ``kaon._fused_triton.param_witness``; kept separate from the latter because this one
-    guards the NATIVE path, which must work in a build without Triton.
+    is the intended outcome. Same contract as ``kaon.adakaon._param_witness``, and as
+    ``kaon._fused_triton.param_witness`` in its default configuration — that one grows an
+    optional fourth field (per-param strides) under ``ft.SHAPE_WITNESS``, which the native path
+    has no use for; kept separate from it because this one guards the NATIVE path, which must
+    work in a build without Triton.
     """
     return (tuple(map(id, plist)), tuple(map(_DATA_PTR, plist)), tuple(map(_IS_CONTIG, plist)))
 
