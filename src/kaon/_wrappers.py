@@ -53,6 +53,33 @@ __all__ = ["CodecBuffer", "TrainEvalWeights", "WrapsInnerOptimizer"]
 FullDtype = ("bfloat16", "float32", "int8", "4bit")
 
 
+def _onto_device(value: Any, device: torch.device) -> Any:
+    """Move every tensor inside ``value`` to ``device``, **preserving dtype exactly**.
+
+    The device/dtype policy of :func:`kaon._momentum_codec.load_state_dict_preserving_dtypes`,
+    applied to a restored per-parameter state entry: ``.to(device=...)`` only — never a
+    dtype cast. Casting would silently rewrite a wrapper buffer's declared storage (a bf16
+    ``phi`` widened to fp32, an int8 code tensor turned into floats, a 4-bit nibble
+    payload destroyed) and its companion fp32 scales.
+
+    Returns ``value`` **itself** whenever nothing has to move, so a checkpoint already on
+    the parameter's device costs no allocation, no copy and no bit of drift. Containers
+    are walked (torch's own loader does the same) and likewise rebuilt only if a tensor
+    inside them actually moved.
+    """
+    if isinstance(value, Tensor):
+        return value if value.device == device else value.to(device=device)
+    if isinstance(value, dict):
+        moved = {k: _onto_device(v, device) for k, v in value.items()}
+        return value if all(moved[k] is v for k, v in value.items()) else moved
+    if type(value) in (list, tuple):  # exact types only: a namedtuple/subclass is left alone
+        moved_seq = [_onto_device(v, device) for v in value]
+        if all(m is v for m, v in zip(moved_seq, value, strict=True)):
+            return value
+        return moved_seq if isinstance(value, list) else tuple(moved_seq)
+    return value
+
+
 class CodecBuffer:
     """Per-parameter full-size buffer stored through the shared momentum codec.
 
@@ -282,6 +309,16 @@ class WrapsInnerOptimizer:
         ``_clear_foreach_plans``). Bypassing it leaks one cache entry per load under a dead
         ``id(group)`` and desynchronises the fused path's noise stream on resume — which is
         exactly what Lookahead did until it was switched to delegate here.
+
+        The wrapper's own per-param state is restored **on the parameter's device** (via
+        :func:`_onto_device`), at the storage dtype the checkpoint carries — the same
+        device policy ``torch.optim.Optimizer.load_state_dict`` applies to the inner
+        optimizer's state, and the reason the inner half of a resume always worked. This
+        used to install the checkpoint's dicts verbatim, so the near-universal consumer
+        idiom ``torch.load(path, map_location="cpu")`` left Lookahead's ``phi`` (and its
+        scales) on the CPU under CUDA parameters and the next sync died with *"Expected
+        all tensors to be on the same device"*. Nothing is copied when the state already
+        sits on the right device, so a same-device resume stays free and bit-identical.
         """
         sd = dict(state_dict)
         wrapped = sd.pop(self._wrap_state_key, {})
@@ -293,4 +330,8 @@ class WrapsInnerOptimizer:
             if st is None and str(i) in wrapped:  # int->str key drift (JSON round-trips)
                 st = wrapped[str(i)]
             if st is not None:
+                for key, value in list(st.items()):  # device follows the param, dtype intact
+                    moved = _onto_device(value, p.device)
+                    if moved is not value:
+                        st[key] = moved
                 self.state[p] = st

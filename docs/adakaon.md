@@ -225,6 +225,25 @@ seed counter is not part of any checkpoint, so a `Lookahead` resume is bit-ident
 within one process but not across a fresh one — the same limit the bf16 *native* path
 has for every optimizer.
 
+### `map_location`
+
+`torch.load(path, map_location=...)` decides where the checkpoint's tensors *land*, which
+is not necessarily where the parameters live: loading with `map_location="cpu"` (the
+common idiom — it keeps a resume off the GPU until the optimizer asks for it) hands the
+loader a CPU state dict for CUDA parameters. Every kaon optimizer puts its state back on
+each parameter's own device, at the dtype the checkpoint carries, so **any**
+`map_location` resumes correctly and both directions work (a CUDA checkpoint under CPU
+parameters too). Wrapper optimizers do this for their own buffers as well — `Lookahead`'s
+slow weights `phi` and its int8/4-bit scales, `SAM`'s in-flight `old_p`. Nothing is
+copied when a tensor is already on the right device, so a same-device resume costs
+nothing and stays bit-exact.
+
+> Fixed after 0.7.12: up to and including that release, a wrapper installed its own
+> per-parameter buffers exactly
+> as the checkpoint carried them, so a `map_location="cpu"` resume of a CUDA `Lookahead`
+> left `phi` on the CPU and the next slow-weight sync raised `Expected all tensors to be
+> on the same device`. The inner optimizer was never affected.
+
 ## See also
 
 - [foreach-batching.md](foreach-batching.md) — the multi-tensor batching design

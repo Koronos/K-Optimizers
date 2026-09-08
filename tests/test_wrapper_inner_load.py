@@ -75,12 +75,17 @@ def _apply(params, grads):
         p.grad = g.clone().to(device=p.device, dtype=p.dtype)
 
 
-def _roundtrip(state_dict):
-    """Save/load through torch so a test sees a real checkpoint, not the live tensors."""
+def _roundtrip(state_dict, map_location=None):
+    """Save/load through torch so a test sees a real checkpoint, not the live tensors.
+
+    ``map_location`` mirrors what the consumer actually writes: Rengu-Flow (and most
+    training loops) load every checkpoint with ``map_location="cpu"`` and let the
+    optimizer put the state back where the parameters live.
+    """
     buf = io.BytesIO()
     torch.save(state_dict, buf)
     buf.seek(0)
-    return torch.load(buf, weights_only=False)
+    return torch.load(buf, map_location=map_location, weights_only=False)
 
 
 # ------------------------------------------------- (a) inner caches are invalidated
@@ -348,3 +353,205 @@ def test_resume_through_lookahead_is_bit_identical(device, fused, param_dtype, m
     warm = _snapshot(warm_params, warm_opt)
     _assert_same(reference, warm, "warm-resume")
     _assert_same(cold, warm, "cold-vs-warm")
+
+
+# ---------------------- (c) map_location: the wrapper's own state follows its parameter
+
+# ``torch.optim.Optimizer.load_state_dict`` puts every per-param state tensor on the
+# param's device, so the INNER optimizer always came back correct even from a checkpoint
+# loaded with ``map_location="cpu"``. The wrapper's own per-param state does not go
+# through that loader — ``_load_wrapped`` used to install the checkpoint's dicts verbatim,
+# leaving Lookahead's ``phi`` (and its scales) on the CPU under CUDA parameters until the
+# next sync raised "Expected all tensors to be on the same device". These pin the mixin's
+# contract: device follows the parameter, storage dtype is preserved exactly.
+
+_SLOW = ["float32", "bfloat16", "int8", "4bit"]
+
+
+def _wrapper_state_tensors(opt):
+    """``{(param index, key): tensor}`` for every tensor in the WRAPPER's own state."""
+    return {
+        (i, key): value
+        for i, p in enumerate(opt._flat_params())
+        for key, value in opt.state[p].items()
+        if torch.is_tensor(value)
+    }
+
+
+def _assert_state_on_param_devices(opt, what):
+    params = opt._flat_params()
+    tensors = _wrapper_state_tensors(opt)
+    assert tensors, f"{what}: no wrapper state to check — the test is not exercising anything"
+    for (i, key), value in tensors.items():
+        assert value.device == params[i].device, (
+            f"{what}: wrapper state [{i}][{key!r}] is on {value.device}, "
+            f"but its parameter lives on {params[i].device}"
+        )
+
+
+@pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("slow_dtype", _SLOW)
+def test_lookahead_load_from_a_cpu_mapped_checkpoint_syncs(slow_dtype, param_dtype):
+    """The consumer's idiom: ``torch.load(path, map_location="cpu")`` into CUDA params.
+
+    ``phi`` (plus ``phi_scale`` at int8/4bit) must come back on the parameter's device, at
+    its declared storage dtype, and the next sync must run instead of raising.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    shapes = [(16, 8), (8,)]
+    params = _make_params(shapes, dtype=param_dtype, device="cuda")
+    kwargs = dict(lr=1e-2, k=2, slow_dtype=slow_dtype, momentum_dtype="int8", fused=False)
+    opt = Lookahead(params, **kwargs)
+    for grads in _grad_seq(params, 3):
+        _apply(params, grads)
+        opt.step()
+    stored = {k: (t.dtype, t.shape) for k, t in _wrapper_state_tensors(opt).items()}
+
+    reloaded = Lookahead(params, **kwargs)
+    reloaded.load_state_dict(_roundtrip(opt.state_dict(), map_location="cpu"))
+
+    _assert_state_on_param_devices(reloaded, "cpu-mapped load")
+    assert {k: (t.dtype, t.shape) for k, t in _wrapper_state_tensors(reloaded).items()} == stored
+
+    for grads in _grad_seq(params, 2, seed=7):  # crosses a k=2 sync
+        _apply(params, grads)
+        reloaded.step()
+
+
+@pytest.mark.parametrize("slow_dtype", _SLOW)
+def test_lookahead_load_with_explicit_cuda_map_location_still_works(slow_dtype):
+    """A checkpoint mapped straight onto the param's device must stay a no-op: nothing to
+    move, so nothing is copied or reallocated."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    params = _make_params([(16, 8), (8,)], dtype=torch.bfloat16, device="cuda")
+    kwargs = dict(lr=1e-2, k=2, slow_dtype=slow_dtype, fused=False)
+    opt = Lookahead(params, **kwargs)
+    for grads in _grad_seq(params, 3):
+        _apply(params, grads)
+        opt.step()
+
+    sd = _roundtrip(opt.state_dict(), map_location=torch.device("cuda", 0))
+    from_checkpoint = {
+        (int(i), key): value
+        for i, st in sd["lookahead"].items()
+        for key, value in st.items()
+        if torch.is_tensor(value)
+    }
+    reloaded = Lookahead(params, **kwargs)
+    reloaded.load_state_dict(sd)
+
+    _assert_state_on_param_devices(reloaded, "cuda-mapped load")
+    # Already on the right device: the very tensors the checkpoint carried are installed,
+    # not copies of them — no allocation on the load path when nothing has to move.
+    for key, restored in _wrapper_state_tensors(reloaded).items():
+        assert restored is from_checkpoint[key], f"{key} was needlessly reallocated"
+
+    _apply(params, _grad_seq(params, 1, seed=7)[0])
+    reloaded.step()
+
+
+@pytest.mark.parametrize("slow_dtype", _SLOW)
+def test_lookahead_load_of_a_cuda_checkpoint_into_cpu_params_syncs(slow_dtype):
+    """The inverse direction: a CUDA checkpoint restored under CPU parameters (an offload
+    resume, or a GPU run continued on the CPU). The state must come DOWN to the params."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    shapes = [(16, 8), (8,)]
+    kwargs = dict(lr=1e-2, k=2, slow_dtype=slow_dtype, fused=False)
+    cuda_params = _make_params(shapes, device="cuda")
+    cuda_opt = Lookahead(cuda_params, **kwargs)
+    for grads in _grad_seq(cuda_params, 3):
+        _apply(cuda_params, grads)
+        cuda_opt.step()
+    sd = _roundtrip(cuda_opt.state_dict())  # no map_location: comes back on CUDA
+
+    cpu_params = _make_params(shapes, device="cpu")
+    cpu_opt = Lookahead(cpu_params, **kwargs)
+    cpu_opt.load_state_dict(sd)
+
+    _assert_state_on_param_devices(cpu_opt, "cuda checkpoint into cpu params")
+    for grads in _grad_seq(cpu_params, 2, seed=7):
+        _apply(cpu_params, grads)
+        cpu_opt.step()
+
+
+def test_lookahead_eval_backup_lands_on_the_param_device():
+    """A checkpoint taken in eval mode (what the docs prescribe) carries the saved fast
+    weights ``backup``; the ``train()`` after the resume restores them, so they migrate."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    params = _make_params([(16, 8), (8,)], device="cuda")
+    kwargs = dict(lr=1e-2, k=2, slow_dtype="bfloat16", fused=False)
+    opt = Lookahead(params, **kwargs)
+    for grads in _grad_seq(params, 3):
+        _apply(params, grads)
+        opt.step()
+    opt.eval()
+    assert any(key == "backup" for _i, key in _wrapper_state_tensors(opt))
+
+    reloaded = Lookahead(params, **kwargs)
+    reloaded.load_state_dict(_roundtrip(opt.state_dict(), map_location="cpu"))
+    _assert_state_on_param_devices(reloaded, "eval-mode checkpoint")
+
+
+def test_sam_load_from_a_cpu_mapped_checkpoint_keeps_its_state_on_the_params():
+    """SAM keeps no state ACROSS steps, but a checkpoint taken between its two passes
+    carries ``old_p``. The mixin's contract is wrapper-agnostic, so pin it here too."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    params = _make_params([(16, 8), (8,)], device="cuda")
+    kwargs = dict(lr=1e-2, fused=False)
+    opt = SAM(params, **kwargs)
+    _apply(params, _grad_seq(params, 1)[0])
+    opt.first_step()
+    assert any(key == "old_p" for _i, key in _wrapper_state_tensors(opt))
+
+    reloaded = SAM(params, **kwargs)
+    reloaded.load_state_dict(_roundtrip(opt.state_dict(), map_location="cpu"))
+    _assert_state_on_param_devices(reloaded, "SAM mid-step checkpoint")
+
+
+@pytest.mark.parametrize("momentum_dtype", _MOMENTUM)
+@pytest.mark.parametrize("slow_dtype", _SLOW)
+def test_cpu_mapped_resume_through_lookahead_is_bit_identical(slow_dtype, momentum_dtype):
+    """A resume from a ``map_location="cpu"`` checkpoint must land bit-for-bit on the
+    uninterrupted run — a device move changes no bit, so the only thing this can catch is
+    the migration doing something *else* (a dtype cast, a requant, a re-scaled buffer).
+
+    Same protocol as :func:`test_resume_through_lookahead_is_bit_identical`: the arms run
+    sequentially and each re-seeds kaon's global stochastic-rounding streams first, so
+    both draw the same SR noise at the same step index.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    kwargs = dict(
+        lr=1e-2, k=2, alpha=0.5, slow_dtype=slow_dtype,
+        momentum_dtype=momentum_dtype, fused=False,
+    )
+    grads = _grad_seq(_make_params(_SHAPES), _WARMUP + _TAIL, seed=5)
+
+    def fresh():
+        torch.manual_seed(0x5EED)
+        kaon.reseed_stochastic_rounding()
+        params = _make_params(_SHAPES, dtype=torch.bfloat16, device="cuda", seed=3)
+        return params, Lookahead(params, **kwargs)
+
+    def advance(params, opt, window):
+        for gs in window:
+            _apply(params, gs)
+            opt.step()
+
+    ref_params, ref_opt = fresh()
+    advance(ref_params, ref_opt, grads)
+    reference = _snapshot(ref_params, ref_opt)
+
+    res_params, res_opt = fresh()
+    advance(res_params, res_opt, grads[:_WARMUP])
+    sd = _roundtrip(res_opt.state_dict(), map_location="cpu")
+    res_opt = Lookahead(res_params, **kwargs)
+    res_opt.load_state_dict(sd)
+    advance(res_params, res_opt, grads[_WARMUP:])
+    _assert_same(reference, _snapshot(res_params, res_opt), "cpu-mapped resume")
