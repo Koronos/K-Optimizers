@@ -25,13 +25,21 @@ stochastic-rounding seed fix below):
   that never rounds). 0.7.12 ignores unknown top-level keys, so new checkpoints still load
   there — minus the resume guarantee.
 - **Known limitation / follow-up.** A stream identity is allocated in order of *first draw*.
-  A checkpointed run is unaffected (the id travels in the checkpoint), but a **new** run's
-  trajectory moves if that order changes — reordering optimizer construction, adding a
-  second rounding optimizer, or calling `kaon.tune()` first (it builds and steps optimizers).
-  0.7.12's global counter was strictly more order-sensitive (its noise depended on the
-  interleaving of *every* optimizer's writes), so this is an improvement rather than a
-  regression, but an identity derived from something stable about the owner instead of from
-  allocation order would remove the sensitivity altogether. Not done here.
+  Across a resume it is preserved for every owner that had already drawn when the checkpoint
+  was written (its id travels in the checkpoint) and an owner that draws for the *first* time
+  after the resume takes the next free id, which the allocator's watermark makes the same one
+  the continuous run gave it. What is **not** stable is a **new** run's trajectory when the
+  draw order itself changes: reordering optimizer construction, adding a second rounding
+  optimizer, or calling `kaon.tune()` first (it builds and steps optimizers) shifts the ids
+  and therefore the noise. 0.7.12's global counter was strictly more order-sensitive (its
+  noise depended on the interleaving of *every* optimizer's writes), so this is an
+  improvement rather than a regression, but an identity derived from something stable about
+  the owner instead of from allocation order would remove the sensitivity altogether. Not
+  done here.
+- **The unreleased intermediate layout is not read back.** The wrapper key was briefly a
+  single shared `_sr_wrap_meta`; a checkpoint carrying it is loaded, but that one blob is
+  dropped rather than adopted (guessing which level of a nested stack it belonged to is
+  worse than resuming it from draw 0). Only 0.7.13 development checkpoints are affected.
 
 ### Fixed
 - **The shared bf16 stochastic-rounding kernel took its seed from a process-global counter

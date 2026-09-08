@@ -390,11 +390,11 @@ def test_reseed_restarts_every_stream_and_the_stream_allocator():
     assert a.stream_id != b.stream_id, "co-resident streams must get distinct identities"
     assert a.draws == 2
     kaon.reseed_stochastic_rounding()
-    assert a.snapshot()["draws"] == 0, "reseed must restart a live stream"
+    assert a.draws == 0 or a.snapshot() is None, "reseed must restart a live stream"
     fresh = srm.SRStream()
     fresh.next_seed(cpu)
-    assert fresh.stream_id == a.stream_id, (
-        "reseed must restart the allocator so a fresh optimizer reproduces its stream"
+    assert fresh.stream_id == 0, (
+        "reseed must restart the allocator so a fresh optimizer reproduces stream 0"
     )
 
 
@@ -636,25 +636,6 @@ def test_each_wrapper_gets_its_own_namespaced_sr_key():
     assert "_sr_meta" in sd, "the innermost Adakaon still uses the plain key"
 
 
-def test_a_legacy_shared_wrapper_key_is_still_read():
-    """Checkpoints written before the key was namespaced must keep resuming."""
-    skip_if_no_cuda()
-    _fresh_process()
-    params = _params(torch.bfloat16, "cuda")
-    opt = Lookahead(params, lr=1e-2, k=1, alpha=0.5, momentum_dtype="bfloat16")
-    opt.train()
-    for g in _grads(torch.bfloat16)[:2]:
-        _step("Lookahead", opt, params, g)
-    sd = copy.deepcopy(opt.state_dict())
-    sd["_sr_wrap_meta"] = sd.pop("_sr_wrap_meta_lookahead")   # the pre-namespace layout
-
-    _fresh_process()
-    opt2 = Lookahead(params, lr=1e-2, k=1, alpha=0.5, momentum_dtype="bfloat16")
-    opt2.train()
-    opt2.load_state_dict(sd)
-    assert opt2.sr_stream.draws == opt.sr_stream.draws > 0
-
-
 # ============================================================== stream-id economy
 def test_an_optimizer_that_never_rounds_does_not_claim_a_stream_id():
     """fp32 params / kahan never draw SR noise, so they must not shift anyone's stream.
@@ -680,3 +661,201 @@ def test_an_optimizer_that_never_rounds_does_not_claim_a_stream_id():
     assert rounds.sr_stream.stream_id == 0, "the rounding optimizer keeps the anchor"
     assert "_sr_meta" not in plain.state_dict(), "no draws -> nothing to checkpoint"
     assert "_sr_meta" in rounds.state_dict()
+
+
+# ==================================================== owners that draw for the FIRST time
+# after a resume. Their id is not in the checkpoint (they had no position to save), so they
+# take one from the allocator — which must already be past every id the load adopted, or
+# they collide with a restored owner and the two share a seed sequence. Both scenarios below
+# are ordinary settings, and both are checked across two real interpreters.
+_LATE_SYNC_SCRIPT = """
+import hashlib, sys, torch, kaon
+from kaon import Lookahead
+
+SHAPES = [(64, 32), (48, 16), (24,)]
+STEPS, SPLIT, K = 10, 4, 6      # the phi sync draws for the first time at step 6 > SPLIT
+mode, ckpt = sys.argv[1], sys.argv[2]
+
+def fresh():
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    kaon.reseed_stochastic_rounding()
+
+def params():
+    g = torch.Generator().manual_seed(11)
+    return [torch.nn.Parameter(torch.randn(s, generator=g).to("cuda", torch.bfloat16))
+            for s in SHAPES]
+
+def grads():
+    g = torch.Generator().manual_seed(23)
+    return [[torch.randn(s, generator=g).mul_(0.1) for s in SHAPES] for _ in range(STEPS)]
+
+fresh()
+ps, gs = params(), grads()
+o = Lookahead(ps, lr=1e-2, k=K, alpha=0.5, momentum_dtype="bfloat16")
+lo, hi = (0, STEPS) if mode == "continuous" else (
+    (0, SPLIT) if mode == "save" else (SPLIT, STEPS))
+if mode == "resume":
+    o.load_state_dict(torch.load(ckpt, map_location=torch.device("cuda:0"),
+                                 weights_only=False))
+    for p, w in zip(ps, torch.load(ckpt + ".w", weights_only=False)):
+        p.data.copy_(w.to(p.device))
+for i in range(lo, hi):
+    for p, g in zip(ps, gs[i]):
+        p.grad = g.detach().clone().to(device=p.device, dtype=p.dtype)
+    o.step()
+if mode == "save":
+    torch.save(o.state_dict(), ckpt)
+    torch.save([p.detach().cpu().clone() for p in ps], ckpt + ".w")
+else:
+    h = hashlib.blake2b(digest_size=12)
+    for p in ps:
+        h.update(p.detach().float().cpu().contiguous().reshape(-1).numpy().tobytes())
+    print(h.hexdigest())
+"""
+
+_LATE_SECOND_SCRIPT = """
+import hashlib, sys, torch, kaon
+from kaon import Adakaon, Lion
+
+SHAPES = [(64, 32), (48, 16), (24,)]
+STEPS, SPLIT, THAW = 10, 4, 6    # the second optimizer starts stepping at 6 > SPLIT
+mode, ckpt = sys.argv[1], sys.argv[2]
+
+def fresh():
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    kaon.reseed_stochastic_rounding()
+
+def params(seed):
+    g = torch.Generator().manual_seed(seed)
+    return [torch.nn.Parameter(torch.randn(s, generator=g).to("cuda", torch.bfloat16))
+            for s in SHAPES]
+
+def grads():
+    g = torch.Generator().manual_seed(23)
+    return [[torch.randn(s, generator=g).mul_(0.1) for s in SHAPES] for _ in range(STEPS)]
+
+def step(o, ps, gs):
+    for p, g in zip(ps, gs):
+        p.grad = g.detach().clone().to(device=p.device, dtype=p.dtype)
+    o.step()
+
+fresh()
+pa, pb, gs = params(11), params(12), grads()
+oa = Adakaon(pa, lr=1e-2, momentum_dtype="bfloat16")
+ob = Lion(pb, lr=1e-2, momentum_dtype="bfloat16")
+lo, hi = (0, STEPS) if mode == "continuous" else (
+    (0, SPLIT) if mode == "save" else (SPLIT, STEPS))
+if mode == "resume":
+    sd = torch.load(ckpt, map_location=torch.device("cuda:0"), weights_only=False)
+    oa.load_state_dict(sd["a"])
+    ob.load_state_dict(sd["b"])
+    for p, w in zip(pa + pb, torch.load(ckpt + ".w", weights_only=False)):
+        p.data.copy_(w.to(p.device))
+for i in range(lo, hi):
+    step(oa, pa, gs[i])
+    if i >= THAW:
+        step(ob, pb, gs[i])
+if mode == "save":
+    torch.save({"a": oa.state_dict(), "b": ob.state_dict()}, ckpt)
+    torch.save([p.detach().cpu().clone() for p in pa + pb], ckpt + ".w")
+else:
+    h = hashlib.blake2b(digest_size=12)
+    for p in pa + pb:
+        h.update(p.detach().float().cpu().contiguous().reshape(-1).numpy().tobytes())
+    print(h.hexdigest())
+"""
+
+
+@pytest.mark.parametrize(
+    "script,name",
+    [(_LATE_SYNC_SCRIPT, "lookahead-k6-sync-after-resume"),
+     (_LATE_SECOND_SCRIPT, "second-optimizer-thawed-after-resume")],
+    ids=["late-sync", "late-second-optimizer"],
+)
+def test_an_owner_that_first_draws_after_the_resume_gets_a_free_id(script, name, tmp_path):
+    """The allocator must be past every restored id, across two real processes.
+
+    ``Lookahead(k=6)`` checkpointed at step 4 has not synced yet, so its wrapper stream is
+    absent from the checkpoint and claims an id only at step 6; a second optimizer unfrozen
+    after the resume is the same shape of problem. Without the watermark both land on id 0
+    — already taken by the restored inner optimizer — and the two owners then draw the same
+    seeds (measured 1.56e-2 and 3.13e-2).
+    """
+    skip_if_no_cuda()
+    ckpt = str(tmp_path / f"{name}.pt")
+    ref = _run_script(script, tmp_path, "continuous", ckpt)
+    _run_script(script, tmp_path, "save", ckpt)
+    got = _run_script(script, tmp_path, "resume", ckpt)
+    assert ref and got and ref == got, f"{name} diverged: {ref} vs {got}"
+
+
+def test_restoring_an_id_pushes_the_allocator_past_it():
+    """The unit-level invariant behind the two process tests above."""
+    cpu = torch.device("cpu")
+    _fresh_process()
+    restored = srm.SRStream()
+    restored.restore({"stream": 3, "draws": 12})
+    late = srm.SRStream()
+    late.next_seed(cpu)
+    assert restored.stream_id == 3
+    assert late.stream_id == 4, "a first-time drawer must not land on a restored id"
+
+
+def test_reseed_hands_out_distinct_ids_to_live_and_new_streams():
+    """A reseed restarts the allocator, so live streams must release their ids too.
+
+    Otherwise a process that reseeds with optimizers already alive and then builds another
+    one puts two owners on the same seed sequence — the pre-0.7.13 defect, reintroduced.
+    """
+    cpu = torch.device("cpu")
+    _fresh_process()
+    a, b = srm.SRStream(), srm.SRStream()
+    a.next_seed(cpu)
+    b.next_seed(cpu)
+    assert {a.stream_id, b.stream_id} == {0, 1}
+
+    kaon.reseed_stochastic_rounding()
+    # The release is lazy, like every other part of a reseed: a stale id is still readable
+    # but can never be USED, because any draw (or snapshot) applies the reset first.
+    assert a.snapshot() is None, "a released stream has no position to checkpoint"
+    c = srm.SRStream()
+    a.next_seed(cpu)
+    c.next_seed(cpu)
+    b.next_seed(cpu)
+    ids = [a.stream_id, c.stream_id, b.stream_id]
+    assert ids == [0, 1, 2], f"re-claim must follow draw order and stay unique, got {ids}"
+    assert len(set(ids)) == 3, "no two live streams may share an identity"
+
+
+def test_reseed_keeps_two_runs_of_a_fresh_optimizer_identical():
+    """The reproducibility contract the released allocator must not break: same seed +
+    reseed + a freshly built optimizer reproduces the previous run bit for bit."""
+    skip_if_no_cuda()
+
+    def once() -> list[torch.Tensor]:
+        _fresh_process()
+        params = _params(torch.bfloat16, "cuda")
+        opt = Adakaon(params, lr=1e-2, momentum_dtype="bfloat16")
+        for g in _grads(torch.bfloat16)[:4]:
+            _step("Adakaon", opt, params, g)
+        return [p.detach().float().cpu().clone() for p in params]
+
+    _assert_same(once(), once(), "manual_seed+reseed rerun")
+
+
+def test_the_kernels_process_wide_fallback_keeps_stream_zero_across_a_reseed():
+    """The fallback's id is PINNED: releasing it on a reseed would move the sequence that
+    un-threaded callers of ``sr_add_`` rely on off the 0.7.12 anchor."""
+    skip_if_no_cuda()
+    import kaon._fused_triton as ft
+
+    _fresh_process()
+    dev = torch.device("cuda", 0)
+    ft._PROCESS_SR_STREAM.next_seed(dev)
+    kaon.reseed_stochastic_rounding()
+    srm.SRStream().next_seed(dev)                    # an optimizer claims id 0 meanwhile
+    base = torch.cuda.default_generators[0].initial_seed()
+    assert ft._PROCESS_SR_STREAM.next_seed(dev) == (base + 0x9E3779B1) & 0x7FFFFFFF
+    assert ft._PROCESS_SR_STREAM.stream_id == 0

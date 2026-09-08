@@ -191,8 +191,6 @@ class SRSeedState:
     """
 
     SR_META_KEY = "_sr_meta"
-    # Keys a load also accepts, for checkpoint layouts written before the current one.
-    SR_META_FALLBACK_KEYS: tuple[str, ...] = ()
 
     def __getattr__(self, name: str) -> Any:
         # Only ever reached when normal attribute lookup FAILS, so the lazy install below
@@ -220,10 +218,6 @@ class SRSeedState:
         whose weight writes are all the inner optimizer's).
         """
         meta = state_dict.get(self.SR_META_KEY)
-        for key in self.SR_META_FALLBACK_KEYS:
-            if meta is not None:
-                break
-            meta = state_dict.get(key)
         if meta is None and self.__dict__.get("sr_stream") is None:
             return
         self.sr_stream.restore(meta)

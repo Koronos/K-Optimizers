@@ -88,10 +88,13 @@ _SEED_MASK = 0x7FFFFFFF
 #   restarts its counter when it moved. That is how ONE call resets streams owned by
 #   optimizers this module has no reference to (and streams created later), with no
 #   registry, no weakrefs and no per-step cost.
-# * ``_next_stream`` — the stream-id allocator. Restarting it is what makes
-#   ``torch.manual_seed(s)`` + reseed reproducible for a *freshly built* optimizer: it
-#   gets stream 0 again, so the second run of a two-run comparison draws the first run's
-#   noise (the foreach-vs-per-param and resume tests all rest on this).
+# * ``_next_stream`` — the stream-id allocator, doubling as a **watermark**: an id is
+#   handed out at a stream's first draw, and :meth:`SRStream.restore` pushes the allocator
+#   past any id it adopts, so an owner that draws for the first time only AFTER a resume
+#   cannot collide with a restored one. Restarting it is what makes ``torch.manual_seed(s)``
+#   + reseed reproducible for a *freshly built* optimizer: it gets stream 0 again, so the
+#   second run of a two-run comparison draws the first run's noise (the foreach-vs-per-param
+#   and resume tests all rest on this).
 _reseed_epoch = 0
 _next_stream = 0
 
@@ -211,8 +214,12 @@ class SRStream:
     path of a 428-adapter bag would have been ~0.3 ms/step of pure bookkeeping.
 
     ``stream_id`` comes from a process-wide allocator that :func:`reseed_generators`
-    restarts, and is carried in the checkpoint so a resume reproduces the identity even if
-    the new process builds its optimizers in a different order.
+    restarts, is claimed at the stream's first draw, and is carried in the checkpoint so a
+    resume reproduces the identity even if the new process builds its optimizers in a
+    different order. An owner that draws for the first time only *after* a resume has no
+    id in the checkpoint and takes the next free one — the allocator doubles as a watermark
+    that :meth:`restore` pushes past every id it adopts, so that "next free" is the same id
+    the continuous run handed out.
 
     **Known limitation of that identity.** An id is handed out in order of *first draw*, so
     the noise a given optimizer receives depends on how many other streams drew before it.
@@ -226,7 +233,8 @@ class SRStream:
     owner rather than from allocation order; recorded as a follow-up in the CHANGELOG.
     """
 
-    __slots__ = ("_bound", "_epoch", "_generators", "_pending_gen", "draws", "stream_id")
+    __slots__ = ("_bound", "_epoch", "_generators", "_pending_gen", "_pinned_id",
+                 "draws", "stream_id")
 
     def __init__(self, stream_id: int | None = None) -> None:
         # ``None`` = unclaimed. The id is taken from the allocator at the first REAL draw,
@@ -235,7 +243,13 @@ class SRStream:
         # an fp32 group and a bf16 group — routine in diffusion — would otherwise push the
         # bf16 optimizer off stream 0 and off the 0.7.12 sequence for nothing. It also keeps
         # such an optimizer's ``state_dict`` free of an ``_sr_meta`` key.
-        self.stream_id = stream_id if stream_id is None else int(stream_id)
+        #
+        # An id passed in explicitly is PINNED: it survives :meth:`reset`, where an
+        # allocated one is released. Only the Triton module's process-wide fallback stream
+        # uses that, and it has to stay on 0 for the lifetime of the process — that is the
+        # id whose sequence reproduces 0.7.12's global counter.
+        self._pinned_id = stream_id if stream_id is None else int(stream_id)
+        self.stream_id = self._pinned_id
         self.draws = 0
         self._epoch = _reseed_epoch
         # torch.device -> (global initial seed bound to, kernel offset, seed reader, key)
@@ -316,7 +330,28 @@ class SRStream:
 
     # ------------------------------------------------------------------- state
     def reset(self) -> None:
-        """Restart at draw 0 and re-sync to the global seed (keeps ``stream_id``)."""
+        """Restart at draw 0, re-sync to the global seed, and **release the identity**.
+
+        Releasing is what keeps the identities unique across a reseed:
+        :func:`reseed_generators` restarts the allocator, so a stream that hung on to its
+        old id would collide with the next stream to draw — two owners on one seed
+        sequence, which is precisely the pre-0.7.13 defect. Every live stream re-claims on
+        its next draw instead, in draw order, which is the order a clean run would have
+        assigned anyway (the reseed is a run boundary; the allocator is back at 0).
+
+        Like the rest of a reseed this lands lazily — a released ``stream_id`` is still
+        readable on a stream that has not been touched since — but it can never be *used*:
+        every draw and every :meth:`snapshot` applies the pending reset first. A stream
+        constructed with an explicit id keeps it (``_pinned_id``): the Triton module's
+        process-wide fallback must stay on stream 0 for the whole process.
+
+        Only :func:`reseed_generators` gets here. A mid-process ``torch.manual_seed`` with
+        a DIFFERENT value also restarts the positions (:meth:`_bind` with ``restart``) but
+        deliberately keeps the identities: it does not touch the allocator, so re-claiming
+        there would hand out fresh high ids and move the run off the compatibility anchor
+        for no reason.
+        """
+        self.stream_id = self._pinned_id
         self.draws = 0
         self._epoch = _reseed_epoch
         self._bound.clear()
@@ -373,7 +408,17 @@ class SRStream:
         first ``step()`` after a load that looked fine. Validating the payload here also
         turns a corrupt blob into a checkpoint error at load time instead of a ``TypeError``
         from inside the optimizer.
+
+        Restoring an id also pushes the allocator's **watermark** past it. Without that, an
+        owner that had not drawn yet when the checkpoint was taken (so it carried no
+        position at all) would claim a fresh ``0`` on the resume and collide with the owner
+        restored *onto* 0 — two owners on one seed sequence. That is reachable with ordinary
+        settings: ``Lookahead(k=6)`` checkpointed at step 4 syncs for the first time at step
+        6 (measured 1.56e-2 divergence), and so does a second optimizer that starts stepping
+        only after the resume (3.13e-2). With the watermark, a first-time drawer takes the
+        next free id — the same one the continuous run gave it.
         """
+        global _next_stream
         if not meta:
             self.reset()
             return
@@ -396,6 +441,7 @@ class SRStream:
             # ``.cpu()`` is what makes ``map_location=<cuda device>`` survivable.
             pending[int(key)] = state.detach().cpu()
         self.stream_id = stream_id
+        _next_stream = max(_next_stream, stream_id + 1)   # see the watermark note above
         self.draws = draws
         self._epoch = _reseed_epoch
         self._bound.clear()

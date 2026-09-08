@@ -197,9 +197,12 @@ Since 0.7.13 that also covers the **bf16 stochastic-rounding noise position**, w
 to be the one piece of a bf16 run's state no checkpoint carried. The bf16 weight write is
 seeded from a counter, so a resume that restarted it at 0 rounded differently than the run
 it continued — measured up to `4.7e-2` on bf16 weights four steps after a resume, with
-every state tensor restored bit-exactly. A resume in a **fresh process** is now
-bit-identical to the uninterrupted run on the native bf16 path and through the wrappers,
-not just within one process.
+every state tensor restored bit-exactly. A resume in a **fresh process, on the same
+device**, is now bit-identical to the uninterrupted run on the native bf16 path and through
+the wrappers, not just within one process. (Moving devices is a different question: a
+CPU-trained checkpoint resumed on CUDA switches which SR implementation rounds the weights —
+the Triton kernel instead of the torch reference — so it resumes *correctly* but not
+bit-identically to a continuous CPU run.)
 
 Where that position lives depends on which write does the rounding, and the two are
 separate blobs:

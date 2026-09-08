@@ -253,10 +253,9 @@ class WrapsInnerOptimizer(SRSeedState):
 
     # Namespaced away from the inner optimizer's own ``_sr_meta``, which the inner's
     # ``state_dict`` has already written into the same dict by the time we add ours.
-    # ``_bind_inner`` narrows it further, PER WRAPPER; this stays as the read fallback for
-    # checkpoints written while the key was shared.
+    # ``_bind_inner`` narrows it further, PER WRAPPER; this bare name is only ever a
+    # placeholder for a wrapper that never bound an inner optimizer.
     SR_META_KEY = _WRAP_SR_KEY
-    SR_META_FALLBACK_KEYS = (_WRAP_SR_KEY,)
 
     def _bind_inner(self, inner: Any, *, state_key: str) -> None:
         self.inner = inner
@@ -318,11 +317,13 @@ class WrapsInnerOptimizer(SRSeedState):
         sd = dict(state_dict)
         wrapped = sd.pop(self._wrap_state_key, {})
         # The wrapper's OWN noise stream (its ``phi`` sync / climb writes); the inner's
-        # rides in ``_sr_meta`` and is restored by the inner's loader below. Both this
-        # wrapper's key and the legacy shared one are consumed, so a nested inner wrapper
-        # cannot pick up a position that was meant for the outer one.
+        # rides in ``_sr_meta`` and is restored by the inner's loader below. Only THIS
+        # wrapper's key is consumed, so a nested inner wrapper never picks up a position
+        # meant for the outer one. The un-namespaced ``_sr_wrap_meta`` of the (unreleased)
+        # intermediate layout is dropped rather than read: guessing which level of a nested
+        # stack it belonged to is worse than resuming that one blob from draw 0.
         self._sr_load(sd)
-        for key in (self.SR_META_KEY, *self.SR_META_FALLBACK_KEYS):
+        for key in (self.SR_META_KEY, _WRAP_SR_KEY):
             sd.pop(key, None)
         inner_loader(self.inner, sd)
         self.param_groups = self.inner.param_groups
