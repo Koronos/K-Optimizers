@@ -1921,16 +1921,25 @@ def test_sr_noise_stays_isolated_from_the_user_rng(sr_triton):
     assert torch.equal(ra, rb)
 
 
-def test_reseed_hook_is_registered_once_and_stays_internal():
-    """One public reseed entry point, and the kernel counter hangs off it."""
+def test_reseed_reaches_the_kernels_fallback_stream_and_stays_internal():
+    """One public reseed entry point, and the kernel's fallback counter hangs off it.
+
+    Since 0.7.13 the kernel counter is an :class:`~kaon._stochastic_rounding.SRStream` like
+    every other, so the reset arrives through the module reseed epoch the streams check on
+    use — no registry, and no second public entry point to reset it with.
+    """
     import kaon._fused_triton as ft
-    from kaon import _stochastic_rounding as sr
-    assert ft._reseed_sr_kernel in sr._reseed_hooks
-    assert sr._reseed_hooks.count(ft._reseed_sr_kernel) == 1
     assert not hasattr(ft, "reseed_sr_kernel"), "the kernel reset must not be a second public API"
-    ft._sr_seed_state[0] = [1, 99]
+    stream = ft._PROCESS_SR_STREAM
+    assert stream.stream_id == 0, "the fallback must keep reproducing stream 0's sequence"
+    stream.next_seed(torch.device(DEV))
+    stream.next_seed(torch.device(DEV))
+    assert stream.draws == 2
     kaon.reseed_stochastic_rounding()
-    assert not ft._sr_seed_state, "reseed_stochastic_rounding must clear the kernel counter"
+    assert stream.draws == 0 or stream.snapshot()["draws"] == 0, (
+        "reseed_stochastic_rounding must restart the kernel counter"
+    )
+    assert stream.stream_id == 0, "the fallback's id is pinned, so a reseed must keep it"
 
 
 # ------------------------------------- gradient_centralization flipped on a live param group

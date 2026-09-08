@@ -13,18 +13,26 @@ All are bit-exact with the per-optimizer copies they replaced (same arithmetic);
 
 ONE EXCEPTION, since 0.7.12: the bf16 stochastic-rounding write prefers a Triton kernel on
 CUDA (:data:`SR_TRITON`), whose noise comes from a different RNG than the torch path's. Both
-are unbiased and the ``foreach == per-param`` invariant still holds within either path, but
-the two do not reproduce each other's draws. ``kaon.reseed_stochastic_rounding()`` resets
-both streams; ``SR_TRITON = False`` pins the torch reference implementation.
+are unbiased, but they do not reproduce each other's draws, and only the torch path keeps
+``foreach == per-param`` for the *noise* as well as the arithmetic (its generator is one
+running sequence, so a stacked draw and the equivalent per-param draws consume the same
+numbers; the kernel seeds each launch separately). ``kaon.reseed_stochastic_rounding()``
+resets both streams; ``SR_TRITON = False`` pins the torch reference implementation.
+
+Both paths draw from the **caller's** noise stream (:class:`SRSeedState`, threaded as ``sr``
+through the writers below), so where the noise sits is per-optimizer, checkpointed state
+instead of a process-global counter — which is what makes a bf16 resume bit-identical to
+the run it continues.
 """
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 from torch import Tensor
 
-from kaon._stochastic_rounding import add_stochastic_
+from kaon._stochastic_rounding import SRStream, add_stochastic_
 
 __all__ = [
     "DEFAULT_STACK_ELEMS",
@@ -32,6 +40,7 @@ __all__ = [
     "LOW_PRECISION",
     "MIN_STACK_ELEMS",
     "STACK_SAFETY_FRACTION",
+    "SRSeedState",
     "cautious_batched_",
     "cautious_one_",
     "centralize_grads_",
@@ -123,21 +132,105 @@ def foreach_budget(stack_budget: int | None, batch_cutoff: int, bytes_per_elem: 
 SR_TRITON = True
 
 
-def _sr_write_(target: Tensor, source: Tensor, alpha: float, triton: bool | None = None) -> None:
-    """``target += alpha * source`` with bf16 SR, through Triton when it applies."""
+def _sr_write_(
+    target: Tensor,
+    source: Tensor,
+    alpha: float,
+    triton: bool | None = None,
+    sr: SRStream | None = None,
+) -> None:
+    """``target += alpha * source`` with bf16 SR, through Triton when it applies.
+
+    ``sr`` is the calling optimizer's noise stream (see :class:`SRSeedState`). The stream
+    holds a position per path and the write advances the one it actually took — the kernel's
+    launch counter here, the torch path's generator inside ``add_stochastic_``; a write that
+    takes Triton does not move the generator and vice versa. Both positions are
+    checkpointed, so a run that crosses between the paths still resumes exactly. Leaving
+    ``sr`` at ``None`` falls back to the process-wide stream and generator, whose positions
+    no checkpoint saves.
+    """
     use = SR_TRITON if triton is None else triton
     if use:
         from kaon import _fused_triton as ft
         if ft.sr_add_supported(target, source):
-            ft.sr_add_(target, source, alpha)
+            ft.sr_add_(target, source, alpha, sr)
             return
-    add_stochastic_(target, source, alpha=alpha)
+    add_stochastic_(target, source, alpha=alpha, sr=sr)
+
+
+# ----------------------------- per-optimizer SR noise stream -----------------------------
+class SRSeedState:
+    """Mixin: the optimizer's own stochastic-rounding noise stream, in its ``state_dict``.
+
+    Where a bf16 SR weight write sits in its noise — a launch counter for the Triton kernel,
+    a generator state for the torch reference path — is **optimizer state**: an optimizer
+    that restarts it at 0 on resume applies different noise than the run it continues, so a
+    resumed run's weights diverge from the continuous run's even with every state tensor
+    restored bit-exactly. Until 0.7.13 the counter was one process-global, per-device one
+    that no checkpoint saved, and no optimizer with bf16 params on the native path resumed
+    bit-identically (measured ~4.7e-2 max abs four steps after a resume).
+
+    Mixed in **before** ``Optimizer`` in the bases, so a subclass's
+    ``super().state_dict()`` picks the meta up with no per-optimizer save code; the restore
+    side is :func:`kaon._momentum_codec.load_state_dict_preserving_dtypes`, which every
+    kaon optimizer's ``load_state_dict`` already funnels through (wrappers do it for their
+    own stream in :class:`kaon._wrappers.WrapsInnerOptimizer`). What each optimizer *does*
+    have to do is hand :attr:`sr_stream` to the writers (``sr=self.sr_stream``) — an
+    optimizer that forgets silently falls back to the process-wide counter and stops
+    resuming exactly, which ``tests/test_sr_seed_checkpoint.py`` sweeps for.
+
+    The stream is created on first *access* and claims its noise identity only on its
+    first real *draw*, so no optimizer has to grow a constructor line and one that never
+    rounds (fp32 params, ``bf16_method="kahan"``, Adakaon's fused path) neither consumes a
+    stream id nor grows an ``_sr_meta`` key.
+
+    :attr:`sr_stream` is installed as a plain instance attribute by :meth:`__getattr__`
+    rather than served by a ``property``, because the writers read it once per weight on
+    the per-parameter path: a descriptor call measured ~260 ns against ~71 ns for an
+    instance lookup — ~+0.11 ms/step on a 428-adapter bag, for nothing.
+    """
+
+    SR_META_KEY = "_sr_meta"
+
+    def __getattr__(self, name: str) -> Any:
+        # Only ever reached when normal attribute lookup FAILS, so the lazy install below
+        # happens once and every later read is a plain ``__dict__`` hit.
+        if name == "sr_stream":
+            stream = SRStream()
+            self.__dict__[name] = stream
+            return stream
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def _sr_save(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Add the stream's position to ``state_dict`` (no-op if it never drew)."""
+        stream = self.__dict__.get("sr_stream")
+        if stream is not None:
+            meta = stream.snapshot()
+            if meta is not None:
+                state_dict[self.SR_META_KEY] = meta
+        return state_dict
+
+    def _sr_load(self, state_dict: dict[str, Any]) -> None:
+        """Adopt the checkpoint's stream position; a checkpoint without one resets.
+
+        An optimizer with neither a saved position nor a live stream is left WITHOUT one:
+        a load must not allocate a stream for an owner that never draws (the wrappers
+        whose weight writes are all the inner optimizer's).
+        """
+        meta = state_dict.get(self.SR_META_KEY)
+        if meta is None and self.__dict__.get("sr_stream") is None:
+            return
+        self.sr_stream.restore(meta)
+
+    def state_dict(self) -> dict[str, Any]:
+        return self._sr_save(super().state_dict())  # type: ignore[misc]
 
 
 # ----------------------------- weight write: p -= delta -----------------------------
 @torch.no_grad()
 def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
-                  alpha: float = 1.0, triton: bool | None = None) -> None:
+                  alpha: float = 1.0, triton: bool | None = None,
+                  sr: SRStream | None = None) -> None:
     """Per-parameter ``p -= alpha * delta`` with the configured bf16 handling.
 
     ``kahan`` keeps a per-param compensation buffer (``state['shift']``); ``stochastic_
@@ -165,7 +258,7 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
         p.add_(shift)
         shift.add_(p_before.sub_(p))
     elif low and bf16_method == "stochastic_rounding" and p.dtype == torch.bfloat16:
-        _sr_write_(p.data, delta_fp32, -alpha, triton)
+        _sr_write_(p.data, delta_fp32, -alpha, triton, sr)
     elif p.dtype == delta_fp32.dtype:
         p.data.sub_(delta_fp32, alpha=alpha)
     elif alpha == 1.0:
@@ -176,7 +269,8 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
 
 @torch.no_grad()
 def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
-                      alpha: float = 1.0, triton: bool | None = None) -> None:
+                      alpha: float = 1.0, triton: bool | None = None,
+                      sr: SRStream | None = None) -> None:
     """In-place ``p -= alpha * delta`` over a foreach bucket of (matrixized) param views.
 
     ``pviews`` is the list of N same-shape param views (each ``[*shape]``); ``delta`` is
@@ -202,7 +296,7 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
     p0 = pviews[0]
     if p0.dtype == torch.bfloat16 and bf16_method == "stochastic_rounding":
         weights = torch.stack(pviews)
-        _sr_write_(weights, delta, -alpha, triton)
+        _sr_write_(weights, delta, -alpha, triton, sr)
         torch._foreach_copy_(pviews, list(weights.unbind(0)))
     elif p0.dtype == delta.dtype:
         torch._foreach_sub_(pviews, list(delta.unbind(0)), alpha=alpha)

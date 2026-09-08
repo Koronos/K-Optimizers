@@ -202,7 +202,7 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
         phi.lerp_(theta, alpha)                     # phi += alpha*(theta - phi)
         CodecBuffer.write(st, "phi", md, phi)
         delta = theta.sub_(phi)                     # theta - phi_new
-        subtract_one_(p, delta, st, bf16_method)    # theta <- phi (bf16-correct)
+        subtract_one_(p, delta, st, bf16_method, sr=self.sr_stream)  # theta <- phi
 
     @torch.no_grad()
     def _sync_foreach(
@@ -227,7 +227,7 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
                 phi.lerp_(theta, alpha)
                 CodecBuffer.write_stacked(states, "phi", md, phi)
                 delta = theta.sub_(phi)                                         # theta - phi_new
-                subtract_batched_([p.data for p in chunk], delta, bf16_method)
+                subtract_batched_([p.data for p in chunk], delta, bf16_method, sr=self.sr_stream)
 
     # ================================================================= state_dict glue
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:

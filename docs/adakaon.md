@@ -219,11 +219,43 @@ predates, and drops every host-side cache that aliases the state tensors the loa
 replaced (the fused pointer tables and the foreach plans). Wrapping optimizers
 (`Lookahead`, `SAM`, `MSAM`, `Nekaon`) therefore restore their inner Adakaon by calling
 *its* `load_state_dict`, so a checkpoint resumed through a wrapper restores the inner
-Adakaon exactly as a bare one would. One caveat is the wrapper's own writes: `Lookahead`'s
-slow-weight sync goes through the shared stochastic-rounding kernel, whose per-process
-seed counter is not part of any checkpoint, so a `Lookahead` resume is bit-identical
-within one process but not across a fresh one — the same limit the bf16 *native* path
-has for every optimizer.
+Adakaon exactly as a bare one would.
+
+Since 0.7.13 that also covers the **bf16 stochastic-rounding noise position**, which used
+to be the one piece of a bf16 run's state no checkpoint carried. The bf16 weight write is
+seeded from a counter, so a resume that restarted it at 0 rounded differently than the run
+it continued — measured up to `4.7e-2` on bf16 weights four steps after a resume, with
+every state tensor restored bit-exactly. A resume in a **fresh process, on the same
+device**, is now bit-identical to the uninterrupted run on the native bf16 path and through
+the wrappers, not just within one process. (Moving devices is a different question: a
+CPU-trained checkpoint resumed on CUDA switches which SR implementation rounds the weights —
+the Triton kernel instead of the torch reference — so it resumes *correctly* but not
+bit-identically to a continuous CPU run.)
+
+Where that position lives depends on which write does the rounding, and the two are
+separate blobs:
+
+| write | seeded from | checkpoint key |
+|---|---|---|
+| Adakaon's **fused** path (`fused=True`) | `Adakaon._t`, the fused step counter | `_adakaon_meta.fused_step` |
+| the **native** path (per-param and foreach), every optimizer | the optimizer's own `SRStream` | `_sr_meta` |
+| a **wrapper's own** write (`Lookahead`'s slow-weight sync, `SAM`'s climb) | that wrapper's own `SRStream` | `_sr_wrap_meta_<wrapper>` |
+
+So a purely fused Adakaon run emits **no** `_sr_meta` at all (its noise never goes through
+the shared kernel), and a nested wrapper stack writes one key per level —
+`SAM(base_optimizer=Lookahead)` carries `_sr_wrap_meta_sam`, `_sr_wrap_meta_lookahead` and
+the inner Adakaon's `_sr_meta`. Three more things to know:
+
+- **Reseed before loading, not after.** `kaon.reseed_stochastic_rounding()` restarts every
+  noise stream; calling it *after* `load_state_dict` throws away the position the
+  checkpoint just restored.
+- **A pre-0.7.13 checkpoint has no position to restore**, so it back-fills a fresh stream
+  (draw 0) and loads without complaint; only the resume-exactness is missing. A new
+  checkpoint still loads on 0.7.12 — the extra top-level keys are ignored there.
+- **An optimizer that never rounds carries no position.** fp32 parameters,
+  `bf16_method="kahan"` and the fused path never draw, so they neither take a noise-stream
+  identity nor add a key — which is also what keeps a mixed fp32 + bf16 run's bf16 noise on
+  the 0.7.12 sequence.
 
 ## See also
 

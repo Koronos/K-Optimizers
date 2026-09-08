@@ -76,6 +76,7 @@ from torch.optim import Optimizer
 from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
+    SRSeedState,
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
@@ -104,7 +105,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class Lion(AutoLRMixin, ForeachPlanMixin, Optimizer):
+class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     """Lion sign-momentum optimizer on Adakaon's quantized-momentum backend.
 
     Args:
@@ -419,7 +420,7 @@ class Lion(AutoLRMixin, ForeachPlanMixin, Optimizer):
             delta = cautious_batched_(delta, grad)
 
         delta.mul_(lr)
-        subtract_batched_(chunk.pviews, delta, bf16_method)
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
@@ -454,5 +455,5 @@ class Lion(AutoLRMixin, ForeachPlanMixin, Optimizer):
             delta = cautious_one_(delta, grad)
 
         delta.mul_(lr)
-        subtract_one_(p, delta, state, bf16_method)
+        subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
 

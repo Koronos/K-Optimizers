@@ -66,6 +66,7 @@ from torch.optim import Optimizer
 from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
+    SRSeedState,
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
@@ -362,7 +363,7 @@ def _post_one_math(
     return delta
 
 
-class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
+class AdaMuon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     """Orthogonalized-momentum optimizer with factored quantized variance.
 
     Args:
@@ -851,7 +852,7 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
-        subtract_batched_(pviews, delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -911,7 +912,7 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
                 cautious,
             )
 
-        subtract_batched_(pviews, delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
@@ -964,4 +965,4 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, Optimizer):
             if wd != 0 or cautious:
                 delta = self._post_one_math(delta, grad_fp32, p_fp32, wd_scale, cautious)
 
-        subtract_one_(p, delta, state, bf16_method)
+        subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)

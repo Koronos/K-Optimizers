@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+**Behaviour changes** (numeric trajectories that move as a result of the
+stochastic-rounding seed fix below):
+- The bf16 SR noise stream is now **per optimizer** instead of process-global. A run with a
+  single stream owner on one device is **bit-identical to 0.7.12** — stream 0 on `cuda:0`
+  reproduces the old counter exactly, and seeds the torch reference path's generator with
+  the same value the shared one used. Only runs with **two or more owners that actually
+  round** move, because their draws no longer interleave in one counter: `Lookahead` (the
+  `phi` sync is its own owner on top of the inner optimizer), `SAM` (its climb), and any
+  process holding more than one rounding optimizer or writing on more than one CUDA device
+  (two devices used to draw the *same* sequence over their different shards —
+  `manual_seed_all` gives them the same base). An optimizer that never rounds (fp32 params,
+  `bf16_method="kahan"`, Adakaon's fused path) takes no identity, so a mixed fp32 + bf16 run
+  keeps the 0.7.12 sequence for its bf16 half. Still unbiased, and
+  `kaon.reseed_stochastic_rounding()` still resets everything.
+- Checkpoints gain a top-level `_sr_meta` key (`_sr_wrap_meta_<wrapper>` for a wrapper's own
+  stream — one per level, so a nested `SAM(base_optimizer=Lookahead)` writes three): two
+  integers, plus the torch-path generator state only when that path was used (~5 KB per CPU
+  device, 16 B per CUDA one; absent on the Triton path, and absent entirely for an optimizer
+  that never rounds). 0.7.12 ignores unknown top-level keys, so new checkpoints still load
+  there — minus the resume guarantee.
+- **Known limitation / follow-up.** A stream identity is allocated in order of *first draw*.
+  Across a resume it is preserved for every owner that had already drawn when the checkpoint
+  was written (its id travels in the checkpoint) and an owner that draws for the *first* time
+  after the resume takes the next free id, which the allocator's watermark makes the same one
+  the continuous run gave it. What is **not** stable is a **new** run's trajectory when the
+  draw order itself changes: reordering optimizer construction, adding a second rounding
+  optimizer, or calling `kaon.tune()` first (it builds and steps optimizers) shifts the ids
+  and therefore the noise. 0.7.12's global counter was strictly more order-sensitive (its
+  noise depended on the interleaving of *every* optimizer's writes), so this is an
+  improvement rather than a regression, but an identity derived from something stable about
+  the owner instead of from allocation order would remove the sensitivity altogether. Not
+  done here.
+- **The unreleased intermediate layout is not read back.** The wrapper key was briefly a
+  single shared `_sr_wrap_meta`; a checkpoint carrying it is loaded, but that one blob is
+  dropped rather than adopted (guessing which level of a nested stack it belonged to is
+  worse than resuming it from draw 0). Only 0.7.13 development checkpoints are affected.
+
 ### Fixed
 - **Fused path: a `p.data` rebind that changes the SHAPE can no longer step a plan that
   disagrees with the optimizer state.** Every fused pointer cache
@@ -41,6 +78,60 @@ All notable changes to this project will be documented in this file.
   as strong as the pointer caches' own — which is what the caches' O(1) `built_from`
   revalidation assumes.
 
+- **The shared bf16 stochastic-rounding kernel took its seed from a process-global counter
+  that no checkpoint saved**, so a resume in a fresh process applied a *different* noise
+  sequence than the run it continued: with every state tensor restored bit-exactly, a
+  resumed run's bf16 weights diverged from the uninterrupted run's by up to **4.7e-2**
+  absolute (CUDA, native/foreach path, 4+4 steps) — for **every** optimizer with bf16
+  params, and for `Lookahead`'s `phi` sync (whose bf16-correct write goes through the same
+  kernel) even over an Adakaon whose own fused counter was already checkpointed. Measured
+  before: Adakaon fused `0.0` (already fixed by `_adakaon_meta`), Adakaon native `4.7e-2`,
+  Lookahead `1.6e-2`, SAM/MSAM/Nekaon native `4.7e-2`. MSAM had fixed only its own climb
+  (`_msam_meta.axpy_seed`).
+
+  The counter is now **per owner** (`kaon._stochastic_rounding.SRStream`): the optimizer
+  passes it to the writers (`sr=self.sr_stream`), saves it in its `state_dict` and restores
+  it on load. A process-global counter could not be fixed any other way — restoring it from
+  optimizer A's checkpoint would rewind optimizer B's noise, and leaving it alone breaks
+  A's own resume; per-owner streams make both resumes exact at once, and a mixed stream
+  identity (checkpointed, so it survives a load in a different order) keeps their noise
+  independent. One stream covers both SR paths: the Triton kernel's launch counter and the
+  torch reference path's private per-device generator, whose state is checkpointed too, so
+  CPU params and `SR_TRITON = False` resume exactly as well. The `_reseed_hooks` registry is
+  gone — `reseed_stochastic_rounding()` now bumps a module epoch that every stream checks on
+  use, which also covers streams created after the call.
+
+  Zero measurable step cost: no added kernel and no added sync, and the host-side seed
+  derivation came out at **0.71–0.94x** of 0.7.12's (paired in-process microbenchmark,
+  −0.05 to −0.4 µs/draw — the per-device cache is keyed by the `torch.device` object and
+  holds a bound seed reader, avoiding a `device.type` read that costs ~0.7 µs on its own),
+  and the stream is reached through a lazily-installed instance attribute rather than a
+  property (~2x cheaper per read: 130–159 ns → 67–82 ns, i.e. −0.02 to −0.03 ms/step at one
+  read per weight on a 428-adapter bag). Per-step wall clock on the LoRA-428 bf16 bag is
+  inside the run-to-run spread of the shared card (±25% on either tree). New
+  `tests/test_sr_seed_checkpoint.py` sweeps the cross-process resume over every optimizer ×
+  momentum dtype × foreach/per-param/fused × CPU/CUDA × `SR_TRITON`, plus two optimizers in
+  one process not clobbering each other, `torch.load(map_location=…)` round trips, and a
+  two-real-process resume of a nested `SAM(base_optimizer=Lookahead)`.
+- **A `map_location`'d checkpoint crashed the first step after a resume** (introduced with
+  the fix above, before release). The torch reference path's position is a
+  `torch.Generator` state — a **CPU** byte tensor even for a CUDA generator — and the
+  standard `torch.load(ckpt, map_location=device)` moves it to CUDA, where
+  `Generator.set_state` refuses it: `TypeError: RNG state must be a torch.ByteTensor`.
+  Because the restored state is staged and applied on the first draw, it blew up on the
+  first `step()` after a load that looked clean. Reached by default on bf16 CUDA `SAM` (its
+  climb calls `add_stochastic_` directly), under `SR_TRITON = False`, on a `channels_last`
+  weight (the kernel cannot index a strided target), and on any CPU-trained checkpoint
+  resumed on GPU. The state is now normalised to CPU and **validated** at load, so a corrupt
+  `gen` blob is a checkpoint `ValueError` at `load_state_dict` instead of a `TypeError` from
+  inside the optimizer.
+- **Nested wrappers shared one stochastic-rounding checkpoint key.**
+  `SAM(base_optimizer=Lookahead, …)` is public API and makes three noise owners; the single
+  class-level `_sr_wrap_meta` meant the outer wrapper's `state_dict` overwrote the
+  intermediate one's position and the resume silently continued from the wrong draw
+  (measured 2.34e-2 on bf16 weights). The key is now derived per wrapper from the same
+  `state_key` that already namespaces its per-param state (`_sr_wrap_meta_sam`,
+  `_sr_wrap_meta_lookahead`), with the bare name kept as a read fallback.
 - **`Lookahead.load_state_dict` bypassed the inner Adakaon's own loader.** It handed
   `load_state_dict_preserving_dtypes` straight to the wrapper mixin, so
   `Adakaon.load_state_dict` never ran for the inner optimizer and a resume through

@@ -86,6 +86,7 @@ from torch.optim import Optimizer
 from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
+    SRSeedState,
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
@@ -113,7 +114,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
+class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     """AdamP (AdamW + per-channel radial projection) on kaon's memory backend.
 
     Args:
@@ -643,7 +644,7 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
         delta = perturb.mul_(c["step_size"])
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -700,7 +701,7 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
         delta = perturb.mul_(c["step_size"])
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
@@ -756,4 +757,4 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
 
         if cautious:
             delta = cautious_one_(delta, grad)
-        subtract_one_(p, delta, state, bf16_method)
+        subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)

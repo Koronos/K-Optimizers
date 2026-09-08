@@ -66,6 +66,7 @@ from torch.optim import Optimizer
 
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
+    SRSeedState,
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
@@ -96,7 +97,7 @@ _STACK_BYTES_PER_ELEM = 48
 
 
 
-class KProdigy(ForeachPlanMixin, Optimizer):
+class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
     """Memory-efficient Prodigy with parameter-free D-adaptation.
 
     Args:
@@ -886,7 +887,7 @@ class KProdigy(ForeachPlanMixin, Optimizer):
         if cautious:
             delta = cautious_one_(delta, grad_fp32)
 
-        subtract_one_(p, delta, state, bf16_method)
+        subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
 
     # -- foreach update (the shared bucketing/view plan) -----------------
 
@@ -990,7 +991,7 @@ class KProdigy(ForeachPlanMixin, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_(chunk.pviews, delta, bf16_method)
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream)
 
     @torch.no_grad()
     def _full_bucket(
@@ -1026,7 +1027,7 @@ class KProdigy(ForeachPlanMixin, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_(chunk.pviews, delta, bf16_method)
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream)
 
     # -- weight update -----------------------------------------------------
 

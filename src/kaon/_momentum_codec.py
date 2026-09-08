@@ -31,6 +31,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from kaon._backend import SRSeedState
+
 __all__ = [
     "MomentumDtype",
     "_FOURBIT_BLOCK",
@@ -808,7 +810,18 @@ def load_state_dict_preserving_dtypes(
     State keys may be ``int`` or ``str`` (JSON round-trip drift); they are
     normalised to ``int`` before the torch load (same convention as
     :mod:`kaon._wrappers`).
+
+    It also restores the optimizer's **stochastic-rounding noise stream** (``_sr_meta``),
+    because "byte-identical to the checkpoint" has to include *where in the noise* the run
+    was: the bf16 SR weight write is seeded from a counter, and a resume that restarts it
+    at 0 rounds differently than the run it continues (~4.7e-2 max abs on bf16 weights four
+    steps later) with every state tensor perfectly restored. This is the single restore
+    point for it — every kaon optimizer's ``load_state_dict`` funnels through here, so an
+    optimizer cannot be forgotten; wrappers restore their OWN stream (Lookahead's phi sync)
+    in :meth:`kaon._wrappers.WrapsInnerOptimizer._load_wrapped`.
     """
+    if isinstance(optimizer, SRSeedState):
+        optimizer._sr_load(state_dict)
     saved = state_dict.get("state", {})
     # Snapshot references + normalise int/str keys for torch (JSON may stringify them).
     # No clone here: the ``copy_`` branch below never aliases, and the reassignment

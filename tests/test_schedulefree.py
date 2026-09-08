@@ -855,9 +855,9 @@ def _spy_on_sr_write(monkeypatch):
     calls = []
     real = sf_module._sr_write_
 
-    def spy(target, source, alpha, triton=None):
+    def spy(target, source, alpha, triton=None, sr=None):
         calls.append((target.dtype, tuple(target.shape), alpha))
-        return real(target, source, alpha, triton)
+        return real(target, source, alpha, triton, sr)
 
     monkeypatch.setattr(sf_module, "_sr_write_", spy)
     return calls
@@ -928,8 +928,8 @@ def test_bf16_z_store_reaches_the_triton_sr_kernel():
     launched = []
     real = ft.sr_add_
     try:
-        ft.sr_add_ = lambda target, source, alpha=1.0: (
-            launched.append(target.numel()), real(target, source, alpha))[1]
+        ft.sr_add_ = lambda target, source, alpha=1.0, sr=None: (
+            launched.append(target.numel()), real(target, source, alpha, sr))[1]
         for p in params:
             p.grad = torch.randn_like(p)
         opt.step()
