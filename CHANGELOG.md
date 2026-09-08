@@ -45,8 +45,11 @@ All notable changes to this project will be documented in this file.
   N -> 0, so the next step looked fine) and then left a counter-less mapping behind, 4/4
   written on the step after. Both are closed — `__ior__` on both classes, and
   `WatchedStateMixin.__setattr__` re-wrapping any mapping assigned to `.state` (interception
-  on the WRITE, not a `state` property: a property getter would cost a Python call on each of
-  AdaPNM's ~856 `self.state[p]` reads per step, ~110 µs, more than the whole guard).
+  on the WRITE, not a `state` property: a property getter would cost a Python call on every
+  `self.state` READ, and an AdaPNM fused step makes 1687-1884 of those on the 428-parameter
+  bag (Adakaon fused: 631; Adakaon native: 1). At 21-42 ns more per access than a plain
+  attribute that is +40…+71 µs/step — one to two orders of magnitude above the 0.13-0.80 µs
+  the guard itself costs. The same step writes the attribute 1-4 times. Two machines.)
   `tests/test_state_identity_witness.py` now sweeps `dict`'s entire mutation API from a
   table against both classes, so a new mutator has to be added rather than remembered.
 

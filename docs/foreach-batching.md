@@ -345,9 +345,12 @@ file now sweeps the whole API from a table (`__setitem__`, `operator.setitem`, `
 `__missing__`) against both classes, with the two deliberate `dict.__setitem__` /
 `dict.update` bypasses listed as such, so a new mutator has to be added to the table
 rather than remembered. Assignment is covered too: `opt.state = defaultdict(dict)` is
-re-wrapped by `WatchedStateMixin.__setattr__` (interception on the WRITE, because a
-`state` property's getter would cost a Python call on each of AdaPNM's ~856 `self.state[p]`
-reads per step).
+re-wrapped by `WatchedStateMixin.__setattr__` — interception on the WRITE, which a step
+does 1-4 times, rather than a `state` property whose getter would cost a Python call on
+every `self.state` read. Counted with a counting property: an AdaPNM fused step makes
+1687-1884 of those on the 428-parameter bag (Adakaon fused 631, Adakaon native 1), and a
+property access costs 21-42 ns more than a plain attribute — +40…+71 µs/step, one to two
+orders of magnitude above the 0.13-0.80 µs the guard costs. Two machines.
 
 The `load_state_dict` row is why a **wrapper** (`Lookahead`, `SAM`, `MSAM`, `Nekaon`)
 must restore its inner optimizer through the inner's *own* `load_state_dict` and never

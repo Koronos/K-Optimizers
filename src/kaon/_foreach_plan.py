@@ -147,8 +147,19 @@ class WatchedParamState(dict):
 
     __slots__ = ("_gen",)
 
-    def __init__(self, gen: list[int], items: Any = ()) -> None:
+    def __init__(self, items: Any = (), *, gen: list[int]) -> None:
+        # ``gen`` is KEYWORD-ONLY on purpose. With it first and positional,
+        # ``WatchedParamState({"m": ...})`` — the shape every dict subclass is expected to
+        # take, and the shape ``dict.__init__`` itself takes — bound the MAPPING to
+        # ``_gen`` and left the instance with a generation cell that is a dict: every later
+        # bump then wrote ``self._gen[0] = ...`` into that dict and the state's counter was
+        # silently dead. Keyword-only makes that call a ``TypeError`` instead.
         dict.__init__(self, items)
+        if type(gen) is not list:
+            raise TypeError(
+                f"WatchedParamState needs the mapping's generation CELL (a one-element "
+                f"list), got {type(gen).__name__} — see WatchedState.gen"
+            )
         self._gen = gen
 
     # -- mutation: bump the generation when a baked buffer is retired ------------
@@ -240,10 +251,10 @@ class WatchedState(defaultdict):
         """A per-param state, watched by THIS mapping's generation cell."""
         if type(state) is WatchedParamState and state._gen is self.gen:
             return state
-        return WatchedParamState(self.gen, state)
+        return WatchedParamState(state, gen=self.gen)
 
     def __missing__(self, key: Any) -> WatchedParamState:
-        state = WatchedParamState(self.gen)
+        state = WatchedParamState(gen=self.gen)
         dict.__setitem__(self, key, state)      # no bump — see the class docstring
         return state
 
@@ -346,10 +357,14 @@ class WatchedStateMixin:
       — measured 4/4 retired buffers written on the step after.
 
       ``__setattr__`` and not a ``state`` PROPERTY on purpose: a property getter is a
-      Python-level call on every ``self.state[p]``, and AdaPNM alone reads that ~856 times
-      per step on the 428-parameter bag (~110 µs), which is more than the whole guard
-      costs. Interception belongs on the write, which happens a handful of times per step
-      at most.
+      Python-level call on every ``self.state`` READ, and there are far more of those than
+      the per-parameter loops suggest — counted by installing a counting property, an
+      AdaPNM fused step on the 428-parameter bag performs 1687-1884 (two machines) and an
+      Adakaon fused step 631, against 1 on an Adakaon native step. A property access
+      measures 21-42 ns more than a plain instance attribute (73 vs 31 ns here), so that is
+      +40…+71 µs/step for AdaPNM — one to two orders of magnitude above the 0.13-0.80 µs the
+      whole guard costs. Interception belongs on the WRITE, which the same step does 1-4
+      times.
     * **``__dict__`` writes** — ``Optimizer.__setstate__`` does ``self.__dict__.update(...)``
       and so bypasses ``__setattr__`` entirely. That is the path ``load_state_dict``,
       unpickling and ``deepcopy`` all funnel through, which is why :meth:`__setstate__`

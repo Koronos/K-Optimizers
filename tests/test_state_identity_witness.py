@@ -175,6 +175,26 @@ def _assert_same_objects(now, before, what):
             assert got is was, f"{what} (entry {key} is a NEW object)"
 
 
+def _fused_caches(opt):
+    """Every fused pointer cache the optimizer holds, under NAMESPACED keys.
+
+    Merging the per-route dicts into one flat mapping does not work and does not fail
+    loudly either: ``_fused_ob_caches`` and ``_fused_od_caches`` are BOTH keyed on
+    ``id(group)`` (Adakaon) or ``(id(group), lag)`` (AdaPNM), so on the single-group bag
+    these tests use, ``{**ob, **od}`` collapses to one entry and the one-block
+    ``PointerArrayCache`` vanishes from the assertion entirely — a mutant that rebuilt it
+    on every step survived. ``_fused_big_caches`` keys on
+    ``(id(group), shape, dtype, device)`` and would not have collided, but it is namespaced
+    here too so no future key change can reintroduce the problem.
+    """
+    out = {}
+    for tag, attr in (("ob", "_fused_ob_caches"), ("od", "_fused_od_caches"),
+                      ("big", "_fused_big_caches")):
+        for key, cache in getattr(opt, attr, {}).items():
+            out[tag, key] = cache
+    return out
+
+
 def _maxdiff(pa, pb):
     return max((a.detach().float() - b.detach().float()).abs().max().item()
                for a, b in zip(pa, pb, strict=True))
@@ -296,6 +316,25 @@ def test_scalar_bookkeeping_does_not_move_the_generation():
     assert st.gen[0] == gen
 
 
+@pytest.mark.parametrize("call", ["positional_mapping", "gen_is_a_mapping", "no_gen"])
+def test_watched_param_state_refuses_a_generation_that_is_not_the_cell(call):
+    """``gen`` is keyword-only, and checked.
+
+    With ``gen`` first and positional, ``WatchedParamState({"m": ...})`` — the shape every
+    dict subclass is expected to take, and the shape ``dict.__init__`` itself takes — bound
+    the MAPPING to ``_gen``. Every later bump then wrote ``self._gen[0] = ...`` into that
+    dict, so the state kept a counter that nothing read: the buffer could be retired and the
+    caches would never hear about it.
+    """
+    with pytest.raises(TypeError):
+        if call == "positional_mapping":
+            WatchedParamState({"m": torch.zeros(1)})
+        elif call == "gen_is_a_mapping":
+            WatchedParamState(gen={"m": 1})
+        else:
+            WatchedParamState()
+
+
 def test_the_unwatched_write_bypass_only_covers_scalar_keys():
     """``AdaPNM._prepare_param_steps`` writes ``step`` through ``dict.__setitem__``.
 
@@ -357,6 +396,9 @@ _INNER_API = [
     # behaviour is pinned and visible, not endorsed.
     ("BYPASS dict.__setitem__", lambda s, f: dict.__setitem__(s, "m", f), False, True),
     ("BYPASS dict.update", lambda s, f: dict.update(s, {"m": f}), False, True),
+    # ``dict.__init__`` is the ninth and least obvious in-place mutator: re-running it on a
+    # live instance REPLACES the contents. Same category as the two above.
+    ("BYPASS dict.__init__", lambda s, f: dict.__init__(s, {"m": f}), False, True),
 ]
 
 _OUTER_API = [
@@ -558,11 +600,14 @@ def test_fused_partition_is_reused_while_the_state_stands_still():
     opt = Adakaon(pl, fused=True, **_ADAKAON_CFG)
     _drive([(pl, opt)], 3, 17, "cuda")
     parts = {gid: entry[-4:] for gid, entry in opt._fused_part.items()}
-    caches = {**opt._fused_ob_caches, **opt._fused_od_caches}
+    caches = _fused_caches(opt)
+    assert {tag for tag, _ in caches} == {"ob", "od"}, (
+        f"the bag did not populate both routes: {sorted(caches)}"
+    )
     _drive([(pl, opt)], 3, 19, "cuda")
     _assert_same_objects({gid: e[-4:] for gid, e in opt._fused_part.items()}, parts,
                          "the fused partition was rebuilt on a steady-state step")
-    _assert_same_objects({**opt._fused_ob_caches, **opt._fused_od_caches}, caches,
+    _assert_same_objects(_fused_caches(opt), caches,
                          "a fused pointer cache was rebuilt on a steady-state step")
 
 
@@ -613,10 +658,11 @@ def test_adapnm_fused_partition_is_reused_while_the_state_stands_still():
     pl = _bag(_ROUTES["one_block"], seed=5, device="cuda")
     opt = AdaPNM(pl, fused=True, **_CFG)
     _drive([(pl, opt)], 3, 17, "cuda")
-    caches = dict(opt._fused_ob_caches)
+    caches = _fused_caches(opt)
     parts = {gid: e[-4:] for gid, e in opt._fused_part.items()}
+    assert caches, "the bag populated no fused pointer cache"
     _drive([(pl, opt)], 3, 19, "cuda")
-    _assert_same_objects(dict(opt._fused_ob_caches), caches,
+    _assert_same_objects(_fused_caches(opt), caches,
                          "AdaPNM rebuilt a pointer cache on a steady-state step")
     _assert_same_objects({gid: e[-4:] for gid, e in opt._fused_part.items()}, parts,
                          "AdaPNM rebuilt the partition on a steady-state step")
