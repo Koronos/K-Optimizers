@@ -73,8 +73,14 @@ def _force_native(opt: Adakaon) -> None:
     one rewrite after a warm step holds for the rest of the run.
     """
     for gid, part in list(opt._fused_part.items()):
-        witness, one_block, big, one_dim, native = part
-        opt._fused_part[gid] = (witness, [], big, one_dim, native + one_block)
+        # The memo's LEADING fields are cache keys and must be written back untouched:
+        # ``(witness, state_generation, *routes)`` since 0.7.14. Slice the four route lists
+        # off the END and rebuild the whole entry — unpacking a fixed arity here raised
+        # ``ValueError: too many values to unpack`` the moment the state-identity field was
+        # added, and rewriting a short tuple would have made ``_fused_partition`` compare
+        # its generation against a route LIST.
+        head, (one_block, big, one_dim, native) = part[:-4], part[-4:]
+        opt._fused_part[gid] = (*head, [], big, one_dim, native + one_block)
 
 
 def _warm(opt: Adakaon) -> None:

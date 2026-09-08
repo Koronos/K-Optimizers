@@ -133,9 +133,15 @@ build time. Their validity has **two** halves, and neither implies the other.
    Cost: the generation is one integer read from `self.state`, 133 ns/call, taken 1 time
    per step on a native step and 2-6 on a fused one — **0.01-0.09% of the fused step** on
    the reference bags, with no new CUDA kernel, launch or synchronisation (identical
-   `torch.profiler` counts). The two witness *fields* that were the alternative cost
-   6.0% and 9.2% of the same step and are each blind to at least one of the three rows
-   above. Full table: `benchmarks/fused/bench_state_witness.py`.
+   `torch.profiler` counts) and Python bytecode per step up **+0.05…+0.74%**. The two
+   witness *fields* that were the alternative cost 2.9-6.0% and 7.0-9.2% of the same step
+   (two machines) and are each blind to at least one of the three rows above. Full table:
+   `benchmarks/fused/bench_state_witness.py`.
+
+   `AdaPNM` is the one optimizer that pays anything on the WRITE side (one
+   `state["step"]` per parameter per step, 0.35-0.9% of its fused step even after that
+   write was routed around the hook) — see `AdaPNM._prepare_param_steps`. Adakaon writes
+   no state per step and pays nothing.
 
    The supported way to drop state is still `load_state_dict` or, if you must reach in,
    `del opt.state[p]` — which is now genuinely safe from a steady state and not only after

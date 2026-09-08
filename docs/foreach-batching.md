@@ -303,13 +303,21 @@ enough *or* complete. `self.state` is a `WatchedState` whose per-param dicts cou
 rebinding of a key some cache bakes (`WATCHED_STATE_KEYS`), so a cache compares ONE
 integer and there is no per-step sweep at all. Priced against the three-field parameter
 witness on the reference bags
-(`benchmarks/fused/bench_state_witness.py --case field`, 25 pairs, 95% CI):
+(`benchmarks/fused/bench_state_witness.py --case field`, 25 pairs, 95% CI, ranges spanning
+TWO machines — the ordering and the conclusion were identical on both, the absolutes differ
+by ~2x):
 
 | candidate | 428-param LoRA bag | sees `del` | sees `state[p]["m"] = ...` | sees `state[p].clear()` |
 |---|---|---|---|---|
-| (a) `+ tuple(map(Tensor.data_ptr, m buffers))` | +144 µs, 9.2% of the fused step | yes | yes | **no** (dict, params and pointers can all come back identical) |
-| (b) `+ tuple(map(id, state dicts))` | +95 µs, 6.0% | yes | **no** | **no** |
+| (a) `+ tuple(map(Tensor.data_ptr, m buffers))` | +110 … +144 µs, 7.0-9.2% of the fused step | yes | yes | **no** (dict, params and pointers can all come back identical) |
+| (b) `+ tuple(map(id, state dicts))` | +45 … +95 µs, 2.9-6.0% | yes | **no** | **no** |
 | (c) `state_generation()` — **shipped** | 133 ns/call × 1-6 calls/step = 0.13-0.80 µs, **0.01-0.09%** | yes | yes | yes |
+
+Row (c) is accounting, not a paired A/B: the same harness that puts (a) and (b) well
+outside their CIs returns −1.8 µs [−6.9, +3.2] and +12.2 µs [+4.2, +20.2] for the counter
+on the two machines — zero either side of its own noise floor. The load-independent
+figures are the ones to hold it to: Python bytecode per step moves by +0.05…+0.74%
+(Adakaon) and +0.34…+1.45% (AdaPNM), and every `torch.profiler` CUDA column is identical.
 
 The counter is read once per group per step in `_foreach_chunks` and once per group plus
 once per fused route/bucket in `Adakaon._fused_partition` and the pointer caches —
@@ -322,9 +330,24 @@ constant, so nothing outside Adakaon/AdaPNM changes at all.
 The one place the guard is not free is the WRITE side: every `state[key] = value` now goes
 through a Python-level `__setitem__`. Adakaon makes no per-step state write, so it pays
 nothing. AdaPNM writes one per parameter (`state["step"] += 1`), which is why that write
-alone goes through `dict.__setitem__` — see `AdaPNM._prepare_param_steps` for the +107 µs
-vs +46 µs measurement, and `tests/test_state_identity_witness.py` for the invariant that
-keeps the bypass legal.
+alone goes through `dict.__setitem__` — see `AdaPNM._prepare_param_steps` for the
++56…+107 µs vs +18.5…+48 µs measurement (two machines, 1.1-1.7% vs 0.35-0.9% of that
+bag's AdaPNM fused step), and `tests/test_state_identity_witness.py` for the invariant
+that keeps the bypass legal.
+
+Watching a `dict` means covering **every** slot it mutates through, which is more than the
+methods one thinks of: `|=` reaches `nb_inplace_or`, a different slot from both
+`__setitem__` and `update`, and it slipped through the first round —
+`opt.state[p] |= {"m": fresh}` retired the buffer while the counter stood still, and
+`opt.state |= {p: {...}}` additionally left the incoming plain dict unadopted. The test
+file now sweeps the whole API from a table (`__setitem__`, `operator.setitem`, `__ior__`,
+`__delitem__`, `clear`, `pop`, `popitem`, `update` × mapping/kwargs/pairs, `setdefault`,
+`__missing__`) against both classes, with the two deliberate `dict.__setitem__` /
+`dict.update` bypasses listed as such, so a new mutator has to be added to the table
+rather than remembered. Assignment is covered too: `opt.state = defaultdict(dict)` is
+re-wrapped by `WatchedStateMixin.__setattr__` (interception on the WRITE, because a
+`state` property's getter would cost a Python call on each of AdaPNM's ~856 `self.state[p]`
+reads per step).
 
 The `load_state_dict` row is why a **wrapper** (`Lookahead`, `SAM`, `MSAM`, `Nekaon`)
 must restore its inner optimizer through the inner's *own* `load_state_dict` and never

@@ -266,7 +266,7 @@ def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
     cached = opt._fused_part.get(id(group))
     if cached is None:
         return out
-    _witness, one_block, big, one_dim, native = cached
+    one_block, big, one_dim, native = cached[-4:]   # leading fields are cache keys
     for p in one_block:
         out[id(p)] = "one_block"
     for p in big:
@@ -432,6 +432,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, Optimizer):
         # EXPERIMENTAL (candidate #4): fuse the batched-big reductions into Triton (grad via pointer
         # array, no [N,R,C] stack, GC in-kernel). Default False until the A/B confirms a win.
         self._fused_reductions = True
+        # group id -> (param witness, state-identity generation, one_block, big, one_dim,
+        # native). The two leading fields are the cache KEY; read the routes off the END.
         self._fused_part: dict[int, tuple] = {}
         self._fused_ob_caches: dict[tuple[int, int], Any] = {}
         self._fused_od_caches: dict[tuple[int, int], Any] = {}
@@ -561,17 +563,20 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, Optimizer):
         and it runs once per parameter, so it is the whole per-step cost of the state
         identity guard on AdaPNM (Adakaon writes no state per step and pays nothing).
         Paired against the pre-guard form on the 428-param bag, 31 pairs of 400 reps,
-        ``benchmarks/fused/bench_state_witness.py --case writes``:
+        ``benchmarks/fused/bench_state_witness.py --case writes``. RANGES SPAN TWO MACHINES
+        (the ordering and the conclusion were identical on both; the absolutes differ by
+        ~2x, so treat the percentages of the same machine's own step as the number):
 
-            through the hook (``state["step"] += 1``)   +107 µs [+93, +120]
-            ``dict.__setitem__`` (SHIPPED)               +46 µs [+36,  +56]
+            through the hook (``state["step"] += 1``)   +56 … +107 µs   1.1 … 1.7% of the step
+            ``dict.__setitem__`` (SHIPPED)              +18.5 … +48 µs  0.35 … 0.9%
 
         of which the whole remainder is the unbound-METHOD CALL, not the dict being a
         subclass: the same call form on a PLAIN dict costs the same, and a subclass read or
-        C-level write is bit-for-bit the same slot as ``dict``'s. So +46 µs is the floor for
+        C-level write is bit-for-bit the same slot as ``dict``'s. So that is the floor for
         any per-param write once the hook exists; the only cheaper option is not having the
         hook, which drops the ``state[p]["m"] = ...`` / ``state[p].clear()`` coverage the
-        guard exists for.
+        guard exists for. On the slower machine it is still over the 0.5% budget, which is
+        reported rather than papered over.
 
         Bypassing the hook is sound *for this key and only for this key*: ``step`` is an
         int, it is not in :data:`~kaon._foreach_plan.WATCHED_STATE_KEYS`, and no cache

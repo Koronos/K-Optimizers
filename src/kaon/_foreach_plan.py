@@ -108,9 +108,14 @@ def param_witness(plist: list[Tensor]) -> tuple:
 # moves and no cache is ever rebuilt for it — asserted in
 # ``tests/test_state_identity_witness.py``, which is what keeps the cost at zero.
 #
-# The counter is GLOBALLY monotonic, not per-mapping: a reinstalled watch (``__setstate__``
-# — i.e. ``load_state_dict``, unpickling, ``deepcopy``) therefore cannot hand a cache back
-# the number it recorded against the previous mapping.
+# The CELL is per mapping (each :class:`WatchedState` owns one, shared with its per-param
+# dicts); the VALUES come from one process-wide counter and are therefore never reused. Both
+# halves matter. Per-mapping is what keeps two optimizers in the same process from
+# invalidating each other's caches — a shared cell would make every AdaPNM state write bump
+# Adakaon's number too. Globally unique values are what close ABA: a reinstalled watch
+# (``__setattr__``, or ``__setstate__`` after ``load_state_dict`` / unpickling / ``deepcopy``)
+# starts from a number no cache anywhere can already be holding, instead of restarting at 0
+# and colliding with a cache built by the mapping it replaced.
 _next_epoch = count(1).__next__
 _MISSING = object()
 
@@ -182,6 +187,16 @@ class WatchedParamState(dict):
         # ``dict.update`` is C and would bypass ``__setitem__`` entirely.
         for key, value in dict(*args, **kwargs).items():
             self[key] = value
+
+    def __ior__(self, other: Any) -> WatchedParamState:  # type: ignore[misc]
+        # ``st |= {...}`` lands on ``nb_inplace_or``, a DIFFERENT C slot from
+        # ``mp_ass_subscript`` and from ``update`` — so hooking those two left it wide
+        # open: ``opt.state[p] |= {"m": fresh}`` retired the buffer, moved nothing, and the
+        # next step wrote the retired tensor (measured 4/4 on every fused route, on the
+        # foreach plan and through MSAM / Nekaon / Lookahead / SAM). It must mutate in
+        # place and return ``self``, which is what ``dict.__ior__`` does.
+        self.update(other)
+        return self
 
     def setdefault(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
         # ``dict.setdefault`` is C and would bypass ``__setitem__``. Inserting a key that
@@ -258,6 +273,14 @@ class WatchedState(defaultdict):
         for key, value in dict(*args, **kwargs).items():
             self[key] = value
 
+    def __ior__(self, other: Any) -> WatchedState:  # type: ignore[misc]
+        # See :meth:`WatchedParamState.__ior__`. On this mapping the leak had a second
+        # half: ``opt.state |= {p: {...}}`` also left the incoming plain dict UNADOPTED, so
+        # the mapping looked watched while one of its entries was not and every later
+        # ``state[p]["m"] = ...`` through it was invisible.
+        self.update(other)
+        return self
+
     def setdefault(self, key: Any, default: Any = None) -> Any:  # type: ignore[override]
         if key in self:
             return dict.__getitem__(self, key)
@@ -301,23 +324,56 @@ def state_generation(state: Any) -> int:
     return _NO_GENERATION if gen is None else gen[0]
 
 
-class WatchedStateMixin:
-    """Make ``self.state`` a :class:`WatchedState` and keep it one across a load.
+def _as_watched(value: Any) -> Any:
+    """``value`` as a :class:`WatchedState`, if it is a mapping at all (idempotent)."""
+    if type(value) is WatchedState:
+        return value
+    items = getattr(value, "items", None)
+    return WatchedState(items()) if callable(items) else value
 
-    ``torch.optim.Optimizer.__setstate__`` REPLACES ``self.state`` with a plain
-    ``defaultdict(dict)`` — that is the path ``load_state_dict``, unpickling and
-    ``deepcopy`` all funnel through — so reinstalling there is what makes the watch
-    survive a resume. The reinstalled mapping carries a FRESH generation (globally
-    monotonic), which is itself correct: a load replaces every state tensor, and the
-    number no cache can have recorded is exactly the invalidation that wants.
+
+class WatchedStateMixin:
+    """Make ``self.state`` a :class:`WatchedState` and keep it one, on EVERY route in.
+
+    There are three, and each one needed its own answer:
+
+    * **Assignment** — ``opt.state = defaultdict(dict)``, which user code and
+      ``torch.optim.Optimizer.__init__`` both do. Caught by :meth:`__setattr__`, which
+      re-wraps whatever mapping is handed in. Without it that assignment reopened the
+      blind spot *silently and permanently*: the generation went from N to 0, which
+      invalidated every cache exactly once (so the next step looked fine) and then left a
+      counter-less mapping behind, after which a ``state[p]["m"] = …`` was invisible again
+      — measured 4/4 retired buffers written on the step after.
+
+      ``__setattr__`` and not a ``state`` PROPERTY on purpose: a property getter is a
+      Python-level call on every ``self.state[p]``, and AdaPNM alone reads that ~856 times
+      per step on the 428-parameter bag (~110 µs), which is more than the whole guard
+      costs. Interception belongs on the write, which happens a handful of times per step
+      at most.
+    * **``__dict__`` writes** — ``Optimizer.__setstate__`` does ``self.__dict__.update(...)``
+      and so bypasses ``__setattr__`` entirely. That is the path ``load_state_dict``,
+      unpickling and ``deepcopy`` all funnel through, which is why :meth:`__setstate__`
+      reinstalls afterwards.
+    * **Construction** — the optimizer's own ``__init__`` calls
+      :meth:`_install_state_watch` once, so the watch is in place before the first step
+      even if a future torch stops assigning ``self.state`` at all.
+
+    A reinstalled mapping carries a fresh generation value, which is itself the correct
+    outcome: a load replaces every state tensor, and a number no cache can have recorded
+    is exactly the invalidation that wants.
     """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "state":
+            value = _as_watched(value)
+        super().__setattr__(name, value)
 
     def _install_state_watch(self) -> None:
         """Wrap ``self.state`` (idempotent)."""
         current = self.state                                # type: ignore[attr-defined]
         if type(current) is WatchedState:
             return
-        self.state = WatchedState(current.items())          # type: ignore[attr-defined]
+        self.state = _as_watched(current)                   # type: ignore[attr-defined]
 
     def _state_generation(self) -> int:
         """The state-identity generation, or :data:`_NO_GENERATION` when unwatched."""
@@ -675,10 +731,14 @@ class ForeachPlanMixin:
                     plan = None
         if plan is None:
             plan, values = self._build_foreach_plan(params, group, witness, spec)
-            # AFTER the build, not before: the build allocates state for any param that
-            # has none yet, and allocating it moves the generation. Reading it here is
-            # what keeps a first step (or a param joining the group) from costing a
-            # second, pointless rebuild on the step after.
+            # Read AFTER the build, which is free either way: ``_build_foreach_plan``
+            # allocates state for any param that has none yet, and allocating it does NOT
+            # move the counter (populating an absent key retires nothing — see
+            # ``WatchedParamState.__setitem__``; verified 0 movement across 12
+            # optimizer x route x bag combinations). Taking it here rather than reusing the
+            # value read above is simply the tighter thing to do: it is the generation the
+            # plan's views were actually built against, so no future write inside the build
+            # can leave the plan claiming a generation older than its own contents.
             plan.gen = state_generation(self.state)
             if cached:
                 self._foreach_plans[id(group)] = plan

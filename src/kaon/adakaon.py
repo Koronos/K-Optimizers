@@ -390,7 +390,10 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, Optimizer):
         # off this marker; optimizers without it keep lr-scaled momentum.
         self._momentum_is_unscaled = True
         self._t = 0
-        self._fused_part: dict[int, tuple] = {}          # group id -> (witness, one_block, big, one_dim, native)
+        # group id -> (param witness, state-identity generation, one_block, big, one_dim,
+        # native). The two leading fields are the cache KEY; read the routes off the END
+        # (``entry[-4:]``) so a future field cannot silently break a positional consumer.
+        self._fused_part: dict[int, tuple] = {}
         self._fused_demoted: dict[int, tuple] = {}       # group id -> memo of the non-contiguous-grad demotion
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
         self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPointerCache (1-D)

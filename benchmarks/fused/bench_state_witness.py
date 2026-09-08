@@ -24,6 +24,14 @@ measurement they were chosen on.
 ``--case profile`` is the other half of the claim: the guard must add no CUDA kernel, no
 launch and no synchronisation, only host work.
 
+READING THE NUMBERS. The absolutes here are one machine and do not travel: the same script
+on a second machine returns roughly half of them (e.g. (a) +110 vs +144 µs, the write hook
++56 vs +107 µs). The ORDERING of the candidates and every conclusion drawn from it were
+identical on both. The counter's own row is below this harness's noise floor either way —
+its CI straddles zero — so it is reported as ACCOUNTING (``--case calls`` x a direct
+per-call timing), and the load-independent evidence (``--case profile``, plus the bytecode
+count in the CHANGELOG) is what the cost claim actually rests on.
+
 Usage::
 
     python benchmarks/fused/bench_state_witness.py --case field

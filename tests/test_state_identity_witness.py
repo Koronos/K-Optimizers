@@ -15,6 +15,15 @@ optimizer had already let go of:
 * ``opt.state[p]["m"] = ...`` / ``["row"] = ...`` — an external EMA, a partial
   ``load_state_dict`` that bypasses the optimizer's own loader, a checkpoint tool that
   casts one buffer, a requant that does not follow the in-place codec contract.
+* ``opt.state[p] |= {"m": ...}`` — the same thing through ``dict.__ior__``, which is a
+  DIFFERENT C slot from ``__setitem__`` and from ``update``. It is called out separately
+  because it is the one route hand-written coverage missed, which is why the coverage here
+  is now a TABLE over ``dict``'s whole mutation API rather than a list of methods someone
+  thought of (``test_every_{inner,outer}_dict_mutator_is_accounted_for``).
+* ``opt.state = defaultdict(dict)`` — reassigning the mapping wholesale. On its own that
+  invalidated every cache exactly once (the generation went N -> 0), so the next step
+  looked fine, and then left a counter-less mapping behind: measured 4/4 retired buffers
+  written on the step after a subsequent mutation.
 
 The guard is :class:`kaon._foreach_plan.WatchedState`: ``self.state`` counts every change
 of state IDENTITY, and every cross-step cache carries that count. Cost is zero per step
@@ -28,7 +37,9 @@ from __future__ import annotations
 
 import copy
 import io
+import operator
 import pickle
+from collections import defaultdict
 
 import pytest
 import torch
@@ -53,8 +64,11 @@ _ROUTES = {
     "zero_dim": [()] * 3,
     "big": [(512, 512)] * 2,
 }
-# Which state keys each route's cached pointer tables / views actually bake.
-_MUTATIONS = ("del", "clear", "reassign_m", "reassign_second_moment")
+# How the state can be retired behind the optimizer's back, one row per route x mutation.
+# ``ior_m`` is here because ``|=`` reaches a different C slot from ``__setitem__`` and
+# ``update`` and was the one route through the dict API the hand-written coverage missed.
+_MUTATIONS = ("del", "clear", "reassign_m", "reassign_second_moment", "ior_m",
+              "reassign_state_map")
 
 
 # --------------------------------------------------------------------------- helpers
@@ -98,9 +112,21 @@ def _mutate(opt, params, kind):
             del opt.state[p]
         elif kind == "clear":
             st.clear()
+        elif kind == "ior_m":
+            st |= {k: st[k].detach().clone() for k in keys}
+        elif kind == "reassign_state_map":
+            pass                              # handled once, after the loop
         else:
             for k in keys:
                 st[k] = st[k].detach().clone()
+    if kind == "reassign_state_map":
+        # The bluntest instrument a user has: drop the whole mapping and hand back a plain
+        # one holding FRESH buffers for every parameter. Nothing about any parameter moves.
+        opt.state = defaultdict(dict, {
+            p: {k: (v.detach().clone() if torch.is_tensor(v) else v)
+                for k, v in opt.state[p].items()}
+            for p in params
+        })
     return retired
 
 
@@ -126,6 +152,27 @@ def _drive(pairs, steps, seed, device, mutate=None):
     if device == "cuda":
         torch.cuda.synchronize()
     return out
+
+
+def _assert_same_objects(now, before, what):
+    """Every cached object must be the SAME object, compared by IDENTITY.
+
+    ``==`` is useless here and quietly so: a route list is a ``list``, and ``list.__eq__``
+    short-circuits on element identity, so a REBUILT list holding the same parameters
+    compares equal — the exact thing this is meant to catch. (And where the elements do
+    differ it does not report False, it raises: comparing two tensors yields a tensor whose
+    truth value is ambiguous.) Cache objects define no ``__eq__``, so ``==`` on the dicts
+    holding them already was identity — but only by accident.
+    """
+    assert set(now) == set(before), f"{what} (cache keys moved: {set(now) ^ set(before)})"
+    for key, was in before.items():
+        got = now[key]
+        if isinstance(was, tuple):
+            assert len(got) == len(was), f"{what} (entry {key} changed arity)"
+            for i, (g, w) in enumerate(zip(got, was, strict=True)):
+                assert g is w, f"{what} (entry {key} field {i} is a NEW object)"
+        else:
+            assert got is was, f"{what} (entry {key} is a NEW object)"
 
 
 def _maxdiff(pa, pb):
@@ -253,9 +300,11 @@ def test_the_unwatched_write_bypass_only_covers_scalar_keys():
     """``AdaPNM._prepare_param_steps`` writes ``step`` through ``dict.__setitem__``.
 
     That skips the identity hook, which is sound only while ``step`` is outside
-    :data:`WATCHED_STATE_KEYS` — the write is 428 Python calls per step on the reference bag
-    (+96 µs, 1.06% of its fused step) and had to come off the hot path. If a future change
-    ever routes a BAKED key through the bypass, this is the guard that says so.
+    :data:`WATCHED_STATE_KEYS`. The write is 428 Python calls per step on the reference bag:
+    +56…+107 µs (1.1-1.7% of that bag's AdaPNM fused step, two machines) through the hook
+    against +18.5…+48 µs (0.35-0.9%) through ``dict.__setitem__``, which is why it had to
+    come off the hot path. If a future change ever routes a BAKED key through the bypass,
+    this is the guard that says so.
     """
     from kaon.adapnm import _set_unwatched
 
@@ -265,33 +314,127 @@ def test_the_unwatched_write_bypass_only_covers_scalar_keys():
     assert {"step"}.isdisjoint(WATCHED_STATE_KEYS)
 
 
-@pytest.mark.parametrize("drop", ["del", "clear", "pop", "popitem", "outer_del",
-                                  "outer_clear", "outer_pop", "outer_set", "update"])
-def test_every_removal_route_moves_the_generation(drop):
+# --------------------------------------------------------- the whole dict mutation API
+# EVERY way `dict` lets you retire a value, enumerated rather than sampled. Each entry is
+# ``(label, mutate, retires)``: ``mutate`` acts on a state whose watched key is populated,
+# and ``retires`` says whether the operation drops or replaces that value — i.e. whether
+# the generation MUST move. Sampling this API by hand is what let `|=` through: it lands on
+# the same C slot as ``update`` (``mp_ass_subscript``'s sibling ``nb_inplace_or``), which
+# WAS hooked, so the gap was invisible to a test that listed the methods it thought of.
+#
+# A new `dict` mutator (or a new Python version growing one) must be added here. The test
+# below is the only thing standing between "the class looks watched" and "the class IS
+# watched".
+
+
+def _ior(target, other):
+    """``target |= other`` — mutates in place and returns the same object."""
+    target |= other
+    return target
+
+
+# label, mutate(state, fresh), moves the generation?, actually retires state["m"]?
+_INNER_API = [
+    ("__setitem__", lambda s, f: s.__setitem__("m", f), True, True),
+    ("operator.setitem", lambda s, f: operator.setitem(s, "m", f), True, True),
+    ("__ior__", lambda s, f: _ior(s, {"m": f}), True, True),
+    ("__delitem__", lambda s, f: s.__delitem__("m"), True, True),
+    ("clear", lambda s, f: s.clear(), True, True),
+    ("pop", lambda s, f: s.pop("m"), True, True),
+    ("popitem", lambda s, f: s.popitem(), True, True),
+    ("update_mapping", lambda s, f: s.update({"m": f}), True, True),
+    ("update_kwargs", lambda s, f: s.update(m=f), True, True),
+    ("update_pairs", lambda s, f: s.update([("m", f)]), True, True),
+    # Retire nothing, so they must stay free.
+    ("setdefault_present", lambda s, f: s.setdefault("m", f), False, False),
+    ("setitem_same_object", lambda s, f: s.__setitem__("m", s["m"]), False, False),
+    ("unwatched_key", lambda s, f: s.__setitem__("step", 7), False, False),
+    # DELIBERATE, DOCUMENTED BYPASSES — `dict`'s own C slots, reached explicitly. These DO
+    # retire the buffer and do NOT move the generation: that asymmetry is the whole point of
+    # calling them a bypass, and it is why `AdaPNM._prepare_param_steps` may use
+    # `dict.__setitem__` for its scalar `step` counter and for nothing else. Routing a
+    # WATCHED key through one of these is a bug no type can catch — these rows exist so the
+    # behaviour is pinned and visible, not endorsed.
+    ("BYPASS dict.__setitem__", lambda s, f: dict.__setitem__(s, "m", f), False, True),
+    ("BYPASS dict.update", lambda s, f: dict.update(s, {"m": f}), False, True),
+]
+
+_OUTER_API = [
+    ("__setitem__", lambda s, k, f: s.__setitem__(k, {"m": f}), True, True),
+    ("operator.setitem", lambda s, k, f: operator.setitem(s, k, {"m": f}), True, True),
+    ("__ior__", lambda s, k, f: _ior(s, {k: {"m": f}}), True, True),
+    ("__delitem__", lambda s, k, f: s.__delitem__(k), True, True),
+    ("clear", lambda s, k, f: s.clear(), True, True),
+    ("pop", lambda s, k, f: s.pop(k), True, True),
+    ("popitem", lambda s, k, f: s.popitem(), True, True),
+    ("update_mapping", lambda s, k, f: s.update({k: {"m": f}}), True, True),
+    ("update_pairs", lambda s, k, f: s.update([(k, {"m": f})]), True, True),
+    ("setdefault_present", lambda s, k, f: s.setdefault(k, {"m": f}), False, False),
+    ("__missing__", lambda s, k, f: s[torch.zeros(2)], False, False),
+]
+
+
+@pytest.mark.parametrize("label,mutate,moves,retires", _INNER_API,
+                         ids=[e[0] for e in _INNER_API])
+def test_every_inner_dict_mutator_is_accounted_for(label, mutate, moves, retires):
+    """No route through `dict`'s mutation API may retire a watched buffer silently."""
+    st = WatchedState()
+    inner = st[torch.zeros(2)]
+    inner["m"] = torch.zeros(3)
+    live = inner["m"]
+    gen = st.gen[0]
+    mutate(inner, torch.zeros(3))
+    assert (inner.get("m") is not live) is retires, (
+        f"{label}: the fixture did not do what the table says it does"
+    )
+    assert (st.gen[0] > gen) is moves, (
+        f"{label}: generation moved={st.gen[0] > gen}, expected {moves}. A route that "
+        "retires state['m'] without moving it leaves every pointer table and cached view "
+        "over that buffer 'valid', and the next step writes the tensor the optimizer just "
+        "let go of."
+    )
+
+
+@pytest.mark.parametrize("label,mutate,moves,retires", _OUTER_API,
+                         ids=[e[0] for e in _OUTER_API])
+def test_every_outer_dict_mutator_is_accounted_for(label, mutate, moves, retires):
+    """Same sweep for the ``param -> state`` mapping itself."""
     st = WatchedState()
     key = torch.zeros(2)
-    inner = st[key]
-    inner["m"] = torch.zeros(3)
+    st[key]["m"] = torch.zeros(3)
+    live = st[key]
     gen = st.gen[0]
-    if drop == "del":
-        del inner["m"]
-    elif drop == "clear":
-        inner.clear()
-    elif drop == "pop":
-        inner.pop("m")
-    elif drop == "popitem":
-        inner.popitem()
-    elif drop == "update":
-        inner.update({"m": torch.zeros(3)})
-    elif drop == "outer_del":
-        del st[key]
-    elif drop == "outer_clear":
-        st.clear()
-    elif drop == "outer_pop":
-        st.pop(key)
+    mutate(st, key, torch.zeros(3))
+    assert (st.get(key) is not live) is retires, (
+        f"{label}: the fixture did not do what the table says it does"
+    )
+    assert (st.gen[0] > gen) is moves, (
+        f"{label}: generation moved={st.gen[0] > gen}, expected {moves}"
+    )
+
+
+@pytest.mark.parametrize("how", ["setitem", "ior", "update"])
+def test_a_plain_dict_handed_to_the_outer_mapping_is_adopted(how):
+    """Whatever route installs a per-param state, it must come out WATCHED.
+
+    `|=` left a plain dict in place, so every later ``state[p]["m"] = ...`` through it was
+    invisible — the mapping looked watched and one of its entries was not.
+    """
+    st = WatchedState()
+    key = torch.zeros(2)
+    incoming = {"m": torch.zeros(3)}
+    if how == "setitem":
+        st[key] = incoming
+    elif how == "ior":
+        st |= {key: incoming}
     else:
-        st[key] = {"m": torch.zeros(3)}
-    assert st.gen[0] > gen, f"{drop} must move the generation"
+        st.update({key: incoming})
+    assert isinstance(st[key], WatchedParamState), (
+        f"{how} left an UNWATCHED per-param state in a watched mapping"
+    )
+    gen = st.gen[0]
+    st[key]["m"] = torch.zeros(3)
+    assert st.gen[0] > gen
 
 
 def test_outer_setitem_adopts_a_plain_dict():
@@ -334,10 +477,13 @@ def test_watched_dicts_serialise_as_plain_dicts(dump):
     for obj in (st, st[key]):
         back = (pickle.loads(pickle.dumps(obj)) if dump == "pickle"
                 else copy.deepcopy(obj))
-        assert type(back) in (dict, type(back)) and isinstance(back, dict)
+        assert isinstance(back, dict)
         assert not isinstance(back, (WatchedState, WatchedParamState)), (
             f"{type(obj).__name__} survived {dump} as a watched dict"
         )
+        # ``len``, not ``sorted``/``==``: the OUTER mapping is keyed by TENSORS, and both
+        # sorting them and comparing them raise ("Boolean value of Tensor ... is ambiguous").
+        assert len(back) == len(obj), f"{dump} lost content"
 
 
 # ============================================================ 2. Adakaon, native paths
@@ -412,14 +558,12 @@ def test_fused_partition_is_reused_while_the_state_stands_still():
     opt = Adakaon(pl, fused=True, **_ADAKAON_CFG)
     _drive([(pl, opt)], 3, 17, "cuda")
     parts = {gid: entry[-4:] for gid, entry in opt._fused_part.items()}
-    caches = (dict(opt._fused_ob_caches), dict(opt._fused_od_caches))
+    caches = {**opt._fused_ob_caches, **opt._fused_od_caches}
     _drive([(pl, opt)], 3, 19, "cuda")
-    assert {gid: e[-4:] for gid, e in opt._fused_part.items()} == parts, (
-        "the fused partition was rebuilt on a steady-state step"
-    )
-    assert (dict(opt._fused_ob_caches), dict(opt._fused_od_caches)) == caches, (
-        "a fused pointer cache was rebuilt on a steady-state step"
-    )
+    _assert_same_objects({gid: e[-4:] for gid, e in opt._fused_part.items()}, parts,
+                         "the fused partition was rebuilt on a steady-state step")
+    _assert_same_objects({**opt._fused_ob_caches, **opt._fused_od_caches}, caches,
+                         "a fused pointer cache was rebuilt on a steady-state step")
 
 
 @requires_fused
@@ -472,8 +616,10 @@ def test_adapnm_fused_partition_is_reused_while_the_state_stands_still():
     caches = dict(opt._fused_ob_caches)
     parts = {gid: e[-4:] for gid, e in opt._fused_part.items()}
     _drive([(pl, opt)], 3, 19, "cuda")
-    assert dict(opt._fused_ob_caches) == caches, "AdaPNM rebuilt a pointer cache per step"
-    assert {gid: e[-4:] for gid, e in opt._fused_part.items()} == parts
+    _assert_same_objects(dict(opt._fused_ob_caches), caches,
+                         "AdaPNM rebuilt a pointer cache on a steady-state step")
+    _assert_same_objects({gid: e[-4:] for gid, e in opt._fused_part.items()}, parts,
+                         "AdaPNM rebuilt the partition on a steady-state step")
 
 
 # ============================================================ 5. wrappers
@@ -518,6 +664,48 @@ def test_nekaon_drops_a_retired_inner_momentum(kind):
 
 # ============================================================ 6. checkpoint plumbing
 @pytest.mark.parametrize("cls,cfg", [(Adakaon, _ADAKAON_CFG), (AdaPNM, _CFG)])
+def test_assigning_a_plain_mapping_to_state_is_rewrapped(cls, cfg):
+    """``opt.state = defaultdict(dict)`` must not be able to switch the watch off.
+
+    It reopened the blind spot *silently and permanently*: the generation went N -> 0,
+    which invalidated every cache exactly once (so the next step looked fine) and then
+    left a counter-less mapping in place. ``torch.optim.Optimizer.__init__`` performs the
+    same assignment, so this also pins that the watch is on from construction.
+    """
+    pl = _bag([(8, 16)] * 2, seed=17)
+    opt = cls(pl, **cfg)
+    assert isinstance(opt.state, WatchedState), "not watched straight out of __init__"
+    _drive([(pl, opt)], 2, 41, "cpu")
+    opt.state = defaultdict(dict, {p: dict(opt.state[p]) for p in pl})
+    assert isinstance(opt.state, WatchedState)
+    for p in pl:
+        assert isinstance(opt.state[p], WatchedParamState)
+    gen = opt.state.gen[0]
+    key = _momentum_keys(opt.state[pl[0]])[0]        # "m" / "m_pos" per optimizer
+    opt.state[pl[0]][key] = opt.state[pl[0]][key].detach().clone()
+    assert opt.state.gen[0] > gen, "the re-wrapped mapping is not reporting"
+    _drive([(pl, opt)], 1, 43, "cpu")
+
+
+@requires_fused
+@pytest.mark.parametrize("route", ["one_block", "one_dim", "big"])
+def test_reassigned_state_map_then_mutated_keeps_the_caches_honest(route):
+    """The two-step version, which is the one that actually bit.
+
+    Reassign -> step (this invalidated once on its own) -> retire a buffer -> step. Before
+    the ``__setattr__`` interception the second step wrote all four retired buffers.
+    """
+    pl = _bag(_ROUTES[route], seed=19, device="cuda")
+    opt = Adakaon(pl, fused=True, **_ADAKAON_CFG)
+    _drive([(pl, opt)], 3, 45, "cuda")
+    opt.state = defaultdict(dict, {p: dict(opt.state[p]) for p in pl})
+    _drive([(pl, opt)], 1, 47, "cuda")
+    retired = _mutate(opt, pl, "reassign_m")
+    _drive([(pl, opt)], 1, 49, "cuda")
+    _assert_untouched(retired, f"reassigned-state-map/{route}")
+
+
+@pytest.mark.parametrize("cls,cfg", [(Adakaon, _ADAKAON_CFG), (AdaPNM, _CFG)])
 def test_load_state_dict_reinstalls_the_watch(cls, cfg):
     """``Optimizer.load_state_dict`` REPLACES ``self.state`` with a plain defaultdict."""
     pl = _bag([(8, 16)] * 2, seed=11)
@@ -536,14 +724,31 @@ def test_load_state_dict_reinstalls_the_watch(cls, cfg):
 
 
 @pytest.mark.parametrize("cls,cfg", [(Adakaon, _ADAKAON_CFG), (AdaPNM, _CFG)])
-def test_deepcopy_keeps_the_watch(cls, cfg):
+def test_deepcopy_reinstalls_the_watch_on_the_copy(cls, cfg):
+    """SCOPE: this asserts the watch SURVIVES ``deepcopy``, and nothing more.
+
+    A deep-copied optimizer is not steppable in this repo with or without the watch (the
+    copy's ``param_groups`` hold copies of the parameters while the caller still owns the
+    originals), so nothing here claims ``deepcopy`` is a supported operation. What it does
+    pin is that ``WatchedState.__reduce__`` handing back a PLAIN mapping — so a checkpoint
+    never embeds these classes — is repaired by ``__setstate__`` on the way in, instead of
+    leaving the copy with a silently unwatched state.
+    """
     pl = _bag([(8, 16)] * 2, seed=13)
     opt = cls(pl, **cfg)
     _drive([(pl, opt)], 2, 31, "cpu")
     twin = copy.deepcopy(opt)
     assert isinstance(twin.state, WatchedState)
-    for p in twin.param_groups[0]["params"]:
+    params = twin.param_groups[0]["params"]
+    for p in params:
         assert isinstance(twin.state[p], WatchedParamState)
+    # ...and the copy's counter is its OWN cell: a write to it must not move the original's.
+    origin = opt.state.gen[0]
+    gen = twin.state.gen[0]
+    key = _momentum_keys(twin.state[params[0]])[0]
+    twin.state[params[0]][key] = twin.state[params[0]][key].detach().clone()
+    assert twin.state.gen[0] > gen
+    assert opt.state.gen[0] == origin, "the copy shares the original's generation cell"
 
 
 @pytest.mark.parametrize("cls,cfg", [(Adakaon, _ADAKAON_CFG), (AdaPNM, _CFG)])
