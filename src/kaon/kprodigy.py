@@ -76,6 +76,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _make_codec,
@@ -95,7 +96,7 @@ _STACK_BYTES_PER_ELEM = 48
 
 
 
-class KProdigy(Optimizer):
+class KProdigy(ForeachPlanMixin, Optimizer):
     """Memory-efficient Prodigy with parameter-free D-adaptation.
 
     Args:
@@ -342,6 +343,9 @@ class KProdigy(Optimizer):
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)
+        # The loader REPLACES every state tensor the cached views alias (and every group
+        # dict, which the plan is keyed on), so the plan cannot survive it.
+        self._clear_foreach_plans()
 
     @torch.no_grad()
     def _step_scope(self, groups: list[dict[str, Any]]) -> None:
@@ -707,10 +711,15 @@ class KProdigy(Optimizer):
 
         for (eff, matrixize), idxs in fac_buckets.items():
             group = records[idxs[0]][3]
-            R, C = eff  # noqa: N806
+            # ``eff`` is the matrixized ``(R, C)`` when the bucket matrixizes and the
+            # weight's raw shape otherwise, which under
+            # ``factor_conv_as_matrix=False`` is any rank at all: ``row``/``col`` are
+            # then N-D too and every reduction below is written on the last two axes, so
+            # it works unchanged. Unpacking ``R, C = eff`` here used to raise
+            # ``ValueError: too many values to unpack`` on exactly that configuration.
             grads = torch.stack([
-                (records[i][1].reshape(R, C) if matrixize else records[i][1]) for i in idxs
-            ])                                                          # [B, R, C]
+                (records[i][1].reshape(eff) if matrixize else records[i][1]) for i in idxs
+            ])                                                          # [B, *eff]
             rows = torch.stack([records[i][2]["row"] for i in idxs])    # [B, R]
             cols = torch.stack([records[i][2]["col"] for i in idxs])    # [B, C]
             eps1 = group["eps_factored"]
@@ -727,8 +736,8 @@ class KProdigy(Optimizer):
     def _apply_updates(self, params: list[Tensor], group: dict[str, Any], d: float, dlr: float) -> None:
         """Apply the Prodigy weight update for every param in ``group``.
 
-        Routes to the batched foreach engine (Adakaon's bucketing) when
-        eligible; falls back per-param otherwise. The Prodigy-specific math
+        Routes to the batched foreach engine (the shared bucketing/view plan,
+        ``kaon._foreach_plan``) when eligible; falls back per-param otherwise. The Prodigy-specific math
         (d-scaled denominator, dlr scaling, decoupled WD, eps floor) is identical
         in both paths.
         """
@@ -746,9 +755,13 @@ class KProdigy(Optimizer):
                 for p in slow:
                     self._update_one_param(p, group, d, dlr)
             else:
+                # The whole group updates per-parameter: drop any cached plan for it, so a
+                # cached plan only ever describes a group the foreach path stepped.
+                self._drop_foreach_plan(group)
                 for p in params:
                     self._update_one_param(p, group, d, dlr)
         else:
+            self._drop_foreach_plan(group)
             for p in params:
                 self._update_one_param(p, group, d, dlr)
 
@@ -772,10 +785,18 @@ class KProdigy(Optimizer):
             and p.dtype != torch.bfloat16
         ):
             return False
-        # factored conv kernels (ndim>2) are matrixized into a view -> contiguity.
-        factored = group["second_moment"] == "factored" and p.ndim >= 2 and group["factor_conv_as_matrix"]
-        if p.ndim > 2 and factored:
+        if p.ndim > 2 and group["second_moment"] == "factored":
+            if not group["factor_conv_as_matrix"]:
+                # N-D Adafactor: ``row``/``col`` were allocated over the kernel's own
+                # rank (``row`` is ``[O, I, kh]`` for a 4-D weight), which is not the
+                # 2-D effective layout a factored bucket works in. The per-parameter
+                # path handles it; the batched one used to unpack ``R, C = eff`` on a
+                # rank-4 tuple and raise ``ValueError: too many values to unpack``.
+                return False
+            # A matrixized conv writes back through a ``view(R, C)`` -> needs contiguity.
             return p.data.is_contiguous() and p.grad.is_contiguous()
+        # ndim > 2 under ``second_moment="full"`` needs NO contiguity: its bucket keeps
+        # the weight in its own layout (``ForeachSpec(matrixize=False)``).
         return True
 
     # -- momentum EMA (pass 1; D-relevant, kept numerically as before) -----
@@ -867,109 +888,145 @@ class KProdigy(Optimizer):
 
         subtract_one_(p, delta, state, bf16_method)
 
-    # -- foreach update (Adakaon bucketing) ------------------------------
+    # -- foreach update (the shared bucketing/view plan) -----------------
+
+    # KProdigy is the one optimizer whose bucketing is a per-GROUP property, so it
+    # declares two specs and routes between them in :meth:`_foreach_spec`.
+    #
+    # ``second_moment="full"`` (the default): every param carries a per-coordinate ``v``
+    # shaped like the weight, so there is nothing to matrixize *for* —
+    # ``matrixize=False`` keeps an ``ndim > 2`` weight in its own layout, which is also
+    # what lets a channels_last conv keep being stacked (a ``view(R, C)`` of it does not
+    # exist). One dict keyed by exact shape, in first-appearance order, is what the
+    # pre-plan ``_full_bucket`` stepped, hence ``insertion_order``.
+    #
+    # ``second_moment="factored"``: ``ndim >= 2`` carries an Adafactor ``row``/``col``
+    # pair in the matrixized layout and ``ndim <= 1`` falls back to a full ``v`` — which
+    # IS the shared plan's canonical family split, factored buckets first.
+    #
+    # ``scalar_bucket`` is on for both: KProdigy bucketed 0-D params by their exact
+    # shape, so they never shared the ``L == 1`` bucket with shape-``(1,)`` params. Like
+    # the flags on Lion, that is kept because the partition and the order of the buckets
+    # decide the order the stochastic-rounding draws are consumed in and so reach bf16
+    # weights (``test_pinned_bf16_sr_vector_matches_the_pre_plan_tree``).
+    _FOREACH_SPEC = ForeachSpec(
+        factored_state=("v",),
+        flat_state=("v",),
+        matrixize=False,
+        scalar_bucket=True,
+        insertion_order=True,
+    )
+    _FOREACH_SPEC_FACTORED = ForeachSpec(
+        factored_state=("row", "col"),
+        flat_state=("v",),
+        scalar_bucket=True,
+    )
+
+    def _foreach_spec(self, group: dict[str, Any]) -> ForeachSpec:
+        if group["second_moment"] == "factored":
+            return self._FOREACH_SPEC_FACTORED
+        return self._FOREACH_SPEC
 
     @torch.no_grad()
     def _update_foreach(
         self, params: list[Tensor], group: dict[str, Any], d: float, dlr: float, budget: int
     ) -> None:
-        """Batched pass-2 update: bucket params by effective shape and step each
-        bucket with a handful of stacked kernels (Adakaon's foreach engine),
-        applying Prodigy's d-scaled update math."""
-        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        full_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        for p in params:
-            state = self.state[p]
-            g = p.grad
-            if "v" in state:
-                # Full second moment: bucket by exact shape; update is plain
-                # grad/sqrt(v) with no factoring.
-                full_buckets.setdefault((tuple(g.shape), p.dtype), []).append(p)
-            elif g.ndim >= 2:
-                matrixize = g.ndim > 2 and group["factor_conv_as_matrix"]
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                factored_buckets.setdefault((eff, p.dtype, matrixize), []).append(p)
+        """Batched pass-2 update over the shared plan's cached chunks.
 
-        for (eff, _dt, matrixize), plist in factored_buckets.items():
-            step = max(1, budget // max(eff[0] * eff[1], 1))
-            for i in range(0, len(plist), step):
-                self._factored_bucket(plist[i:i + step], eff, matrixize, group, d, dlr)
-        for (shape, _dt), plist in full_buckets.items():
-            per = math.prod(shape)
-            step = max(1, budget // max(per, 1))
-            for i in range(0, len(plist), step):
-                self._full_bucket(plist[i:i + step], shape, group, d, dlr)
+        A chunk from the *factored* family holds the Adafactor ``row``/``col`` update;
+        everything else (both families under ``second_moment="full"``, and the
+        ``ndim <= 1`` fallback under ``"factored"``) holds a full per-coordinate ``v``.
+        """
+        # ``None`` at beta1 == 0: no momentum buffer exists, the numerator is the grad.
+        codec = self._codec(group) if group["betas"][0] > 0 else None
+        factored = group["second_moment"] == "factored"
+        for chunk in self._foreach_chunks(params, group, budget):
+            if factored and chunk.eff is not None:
+                self._factored_bucket(chunk, group, codec, d, dlr)
+            else:
+                self._full_bucket(chunk, group, codec, d, dlr)
 
     def _numer_stacked(
-        self, plist: list[Tensor], group: dict[str, Any], mat: Any, eff: tuple[int, ...]
+        self, chunk: ForeachChunk, codec: _MomentumCodec | None, eff: tuple[int, ...]
     ) -> Tensor:
-        """Stacked numerator ``[N, *eff]``: d-scaled momentum (beta1>0) or grad."""
-        if group["betas"][0] > 0:
-            states = [self.state[p] for p in plist]
-            return self._codec(group).dequant_stacked(states, mat, eff)
-        return torch.stack([mat(p.grad) for p in plist]).float()
+        """Stacked numerator ``[N, *eff]``: d-scaled momentum (beta1>0) or grad.
+
+        Both branches hand back a FRESH tensor — the bucket bodies scale it in place —
+        which is why the ``beta1 == 0`` case re-stacks the gradient instead of reusing
+        the bucket's own ``grad``.
+        """
+        if codec is not None:
+            return codec.dequant_stacked(chunk.states, chunk.mat, eff,
+                                         views=chunk.momentum_views(codec))
+        return chunk.grad_stack()
 
     @torch.no_grad()
     def _factored_bucket(
-        self, plist: list[Tensor], eff: tuple[int, int], matrixize: bool,
-        group: dict[str, Any], d: float, dlr: float,
+        self, chunk: ForeachChunk, group: dict[str, Any],
+        codec: _MomentumCodec | None, d: float, dlr: float,
     ) -> None:
-        R, C = eff  # noqa: N806
+        R, C = chunk.eff  # type: ignore[misc]  # noqa: N806
         eps = group["eps"]
         decay = group["weight_decay"]
         decouple = group["decouple"]
         cautious = group["cautious"]
         bf16_method = group["bf16_method"]
+        row_views, col_views = chunk.state_views
 
-        def mat(t: Tensor) -> Tensor:
-            return t.view(R, C) if matrixize else t
-
-        grad = torch.stack([mat(p.grad) for p in plist]).float()              # [N, R, C]
-        rows = torch.stack([self.state[p]["row"] for p in plist])            # [N, R]
-        cols = torch.stack([self.state[p]["col"] for p in plist])            # [N, C]
+        grad = chunk.grad_stack()                                             # [N, R, C]
+        rows = torch.stack(row_views)                                        # [N, R]
+        cols = torch.stack(col_views)                                        # [N, C]
 
         r_factor = rows.div(rows.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
         c_factor = cols.rsqrt().unsqueeze(-2)                                        # [N, 1, C]
         inv_denom = (r_factor * c_factor).div_(d).clamp_(max=1.0 / (d * eps))        # [N, R, C]
 
-        numer = self._numer_stacked(plist, group, mat, (R, C))               # [N, R, C]
+        numer = self._numer_stacked(chunk, codec, (R, C))                    # [N, R, C]
         delta = numer.mul_(inv_denom).mul_(dlr)
 
         if decay != 0 and decouple:
-            p_fp32 = torch.stack([mat(p.data) for p in plist]).float()
-            delta = delta.add_(p_fp32, alpha=decay * dlr)
+            delta = delta.add_(chunk.param_stack(), alpha=decay * dlr)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method)
+        subtract_batched_(chunk.pviews, delta, bf16_method)
 
     @torch.no_grad()
     def _full_bucket(
-        self, plist: list[Tensor], shape: tuple[int, ...], group: dict[str, Any], d: float, dlr: float
+        self, chunk: ForeachChunk, group: dict[str, Any],
+        codec: _MomentumCodec | None, d: float, dlr: float,
     ) -> None:
-        """Batched update for params using the FULL second moment (any shape)."""
+        """Batched update for params using the FULL second moment (any shape).
+
+        The chunk's effective layout is the weight's own shape (any rank) for the
+        factored family and ``[N, L]`` for the flat one, where 0-D params ride as
+        length-1 views. Either way ``v`` is per-coordinate and the update is plain
+        ``numer / sqrt(v)``, so the layout only matters to the int8 momentum's per-row
+        scale — which the codec derives from the same ``eff``.
+        """
         eps = group["eps"]
         decay = group["weight_decay"]
         decouple = group["decouple"]
         cautious = group["cautious"]
         bf16_method = group["bf16_method"]
+        eff = chunk.eff if chunk.eff is not None else (chunk.length,)
+        (v_views,) = chunk.state_views
 
-        grad = torch.stack([p.grad for p in plist]).float()                  # [N, *shape]
-        v = torch.stack([self.state[p]["v"] for p in plist])
+        grad = chunk.grad_stack()                                            # [N, *eff]
+        v = torch.stack(v_views)
         denom = v.sqrt().clamp_(min=d * eps)
 
-        numer = self._numer_stacked(plist, group, lambda t: t, tuple(shape))
+        numer = self._numer_stacked(chunk, codec, eff)
         delta = numer.div_(denom).mul_(dlr)
 
         if decay != 0 and decouple:
-            p_fp32 = torch.stack([p.data for p in plist]).float()
-            delta = delta.add_(p_fp32, alpha=decay * dlr)
+            delta = delta.add_(chunk.param_stack(), alpha=decay * dlr)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([p.data for p in plist], delta, bf16_method)
+        subtract_batched_(chunk.pviews, delta, bf16_method)
 
     # -- weight update -----------------------------------------------------
 

@@ -191,7 +191,12 @@ computes them once and caches them per param group:
 - `ForeachSpec` — declared once per optimizer class: which state keys the bucket
   bodies walk, the optimizer-specific extra bucket key (the per-parameter step for
   AdaBelief / AdamP / ADOPT, `t` for AdaMuon with `bias_correction`), whether to
-  prebuild the codec's `mat` lookup.
+  prebuild the codec's `mat` lookup, and the bucketing an optimizer is *pinned* to
+  (see "Per-optimizer bucketing is part of the contract" below). KProdigy is the one
+  optimizer whose bucketing depends on the **group** rather than the class — its
+  `second_moment` decides whether an `ndim >= 2` weight carries a factored `row`/`col`
+  pair or a full per-coordinate `v` — so it declares two specs and routes between them
+  through the `_foreach_spec(group)` hook.
 - `ForeachPlan` — one group's bucket list plus the chunk split; re-chunked only when
   `budget // bucket_size` actually moves (the VRAM-adaptive budget wobbles every step,
   the chunk length almost never does).
@@ -207,20 +212,19 @@ them on every step, once per *use site*: an int8 bucket cost four such lists per
 
 Each codec therefore exposes `stacked_views(states, view, eff) -> _StackedViews | None`,
 built **once per chunk** by `ForeachChunk.momentum_views(codec)` and handed to every
-stacked call as `views=`. **AdaBelief, AdamP, ADOPT and AdaMuon pass them; nobody else
-does** — `views=None` runs the original code, so Lion, KProdigy and AdaPNM (which do
-their own bucketing, not this plan) and **Adakaon** (which has its own plan and is
-being migrated onto this one separately) are unaffected, and the argument is
-bit-identical either way. The gains measured below are therefore those four
-optimizers' only; Adakaon is not in the table.
+stacked call as `views=`. **Every optimizer on the shared plan passes them** — AdaBelief,
+AdamP, ADOPT, AdaMuon, ScheduleFree, Adakaon, Lion and KProdigy. `views=None` still runs
+the original code and is bit-identical, which is what **AdaPNM** (the last optimizer doing
+its own bucketing) keeps using. The gains in the table below were measured on the first
+four to adopt it; Lion's and KProdigy's are in their own section further down.
 
 `stacked_views` returns `None` for a layout it cannot alias — a
 non-contiguous `m` or `m_scale`, where a `reshape` would hand back a detached copy —
 and the codec's existing per-parameter fallbacks take over. Passing a views object
 built for another bucket is *ignored*, not misread: every consumer checks its `eff`.
-That check is defense in depth — the four callers always pass the `eff` they built the
-views with, and a re-chunk hands out fresh chunks — but the failure it prevents (a read
-in another bucket's shape, a write into another bucket's buffers) would be silent.
+That check is defense in depth — every caller passes the `eff` it built the views with,
+and a re-chunk hands out fresh chunks — but the failure it prevents (a read in another
+bucket's shape, a write into another bucket's buffers) would be silent.
 
 Two things follow from the lists being views:
 
@@ -252,6 +256,89 @@ parameter's new `m_scale` with its own `copy_` (the scale shapes differ per para
 layout), which the cached scale views collapse into one `_foreach_copy_`. 4-bit gains
 only that — its `m` is a packed byte string with no effective layout, so it never had
 per-parameter views to cache.
+
+### Per-optimizer bucketing is part of the contract
+
+Bucket order is numerically inert on its own: buckets touch disjoint parameters and
+disjoint state, so reordering them cannot change a single fp32 value. It is **not** inert
+for bf16 weights under stochastic rounding. Each bucket draws its rounding noise in one
+shot, sized by the bucket, from a stream shared by the whole step (a module-owned
+`torch.Generator`, or the Triton kernel's seed counter). Merge two buckets, split one, or
+step them in a different order and every bf16 weight's last bit moves — unbiased either
+way, but a run stops reproducing against its own history.
+
+So an optimizer that bucketed differently before it moved onto this module has to keep
+doing so, and `ForeachSpec` says how, declaratively:
+
+| flag | what it pins | who sets it |
+|---|---|---|
+| `key_major` | all of key 0's buckets, then all of key 1's, instead of factored-then-flat | ADOPT |
+| `insertion_order` | first-appearance order across both families, not factored-then-flat | Lion, KProdigy (`second_moment="full"`) |
+| `scalar_bucket` | 0-D params get their own bucket instead of joining the `L == 1` one | Lion, KProdigy |
+| `raw_shape_key` | two convs that matrixize to the same `[R, C]` stay apart | Lion |
+| `matrixize=False` | `eff` is the weight's own shape, any rank; `view` is the identity | KProdigy (`second_moment="full"`) |
+
+None of those splits is *wanted*: merging is strictly less work. They are the price of a
+bf16+SR run not changing when the plumbing under it does, and each is anchored by a frozen
+bf16 bit-pattern vector in `tests/test_foreach_plan.py` (`_FROZEN_SR_BITS`,
+`_PINNED_SR_BITS`) captured from the tree before the migration. Regenerate one only when a
+change to the *math* is intended.
+
+`matrixize=False` is the one that is not purely historical. `second_moment="full"` keeps a
+per-coordinate `v` shaped like the weight, so there is nothing to matrixize *for*, and not
+reshaping is also what lets a channels_last conv keep being batched at all — a
+`view(R, C)` of it does not exist, which is why every *factored* path has to reject a
+non-contiguous conv and fall back to the per-parameter loop.
+
+### Lion and KProdigy's migration
+
+Both were the last two optimizers rebuilding their buckets and every derived view list on
+every step, `views=None` into the codec included. Lion also carried its own copies of the
+codec's stacked read/write and of the `m` / `m_scale` / `m_numel` / `m_block` layout.
+Measured per step on a shared RTX 3000 Ada Laptop, bf16 params + `stochastic_rounding`,
+counted with `torch.profiler` (Lion; `aten::select` is the stack/unbind residue and does
+not move, and the CUDA launch count moves by `+0…+3` — the `_foreach_copy_` that replaces
+N per-parameter scale writes):
+
+| bag | codec | `aten::view` | `aten::reshape` | `aten::copy_` |
+|---|---|---|---|---|
+| 448 × 0-D | int8 | 3147 → **9** | 2693 → **2** | 453 → **5** |
+| 448 × 0-D | bf16 | 1799 → **6** | 1347 → **1** | 4 → 4 |
+| 448 × 0-D | 4-bit | 1364 → **18** | 1355 → **9** | 454 → **6** |
+| 428-tensor LoRA | int8 | 3031 → **29** | 2583 → **6** | 446 → **18** |
+| 428-tensor LoRA | bf16 | 1737 → **20** | 1293 → **3** | 12 → 12 |
+| 300 convs + 128 × 0-D | int8 | 3031 → **31** | 2583 → **6** | 443 → **15** |
+| 24 × (256,256) | int8 | 180 → **10** | 149 → **2** | 29 → **5** |
+
+Unprofiled host wall time per step follows: **−29 … −78 %** (median of 80, Lion). Treat
+that number as supporting evidence only — the same harness with the *reference* tree as
+both arms reported −23 … +22 % on this (shared) GPU, so the clock here resolves ~±25 %
+and the counters above are what actually rules out a regression. Peak allocated memory is
+unchanged, as everywhere else in this plan: the caches hold only views.
+
+**KProdigy's share is much smaller, and it is worth being precise about why.** Only its
+*pass 2* (the weight update) runs on this plan; *pass 1* — the global D reduction plus the
+`d`-scaled momentum and second-moment EMAs — keeps its own three bucketings, because they
+span param groups and include the parameters pass 2 sends to the per-parameter loop, which
+is not what a per-group plan describes. Pass 1 is where most of the per-step view traffic
+lives:
+
+| bag | codec | `aten::view` | `aten::reshape` | of which pass 1 |
+|---|---|---|---|---|
+| 448 × 0-D, `full` | int8 | 3148 → **2706** | 2245 → **1797** | ~2706 / ~1797 |
+| 448 × 0-D, `full` | 4-bit | 923 → 927 | 908 → 908 | all of it |
+| 300 convs + 128 × 0-D, `factored` | int8 | 3936 → **2614** | 1551 → **1123** | ~2300 / ~1100 |
+| 300 convs + 128 × 0-D, `factored` | bf16 | 2384 → **1489** | 560 → 560 | ~1489 |
+| 428-tensor LoRA, `full` | int8 | 2474 → **2052** | 1299 → **871** | ~2050 / ~870 |
+| 428-tensor LoRA, `full` | bf16 | 889 → 894 | 292 → 292 | all of it |
+
+The `+4 … +5` rows are the honest other side of the trade and they do not scale: a bucket
+whose parameters are already in their effective layout (a 2-D weight, or a 0-D scalar the
+pre-plan `_full_bucket` stacked raw) never had per-param views to cache, and the chunk
+adds exactly **one** `aten::view` per bucket per step — the single reshape of the gradient
+*stack* that replaces N per-param gradient views. Where there are real per-param views to
+remove (quantized momentum, matrixized convs) it removes several hundred to 1300 of them.
+Pass 1 is the largest remaining opportunity in KProdigy and is untouched here.
 
 ### Staleness
 

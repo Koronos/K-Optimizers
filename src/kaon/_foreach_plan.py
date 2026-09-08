@@ -101,12 +101,11 @@ class ForeachSpec:
 
     ``momentum_cache(group)`` says whether a chunk should prebuild the ``mat`` lookup the
     momentum codec calls per param per step; ``None`` for optimizers that do not hand a
-    ``mat`` callback to the codec. **No shared-plan optimizer sets it any more**: the
-    codec's stacked path takes its per-param view lists from
+    ``mat`` callback to the codec. **Only Adakaon sets it**, because it is the one
+    optimizer that still hands the codec a bare ``mat``; everywhere else the codec's
+    stacked path takes its per-param view lists from
     :meth:`ForeachChunk.momentum_views`, so it never calls ``mat``, and a dict keyed on
-    ``Tensor.__hash__`` is a strictly worse cache of the same views. It is kept for
-    Adakaon, which still hands the codec a bare ``mat`` and is being migrated onto this
-    plan separately.
+    ``Tensor.__hash__`` would be a strictly worse cache of the same views.
 
     ``single_alias`` reproduces AdaMuon's ``_stack_fp32``: a one-element bucket is
     ``unsqueeze``d instead of stacked, aliasing the param's storage rather than copying it.
@@ -228,6 +227,11 @@ class ForeachChunk:
                 R, C = eff  # noqa: N806 — matrix dims (the stacked tensor is [N, R, C])
                 self.view = lambda t: t.view(R, C)
                 self.grad_reshape = (n, R, C)
+                # A matrixized bucket is keyed on the EFFECTIVE shape, so it can hold
+                # kernels whose raw shapes differ — (16,8,3,3) and (16,24,3,1) both
+                # matrixize to (16,72). Those cannot be raw-stacked (``torch.stack``
+                # wants one size), so such a bucket keeps the per-param view path.
+                self.grad_uniform = cached and len({p.shape for p in plist}) == 1
             else:
                 # ``eff`` is already the tensor's own layout — 2-D for a matrix bucket,
                 # and any rank at all under ``ForeachSpec(matrixize=False)``.

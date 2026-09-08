@@ -14,9 +14,13 @@ D-estimation math but:
 
 - stores the first moment in **bf16 / int8 / 4bit** and (optionally) the second
   moment **factored** (Adafactor row+col), with **stochastic-rounding** bf16
-  weight updates — the same toolkit as `Adakaon` (its pass-2 update is now backed
-  by Adakaon's full engine), so D-adaptation no longer costs more memory than
-  AdamW;
+  weight updates — the same toolkit as `Adakaon`, so D-adaptation no longer costs
+  more memory than AdamW. Its pass-2 update runs on the shared, cached
+  bucketing/view plan ([foreach-batching.md](foreach-batching.md)); pass 1 (the
+  global D reduction and the two `d`-scaled EMAs) keeps its own bucketing, because
+  that reduction spans param groups. Note that `second_moment="factored"` with
+  `factor_conv_as_matrix=False` keeps an **N-D** Adafactor pair, which the batched
+  bucket cannot work in, so those conv kernels take the per-parameter path;
 - ships **sane defaults** (`d_update_freq=1`, `use_bias_correction=False`). The
   original research repo defaulted these the other way and it *starved the
   D-bootstrap* — the effective LR failed to rise. See
