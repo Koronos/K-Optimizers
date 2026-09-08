@@ -213,16 +213,29 @@ class SRStream:
     ``stream_id`` comes from a process-wide allocator that :func:`reseed_generators`
     restarts, and is carried in the checkpoint so a resume reproduces the identity even if
     the new process builds its optimizers in a different order.
+
+    **Known limitation of that identity.** An id is handed out in order of *first draw*, so
+    the noise a given optimizer receives depends on how many other streams drew before it.
+    A checkpointed run is safe (the id travels with it), but a *new* run's trajectory moves
+    if the draw order changes: reordering optimizer construction, adding a second optimizer,
+    or running something that builds and steps optimizers first — :func:`kaon.tune` does
+    exactly that — shifts the ids. It is unbiased either way and reproducible for a fixed
+    program, which is the same guarantee 0.7.12's global counter gave (its noise depended on
+    the *interleaving* of every optimizer's writes, so it was strictly more order-sensitive).
+    Removing the order sensitivity needs an identity derived from something stable about the
+    owner rather than from allocation order; recorded as a follow-up in the CHANGELOG.
     """
 
     __slots__ = ("_bound", "_epoch", "_generators", "_pending_gen", "draws", "stream_id")
 
     def __init__(self, stream_id: int | None = None) -> None:
-        global _next_stream
-        if stream_id is None:
-            stream_id = _next_stream
-            _next_stream += 1
-        self.stream_id = int(stream_id)
+        # ``None`` = unclaimed. The id is taken from the allocator at the first REAL draw,
+        # not here and not at first access, so an optimizer that never rounds (fp32 params,
+        # ``bf16_method="kahan"``, Adakaon's fused path) does not consume one: a run holding
+        # an fp32 group and a bf16 group — routine in diffusion — would otherwise push the
+        # bf16 optimizer off stream 0 and off the 0.7.12 sequence for nothing. It also keeps
+        # such an optimizer's ``state_dict`` free of an ``_sr_meta`` key.
+        self.stream_id = stream_id if stream_id is None else int(stream_id)
         self.draws = 0
         self._epoch = _reseed_epoch
         # torch.device -> (global initial seed bound to, kernel offset, seed reader, key)
@@ -251,10 +264,14 @@ class SRStream:
         shared generators did (``torch.manual_seed(s)`` at the top of a run has to reproduce
         the sequence without any extra call).
         """
+        global _next_stream
         if restart:
             self.draws = 0
             self._bound.clear()
             self._generators.clear()
+        if self.stream_id is None:            # first real draw: claim an identity
+            self.stream_id = _next_stream
+            _next_stream += 1
         if device.type == "cuda":
             key = device.index if device.index is not None else torch.cuda.current_device()
             read_seed = torch.cuda.default_generators[key].initial_seed
@@ -288,7 +305,13 @@ class SRStream:
             gen.manual_seed((base + _stream_offset(self.stream_id, key)) & 0xFFFFFFFFFFFFFFFF)
             saved = self._pending_gen.pop(key, None)
             if saved is not None:      # a resume: continue the checkpointed sequence
-                gen.set_state(saved)
+                try:
+                    gen.set_state(saved)
+                except RuntimeError as exc:   # right dtype, wrong length for this RNG kind
+                    raise ValueError(
+                        "checkpoint's stochastic-rounding generator state does not fit "
+                        f"this device's generator (device key {key}): {exc}"
+                    ) from exc
         return gen
 
     # ------------------------------------------------------------------- state
@@ -304,10 +327,13 @@ class SRStream:
         """Did the global seed change under this stream since its last draw?"""
         return any(read_seed() != base for base, _off, read_seed, _key in self._bound.values())
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self) -> dict[str, Any] | None:
         """What a checkpoint needs: the identity, the kernel counter, and — only if the
         torch reference path was actually used — that path's generator state per device
         (``"gen"``, ~5 KB per CPU device, 16 B per CUDA one; absent on the Triton path).
+
+        ``None`` when the stream never drew: there is no position to restore, and a
+        checkpoint key would only imply one.
 
         A pending restart (a reseed, or a changed global seed — both applied lazily on the
         next draw so they cost nothing per step) is forced to land FIRST. Otherwise the
@@ -316,6 +342,8 @@ class SRStream:
         """
         if self._epoch != _reseed_epoch or self._base_moved():
             self.reset()
+        if self.stream_id is None:
+            return None
         meta: dict[str, Any] = {"stream": self.stream_id, "draws": self.draws}
         if self._generators or self._pending_gen:
             # str keys: an int/str round trip through JSON must not lose the device.
@@ -338,7 +366,13 @@ class SRStream:
         The generator states are staged, not applied: the generators are rebuilt (and
         seeded from the *live* global seed) on first use, and the staged state is set on
         the one that is actually reached, so a checkpoint written on a device this process
-        does not have costs nothing.
+        does not have costs nothing. They are also **normalised here**, which is load-bearing:
+        ``Generator.set_state`` accepts only a CPU byte tensor, while a resume almost always
+        reads its checkpoint with ``map_location`` pointing at the training device — that
+        moves the state to CUDA and the staged-then-applied design made it blow up on the
+        first ``step()`` after a load that looked fine. Validating the payload here also
+        turns a corrupt blob into a checkpoint error at load time instead of a ``TypeError``
+        from inside the optimizer.
         """
         if not meta:
             self.reset()
@@ -350,12 +384,23 @@ class SRStream:
                 "checkpoint has an invalid stochastic-rounding noise stream "
                 f"(stream={stream_id}, draws={draws})"
             )
+        pending: dict[int, Tensor] = {}
+        for key, state in (meta.get("gen") or {}).items():
+            if not torch.is_tensor(state) or state.dtype != torch.uint8 or state.ndim != 1:
+                raise ValueError(
+                    "checkpoint has an invalid stochastic-rounding generator state for "
+                    f"device {key!r}: expected a 1-D uint8 tensor, got "
+                    f"{type(state).__name__}"
+                    + (f" {tuple(state.shape)} {state.dtype}" if torch.is_tensor(state) else "")
+                )
+            # ``.cpu()`` is what makes ``map_location=<cuda device>`` survivable.
+            pending[int(key)] = state.detach().cpu()
         self.stream_id = stream_id
         self.draws = draws
         self._epoch = _reseed_epoch
         self._bound.clear()
         self._generators.clear()
-        self._pending_gen = {int(k): v for k, v in (meta.get("gen") or {}).items()}
+        self._pending_gen = pending
 
 
 def _device_generator(device: torch.device) -> torch.Generator:

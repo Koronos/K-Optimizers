@@ -27,6 +27,11 @@ weights.
 from __future__ import annotations
 
 import copy
+import io
+import os
+import subprocess
+import sys
+import textwrap
 from typing import Any
 
 import pytest
@@ -130,19 +135,35 @@ def _fresh_process() -> None:
     kaon.reseed_stochastic_rounding()
 
 
+def _roundtrip(state_dict: dict[str, Any], map_location: Any) -> dict[str, Any]:
+    """Serialize and read back the way a real resume does.
+
+    ``map_location`` is the part that matters here: the torch reference path's generator
+    state is a **CPU** byte tensor, and a resume that maps the whole checkpoint onto the
+    training device (the common ``map_location="cuda"`` / ``map_location=device`` spelling)
+    hands it back on CUDA — where ``Generator.set_state`` refuses it.
+    """
+    buf = io.BytesIO()
+    torch.save(state_dict, buf)
+    buf.seek(0)
+    return torch.load(buf, map_location=map_location, weights_only=False)
+
+
 def _run(
     kind: str,
     *,
     resume_at: int | None,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
+    map_location: Any = None,
     **kw: Any,
 ) -> list[torch.Tensor]:
     """Run ``STEPS`` steps and return the final weights.
 
     ``resume_at=None`` runs straight through. ``resume_at=k`` checkpoints after step ``k``,
     simulates a brand-new process, rebuilds the optimizer, loads, and continues — the
-    weights must come out bit-identical either way.
+    weights must come out bit-identical either way. ``map_location`` routes the checkpoint
+    through a real ``torch.save``/``torch.load`` instead of a deep copy.
     """
     _fresh_process()
     params = _params(dtype, device)
@@ -152,7 +173,10 @@ def _run(
         if resume_at is not None and i == resume_at:
             if kind in EVAL_TO_SAVE:
                 opt.eval()
-            sd = copy.deepcopy(opt.state_dict())
+            if map_location is None:
+                sd = copy.deepcopy(opt.state_dict())
+            else:
+                sd = _roundtrip(opt.state_dict(), map_location)
             _fresh_process()
             opt = _build(kind, params, **kw)
             if kind in EVAL_TO_SAVE:
@@ -355,16 +379,21 @@ def test_a_corrupt_sr_counter_is_rejected():
 
 def test_reseed_restarts_every_stream_and_the_stream_allocator():
     """``reseed_stochastic_rounding()`` is still the one call that resets ALL SR noise."""
+    cpu = torch.device("cpu")
     _fresh_process()
     a = srm.SRStream()
     b = srm.SRStream()
+    assert a.stream_id is b.stream_id is None, "an id is claimed by DRAWING, not by existing"
+    a.next_seed(cpu)
+    a.next_seed(cpu)
+    b.next_seed(cpu)
     assert a.stream_id != b.stream_id, "co-resident streams must get distinct identities"
-    a.next_seed(torch.device("cpu"))
-    a.next_seed(torch.device("cpu"))
     assert a.draws == 2
     kaon.reseed_stochastic_rounding()
     assert a.snapshot()["draws"] == 0, "reseed must restart a live stream"
-    assert srm.SRStream().stream_id == a.stream_id, (
+    fresh = srm.SRStream()
+    fresh.next_seed(cpu)
+    assert fresh.stream_id == a.stream_id, (
         "reseed must restart the allocator so a fresh optimizer reproduces its stream"
     )
 
@@ -376,9 +405,9 @@ def test_stream_zero_on_device_zero_keeps_the_0_7_12_seed_sequence():
     dev = torch.device("cuda", 0)
     base = torch.cuda.default_generators[0].initial_seed()
     stream = srm.SRStream()
-    assert stream.stream_id == 0
     for k in (1, 2, 3):
         assert stream.next_seed(dev) == (base + k * 0x9E3779B1) & 0x7FFFFFFF
+    assert stream.stream_id == 0, "the first stream to draw is the compatibility anchor"
 
 
 def test_a_checkpoint_taken_right_after_a_resume_keeps_the_torch_path_position():
@@ -403,3 +432,251 @@ def test_a_checkpoint_taken_right_after_a_resume_keeps_the_torch_path_position()
     assert second["_sr_meta"]["gen"].keys() == first["_sr_meta"]["gen"].keys()
     for key, state in first["_sr_meta"]["gen"].items():
         assert torch.equal(second["_sr_meta"]["gen"][key], state), key
+
+
+# ================================================ torch.load(map_location=...) round trips
+# The torch reference path's position is a `torch.Generator` state — a **CPU** byte tensor,
+# even for a CUDA generator. A resume almost always reads its checkpoint with
+# `map_location` pointing at the training device, which moves that tensor to CUDA, and
+# `Generator.set_state` only accepts a CPU ByteTensor. Because the restored state is
+# *staged* and applied on the first draw, the failure lands on the first `step()` after a
+# successful-looking load — the worst possible place. These pin the whole round trip.
+MAP_LOCATION_CASES = {
+    # SAM's climb calls `add_stochastic_` directly (sam.py), so the torch path — and a
+    # `gen` payload — is what a plain bf16 CUDA SAM produces by DEFAULT.
+    "SAM-default": ("SAM", dict(lr=1e-2, momentum_dtype="bfloat16", foreach=True)),
+    # The documented switch that pins the reference implementation on CUDA.
+    "Adakaon-SR_TRITON-off": ("Adakaon", dict(lr=1e-2, momentum_dtype="bfloat16",
+                                              foreach=True)),
+}
+
+
+@pytest.mark.parametrize("case", list(MAP_LOCATION_CASES))
+def test_a_checkpoint_read_with_map_location_cuda_resumes_bit_identically(case):
+    """``torch.load(..., map_location=cuda)`` must not poison the staged generator state."""
+    skip_if_no_cuda()
+    from kaon import _backend as bk
+
+    kind, kw = MAP_LOCATION_CASES[case]
+    prev = bk.SR_TRITON
+    if case == "Adakaon-SR_TRITON-off":
+        bk.SR_TRITON = False
+    try:
+        ref = _run(kind, resume_at=None, **kw)
+        got = _run(kind, resume_at=STEPS // 2, map_location=torch.device("cuda:0"), **kw)
+    finally:
+        bk.SR_TRITON = prev
+    _assert_same(ref, got, f"{case}/map_location=cuda:0")
+
+
+def test_a_channels_last_weight_resumes_bit_identically_through_map_location():
+    """A strided weight the kernel cannot index falls to the torch path on CUDA.
+
+    ``sr_add_supported`` rejects a non-contiguous target, so a ``channels_last`` conv
+    weight emits a ``gen`` payload even on a Triton build with the kernel enabled — no
+    opt-in knob required to reach the crash.
+    """
+    skip_if_no_cuda()
+
+    def run(*, resume: bool) -> torch.Tensor:
+        _fresh_process()
+        p = torch.nn.Parameter(
+            torch.randn(4, 3, 8, 8).to(device="cuda", dtype=torch.bfloat16)
+            .to(memory_format=torch.channels_last)
+        )
+        assert not p.is_contiguous(), "the point of this test is a strided weight"
+        opt: Any = Adakaon([p], lr=1e-2, momentum_dtype="bfloat16")
+        gen = torch.Generator().manual_seed(5)
+        for i in range(6):
+            if resume and i == 3:
+                sd = _roundtrip(opt.state_dict(), torch.device("cuda:0"))
+                assert "gen" in sd["_sr_meta"], "the strided weight must take the torch path"
+                _fresh_process()
+                opt = Adakaon([p], lr=1e-2, momentum_dtype="bfloat16")
+                opt.load_state_dict(sd)
+            p.grad = (torch.randn(4, 3, 8, 8, generator=gen) * 0.1).to(
+                device="cuda", dtype=torch.bfloat16
+            )
+            opt.step()
+        return p.detach().float().cpu().clone()
+
+    _assert_same([run(resume=False)], [run(resume=True)], "channels_last/map_location")
+
+
+def test_a_cpu_checkpoint_resumes_onto_cuda():
+    """Trained on CPU, resumed on GPU: the staged CPU generator state must still apply."""
+    skip_if_no_cuda()
+    _fresh_process()
+    cpu_params = _params(torch.bfloat16, "cpu")
+    opt = Adakaon(cpu_params, lr=1e-2, momentum_dtype="bfloat16")
+    for g in _grads(torch.bfloat16)[:3]:
+        _step("Adakaon", opt, cpu_params, g)
+    sd = _roundtrip(opt.state_dict(), torch.device("cuda:0"))
+    assert "gen" in sd["_sr_meta"]
+
+    _fresh_process()
+    gpu_params = [torch.nn.Parameter(p.detach().cuda()) for p in cpu_params]
+    opt2 = Adakaon(gpu_params, lr=1e-2, momentum_dtype="bfloat16")
+    opt2.load_state_dict(sd)
+    _step("Adakaon", opt2, gpu_params, _grads(torch.bfloat16)[3])
+    assert all(torch.isfinite(p).all() for p in gpu_params)
+
+
+def test_an_invalid_generator_payload_is_rejected_at_load():
+    """A corrupt ``gen`` blob must fail as a checkpoint error at LOAD, not as a TypeError
+    from deep inside the first step."""
+    _fresh_process()
+    params = _params(torch.bfloat16, "cpu")
+    opt = Adakaon(params, lr=1e-2, momentum_dtype="bfloat16")
+    _step("Adakaon", opt, params, _grads(torch.bfloat16)[0])
+    sd = copy.deepcopy(opt.state_dict())
+    sd["_sr_meta"]["gen"] = {"-1": torch.zeros(3)}      # float32, and the wrong length
+    with pytest.raises(ValueError, match="stochastic-rounding"):
+        Adakaon(params, lr=1e-2, momentum_dtype="bfloat16").load_state_dict(sd)
+
+
+# ============================================================== nested wrappers
+# `SAM(base_optimizer=Lookahead, ...)` is reachable through the public API and makes THREE
+# noise owners: SAM's climb, Lookahead's phi sync and the inner Adakaon's weight write. A
+# single shared `_sr_wrap_meta` key means the outer wrapper's `state_dict` overwrites the
+# intermediate one's, and the resume silently continues from the wrong position (measured
+# 2.34e-2 on bf16 weights).
+_NESTED_SCRIPT = """
+import hashlib, sys, torch, kaon
+from kaon import SAM, Lookahead
+
+SHAPES = [(64, 32), (48, 16), (24,)]
+STEPS, SPLIT = 8, 4
+mode, ckpt = sys.argv[1], sys.argv[2]
+
+def fresh():
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    kaon.reseed_stochastic_rounding()
+
+def params():
+    g = torch.Generator().manual_seed(11)
+    return [torch.nn.Parameter(torch.randn(s, generator=g).to("cuda", torch.bfloat16))
+            for s in SHAPES]
+
+def grads():
+    g = torch.Generator().manual_seed(23)
+    return [[torch.randn(s, generator=g).mul_(0.1) for s in SHAPES] for _ in range(STEPS)]
+
+def step(o, ps, gs):
+    for p, g in zip(ps, gs):
+        p.grad = g.detach().clone().to(device=p.device, dtype=p.dtype)
+    o.first_step()
+    for p, g in zip(ps, gs):
+        p.grad = g.detach().clone().to(device=p.device, dtype=p.dtype)
+    o.second_step()
+
+fresh()
+ps, gs = params(), grads()
+# SAM has no train()/eval() of its own; the inner Lookahead defaults to train mode.
+o = SAM(ps, base_optimizer=Lookahead, rho=0.05, lr=1e-2, k=2, alpha=0.5,
+        momentum_dtype="bfloat16")
+lo, hi = (0, STEPS) if mode == "continuous" else (
+    (0, SPLIT) if mode == "save" else (SPLIT, STEPS))
+if mode == "resume":
+    o.load_state_dict(torch.load(ckpt, map_location=torch.device("cuda:0"),
+                                 weights_only=False))
+    for p, w in zip(ps, torch.load(ckpt + ".w", weights_only=False)):
+        p.data.copy_(w.to(p.device))
+for i in range(lo, hi):
+    step(o, ps, gs[i])
+if mode == "save":
+    torch.save(o.state_dict(), ckpt)
+    torch.save([p.detach().cpu().clone() for p in ps], ckpt + ".w")
+else:
+    h = hashlib.blake2b(digest_size=12)
+    for p in ps:
+        h.update(p.detach().float().cpu().contiguous().reshape(-1).numpy().tobytes())
+    print(h.hexdigest())
+"""
+
+
+def _run_script(script: str, tmp_path, *args: str) -> str:
+    path = tmp_path / "nested_resume.py"
+    path.write_text(textwrap.dedent(script), encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.path.dirname(os.path.dirname(kaon.__file__))
+    out = subprocess.run(
+        [sys.executable, str(path), *args], check=True, capture_output=True, text=True,
+        env=env, cwd=str(tmp_path),
+    )
+    return out.stdout.strip()
+
+
+def test_nested_wrappers_resume_bit_identically_across_two_real_processes(tmp_path):
+    """SAM over Lookahead over Adakaon: three owners, three namespaced positions.
+
+    Two genuinely separate interpreters, so nothing about the noise position can leak
+    through process state — the only channel is the checkpoint.
+    """
+    skip_if_no_cuda()
+    ckpt = str(tmp_path / "ck.pt")
+    ref = _run_script(_NESTED_SCRIPT, tmp_path, "continuous", ckpt)
+    _run_script(_NESTED_SCRIPT, tmp_path, "save", ckpt)
+    got = _run_script(_NESTED_SCRIPT, tmp_path, "resume", ckpt)
+    assert ref and got and ref == got, f"nested wrappers diverged: {ref} vs {got}"
+
+
+def test_each_wrapper_gets_its_own_namespaced_sr_key():
+    """The keys must not collide, or the outer wrapper silently eats the inner one's."""
+    skip_if_no_cuda()
+    _fresh_process()
+    params = _params(torch.bfloat16, "cuda")
+    opt = SAM(params, base_optimizer=Lookahead, rho=0.05, lr=1e-2, k=1, alpha=0.5,
+              momentum_dtype="bfloat16")
+    _step("SAM", opt, params, _grads(torch.bfloat16)[0])
+    sd = opt.state_dict()
+    wrap_keys = sorted(k for k in sd if k.startswith("_sr_wrap_meta"))
+    assert wrap_keys == ["_sr_wrap_meta_lookahead", "_sr_wrap_meta_sam"], wrap_keys
+    assert "_sr_meta" in sd, "the innermost Adakaon still uses the plain key"
+
+
+def test_a_legacy_shared_wrapper_key_is_still_read():
+    """Checkpoints written before the key was namespaced must keep resuming."""
+    skip_if_no_cuda()
+    _fresh_process()
+    params = _params(torch.bfloat16, "cuda")
+    opt = Lookahead(params, lr=1e-2, k=1, alpha=0.5, momentum_dtype="bfloat16")
+    opt.train()
+    for g in _grads(torch.bfloat16)[:2]:
+        _step("Lookahead", opt, params, g)
+    sd = copy.deepcopy(opt.state_dict())
+    sd["_sr_wrap_meta"] = sd.pop("_sr_wrap_meta_lookahead")   # the pre-namespace layout
+
+    _fresh_process()
+    opt2 = Lookahead(params, lr=1e-2, k=1, alpha=0.5, momentum_dtype="bfloat16")
+    opt2.train()
+    opt2.load_state_dict(sd)
+    assert opt2.sr_stream.draws == opt.sr_stream.draws > 0
+
+
+# ============================================================== stream-id economy
+def test_an_optimizer_that_never_rounds_does_not_claim_a_stream_id():
+    """fp32 params / kahan never draw SR noise, so they must not shift anyone's stream.
+
+    A diffusion run routinely holds fp32 and bf16 groups (or several optimizers); if a
+    non-rounding optimizer burned a stream id just by stepping, it would move the bf16
+    optimizer's noise off the 0.7.12 sequence for no reason at all.
+    """
+    skip_if_no_cuda()
+    _fresh_process()
+    fp32 = _params(torch.float32, "cuda")
+    kahan_params = _params(torch.bfloat16, "cuda")
+    bf16 = _params(torch.bfloat16, "cuda")
+    plain = Adakaon(fp32, lr=1e-2, momentum_dtype="bfloat16")
+    kahan = Adakaon(kahan_params, lr=1e-2, momentum_dtype="bfloat16", bf16_method="kahan")
+    rounds = Adakaon(bf16, lr=1e-2, momentum_dtype="bfloat16")
+    for g in _grads(torch.bfloat16)[:2]:
+        _step("Adakaon", plain, fp32, g)
+        _step("Adakaon", kahan, kahan_params, g)
+        _step("Adakaon", rounds, bf16, g)
+    assert plain.sr_stream.stream_id is None, "fp32 params must not claim a stream id"
+    assert kahan.sr_stream.stream_id is None, "kahan must not claim a stream id"
+    assert rounds.sr_stream.stream_id == 0, "the rounding optimizer keeps the anchor"
+    assert "_sr_meta" not in plain.state_dict(), "no draws -> nothing to checkpoint"
+    assert "_sr_meta" in rounds.state_dict()

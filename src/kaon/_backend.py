@@ -141,10 +141,13 @@ def _sr_write_(
 ) -> None:
     """``target += alpha * source`` with bf16 SR, through Triton when it applies.
 
-    ``sr`` is the calling optimizer's noise stream (see :class:`SRSeedState`). BOTH paths
-    consume one draw from it, so which path a write took is invisible to the counter and a
-    run may cross between them without desynchronising its noise. Leaving it ``None`` falls
-    back to the process-wide streams, whose position no checkpoint saves.
+    ``sr`` is the calling optimizer's noise stream (see :class:`SRSeedState`). The stream
+    holds a position per path and the write advances the one it actually took — the kernel's
+    launch counter here, the torch path's generator inside ``add_stochastic_``; a write that
+    takes Triton does not move the generator and vice versa. Both positions are
+    checkpointed, so a run that crosses between the paths still resumes exactly. Leaving
+    ``sr`` at ``None`` falls back to the process-wide stream and generator, whose positions
+    no checkpoint saves.
     """
     use = SR_TRITON if triton is None else triton
     if use:
@@ -176,39 +179,52 @@ class SRSeedState:
     optimizer that forgets silently falls back to the process-wide counter and stops
     resuming exactly, which ``tests/test_sr_seed_checkpoint.py`` sweeps for.
 
-    The stream is created on first use rather than in ``__init__``: no optimizer has to
-    grow a constructor line, and ``state_dict`` on an optimizer that never stepped stays
-    free of a stream id (so it does not consume one and perturb the ids of the streams that
-    follow).
+    The stream is created on first *access* and claims its noise identity only on its
+    first real *draw*, so no optimizer has to grow a constructor line and one that never
+    rounds (fp32 params, ``bf16_method="kahan"``, Adakaon's fused path) neither consumes a
+    stream id nor grows an ``_sr_meta`` key.
+
+    :attr:`sr_stream` is installed as a plain instance attribute by :meth:`__getattr__`
+    rather than served by a ``property``, because the writers read it once per weight on
+    the per-parameter path: a descriptor call measured ~260 ns against ~71 ns for an
+    instance lookup — ~+0.11 ms/step on a 428-adapter bag, for nothing.
     """
 
     SR_META_KEY = "_sr_meta"
+    # Keys a load also accepts, for checkpoint layouts written before the current one.
+    SR_META_FALLBACK_KEYS: tuple[str, ...] = ()
 
-    @property
-    def sr_stream(self) -> SRStream:
-        """This optimizer's noise stream (allocated on first access)."""
-        stream = self.__dict__.get("_sr_stream")
-        if stream is None:
-            stream = self.__dict__["_sr_stream"] = SRStream()
-        return stream
+    def __getattr__(self, name: str) -> Any:
+        # Only ever reached when normal attribute lookup FAILS, so the lazy install below
+        # happens once and every later read is a plain ``__dict__`` hit.
+        if name == "sr_stream":
+            stream = SRStream()
+            self.__dict__[name] = stream
+            return stream
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def _sr_save(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        """Add the stream's position to ``state_dict`` (no-op if it was never used)."""
-        stream = self.__dict__.get("_sr_stream")
+        """Add the stream's position to ``state_dict`` (no-op if it never drew)."""
+        stream = self.__dict__.get("sr_stream")
         if stream is not None:
-            state_dict[self.SR_META_KEY] = stream.snapshot()
+            meta = stream.snapshot()
+            if meta is not None:
+                state_dict[self.SR_META_KEY] = meta
         return state_dict
 
     def _sr_load(self, state_dict: dict[str, Any]) -> None:
         """Adopt the checkpoint's stream position; a checkpoint without one resets.
 
         An optimizer with neither a saved position nor a live stream is left WITHOUT one:
-        a load must not allocate a stream id for an owner that never draws (the wrappers
-        whose weight writes are all the inner optimizer's), because that would shift the
-        ids of the streams allocated after it away from what the live run assigned.
+        a load must not allocate a stream for an owner that never draws (the wrappers
+        whose weight writes are all the inner optimizer's).
         """
         meta = state_dict.get(self.SR_META_KEY)
-        if meta is None and self.__dict__.get("_sr_stream") is None:
+        for key in self.SR_META_FALLBACK_KEYS:
+            if meta is not None:
+                break
+            meta = state_dict.get(key)
+        if meta is None and self.__dict__.get("sr_stream") is None:
             return
         self.sr_stream.restore(meta)
 

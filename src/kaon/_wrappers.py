@@ -58,6 +58,11 @@ __all__ = ["CodecBuffer", "TrainEvalWeights", "WrapsInnerOptimizer"]
 
 FullDtype = ("bfloat16", "float32", "int8", "4bit")
 
+# Base of every wrapper's stochastic-rounding checkpoint key. The live key appends the
+# wrapper's own ``state_key`` (see ``WrapsInnerOptimizer._bind_inner``); the bare name
+# stays readable so checkpoints written while the key was shared still resume.
+_WRAP_SR_KEY = "_sr_wrap_meta"
+
 
 class CodecBuffer:
     """Per-parameter full-size buffer stored through the shared momentum codec.
@@ -248,11 +253,22 @@ class WrapsInnerOptimizer(SRSeedState):
 
     # Namespaced away from the inner optimizer's own ``_sr_meta``, which the inner's
     # ``state_dict`` has already written into the same dict by the time we add ours.
-    SR_META_KEY = "_sr_wrap_meta"
+    # ``_bind_inner`` narrows it further, PER WRAPPER; this stays as the read fallback for
+    # checkpoints written while the key was shared.
+    SR_META_KEY = _WRAP_SR_KEY
+    SR_META_FALLBACK_KEYS = (_WRAP_SR_KEY,)
 
     def _bind_inner(self, inner: Any, *, state_key: str) -> None:
         self.inner = inner
         self._wrap_state_key = state_key
+        # One SR key per wrapper, derived from the same ``state_key`` that already
+        # namespaces its per-param state. A single shared key is wrong as soon as wrappers
+        # NEST — ``SAM(base_optimizer=Lookahead, ...)`` is public API and makes three noise
+        # owners — because the outer ``state_dict`` then overwrites the intermediate one's
+        # position and the resume silently continues from the wrong draw (measured 2.34e-2
+        # on bf16 weights). Instance attribute on purpose: it shadows the class default,
+        # which stays reachable as the read fallback.
+        self.SR_META_KEY = f"{_WRAP_SR_KEY}_{state_key}"
         self.param_groups = inner.param_groups
         # Mirror the inner optimizer's foreach toggles for any batched wrapper path.
         self._foreach = getattr(inner, "_foreach", True)
@@ -302,9 +318,12 @@ class WrapsInnerOptimizer(SRSeedState):
         sd = dict(state_dict)
         wrapped = sd.pop(self._wrap_state_key, {})
         # The wrapper's OWN noise stream (its ``phi`` sync / climb writes); the inner's
-        # rides in ``_sr_meta`` and is restored by the inner's loader below.
+        # rides in ``_sr_meta`` and is restored by the inner's loader below. Both this
+        # wrapper's key and the legacy shared one are consumed, so a nested inner wrapper
+        # cannot pick up a position that was meant for the outer one.
         self._sr_load(sd)
-        sd.pop(self.SR_META_KEY, None)
+        for key in (self.SR_META_KEY, *self.SR_META_FALLBACK_KEYS):
+            sd.pop(key, None)
         inner_loader(self.inner, sd)
         self.param_groups = self.inner.param_groups
         self._wrap_state = defaultdict(dict)
