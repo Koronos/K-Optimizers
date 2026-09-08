@@ -72,6 +72,23 @@ is what the factored path must do since it never materializes ``sqrt(v)``). The
 factored ``eps1`` (Adafactor's pre-reduction stabilizer) is left at **0** to match
 the official, which adds no eps inside ``g**2``.
 
+``eps1 == 0`` is unique to ADOPT in this repo, and it makes one degenerate case
+reachable that no other factored optimizer here can hit with its defaults: an
+**all-zero gradient** leaves the row stats at exactly zero, and the
+reconstruction's ``row / mean(row)`` is then ``0 / 0``. That NaN used to survive
+the ``1/eps`` cap and poison ``m`` and the weights. So ADOPT — and only ADOPT —
+asks :func:`kaon._factored.factored_inv_sqrt_factors` for a positive ``floor`` on
+the row-mean divisor (``_MIN_NORMAL``; the inlined copy in
+:meth:`ADOPT._factored_bucket` does the same), which makes a zero ``v`` saturate
+the cap at ``1/eps`` — the exact value the 1-D path produces from
+``denom = max(sqrt(0), eps)``. **The floor is only sound because of that cap.**
+Callers that do not cap the reconstruction must keep the ``floor=0.0`` default: for
+them a subnormal row mean is a legitimate (finite) update, and clamping the divisor
+would move it rather than rescue a NaN. Note that Gradient Centralization zeroes the gradient of any
+param whose fan-in is 1 (``(out, 1)``, ``(out, 1, 1, 1)``) by construction, which
+is how this case shows up in practice; those params are frozen by GC for every
+optimizer here (see the CHANGELOG's *Known* entry), ADOPT merely used to NaN.
+
 **The v-lag in BOTH paths (the parity-critical part).** ADOPT's distinctive
 ordering means the second moment used to normalize ``g_t`` must be read **before**
 ``g_t`` is folded in. The per-param path reads ``v`` (or the factored
@@ -118,7 +135,7 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
 )
-from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -469,7 +486,10 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
             torch._foreach_mul_(pviews, 1.0 - group["lr"] * wd)
 
         # --- normalize by the PRE-update (lagged) v ---
-        r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
+        # ``clamp_min_`` on the divisor: with eps1 == 0 an all-zero grad leaves row == 0,
+        # and 0/0 would NaN past the cap below. See kaon._factored (same floor, same reason).
+        row_mean = row.mean(dim=-1, keepdim=True).clamp_min_(_MIN_NORMAL)
+        r_factor = row.div(row_mean).rsqrt_().unsqueeze(-1)                        # [N, R, 1]
         c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
         inv_denom = (r_factor * c_factor).clamp_(max=1.0 / c["eps"])               # 1/max(sqrt v, eps)
         normed = grad * inv_denom
@@ -584,7 +604,13 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
             matrixize = ndim > 2
             gv = grad.reshape(grad.shape[0], -1) if matrixize else grad
             # normalize by the PRE-update factored v (read BEFORE the EMA update).
-            r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
+            # ``floor``: with eps1 == 0 an all-zero grad leaves row == 0 and the
+            # reconstruction's row/mean(row) would be 0/0. Safe here (and only here)
+            # because the 1/eps cap below turns the resulting +inf into the same
+            # denominator the non-factored path uses for v == 0.
+            r_factor, c_factor = factored_inv_sqrt_factors(
+                state["row"], state["col"], floor=_MIN_NORMAL
+            )
             inv_denom = (r_factor * c_factor).clamp_(max=1.0 / c["eps"])
             normed = gv * inv_denom
             if c["clip"] is not None:
