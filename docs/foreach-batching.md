@@ -190,8 +190,8 @@ computes them once and caches them per param group:
 
 - `ForeachSpec` — declared once per optimizer class: which state keys the bucket
   bodies walk, the optimizer-specific extra bucket key (the per-parameter step for
-  AdaBelief / AdamP / ADOPT, `t` for AdaMuon with `bias_correction`), whether to
-  prebuild the codec's `mat` lookup.
+  AdaBelief / AdamP / ADOPT, `t` for AdaMuon with `bias_correction`), and whether a
+  one-element bucket may alias instead of stacking (AdaMuon).
 - `ForeachPlan` — one group's bucket list plus the chunk split; re-chunked only when
   `budget // bucket_size` actually moves (the VRAM-adaptive budget wobbles every step,
   the chunk length almost never does).
@@ -207,20 +207,27 @@ them on every step, once per *use site*: an int8 bucket cost four such lists per
 
 Each codec therefore exposes `stacked_views(states, view, eff) -> _StackedViews | None`,
 built **once per chunk** by `ForeachChunk.momentum_views(codec)` and handed to every
-stacked call as `views=`. **AdaBelief, AdamP, ADOPT and AdaMuon pass them; nobody else
-does** — `views=None` runs the original code, so Lion, KProdigy and AdaPNM (which do
-their own bucketing, not this plan) and **Adakaon** (which has its own plan and is
-being migrated onto this one separately) are unaffected, and the argument is
-bit-identical either way. The gains measured below are therefore those four
-optimizers' only; Adakaon is not in the table.
+stacked call as `views=`. **Every optimizer on this plan passes them** — AdaBelief,
+AdamP, ADOPT, AdaMuon and, since the follow-up below, Adakaon. `views=None` still runs
+the original code, so Lion, KProdigy and AdaPNM (which do their own bucketing, not this
+plan) are unaffected, and the argument is bit-identical either way.
+
+Because nothing calls the codec's `mat` argument on the cached path any more, the
+plan's old `ForeachSpec(momentum_cache=…)` flag — which prebuilt an identity-keyed
+`{state["m"]: view(state["m"])}` dict for exactly that callback — is gone, together
+with `ForeachChunk.mat`. Callers pass `chunk.view`, which is the same callback and is
+only reached when `stacked_views` declined the layout.
 
 `stacked_views` returns `None` for a layout it cannot alias — a
 non-contiguous `m` or `m_scale`, where a `reshape` would hand back a detached copy —
 and the codec's existing per-parameter fallbacks take over. Passing a views object
 built for another bucket is *ignored*, not misread: every consumer checks its `eff`.
-That check is defense in depth — the four callers always pass the `eff` they built the
-views with, and a re-chunk hands out fresh chunks — but the failure it prevents (a read
-in another bucket's shape, a write into another bucket's buffers) would be silent.
+That check is defense in depth — every caller passes the `eff` it built the views
+with, and a re-chunk hands out fresh chunks — but the failure it prevents (a read in
+another bucket's shape, a write into another bucket's buffers) would be silent. It is
+also what makes the guard worth its one tuple compare: a *per-codec* rather than
+per-chunk cache was tried as a deliberate mutant and every bucket after the first
+either stepped the wrong slice or raised a shape error.
 
 Two things follow from the lists being views:
 
@@ -246,6 +253,16 @@ move):
 | AdaBelief, 428-tensor LoRA | bf16 | 874 → **18** | 432 → **4** | 6 → 6 |
 | ADOPT, 428-tensor LoRA | int8 | 874 → **18** | 2 → 2 | 436 → **8** |
 | AdaMuon, 448 × 0-D | 4-bit | 20 → 20 | 8 → 8 | 454 → **6** |
+| **Adakaon**, 448 × 0-D | int8 | 905 → **9** | — | 453 → **5** |
+| **Adakaon**, 428-tensor LoRA | int8 | 897 → **41** | — | 448 → **20** |
+| **Adakaon**, 128×(512,512)+64×(1024,) | int8 | 449 → **65** | — | 222 → **30** |
+| **Adakaon**, 24×(320,320,3,3) | int8 | 85 → **37** | — | 39 → **15** |
+
+The Adakaon rows are the follow-up (medians of 3 interleaved repeats against the
+pre-change tree). Its float and 4-bit codecs are **count-for-count unchanged**: the
+float lists were already served by the `momentum_cache` dict that this change deletes,
+and the cached views replace it at the same cost, so the win is the quantized-with-a-
+layout case — int8 — where the scale views and the write-back were the expensive half.
 
 The `copy_` column is the second half of the change: the quantized codecs wrote each
 parameter's new `m_scale` with its own `copy_` (the scale shapes differ per parameter

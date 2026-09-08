@@ -533,8 +533,8 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
     # slice of a bucket shares one bias correction (and one ``_coeffs`` dict) — and, with
     # it, the projection's per-channel view dims. The momentum goes through the shared
     # codec's stacked read/write, whose own per-param view lists come from
-    # ``chunk.momentum_views`` — so ``momentum_cache`` (the identity-keyed ``mat``
-    # lookup, a strictly worse cache of the same views) stays off here.
+    # ``chunk.momentum_views``; ``chunk.view`` rides along as the codec's ``mat``
+    # fallback for a layout those views declined.
     _FOREACH_SPEC = ForeachSpec(
         factored_state=("row", "col"),
         flat_state=("v",),
@@ -620,7 +620,7 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
         # First-moment EMA (raw Adam momentum), read, EMA, store back.
         codec = self._codec(md)
         views = chunk.momentum_views(codec)
-        m = codec.dequant_stacked(states, chunk.mat, (R, C), views=views)         # [N, R, C]
+        m = codec.dequant_stacked(states, chunk.view, (R, C), views=views)         # [N, R, C]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
         codec.store_stacked(states, m.reshape((chunk.n, R, C)), views=views)
 
@@ -684,7 +684,7 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, Optimizer):
 
         codec = self._codec(md)
         views = chunk.momentum_views(codec)
-        m = codec.dequant_stacked(states, chunk.mat, (length,), views=views)  # [N, L]
+        m = codec.dequant_stacked(states, chunk.view, (length,), views=views)  # [N, L]
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
         codec.store_stacked(states, m.reshape((chunk.n, length)), views=views)
 

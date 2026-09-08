@@ -1258,20 +1258,18 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
     # ``L == 1`` bucket as length-1 views. There is no ``extra_key``: every coefficient here
     # is per group per step (fixed beta2, no bias correction), so nothing per-parameter
     # enters the bucket key and the plan survives every step that keeps the param set.
-    # ``momentum_cache`` asks the chunk to prebuild the ``mat`` lookup the codec calls once
-    # (float) or twice (int8) per param per step — worth it only when the bucket's view is a
-    # real reshape AND the momentum is a tensor in that layout, so beta1 == 0 (no ``m`` at
-    # all) and 4bit (``m`` is a packed byte string) opt out. Invalidation is the mixin's
-    # witness plus :meth:`_invalidate_fused_caches` (state reset / checkpoint load) and the
+    # The momentum goes through the codec's stacked EMA, whose own per-param view lists
+    # (``mat(state["m"])``, the per-row ``m_scale`` views, the requant's write-back
+    # targets) come from ``chunk.momentum_views``; ``chunk.view`` is handed over as the
+    # codec's ``mat`` argument only as the fallback for a layout those views declined (a
+    # non-contiguous buffer). Invalidation is the mixin's witness plus
+    # :meth:`_invalidate_fused_caches` (state reset / checkpoint load) and the
     # per-parameter fallback in :meth:`_native_dispatch`. Set ``_foreach_cache_enabled =
     # False`` on an instance to rebuild the plan every step — the A/B switch the cache's
     # speedup is measured with; it is numerically a no-op either way.
     _FOREACH_SPEC = ForeachSpec(
         factored_state=("row", "col"),
         flat_state=("v",),
-        momentum_cache=lambda group: (
-            group["betas"][0] > 0 and group["momentum_dtype"] != "4bit"
-        ),
     )
 
     @torch.no_grad()
@@ -1381,7 +1379,10 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         if beta1 > 0:
             # The codec owns every dtype's dequant → fp32 EMA → requant detail; this
             # block is identical for fp32/bf16/int8/4bit (and to _step_one_param).
-            delta = codec.ema_stacked(chunk.states, update, chunk.mat, (R, C), beta1)  # [N, R, C]
+            # ``views`` hands it this chunk's cached per-param view lists (built once);
+            # ``chunk.view`` is the ``mat`` fallback for a layout it declined.
+            delta = codec.ema_stacked(chunk.states, update, chunk.view, (R, C), beta1,
+                                      views=chunk.momentum_views(codec))       # [N, R, C]
         else:
             delta = update
 
@@ -1456,11 +1457,12 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1))
 
         if beta1 > 0:
-            # Same codec entry point as the factored bucket; mat flattens a 0-D
-            # ``m`` to its length-1 view (identity on 1-D) and the effective
+            # Same codec entry point as the factored bucket; ``chunk.view`` flattens a
+            # 0-D ``m`` to its length-1 view (identity on 1-D) and the effective
             # per-param shape is the 1-D length (so int8 reduces the whole L axis
             # to one scalar scale, 4bit blocks over L).
-            delta = codec.ema_stacked(chunk.states, update, chunk.mat, (length,), beta1)  # [N, L]
+            delta = codec.ema_stacked(chunk.states, update, chunk.view, (length,), beta1,
+                                      views=chunk.momentum_views(codec))          # [N, L]
         else:
             delta = update
 

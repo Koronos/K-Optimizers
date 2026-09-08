@@ -386,10 +386,10 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
     # one clip factor and one coefficient dict. ``key_major`` keeps the pre-refactor
     # bucket order (one pstep group at a time, factored before flat) — bucket order is
     # numerically inert on its own, but it decides the order the stochastic-rounding
-    # draws are consumed in, so reordering would move bf16+SR weights. ``momentum_cache``
-    # (the identity-keyed ``mat`` lookup) stays off: the codec's stacked path reads its
-    # per-param view lists from ``chunk.momentum_views``, so it never calls ``mat``, and
-    # a dict keyed on ``Tensor.__hash__`` is a strictly worse cache of the same views.
+    # draws are consumed in, so reordering would move bf16+SR weights. The codec's
+    # stacked path reads its per-param view lists from ``chunk.momentum_views``, so it
+    # never calls ``mat``; ``chunk.view`` is passed as that argument only as the
+    # fallback for a layout those views declined.
     _FOREACH_SPEC = ForeachSpec(
         factored_state=("row", "col"),
         flat_state=("v",),
@@ -478,7 +478,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
 
         # --- momentum EMA of the NORMALIZED grad, then p -= lr * m ---
         codec = self._codec(group)
-        m = codec.ema_stacked(states, normed, chunk.mat, (R, C), c["beta1"],
+        m = codec.ema_stacked(states, normed, chunk.view, (R, C), c["beta1"],
                               views=chunk.momentum_views(codec))          # [N, R, C]
         delta = m.mul_(c["lr"])
 
@@ -534,7 +534,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
             normed.clamp_(-c["clip"], c["clip"])
 
         codec = self._codec(group)
-        m = codec.ema_stacked(states, normed, chunk.mat, (chunk.length,), c["beta1"],
+        m = codec.ema_stacked(states, normed, chunk.view, (chunk.length,), c["beta1"],
                               views=chunk.momentum_views(codec))
         delta = m.mul_(c["lr"])
 

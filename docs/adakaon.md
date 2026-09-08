@@ -74,6 +74,21 @@ leaves the one-block route (its nibble packing pairs adjacent columns).
 `Adakaon` is a standard `torch.optim.Optimizer` that works one parameter at a
 time, so it drops into per-parameter / gradient-release training loops unchanged.
 
+### Host-side cost of a step
+
+Both of Adakaon's batched routes are launch-bound on the bags it is built for
+(hundreds of small adapters, thousands of biases/norms), so the host work per step is
+part of the design and is measured with counters rather than the clock — see
+[foreach-batching.md](foreach-batching.md) for the full method and the shared plan.
+One cache is Adakaon-specific:
+
+- **The codec's per-parameter view lists** (`ema_stacked(..., views=…)`). Built once
+  per stacked chunk, not per step. With int8 momentum this removes 896 `aten::view` +
+  448 `aten::copy_` per step on a 448 × 0-D bag and 856 + 428 on a 428-tensor LoRA bag;
+  the float and 4-bit codecs are unchanged (they had no per-parameter layout views to
+  cache). Peak allocated memory does not move — the lists are *views* of
+  `state["m"]` / `state["m_scale"]`.
+
 ## On `torch.compile`
 
 `Adakaon` intentionally exposes **no** `compile` flag. A whole-step

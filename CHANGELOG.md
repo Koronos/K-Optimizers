@@ -6,8 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - **Adakaon's foreach bucketing/view plan is now the shared one** (`kaon._foreach_plan`).
-  `ForeachPlanMixin` plus a five-line `ForeachSpec` (`factored_state=("row", "col")`,
-  `flat_state=("v",)`, `momentum_cache=beta1 > 0 and momentum_dtype != "4bit"`) replace
+  `ForeachPlanMixin` plus a three-line `ForeachSpec` (`factored_state=("row", "col")`,
+  `flat_state=("v",)`) replace
   `kaon.adakaon._ForeachPlan` / `_ForeachChunk` / `_identity` / `_foreach_buckets` /
   `_foreach_plan` / `_param_witness` — **−175 lines** of duplicated machinery. Adakaon is
   the optimizer this design was extracted *from* and the last one still carrying its own
@@ -86,6 +86,42 @@ All notable changes to this project will be documented in this file.
   AdaMuon, KProdigy and Lion over fp32/bf16 parameters × fp32/bf16/int8/4-bit
   momentum, mixed 0-D/1-D/2-D/conv bags, multi-chunk buckets and a mid-run
   checkpoint reload.
+
+- **Adakaon's foreach path hands the momentum codec its cached view lists too.** It was
+  the last user of the codec's stacked entry points still rebuilding them per step: both
+  bucket bodies now pass `views=chunk.momentum_views(codec)` to `ema_stacked`. Measured
+  per step (RTX 3000 Ada Laptop, bf16 params + SR, `torch.profiler`, medians of 3
+  interleaved repeats):
+
+  | bag (foreach) | `aten::view` | `aten::copy_` |
+  |---|---|---|
+  | 448 × 0-D, int8 | 905 → **9** | 453 → **5** |
+  | 428-tensor LoRA, int8 | 897 → **41** | 448 → **20** |
+  | 128×(512,512)+64×(1024,), int8 | 449 → **65** | 222 → **30** |
+  | 24×(320,320,3,3), int8 | 85 → **37** | 39 → **15** |
+
+  The removed per-parameter `m_scale` write-back becomes 1–6 more `_foreach_copy_` calls.
+  The float codecs (`float32`/`bfloat16`) and 4-bit are **count-for-count unchanged**:
+  their lists were already served by the plan's identity-keyed `mat` lookup (see below),
+  and the cached views replace it at the same cost. Peak allocated memory unchanged
+  (0.00 MiB on every bag and both kernel modes) — the lists are views of `state["m"]` /
+  `state["m_scale"]`.
+- `ForeachSpec.momentum_cache` and `ForeachChunk.mat` are **gone**. The flag prebuilt an
+  identity-keyed `{state["m"]: view(state["m"])}` lookup for the codec's `mat` callback;
+  now that every optimizer on the shared plan passes `views=`, the codec's stacked path
+  never calls `mat` at all, so the dict was a strictly worse cache (`Tensor.__hash__` is
+  a Python-level call in torch) of the very same views. Adakaon was its last user.
+  Call sites pass `chunk.view` — the same callback — which the codec keeps only as the
+  fallback for a layout `stacked_views` declined (a non-contiguous buffer).
+  `ForeachChunk.__init__` and `ForeachPlan.rechunk` lost their now-unused `group`
+  argument.
+- Bit-identity: 272 configurations (fp32/bf16 params × `float32`/`bfloat16`/`int8`/`4bit`
+  momentum × foreach/fused × 5 bags — 428-tensor LoRA, 448 × 0-D, convs+1-D+0-D mixed,
+  24×(320,320,3,3), 128×(512,512)+64×(1024,) — × 7 interference scenarios ×
+  Adakaon/Nekaon/MSAM/Lookahead), 6 steps each, every weight and every state tensor of
+  both the wrapper and the inner optimizer hashed byte-for-byte. **272/272 match** the
+  reference tree, which also matched itself run-to-run (the control) with the chunked-big
+  fused route under `deterministic_reductions=True`.
 
 ## [0.7.12]
 
