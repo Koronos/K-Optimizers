@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **Fused path: a `p.data` rebind that changes the SHAPE can no longer step a plan that
+  disagrees with the optimizer state.** Every fused pointer cache
+  (`PointerArrayCache`, `BigPointerCache`, `AdaPnmCache`, `OneDimPointerCache`,
+  `OneDimPnmCache`, `BigPnmCache`) now validates the state geometry against each
+  parameter when it is built — `row`/`col` against the effective 2-D shape on the
+  factored routes, `v` against `numel` on the 1-D/0-D route — and raises a
+  `RuntimeError` naming the parameter, the mismatch and the recovery (reshape before
+  constructing the optimizer, or `del opt.state[p]`). Affects Adakaon and AdaPNM.
+
+  Two real out-of-bounds paths, not hypothetical ones, both confirmed silent on 0.7.12:
+
+  - **Rebind of both storage and shape** (`p.data = p.data.view(64, 16).clone()`): the
+    witness moved, the plan was rebuilt with the *new* `R`/`C`, and the kernel indexed 64
+    entries of a 16-element `row`. The overrun is a **write**, not just a read — it lands
+    on the neighbouring allocation, measured as `state[p]["col"]` being modified 512 B
+    past `row` (Δ 2.36e-3) — and the step raised nothing and left finite weights.
+  - **`load_state_dict` from a checkpoint with different shapes.** A checkpoint saved from
+    `(512,16)` weights loads onto `(16,512)` ones without complaint (same param count,
+    same numel; `load_state_dict` does not compare shapes), after which the factored state
+    carries `row=512`/`col=16` against an effective shape of `(16,512)`: 2048 B written
+    into a 64-byte `col`, leaving `p` non-finite with no exception. No parameter was
+    rebound here, so no witness field is involved — what catches it is the cache rebuild
+    `load_state_dict` already forces, plus the new check.
+
+  **Cost: zero per step.** The check runs only when a cache is built, so a steady-state
+  step does not execute it. Verified bit-identical to 0.7.12 across 32 configurations
+  (Adakaon/AdaPNM x fused/native x fp32/bf16 parameters x fp32/bf16/int8/4bit momentum,
+  on a bag covering the one-block, chunked-big, 1-D, 0-D and conv routes), 1528 state
+  and parameter buffers digested.
+
+- The native foreach plan already refused such a rebind (it re-stacks by effective shape
+  every step, so `torch.stack` raises); its witness is deliberately unchanged, and
+  `Adakaon._fused_partition` now keys on `ft.param_witness` so the fused key is exactly
+  as strong as the pointer caches' own — which is what the caches' O(1) `built_from`
+  revalidation assumes.
+
 - **`Lookahead.load_state_dict` bypassed the inner Adakaon's own loader.** It handed
   `load_state_dict_preserving_dtypes` straight to the wrapper mixin, so
   `Adakaon.load_state_dict` never ran for the inner optimizer and a resume through
@@ -116,6 +152,51 @@ All notable changes to this project will be documented in this file.
   AdaMuon, KProdigy and Lion over fp32/bf16 parameters × fp32/bf16/int8/4-bit
   momentum, mixed 0-D/1-D/2-D/conv bags, multi-chunk buckets and a mid-run
   checkpoint reload.
+
+### Added
+
+- `kaon._fused_triton.SHAPE_WITNESS` (default `False`) adds per-parameter strides to the
+  fused staleness witness, which makes the remaining case detectable: a rebind that
+  changes the shape and **nothing else** moves no witness field today, so the plan is
+  never rebuilt, never revalidated, and the weight goes on being optimized as the shape
+  it used to have. For a plain `view` that variant stays in bounds (the storage is the same
+  size), so it degrades quality rather than corrupting memory — which is why it is opt-in
+  while the fix above is not.
+
+  It also has a **blind spot**: strides are a proxy for the shape, and a truncation along
+  dim 0 of a contiguous tensor does not move them (`(16,64) -> p.data[:8]` keeps `(64,1)`;
+  a 1-D `[:256]` keeps `(1,)`). Only `numel` moves there, and `numel` is the *complementary*
+  field — cheaper than strides but blind to the `view` case, which preserves numel; only
+  `strides + numel` is complete, at the sum of both costs. That blind spot is worse than a
+  stale factorization and is pinned by a test: the param keeps being stepped at its
+  pre-narrowing extent, so the optimizer writes past the param's current `numel` *inside the
+  original storage* (measured: 324 of the 512 elements beyond a narrowed `(16,64)` modified,
+  max Δ 1.5e-3), which silently rewrites any sibling view of that storage — a split QKV,
+  anything out of `chunk()`/`split()`. Neither the flag nor the build-time check closes it
+  (nothing triggers a rebuild, so the check never runs); what does in practice is the
+  narrowing also moving the storage, which is the ordinary case and is caught by default.
+
+  It is opt-in because it **cannot be made cheap**: the witness is a host sweep over every
+  parameter in the group, run once per group per step plus once per big shape bucket, and a
+  shape field is one more sweep. Measured with `benchmarks/fused/bench_shape_witness.py`
+  (paired and interleaved, against each bag's minimum step) on **two machines**, both laptop
+  GPUs shared with other jobs — the ordering of the candidate fields was stable in every run,
+  the absolutes were not, so the spread is given rather than a point estimate:
+
+  | bag | witness calls/step | added host | % of step |
+  |---|---|---|---|
+  | 428 LoRA-ish (200x(256,256) + 100x(512,) + 128x 0-D) | 2 (428p + 200p) | +61..65 µs | 3.0..3.6% |
+  | 448x 0-D (launch-bound) | 1 (448p) | +35..55 µs | 8..18% |
+  | UNet/DiT-ish, 80 params | 5 (80p + 4 buckets) | +14..17 µs | 1.1..1.7% |
+
+  `Tensor.stride` is the cheapest field measured that can see the reported bug (+42..65 µs
+  on the 428-parameter bag, against +65..104 for `Tensor.size`); `numel` is +22..32 µs.
+  `Tensor.dim` is the floor for any per-parameter field at +13..25 µs and cannot see it at
+  all — already ~1% of that step and >4% of the 0-D one, where the three existing fields are
+  themselves ~20-25% of the step. So no per-step shape witness fits a 1%-of-step budget, and
+  the launch-bound 0-D regime is where it hurts most. Turning it on is numerically inert
+  (bit-identical to 0.7.12 across the same 32 configurations); flipping it mid-run is safe
+  and rebuilds every plan once.
 
 ## [0.7.12]
 

@@ -22,8 +22,10 @@ buffer the optimizer holds anyway. Gradients are the deliberate exception — se
 Every batched optimizer in kaon now shares this module, Adakaon included: this design was
 extracted FROM Adakaon and folded back into it once the shared version had settled. Adakaon
 is also the only user whose fused Triton routing sits next to the native plan; the two stay
-consistent because ``Adakaon._fused_partition`` keys on :func:`param_witness` from here and
-``Adakaon._invalidate_fused_caches`` drops both sets of caches in one call.
+consistent because ``Adakaon._fused_partition`` keys on the same witness CONTRACT —
+:func:`kaon._fused_triton.param_witness`, this module's three fields plus an optional strides
+field under ``ft.SHAPE_WITNESS`` — and ``Adakaon._invalidate_fused_caches`` drops both sets of
+caches in one call.
 """
 
 from __future__ import annotations
@@ -67,11 +69,17 @@ def param_witness(plist: list[Tensor]) -> tuple:
     supported and deliberately not watched: the factored second moment is bound to the
     effective 2-D shape, and there is no meaningful migration of an EMA onto a different
     factorization. The stale bucketing makes the next step raise a size mismatch, which
-    is the intended outcome. Same contract as ``kaon._fused_triton.param_witness``, kept
-    separate from it because this one guards the NATIVE path, which must work in a build
-    without Triton and must not import the Triton module at module scope. Adakaon's fused
-    ROUTING (``_fused_partition``) calls this one for that reason; the pointer-array caches
-    inside ``_fused_triton`` use their own copy.
+    is the intended outcome. THIS WITNESS IS FIXED AT THREE FIELDS, and that is a property of
+    the native path, not a compromise: the plan re-stacks by effective shape every step, so a
+    shape-changing rebind raises out of ``torch.stack`` on the very next step and a fourth field
+    would add nothing but cost. ``kaon._fused_triton.param_witness`` holds this exact contract in
+    its default configuration and grows an optional FOURTH field (per-param strides) under
+    ``ft.SHAPE_WITNESS``, because the fused path freezes its whole geometry at plan-build time and
+    has to be told; that field is defined THERE, once, and never here. Adakaon's fused ROUTING
+    (``Adakaon._fused_partition``) therefore keys on the fused witness — through the ``ft`` module
+    it is already handed, so nothing imports Triton at module scope — which also keeps its key
+    exactly as strong as the pointer caches' own. This one is what the NATIVE plan keys on, and it
+    has to keep working in a build without Triton.
     """
     return (tuple(map(id, plist)), tuple(map(_DATA_PTR, plist)), tuple(map(_IS_CONTIG, plist)))
 

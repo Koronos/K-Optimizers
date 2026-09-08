@@ -53,7 +53,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
-from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec, param_witness
+from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -623,38 +623,59 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
     def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
         """Split a group's params into (one-block, chunked-big, one-dim, native), cached per param-set.
 
-        Keyed on :func:`kaon._foreach_plan.param_witness` — ids, ``data_ptr``s and
-        contiguity — because each is a routing input the partition (and the pointer arrays
-        derived from it) bakes in, and ``p.data = ...`` can change any of them while the
-        Parameter object stays the same. An id-only key kept dispatching a stale plan at
-        memory the optimizer no longer owns. The native foreach plan
-        (:meth:`_step_foreach`) and ``_fused_triton._WitnessedCache`` guard themselves with
-        the same three fields, so all three caches rebuild on the same events.
+        Keyed on :func:`kaon._fused_triton.param_witness` — ids, ``data_ptr``s and contiguity,
+        plus strides under ``ft.SHAPE_WITNESS`` — because each is a routing input the partition
+        (and the pointer arrays derived from it) bakes in, and ``p.data = ...`` can change any of
+        them while the Parameter object stays the same. An id-only key kept dispatching a stale
+        plan at memory the optimizer no longer owns. The FUSED witness is used here rather than
+        the native :func:`kaon._foreach_plan.param_witness` deliberately, and the ``ft`` module is
+        already a parameter of this method so nothing imports Triton at module scope: see that
+        function on why the native plan carries no shape field, and on why this key must be
+        exactly as strong as the pointer caches' own — that is what makes their O(1)
+        ``_WitnessedCache.built_from`` revalidation sound. With the flag off the two witnesses are
+        the same three tuples, so the default path is unchanged, bit for bit and cost for cost.
 
-        SHAPE-REBIND LIMIT (the witness's, spelled out for the fused side). ``p.data =
-        p.data.view(...)`` is unsupported and deliberately unwatched. The factored second
-        moment is bound to the effective 2-D shape: ``state["row"]``/``state["col"]`` were
-        allocated with the old lengths and there is no meaningful migration of an EMA onto a
-        different factorization. Rebuilding on such a rebind does not fix it, it makes it
-        worse — the fused pointer arrays would then carry the NEW R/C against the OLD
-        row/col buffers and write past them. As it stands the native path raises a size
-        mismatch on the next step and the fused path silently keeps stepping the pre-rebind
-        geometry; validating ``row``/``col`` against ``p`` (or migrating the state) is
-        follow-up work, tracked in ``tests/test_fused_safety.py`` next to the routing tests.
+        A rebuild is where the state geometry gets revalidated (the caches call
+        ``ft.check_state_geometry``), so this key moving is what turns a shape-changing rebind
+        into a clear error instead of a plan pointed at the wrong buffers.
 
-        COST on a 428-param LoRA-shaped bag: 80 µs for an ``(ids, data_ptr)`` witness,
-        131 µs (8.0% of a 1633 µs fused step) for the three fields kept, 254 µs (15.6%) with
-        a ``torch.Size`` added — which is why shapes are out. It runs once per group here
-        (the route caches then revalidate by list identity — see
-        ``_WitnessedCache.built_from``) plus once per big shape bucket, and the per-step grad
-        contiguity sweep in :meth:`_fused_demote` adds ~60 µs on the same bag.
+        SHAPE-REBIND LIMIT — ``p.data = p.data.view(...)`` mid-training is REFUSED, never
+        supported. ``state["row"]``/``state["col"]`` were allocated for the old effective 2-D
+        shape and an EMA has no meaningful migration onto a different factorization. What 0.7.13
+        guarantees, at no per-step cost and with no flag, is that the fused path cannot step a plan
+        that disagrees with the state: every pointer cache validates the state geometry at build
+        (:func:`kaon._fused_triton.check_state_geometry`), so any rebind that moves the witness at
+        all — a fresh buffer, a dtype or device change, a transpose, or a reshape bundled with any
+        of those — raises with an actionable message instead of pointing the new ``R``/``C`` at the
+        old buffers and reading past them (which is what main did: measured, silent, on
+        ``p.data = p.data.view(64, 16).clone()``). The native path refuses on its own, out of the
+        stack. The recovery is to reshape before constructing the optimizer, or ``del opt.state[p]``
+        to restart that parameter's second moment.
+
+        Left over, and the reason ``SHAPE_WITNESS`` exists: a rebind that changes the shape and
+        NOTHING else moves no field, so the plan is never rebuilt and never revalidated. That
+        weight keeps being stepped as the shape it used to have. For a plain ``view`` it stays in
+        bounds (the storage is the same size), so it degrades quality rather than corrupting
+        memory, which is why detecting it is opt-in and closing the corruption paths is not. A
+        NARROWING rebind (``p.data[:8]``) is the sharper version and the flag does not see it
+        either — strides do not move when only ``R`` shrinks; see ``SHAPE_WITNESS`` for what that
+        costs a sibling view of the same storage.
+
+        COST on the 428-param LoRA-shaped bag (200x(256,256) + 100x(512,) + 128x 0-D),
+        ``benchmarks/fused/bench_shape_witness.py``, paired against the 3-field base: 67 µs for
+        the three base fields (median of 15x250 reps, build + compare). The witness runs once per
+        group here (the route caches then revalidate by list identity — see
+        ``_WitnessedCache.built_from``) plus once per big shape bucket — 2 calls per step on that
+        bag, 5 on a UNet-shaped one — and the per-step grad contiguity sweep in
+        :meth:`_fused_demote` adds ~75 µs on the same bag. ``SHAPE_WITNESS`` itself is priced on
+        the flag, per bag.
 
         Grad properties deliberately stay OUT of this key: a gradient is a new tensor every
         backward, so its contiguity is re-checked per step in :func:`_demote_non_contiguous_grads`
         rather than frozen into the routing.
         """
         gid = id(group)
-        witness = param_witness(params)
+        witness = ft.param_witness(params)
         cached = self._fused_part.get(gid)
         if cached is not None and cached[0] == witness:
             return cached[1], cached[2], cached[3], cached[4]
