@@ -16,7 +16,9 @@ stochastic-rounding seed fix below):
   (two devices used to draw the *same* sequence over their different shards —
   `manual_seed_all` gives them the same base). An optimizer that never rounds (fp32 params,
   `bf16_method="kahan"`, Adakaon's fused path) takes no identity, so a mixed fp32 + bf16 run
-  keeps the 0.7.12 sequence for its bf16 half. Still unbiased, and
+  keeps the 0.7.12 sequence for its bf16 half — **with one exception: `ScheduleFree`, whose
+  default `momentum_dtype="bfloat16"` rounds its `z` write-back and therefore claims an
+  identity even over fp32 weights** (see the `### Known` entry below). Still unbiased, and
   `kaon.reseed_stochastic_rounding()` still resets everything.
 - Checkpoints gain a top-level `_sr_meta` key (`_sr_wrap_meta_<wrapper>` for a wrapper's own
   stream — one per level, so a nested `SAM(base_optimizer=Lookahead)` writes three): two
@@ -594,6 +596,36 @@ stochastic-rounding seed fix below):
   and rebuilds every plan once.
 
 ### Known
+- **`ScheduleFree` is stochastic by default even over an fp32 model, so two runs in one
+  process are not bit-identical without `kaon.reseed_stochastic_rounding()`.** Reported as
+  "`kaon.ScheduleFree` is not reproducible against itself": identical seed, fp32
+  parameters, fp32 gradients, GC off, same gradients, and the weights part ways at the
+  **second** step (measured `5.9e-3` on CPU, `1.2e-2` on CUDA on a `(6,3)`/`(8,4)` bag) —
+  on both the foreach and per-parameter paths, and unaffected by
+  `torch.use_deterministic_algorithms(True)`, while every other kaon optimizer has a noise
+  floor of exactly `0.0` in the same harness. **Not a bug in the step**: bisected to
+  `momentum_dtype="bfloat16"` (the default), which stores `z` in bf16 and must therefore
+  write it back stochastically or freeze it outright (`schedulefree.py:414` `_store_z`).
+  That makes ScheduleFree the only optimizer here that draws SR noise with no
+  low-precision *weight* in the model, which in turn exposes it to the per-owner stream's
+  first-draw identity allocator (`_stochastic_rounding.py:99` `_next_stream`, the
+  "Known limitation / follow-up" above): run 1 takes stream 0, run 2 takes stream 1, and
+  the differently-rounded `z` reaches the weights one step later through the
+  `ckp1*(y - z)` averaging term. Proven by construction — with `momentum_dtype` in
+  `float32`/`int8`/`4bit` there is no draw at all (no stream id, no `_sr_meta`) and the
+  runs are bit-identical with **no** reseed; handing both runs the same pinned
+  `SRStream(0)` is also bit-identical with no reseed; and under the documented protocol
+  (`torch.manual_seed` + `kaon.reseed_stochastic_rounding()`) ScheduleFree is bit-identical
+  against itself across all 32 combinations of device x foreach/per-param x fp32/bf16
+  parameters x fp32/bf16/int8/4bit momentum. Not fixed here: the two candidate fixes are
+  flipping the `momentum_dtype` default to `"float32"` (`schedulefree.py:236` — wire-visible,
+  and it doubles `z`'s footprint) or deriving an `SRStream` identity from something stable
+  about the owner (already the recorded 0.7.13 follow-up, and it moves the noise of every
+  process holding two rounding owners). The behaviour and both escape hatches are now
+  documented in `ScheduleFree`'s module docstring ("Reproducibility") and on the
+  `momentum_dtype` argument, and pinned by `tests/test_schedulefree_determinism.py` —
+  including a strict xfail (`::test_default_config_is_reproducible_under_manual_seed_alone`)
+  that flips to XPASS the day either fix lands.
 - **A zero `eps` still NaNs the non-capping factored optimizers.** `AdaBelief`,
   `AdamP`, `AdaPNM` and `ScheduleFree` accept `eps=0.0`, and `Adakaon` accepts
   `eps=(0.0, ...)`; that makes their `eps1` zero, so a zero gradient reaches the same

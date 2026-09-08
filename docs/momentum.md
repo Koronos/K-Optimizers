@@ -35,6 +35,32 @@ OOMs. Below int8 you trade away nothing measurable on quality *if* you use 4-bit
 > `kaon._stochastic_rounding.SRStream`. Reseed with `kaon.reseed_stochastic_rounding()`
 > **before** `load_state_dict`, never after.
 
+> **`ScheduleFree` is the one place `momentum_dtype` decides whether the run is
+> stochastic.** Its `momentum_dtype` stores the full-size iterate `z`, not a first
+> moment, and `z` is read, stepped by `lr_t*d` and written back every step — a step that
+> routinely sits *below* one bf16 ULP of `z`. A round-to-nearest write would therefore
+> return the old value and freeze the sequence, so a bf16 `z` is **always** written
+> stochastically rounded (`schedulefree.py`'s `_store_z`); `bf16_method` does not govern
+> it, and neither does the weights' dtype. Since `"bfloat16"` is ScheduleFree's default,
+> it is the only kaon optimizer that draws SR noise for a model whose weights are fp32 —
+> every other one reaches the SR write only through a low-precision *weight*. Two
+> practical consequences:
+>
+> * **Comparing two runs in one process needs a reseed per run.**
+>   `torch.manual_seed(s)` alone is not enough (re-seeding to the same value is not
+>   observable, and an SR stream's identity is handed out in order of first draw), so the
+>   second run rounds `z` off a different offset and the weights part ways at the
+>   **second** step by about one bf16 grid step of `z` (measured `5.9e-3` CPU / `1.2e-2`
+>   CUDA). Call `kaon.reseed_stochastic_rounding()` after `torch.manual_seed` in every
+>   arm of a sweep, an A/B or a test — then ScheduleFree is bit-identical against itself
+>   on every device, on both the foreach and per-parameter paths, and for every parameter
+>   and momentum dtype.
+> * **A trajectory that is deterministic under a bare `torch.manual_seed` needs a
+>   non-bf16 `z`.** `momentum_dtype="float32"` (exact, 4 B/param), `"int8"` or `"4bit"`
+>   all write `z` round-to-nearest, draw no noise at all and claim no stream — at the
+>   cost, for the quantized two, of `z`'s own stall risk at small `lr*d`. Pinned by
+>   `tests/test_schedulefree_determinism.py`.
+
 ## Why momentum is the expensive part
 
 An optimizer does two separable jobs: **(1)** normalize the per-coordinate step
