@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **ADOPT turned a finite gradient into NaN through the factored second moment.**
+  The Adafactor reconstruction divides the row stats by their own mean. That mean is
+  zero only when the whole row vector is zero, which needs `eps1 == 0` — and ADOPT is
+  the only optimizer here that passes `eps1 == 0` (to match the official
+  implementation, which adds no eps inside `g ** 2`). An all-zero gradient therefore
+  left `row == 0` and the reconstruction computed `0 / 0`; the NaN survived the
+  `clamp(max=1/eps)` cap and poisoned the momentum and the weights, permanently.
+  Reported for 2-D params whose fan-in is 1 (`(5, 1)`, `(129, 1)`, `(1, 1)`,
+  `(R, 1, 1, 1)`), where Gradient Centralization zeroes the gradient by construction,
+  but reachable on **any** shape from a genuinely zero gradient (a dead branch, a
+  frozen slice, a masked loss term). Both routes were affected (`foreach` and
+  per-param). The row-mean divisor is now floored at the smallest normal fp32, so the
+  degenerate case saturates at the same `1 / eps` cap the non-factored path already
+  produced for `v == 0` (`denom = max(sqrt(0), eps)`) instead of going NaN — verified
+  to give the identical step to the 1-D path. NaNs arriving *from* the gradient still
+  propagate. Bit-identical to 0.7.12 for every non-degenerate shape (240 dumped
+  cases per device across all 10 optimizers, CPU + CUDA + the fused big route), and
+  the hot `foreach` path costs one extra elementwise op per shape bucket per step —
+  +10 aten ops on a 428-tensor LoRA bag, paired A/B 1.006x [0.986, 1.027], n.s.
+
+### Known
+- **Gradient Centralization destroys fan-in-1 gradients.** `g - mean_fanin(g)` over a
+  one-element fan-in is identically zero, so every GC-enabled optimizer silently
+  freezes params shaped `(out, 1)` / `(out, 1, 1, 1)` — rank-1 LoRA up-projections
+  among them (`AdaMuon` is unaffected: GC defaults off). ADOPT was the one that
+  escalated this to NaN, which is fixed above; the freeze itself is not. Skipping
+  those params in `centralize_grads_` alone is *not* the fix — the Triton path
+  centralizes in-kernel and both `_chunked_reductions_batched` copies do it in torch,
+  so a native-only skip makes fused and native disagree (measured: it breaks
+  `test_degenerate_2d_shapes_match_native` and
+  `test_pnm_extreme_aspect_shapes_compile_and_match_native`). All four GC sites have
+  to move together. Pinned by
+  `tests/test_degenerate_fanin.py::test_gc_zeroes_fanin_1_grads_known_limitation`.
+
 ## [0.7.12]
 
 This release is a full correctness and performance audit of the 0.7.11 fused/Triton
