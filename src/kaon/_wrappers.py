@@ -28,6 +28,11 @@ three; SAM needs only :class:`WrapsInnerOptimizer`; Schedule-Free needs
 hooks don't materialize an explicit backup). The four recurring footguns —
 fp32-aliasing, hyperparameter/``eps`` namespace collisions, non-bf16-correct swaps, and
 foreach↔per-param parity — are owned here once, so each wrapper stays small and clean.
+
+A wrapper that writes weights itself (Lookahead's ``phi`` sync, SAM's climb) is a *second*
+owner of stochastic-rounding noise on top of the inner optimizer's weight write, so
+:class:`WrapsInnerOptimizer` carries its own :class:`kaon._backend.SRSeedState` stream and
+persists it under a namespaced key — for the same reason its per-param state is namespaced.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from kaon._backend import SRSeedState
 from kaon._momentum_codec import (
     _dequant_4bit,
     _dequant_4bit_stacked,
@@ -226,7 +232,7 @@ class TrainEvalWeights:
         raise NotImplementedError
 
 
-class WrapsInnerOptimizer:
+class WrapsInnerOptimizer(SRSeedState):
     """Mixin: delegation boilerplate for a wrapper that drives an inner base optimizer.
 
     The inner optimizer owns the ``param_groups`` and the per-param base state (factored /
@@ -239,6 +245,10 @@ class WrapsInnerOptimizer:
 
     Call :meth:`_bind_inner` from ``__init__`` after building ``self.inner``.
     """
+
+    # Namespaced away from the inner optimizer's own ``_sr_meta``, which the inner's
+    # ``state_dict`` has already written into the same dict by the time we add ours.
+    SR_META_KEY = "_sr_wrap_meta"
 
     def _bind_inner(self, inner: Any, *, state_key: str) -> None:
         self.inner = inner
@@ -262,11 +272,17 @@ class WrapsInnerOptimizer:
         return [p for group in self.param_groups for p in group["params"]]
 
     def state_dict(self) -> dict[str, Any]:
-        """Inner optimizer's state_dict + the wrapper's per-param state under ``state_key``."""
+        """Inner optimizer's state_dict + the wrapper's per-param state under ``state_key``.
+
+        The wrapper's own SR noise stream rides along under a namespaced key too: the inner
+        optimizer's ``state_dict`` already carries ITS stream under ``_sr_meta``, and the
+        two are different owners (Lookahead's ``phi`` sync writes through the same shared
+        kernel as the inner weight write, from its own position in the noise space).
+        """
         inner = self.inner.state_dict()
         idx = {p: i for i, p in enumerate(self._flat_params())}
         inner[self._wrap_state_key] = {idx[p]: st for p, st in self.state.items() if p in idx}
-        return inner
+        return self._sr_save(inner)
 
     def _load_wrapped(self, state_dict: dict[str, Any], inner_loader: Any) -> None:
         """Restore the inner optimizer (via ``inner_loader``) and the wrapper's per-param state.
@@ -285,6 +301,10 @@ class WrapsInnerOptimizer:
         """
         sd = dict(state_dict)
         wrapped = sd.pop(self._wrap_state_key, {})
+        # The wrapper's OWN noise stream (its ``phi`` sync / climb writes); the inner's
+        # rides in ``_sr_meta`` and is restored by the inner's loader below.
+        self._sr_load(sd)
+        sd.pop(self.SR_META_KEY, None)
         inner_loader(self.inner, sd)
         self.param_groups = self.inner.param_groups
         self._wrap_state = defaultdict(dict)

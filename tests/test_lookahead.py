@@ -254,9 +254,9 @@ def test_sync_foreach_chunks_under_budget(monkeypatch):
     chunk_sizes: list[int] = []
     orig_sub = la_mod.subtract_batched_
 
-    def spy_sub(weights, delta, bf16_method):
+    def spy_sub(weights, delta, bf16_method, **kw):
         chunk_sizes.append(len(weights))
-        return orig_sub(weights, delta, bf16_method)
+        return orig_sub(weights, delta, bf16_method, **kw)
 
     monkeypatch.setattr(la_mod, "subtract_batched_", spy_sub)
 

@@ -4,7 +4,54 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+**Behaviour changes** (numeric trajectories that move as a result of the
+stochastic-rounding seed fix below):
+- The bf16 SR noise stream is now **per optimizer** instead of process-global. A run with a
+  single stream owner on one device is **bit-identical to 0.7.12** — stream 0 on `cuda:0`
+  reproduces the old counter exactly, and seeds the torch reference path's generator with
+  the same value the shared one used. Only runs with **two or more owners** move, because
+  their draws no longer interleave in one counter: `Lookahead` (the `phi` sync is its own
+  owner on top of the inner optimizer), `SAM` (its climb), and any process holding more
+  than one optimizer or writing on more than one CUDA device (two devices used to draw the
+  *same* sequence over their different shards — `manual_seed_all` gives them the same base).
+  Still unbiased, and `kaon.reseed_stochastic_rounding()` still resets everything.
+- Checkpoints gain a top-level `_sr_meta` key (`_sr_wrap_meta` for a wrapper's own stream):
+  two integers, plus the torch-path generator state only when that path was used (~5 KB per
+  CPU device, 16 B per CUDA one; absent on the Triton path). 0.7.12 ignores unknown
+  top-level keys, so new checkpoints still load there — minus the resume guarantee.
+
 ### Fixed
+- **The shared bf16 stochastic-rounding kernel took its seed from a process-global counter
+  that no checkpoint saved**, so a resume in a fresh process applied a *different* noise
+  sequence than the run it continued: with every state tensor restored bit-exactly, a
+  resumed run's bf16 weights diverged from the uninterrupted run's by up to **4.7e-2**
+  absolute (CUDA, native/foreach path, 4+4 steps) — for **every** optimizer with bf16
+  params, and for `Lookahead`'s `phi` sync (whose bf16-correct write goes through the same
+  kernel) even over an Adakaon whose own fused counter was already checkpointed. Measured
+  before: Adakaon fused `0.0` (already fixed by `_adakaon_meta`), Adakaon native `4.7e-2`,
+  Lookahead `1.6e-2`, SAM/MSAM/Nekaon native `4.7e-2`. MSAM had fixed only its own climb
+  (`_msam_meta.axpy_seed`).
+
+  The counter is now **per owner** (`kaon._stochastic_rounding.SRStream`): the optimizer
+  passes it to the writers (`sr=self.sr_stream`), saves it in its `state_dict` and restores
+  it on load. A process-global counter could not be fixed any other way — restoring it from
+  optimizer A's checkpoint would rewind optimizer B's noise, and leaving it alone breaks
+  A's own resume; per-owner streams make both resumes exact at once, and a mixed stream
+  identity (checkpointed, so it survives a load in a different order) keeps their noise
+  independent. One stream covers both SR paths: the Triton kernel's launch counter and the
+  torch reference path's private per-device generator, whose state is checkpointed too, so
+  CPU params and `SR_TRITON = False` resume exactly as well. The `_reseed_hooks` registry is
+  gone — `reseed_stochastic_rounding()` now bumps a module epoch that every stream checks on
+  use, which also covers streams created after the call.
+
+  Zero measurable step cost: no added kernel and no added sync, and the host-side seed
+  derivation came out at **0.71–0.85x** of 0.7.12's (paired in-process microbenchmark,
+  −0.1 to −0.4 µs/draw — the per-device cache is keyed by the `torch.device` object and
+  holds a bound seed reader, avoiding a `device.type` read that costs ~0.7 µs on its own).
+  Per-step wall clock on the LoRA-428 bf16 bag is inside the run-to-run spread of the
+  shared card (±25% on either tree). New `tests/test_sr_seed_checkpoint.py` sweeps the
+  cross-process resume over every optimizer × momentum dtype × foreach/per-param/fused ×
+  CPU/CUDA × `SR_TRITON`, plus two optimizers in one process not clobbering each other.
 - **`Lookahead.load_state_dict` bypassed the inner Adakaon's own loader.** It handed
   `load_state_dict_preserving_dtypes` straight to the wrapper mixin, so
   `Adakaon.load_state_dict` never ran for the inner optimizer and a resume through

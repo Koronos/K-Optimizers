@@ -191,11 +191,24 @@ predates, and drops every host-side cache that aliases the state tensors the loa
 replaced (the fused pointer tables and the foreach plans). Wrapping optimizers
 (`Lookahead`, `SAM`, `MSAM`, `Nekaon`) therefore restore their inner Adakaon by calling
 *its* `load_state_dict`, so a checkpoint resumed through a wrapper restores the inner
-Adakaon exactly as a bare one would. One caveat is the wrapper's own writes: `Lookahead`'s
-slow-weight sync goes through the shared stochastic-rounding kernel, whose per-process
-seed counter is not part of any checkpoint, so a `Lookahead` resume is bit-identical
-within one process but not across a fresh one — the same limit the bf16 *native* path
-has for every optimizer.
+Adakaon exactly as a bare one would.
+
+Since 0.7.13 that also covers the **bf16 stochastic-rounding noise position**, which used
+to be the one piece of a bf16 run's state no checkpoint carried. The bf16 weight write is
+seeded from a counter, so a resume that restarted it at 0 rounded differently than the run
+it continued — measured up to `4.7e-2` on bf16 weights four steps after a resume, with
+every state tensor restored bit-exactly. Each optimizer now owns its noise stream, saves
+it under `_sr_meta` and restores it on load; a wrapper's own writes (`Lookahead`'s
+slow-weight sync, `SAM`'s climb) are a second owner and ride in `_sr_wrap_meta`. So a
+resume in a **fresh process** is now bit-identical to the uninterrupted run on the native
+bf16 path and through the wrappers, not just within one process. Two things to know:
+
+- **Reseed before loading, not after.** `kaon.reseed_stochastic_rounding()` restarts every
+  noise stream; calling it *after* `load_state_dict` throws away the position the
+  checkpoint just restored.
+- **A pre-0.7.13 checkpoint has no position to restore**, so it back-fills a fresh stream
+  (draw 0) and loads without complaint; only the resume-exactness is missing. A new
+  checkpoint still loads on 0.7.12 — the extra top-level key is ignored there.
 
 ## See also
 

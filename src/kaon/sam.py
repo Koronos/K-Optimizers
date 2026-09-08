@@ -207,7 +207,7 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         if weights.dtype == torch.float32:
             weights.add_(e_w)
         else:
-            add_stochastic_(weights, e_w, alpha=1.0)
+            add_stochastic_(weights, e_w, alpha=1.0, sr=self.sr_stream)
         for p, old in zip(plist, old_stack.unbind(0), strict=True):
             self.state[p]["old_p"] = old
         torch._foreach_copy_([p.data for p in plist], list(weights.unbind(0)))  # type: ignore[attr-defined]

@@ -23,6 +23,18 @@ Adakaon factors the **second** moment for ~free (Adafactor row+col). The
 OOMs. Below int8 you trade away nothing measurable on quality *if* you use 4-bit
 (see below), but you should know exactly what was tried and why.
 
+> **Not the same knob as `bf16_method`.** `momentum_dtype` is how the *first moment* is
+> stored; `bf16_method="stochastic_rounding"` is how a bf16 **weight** is written (the
+> unbiased sub-ULP round that lets small updates survive at all). The two are independent
+> and both are fully checkpointed since 0.7.13 — including SR's *noise position*, which
+> is optimizer state exactly like the momentum: a resume that restarts it rounds
+> differently than the run it continues (measured up to `4.7e-2` on bf16 weights four
+> steps later, with every state tensor restored bit-exactly). Each optimizer now owns its
+> noise stream and carries it in its `state_dict`; see
+> [adakaon.md § Checkpointing](adakaon.md#checkpointing) and
+> `kaon._stochastic_rounding.SRStream`. Reseed with `kaon.reseed_stochastic_rounding()`
+> **before** `load_state_dict`, never after.
+
 ## Why momentum is the expensive part
 
 An optimizer does two separable jobs: **(1)** normalize the per-coordinate step

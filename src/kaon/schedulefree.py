@@ -119,6 +119,7 @@ from torch.optim import Optimizer
 
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
+    SRSeedState,
     _sr_write_,
     cautious_batched_,
     cautious_one_,
@@ -136,6 +137,7 @@ from kaon._momentum_codec import (
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
 )
+from kaon._stochastic_rounding import SRStream
 from kaon._wrappers import CodecBuffer, TrainEvalWeights
 
 __all__ = ["ScheduleFree"]
@@ -147,7 +149,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
+class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
     """Schedule-Free AdamW (Defazio et al. 2024) on kaon's memory backend.
 
     The model's parameter buffer holds ``y`` (the interpolation point) in **train**
@@ -409,7 +411,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
     # only — not on ``bf16_method`` (which governs the weight write-back) and not on the
     # weights' dtype: an fp32 model with a bf16 ``z`` has exactly the same stall.
     @staticmethod
-    def _store_z(state: dict[str, Any], md: str, z_fp32: Tensor) -> None:
+    def _store_z(state: dict[str, Any], md: str, z_fp32: Tensor, sr: SRStream) -> None:
         """Write the updated fp32 ``z`` into its storage; bf16 storage rounds stochastically.
 
         A bf16 ``z`` cannot use the codec's round-to-nearest ``copy_``: the per-step
@@ -439,10 +441,12 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
         # ``buf.float().neg_().add_(...)`` spelling allocated the same single temporary
         # but took three passes over it; the rounded result is bit-identical.
         delta = z_fp32.reshape(buf.shape) - buf
-        _sr_write_(buf, delta, 1.0)
+        _sr_write_(buf, delta, 1.0, sr=sr)
 
     @staticmethod
-    def _store_z_stacked(states: list[dict[str, Any]], md: str, z_fp32: Tensor) -> None:
+    def _store_z_stacked(
+        states: list[dict[str, Any]], md: str, z_fp32: Tensor, sr: SRStream
+    ) -> None:
         """Batched :meth:`_store_z` over a foreach bucket's stacked ``z`` ``[N, *shape]``.
 
         One noise draw over the whole stack (not one per param) followed by a single
@@ -470,7 +474,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
         # [N, *shape], bf16 — a VIEW of the sole storage when N == 1, else a stacked copy.
         stacked = bufs[0].unsqueeze(0) if single else torch.stack(bufs)
         delta = z_fp32 - stacked                    # one promoting kernel; see _store_z
-        _sr_write_(stacked, delta, 1.0)
+        _sr_write_(stacked, delta, 1.0, sr=sr)
         if not single:
             torch._foreach_copy_(bufs, list(stacked.unbind(0)))
 
@@ -711,7 +715,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
         # y <- (1-ckp1)*y + ckp1*z, then y += d * y_d_coef ; z -= lr_t*d
         self._lerp_then_add_batched(ys, z, d, c["ckp1"], c["y_d_coef"], bf16_method)
         z.sub_(d, alpha=c["lr_t"])
-        self._store_z_stacked(states, md, z)
+        self._store_z_stacked(states, md, z, self.sr_stream)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -754,7 +758,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
         ys = chunk.pviews
         self._lerp_then_add_batched(ys, z, d, c["ckp1"], c["y_d_coef"], bf16_method)
         z.sub_(d, alpha=c["lr_t"])
-        self._store_z_stacked(states, md, z)
+        self._store_z_stacked(states, md, z, self.sr_stream)
 
     @torch.no_grad()
     def _lerp_then_add_batched(
@@ -772,7 +776,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
         # => delta = ckp1*(y - z) - y_d_coef*d
         ystack = torch.stack(yviews).float()
         delta = ystack.sub_(z).mul_(ckp1).sub_(d, alpha=y_d_coef)
-        subtract_batched_(yviews, delta, bf16_method)
+        subtract_batched_(yviews, delta, bf16_method, sr=self.sr_stream)
 
     # ===================================================================== per-param path
     @torch.no_grad()
@@ -827,7 +831,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
 
         # z step: z -= lr_t * d
         z.sub_(d, alpha=c["lr_t"])
-        self._store_z(state, md, z)
+        self._store_z(state, md, z, self.sr_stream)
 
     @torch.no_grad()
     def _subtract_y(
@@ -858,6 +862,6 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, Optimizer):
             p.add_(shift)
             shift.add_(p_before.sub_(p))
         elif low and bf16_method == "stochastic_rounding" and p.dtype == torch.bfloat16:
-            _sr_write_(p.data, delta_fp32, -1.0)
+            _sr_write_(p.data, delta_fp32, -1.0, sr=self.sr_stream)
         else:
             p.data.sub_(delta_fp32.to(p.dtype))

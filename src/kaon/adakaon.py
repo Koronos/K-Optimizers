@@ -43,6 +43,7 @@ from torch.optim import Optimizer
 from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
+    SRSeedState,
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
@@ -168,7 +169,7 @@ def _demote_non_contiguous_grads(
     return kept[0], kept[1], kept[2], native + demoted
 
 
-class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
+class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     """Conv-aware factored optimizer with optional bf16 momentum.
 
     Args:
@@ -1399,10 +1400,10 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         # lr rides the weight write (``alpha``) instead of a separate ``delta.mul_(lr)``
         # pass over the stacked bucket - see :func:`kaon._backend.subtract_batched_`.
         if self._write_fold_lr:
-            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr)
+            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream)
         else:                                        # A/B baseline (pre-0.7.12 order)
             delta.mul_(lr)
-            subtract_batched_(chunk.pviews, delta, bf16_method)
+            subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -1476,10 +1477,10 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
             delta = delta.add_(p_fp32, alpha=wd)
 
         if self._write_fold_lr:                      # see _factored_bucket
-            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr)
+            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream)
         else:
             delta.mul_(lr)
-            subtract_batched_(chunk.pviews, delta, bf16_method)
+            subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
@@ -1541,9 +1542,9 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         # lr rides the write, exactly as the foreach buckets do — the two must fold it the
         # same way or they stop being bit-exact with each other (see subtract_one_).
         if self._write_fold_lr:
-            subtract_one_(p, delta, state, bf16_method, alpha=lr)
+            subtract_one_(p, delta, state, bf16_method, alpha=lr, sr=self.sr_stream)
         else:                                        # A/B baseline (pre-0.7.12 order)
             delta.mul_(lr)
-            subtract_one_(p, delta, state, bf16_method)
+            subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
 
 

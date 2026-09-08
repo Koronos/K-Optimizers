@@ -110,6 +110,7 @@ from torch.optim import Optimizer
 from kaon._autolr import DEFAULT_FUSE_REL, AutoLRMixin
 from kaon._backend import (
     FOREACH_BATCH_CUTOFF,
+    SRSeedState,
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
@@ -136,7 +137,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
+class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     """ADOPT (any-beta2 modified Adam) on Adakaon's memory backend.
 
     Args:
@@ -484,7 +485,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
 
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
 
         # --- fold g_t into v AFTER it has been used (the v-lag) ---
         grad_sq = grad * grad
@@ -540,7 +541,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
 
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
 
         # fold g_t into v AFTER use.
         v.mul_(c["beta2"]).addcmul_(grad, grad, value=1.0 - c["beta2"])
@@ -610,5 +611,5 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
 
         if cautious:
             delta = cautious_one_(delta, grad)
-        subtract_one_(p, delta, state, bf16_method)
+        subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
         state["step"] = pstep + 1

@@ -50,6 +50,8 @@ from __future__ import annotations
 
 import torch
 
+from kaon._stochastic_rounding import SRStream
+
 try:  # Triton is an optional, GPU-only dependency — keep ``import kaon`` working without it.
     import triton
     import triton.language as tl
@@ -2035,51 +2037,23 @@ class _WitnessedCache:
 
 
 # ============================================================ Triton bf16 SR weight write
-# Seed stream for :func:`_sr_axpy_kernel`, isolated from the global RNG exactly as
-# ``kaon._stochastic_rounding`` isolates its generator, and derived from the global INITIAL
-# seed so ``torch.manual_seed(s)`` at the top of a run reproduces the sequence — the counter
-# restarts whenever that seed changes.
+# Fallback noise stream for :func:`_sr_axpy_kernel`, for a caller that hands over no stream
+# of its own. Every kaon optimizer DOES hand one over (that is how its noise position gets
+# into its ``state_dict`` and stays independent of the other optimizers in the process —
+# see :class:`kaon._stochastic_rounding.SRStream`), so this serves direct callers of
+# :func:`sr_add_` only: benchmarks, tests, downstream code.
 #
-# Same limitation as the torch path: re-seeding to the SAME value mid-process is not
-# observable through the global RNG. That is why ``_reseed_sr_kernel`` is REGISTERED below as
-# a ``kaon._stochastic_rounding`` reseed hook instead of being a second public entry point.
-# ``kaon.reseed_stochastic_rounding()`` is the one call users are told about, and it has to
-# reset every SR noise stream kaon owns — when this counter was left out of it, a bf16 run on
-# a Triton build stopped reproducing under ``torch.manual_seed(s)`` + that call, silently,
-# for all ten optimizers (the reseed-to-the-same-value case is exactly the one the torch
-# module documents as needing it).
-_sr_seed_state: dict[int, list[int]] = {}
-
-
-def _sr_next_seed(device) -> int:
-    """Next per-call seed for :func:`_sr_axpy_kernel` on ``device``."""
-    idx = device.index if device.index is not None else torch.cuda.current_device()
-    base = torch.cuda.default_generators[idx].initial_seed()
-    entry = _sr_seed_state.get(idx)
-    if entry is None or entry[0] != base:
-        entry = [base, 0]
-        _sr_seed_state[idx] = entry
-    entry[1] += 1
-    # Odd Weyl increment (golden-ratio constant): consecutive calls land far apart in the
-    # Philox stream, so two buckets stepped back to back do not share lane noise.
-    return (base + entry[1] * 0x9E3779B1) & 0x7FFFFFFF
-
-
-def _reseed_sr_kernel() -> None:
-    """Restart the Triton SR seed stream. INTERNAL — reached through
-    ``kaon.reseed_stochastic_rounding()``, which is the single public reseed entry point."""
-    _sr_seed_state.clear()
-
-
-# Register with the torch SR module so ONE user-facing call resets both noise streams.
-# ``_backend`` imports this module lazily, so a Triton-less build never gets here — and never
-# has a kernel counter to reset either. The membership guard keeps a re-import of this module
-# object from stacking duplicates; an ``importlib.reload`` would still register the new
-# function (the stale one then clears an orphaned dict, which is harmless).
-from kaon._stochastic_rounding import _reseed_hooks as _sr_reseed_hooks  # noqa: E402
-
-if _reseed_sr_kernel not in _sr_reseed_hooks:
-    _sr_reseed_hooks.append(_reseed_sr_kernel)
+# It takes ``stream_id=0`` explicitly rather than an allocated id, for two reasons: it must
+# not consume the id the first optimizer needs (stream 0 on cuda:0 is the compatibility
+# anchor that reproduces 0.7.12's sequence), and the fallback itself should keep producing
+# exactly the sequence 0.7.12's global counter produced. Sharing the id with the first
+# optimizer is harmless: streams collide only if they are used at the same time, and a run
+# that threads streams never reaches here.
+#
+# ``kaon.reseed_stochastic_rounding()`` restarts it like every other stream (the module
+# epoch, checked on use) — when this counter was left out of that call, a bf16 run on a
+# Triton build silently stopped reproducing under ``torch.manual_seed(s)`` + that call.
+_PROCESS_SR_STREAM = SRStream(stream_id=0)
 
 
 def sr_add_supported(target, source) -> bool:
@@ -2101,15 +2075,25 @@ def sr_add_supported(target, source) -> bool:
 
 
 @torch.no_grad()
-def sr_add_(target, source, alpha: float = 1.0) -> None:
+def sr_add_(target, source, alpha: float = 1.0, sr: SRStream | None = None) -> None:
     """``target += alpha * source`` with bf16 stochastic rounding, in ONE Triton launch.
 
     The caller must have checked :func:`sr_add_supported`.
+
+    ``sr`` is the caller's noise stream; its next draw becomes the launch's seed. Passing
+    one costs the same three integer ops the process-wide fallback costs (no extra kernel,
+    no sync) and is what makes the draw checkpointable — see
+    :class:`kaon._stochastic_rounding.SRStream`.
     """
     n = target.numel()
+    stream = _PROCESS_SR_STREAM if sr is None else sr
+    # Drawn OUTSIDE the device guard, as the global counter was: for a device without an
+    # explicit index the draw reads the ambient current device, and moving it inside would
+    # silently change which device's global seed the stream binds to.
+    seed = stream.next_seed(target.device)
     with torch.cuda.device(target.device):   # a launch targets the CURRENT device
         _sr_axpy_kernel[((n + 1023) // 1024,)](
-            target, source, alpha, n, _sr_next_seed(target.device), BLOCK=1024,
+            target, source, alpha, n, seed, BLOCK=1024,
         )
 
 
