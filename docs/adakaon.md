@@ -256,6 +256,14 @@ the inner Adakaon's `_sr_meta`. Three more things to know:
   `bf16_method="kahan"` and the fused path never draw, so they neither take a noise-stream
   identity nor add a key — which is also what keeps a mixed fp32 + bf16 run's bf16 noise on
   the 0.7.12 sequence.
+- **`bf16_method="kahan"` under a wrapper shares ONE compensation buffer with the inner
+  optimizer.** Unlike the noise stream, which is per writer, the Kahan residue belongs to
+  the *weight*: `Lookahead`'s slow-weight sync and the inner Adakaon step both write the
+  same `p`, so the bits both of them drop accumulate in the single `state["shift"]` the
+  inner allocates (`_sr_wrap_meta_<wrapper>` has no counterpart here — there is nothing
+  extra to checkpoint, and no extra 2 B/param). A wrapper-owned second buffer would split
+  the residue and carry compensation for a `theta` the `theta <- phi` reset already
+  overwrote.
 
 ### `map_location`
 

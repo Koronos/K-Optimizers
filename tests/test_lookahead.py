@@ -277,3 +277,182 @@ def test_sync_foreach_chunks_under_budget(monkeypatch):
     assert sum(chunk_sizes) == 12
     assert max(chunk_sizes) == 2
     assert len(chunk_sizes) == 6
+
+
+# ------------------------------------------------------------------ kahan on bf16 params
+def _kahan_run(*, foreach, slow_dtype, bf16_method, steps=6, k=2, dtype=torch.bfloat16):
+    """Run Lookahead(bf16 params) for ``steps`` steps with several syncs.
+
+    Returns ``(opt, params, grads_fp32)``; the grads are drawn in the params' dtype and
+    handed back upcast, so an fp32 reference run can consume the SAME rounded gradients
+    and differ from this run only in the precision of the *weight* writes.
+    """
+    params = _make_params([(6, 5), (4,)], dtype=dtype, seed=11)
+    g = torch.Generator().manual_seed(12)
+    grads = [
+        [torch.randn(*p.shape, generator=g, dtype=torch.float32).to(dtype) for p in params]
+        for _ in range(steps)
+    ]
+    opt = Lookahead(
+        params, lr=1e-2, k=k, alpha=0.5, slow_dtype=slow_dtype,
+        bf16_method=bf16_method, foreach=foreach,
+    )
+    for gs in grads:
+        for p, gr in zip(params, gs, strict=True):
+            p.grad = gr.clone()
+        opt.step()
+    return opt, params, [[gr.float() for gr in gs] for gs in grads]
+
+
+def test_kahan_sync_bf16_params():
+    """kahan + bf16 params must survive the sync on every foreach/slow_dtype combination.
+
+    The sync's ``theta <- phi`` write goes through ``subtract_one_``, whose kahan branch
+    reads the compensation buffer ``shift``. The wrapper's own per-param state never holds
+    one (it allocates ``phi``/``backup`` only), so handing it over raised ``KeyError:
+    'shift'`` — on BOTH foreach settings, since ``_sync`` routes kahan to the per-param
+    path regardless.
+    """
+    for foreach in (False, True):
+        for slow_dtype in ("float32", "bfloat16"):
+            opt, params, _ = _kahan_run(
+                foreach=foreach, slow_dtype=slow_dtype, bf16_method="kahan"
+            )
+            for p in params:
+                assert torch.isfinite(p.detach()).all(), (foreach, slow_dtype)
+                phi = CodecBuffer.read(opt.state[p], "phi", slow_dtype, p)
+                assert torch.isfinite(phi).all(), (foreach, slow_dtype)
+
+
+def test_kahan_sync_uses_inner_shift_buffer():
+    """The sync must accumulate its residue in the INNER's ``shift``, not a wrapper copy.
+
+    Kahan compensation is a property of the WEIGHT, not of whoever writes it: the inner
+    step and the sync both write the same ``p``, so a second buffer owned by the wrapper
+    would split the residue and carry stale compensation across the ``theta <- phi`` reset.
+    """
+    opt, params, _ = _kahan_run(foreach=False, slow_dtype="float32", bf16_method="kahan", k=2)
+    for p in params:
+        assert "shift" not in opt.state[p], "wrapper must not allocate its own shift"
+        assert "shift" in opt.inner.state[p]
+
+    # A sync moves the inner's shift: the residue of ``theta <- phi`` lands there.
+    p = params[0]
+    before = opt.inner.state[p]["shift"].detach().clone()
+    for q in params:
+        q.grad = torch.randn_like(q)
+    opt.step()  # la_step 1 -> no sync yet
+    mid = opt.inner.state[p]["shift"].detach().clone()
+    for q in params:
+        q.grad = torch.randn_like(q)
+    opt.step()  # la_step 2 == k -> sync
+    after = opt.inner.state[p]["shift"].detach().clone()
+    assert not torch.equal(before, mid) or not torch.equal(mid, after)
+    assert torch.isfinite(after).all()
+
+def test_kahan_sync_beats_uncompensated():
+    """kahan must track an fp32 reference more closely than ``bf16_method="none"``.
+
+    Same initial weights and the same (bf16-rounded) gradients in all three runs, so the
+    only difference is how the bf16 weight writes — the inner step's AND the sync's —
+    handle the bits that fall off the end. The kept sequence is the slow ``phi``, so that
+    is the error that matters; the live ``theta`` is compared in L2 because its max-abs
+    error sits on the bf16 grid and ties at short horizons.
+    """
+    steps, k, lr, shapes, seed = 24, 2, 1e-2, [(6, 5), (4,)], 11
+    opt_k, p_k, grads = _kahan_run(
+        foreach=False, slow_dtype="float32", bf16_method="kahan", steps=steps, k=k
+    )
+    opt_n, p_n, _ = _kahan_run(
+        foreach=False, slow_dtype="float32", bf16_method="none", steps=steps, k=k
+    )
+
+    ref_params = [
+        torch.nn.Parameter(p.detach().float())
+        for p in _make_params(shapes, dtype=torch.bfloat16, seed=seed)
+    ]
+    ref = Lookahead(
+        ref_params, lr=lr, k=k, alpha=0.5, slow_dtype="float32",
+        bf16_method="none", foreach=False,
+    )
+    for gs in grads:
+        for p, gr in zip(ref_params, gs, strict=True):
+            p.grad = gr.clone()
+        ref.step()
+
+    def theta_err(params):
+        return max(
+            (p.detach().float() - r.detach()).norm().item()
+            for p, r in zip(params, ref_params, strict=True)
+        )
+
+    def phi_err(opt, params, norm):
+        return max(
+            norm(
+                CodecBuffer.read(opt.state[p], "phi", "float32", p)
+                - CodecBuffer.read(ref.state[r], "phi", "float32", r)
+            )
+            for p, r in zip(params, ref_params, strict=True)
+        )
+
+    amax = lambda t: t.abs().max().item()   # noqa: E731
+    l2 = lambda t: t.norm().item()          # noqa: E731
+
+    for label, ek, en in (
+        ("phi maxabs", phi_err(opt_k, p_k, amax), phi_err(opt_n, p_n, amax)),
+        ("phi l2", phi_err(opt_k, p_k, l2), phi_err(opt_n, p_n, l2)),
+        ("theta l2", theta_err(p_k), theta_err(p_n)),
+    ):
+        assert ek < en, f"{label}: kahan {ek:.3e} did not improve on none {en:.3e}"
+
+
+def test_kahan_resume_is_bit_exact():
+    """The shared ``shift`` travels in the INNER's state_dict, so a kahan resume is exact.
+
+    The wrapper owns no compensation buffer, so there is nothing extra to checkpoint: the
+    inner Adakaon's loader restores ``shift`` the way it restores every other state tensor.
+    A run split by a save/load must land on the same bits as the uninterrupted one, on
+    every ``slow_dtype``.
+    """
+    shapes, k, lr, steps = [(6, 5), (4,)], 3, 1e-2, 8
+
+    def fresh():
+        return _make_params(shapes, dtype=torch.bfloat16, seed=11)
+
+    g = torch.Generator().manual_seed(12)
+    grads = [
+        [torch.randn(*s, generator=g, dtype=torch.float32).to(torch.bfloat16) for s in shapes]
+        for _ in range(steps)
+    ]
+
+    def feed(opt, params, chunk):
+        for gs in chunk:
+            for p, gr in zip(params, gs, strict=True):
+                p.grad = gr.clone()
+            opt.step()
+
+    def make_build(slow_dtype):
+        def build(ps):
+            return Lookahead(
+                ps, lr=lr, k=k, alpha=0.5, slow_dtype=slow_dtype, bf16_method="kahan",
+            )
+        return build
+
+    for slow_dtype in ("float32", "bfloat16", "int8", "4bit"):
+        build = make_build(slow_dtype)
+
+        cont = fresh()
+        feed(build(cont), cont, grads)
+
+        split = fresh()
+        opt_a = build(split)
+        feed(opt_a, split, grads[: steps // 2])
+        sd = copy.deepcopy(opt_a.state_dict())
+        resumed = [torch.nn.Parameter(p.detach().clone()) for p in split]
+        opt_b = build(resumed)
+        opt_b.load_state_dict(sd)
+        feed(opt_b, resumed, grads[steps // 2 :])
+
+        for a, b in zip(cont, resumed, strict=True):
+            torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0,
+                                       msg=f"slow_dtype={slow_dtype}")

@@ -179,6 +179,11 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
         ``phi`` is updated in fp32 through the codec (dequant -> lerp -> requant); the live
         ``theta`` is then written to the new ``phi`` via the bf16-correct subtract
         (``theta -= theta - phi_new``), so on bf16 params the reset is SR/kahan-correct.
+
+        ``bf16_method="kahan"`` keeps the whole sync on the per-parameter path: the kahan
+        write needs the param's compensation buffer, which only ``subtract_one_`` handles
+        (``subtract_batched_`` has no kahan branch at all and would silently downgrade the
+        reset to a plain narrowing cast).
         """
         alpha = group["alpha"]
         md = group["slow_dtype"]
@@ -202,7 +207,15 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
         phi.lerp_(theta, alpha)                     # phi += alpha*(theta - phi)
         CodecBuffer.write(st, "phi", md, phi)
         delta = theta.sub_(phi)                     # theta - phi_new
-        subtract_one_(p, delta, st, bf16_method, sr=self.sr_stream)  # theta <- phi
+        # theta <- phi, through the INNER's per-param state. The only thing the writer
+        # reads from it is the kahan compensation buffer ``shift``, and that buffer belongs
+        # to the WEIGHT, not to whoever writes it: the inner step and this sync both write
+        # the same ``p``, so the dropped bits of both have to accumulate in ONE buffer.
+        # A ``shift`` of the wrapper's own would split the residue in half and, worse,
+        # carry compensation for a theta the ``theta <- phi`` reset has already overwritten
+        # into the next inner step. The wrapper's state has no ``shift`` at all (it
+        # allocates ``phi``/``backup``), which is why passing it raised ``KeyError``.
+        subtract_one_(p, delta, self.inner.state[p], bf16_method, sr=self.sr_stream)
 
     @torch.no_grad()
     def _sync_foreach(

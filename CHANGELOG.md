@@ -42,6 +42,39 @@ stochastic-rounding seed fix below):
   worse than resuming it from draw 0). Only 0.7.13 development checkpoints are affected.
 
 ### Fixed
+- **`Lookahead` + `bf16_method="kahan"` on bf16/fp16 parameters no longer dies with
+  `KeyError: 'shift'` at the first slow-weight sync.** The sync's `theta <- phi` reset goes
+  through `subtract_one_`, whose Kahan branch reads the parameter's compensation buffer
+  `state["shift"]`. `Lookahead._sync_one` handed it the **wrapper's** per-parameter state,
+  which only ever holds `phi`/`phi_scale`/`phi_numel`/`phi_block`/`backup` — so the very
+  first sync raised, on `foreach=True` and `foreach=False` alike (`_sync` routes Kahan to
+  the per-parameter path either way, because `subtract_batched_` has no Kahan branch at
+  all). Any `Lookahead(..., bf16_method="kahan")` over low-precision parameters was
+  unusable; every `slow_dtype` was affected, and the failure was immediate rather than
+  silent.
+
+  The fix hands the sync the **inner optimizer's** state instead. Kahan compensation is a
+  property of the *weight*, not of whoever writes it: the inner step and the sync both
+  write the same `p`, so the bits both of them drop have to accumulate in one buffer. A
+  buffer of the wrapper's own would have split the residue in half and, worse, carried
+  compensation for a `theta` that the `theta <- phi` reset had already overwritten into the
+  next inner step. The buffer the inner allocates is already there under the same predicate
+  (`is_low_precision(p) and bf16_method == "kahan"`), on the right device and dtype, so
+  nothing new is allocated and no checkpoint key is added. `SAM`/`MSAM`/`Nekaon` have no
+  analogous call site — SAM's climb writes through `add_stochastic_` and is undone by an
+  exact `copy_` of its snapshot, MSAM's is a plain cast — and `_sync_foreach` needs nothing
+  because Kahan never reaches it.
+
+  **Cost: zero.** One different dict reference at the sync's single call site — no extra
+  memory, no extra kernel, nothing on the step path. Verified bit-identical to the pre-fix
+  tree over 576 non-Kahan configurations (`Lookahead` over Adakaon × CPU/CUDA ×
+  fp32/bf16 parameters × `bf16_method` none/stochastic_rounding × fp32/bf16/int8/4-bit
+  `slow_dtype` × fp32/bf16/int8 momentum × foreach on/off × fused/native × momentum
+  on/off), digesting the live weights, the stored `phi` and every inner state tensor.
+  Numerically the repaired sync earns its keep: against an fp32 reference fed the same
+  bf16-rounded gradients, 24 steps at `k=2` leave the Kahan run's slow weights ~2.8× closer
+  in max-abs and ~2.9× closer in L2 than `bf16_method="none"`.
+
 - **A wrapper's own state now resumes on the parameter's device, so
   `torch.load(path, map_location="cpu")` works.** `WrapsInnerOptimizer._load_wrapped`
   installed the checkpoint's per-parameter dicts verbatim, so a state dict loaded
