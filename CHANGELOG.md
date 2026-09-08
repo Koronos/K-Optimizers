@@ -42,6 +42,43 @@ stochastic-rounding seed fix below):
   worse than resuming it from draw 0). Only 0.7.13 development checkpoints are affected.
 
 ### Fixed
+- **A wrapper's own state now resumes on the parameter's device, so
+  `torch.load(path, map_location="cpu")` works.** `WrapsInnerOptimizer._load_wrapped`
+  installed the checkpoint's per-parameter dicts verbatim, so a state dict loaded
+  anywhere other than the parameters' device left the *wrapper's* buffers there. With
+  the near-universal consumer idiom — `torch.load(ckpt, map_location="cpu")` into a CUDA
+  model — `Lookahead`'s slow weights `phi` (and its int8/4-bit scales) stayed on the CPU
+  and the next slow-weight sync died with `RuntimeError: Expected all tensors to be on
+  the same device, cuda:0 and cpu`. The inner optimizer was never affected:
+  `torch.optim.Optimizer.load_state_dict` (reached through
+  `load_state_dict_preserving_dtypes`) already puts inner state on the param's device,
+  which is why only the wrapper half broke.
+
+  The fix applies exactly that policy to the wrapper's own state, in the one place every
+  wrapper loads through: **device follows the parameter, storage dtype is preserved
+  bit-for-bit** — `phi` is never widened from bf16 to fp32 or narrowed back, and the
+  int8/4-bit code payloads and their fp32 scales keep their dtypes. Both directions are
+  covered (a CUDA checkpoint restored under CPU parameters too), and an explicit
+  `map_location=torch.device("cuda:0")` keeps working.
+
+  Affected in practice: **`Lookahead`** (persistent `phi`/`phi_scale`, plus the `backup`
+  a checkpoint taken in eval mode carries) and **`SAM`** (a checkpoint taken between
+  `first_step` and `second_step` carries `old_p`; SAM's restore is a cross-device `copy_`,
+  so it did not raise — it just silently synchronized). **`MSAM`/`Nekaon`** keep no
+  persistent per-parameter state of their own (the perturbation is recomputed from the
+  inner momentum, which torch migrates), so they were correct already and are now covered
+  by the same contract. `Schedule-Free` is not a wrapper of this kind and goes through
+  `load_state_dict_preserving_dtypes` directly.
+
+  **Cost: zero per step, and zero on a same-device load.** The migration lives only on
+  the checkpoint path, and a tensor already on the parameter's device is installed as
+  itself — no `.to()`, no allocation, no copy. Verified bit-identical to the pre-fix tree
+  across 168 configurations (`Lookahead`/`SAM`/`MSAM`/`Nekaon` over Adakaon x CPU/CUDA x
+  fp32/bf16 parameters x fp32/bf16/int8/4-bit momentum x fused/native, `Lookahead` also x
+  fp32/bf16/int8/4-bit `slow_dtype`), 3264 state and parameter buffers digested; and a
+  `map_location="cpu"` resume is bit-identical to the uninterrupted run over
+  `slow_dtype` x `momentum_dtype` (16 arms).
+
 - **Fused path: a `p.data` rebind that changes the SHAPE can no longer step a plan that
   disagrees with the optimizer state.** Every fused pointer cache
   (`PointerArrayCache`, `BigPointerCache`, `AdaPnmCache`, `OneDimPointerCache`,
