@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.7.13]
 
 ### Fixed
 - **`Lookahead` + `bf16_method="kahan"` on bf16/fp16 parameters no longer dies with
