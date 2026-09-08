@@ -105,6 +105,38 @@ is train.** Call ``.train()`` before each training step's forward/backward and
 
 (Calling :meth:`train` / :meth:`eval` is idempotent — a no-op if already in that
 mode — so it is safe to bracket liberally.)
+
+Reproducibility (read this before comparing two runs)
+-----------------------------------------------------
+**With the default ``momentum_dtype="bfloat16"`` a ScheduleFree run is stochastic even
+when the model is fp32.** ``z`` is stored in bf16 and its write-back therefore has to be
+stochastically rounded — a round-to-nearest write would freeze the sequence outright
+(:meth:`ScheduleFree._store_z`) — so this is the one optimizer in kaon that draws SR noise
+without a single low-precision *weight* in the model. Every other kaon optimizer reaches
+the SR write only through a bf16/fp16 parameter, which is why an fp32 run of any of them
+has a noise floor of exactly zero and this one does not.
+
+Two consequences, both of them expected behaviour rather than bugs:
+
+* **Re-running inside one process needs kaon's own reseed.** ``torch.manual_seed(s)``
+  alone is not enough, because re-seeding the global RNG to the *same* value is not
+  observable through it and because an SR stream's identity is handed out in order of
+  first draw (see :class:`kaon._stochastic_rounding.SRStream`): the second run claims a
+  different stream and rounds ``z`` differently, so the weights part ways at the
+  **second** step by about one bf16 grid step of ``z``. Call
+  ``kaon.reseed_stochastic_rounding()`` after ``torch.manual_seed`` in a sweep, a test or
+  any two-run comparison — then ScheduleFree is bit-identical against itself on every
+  device, on both the foreach and per-parameter paths, and for every parameter / momentum
+  dtype (``tests/test_schedulefree_determinism.py``).
+* **A fully deterministic trajectory means a ``z`` that is not bf16.**
+  ``momentum_dtype="float32"`` (the exact choice, 4 B/param for ``z``), ``"int8"`` or
+  ``"4bit"`` all write ``z`` round-to-nearest, draw no noise at all, claim no stream, and
+  reproduce under a bare ``torch.manual_seed``. The quantized two trade that determinism
+  against ``z``'s own stall risk at small ``lr*d`` (see ``momentum_dtype`` below), so
+  ``"float32"`` is the one to pick when reproducibility is the requirement.
+
+The noise is unbiased either way, and the stream position is checkpointed, so a *resume*
+is bit-exact regardless (``tests/test_sr_seed_checkpoint.py``).
 """
 
 from __future__ import annotations
@@ -200,6 +232,13 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
             ``"int8"`` / ``"4bit"`` still requant ``z`` with round-to-nearest and are
             therefore still exposed to the stall at small ``lr*d``; pick them only
             when the memory saving outweighs that.
+            **It is also the reproducibility knob.** Because a bf16 ``z`` rounds
+            stochastically on every step, the default makes the run stochastic *even for
+            an fp32 model* — the only optimizer in kaon that does — so two runs in one
+            process need ``kaon.reseed_stochastic_rounding()`` between them to land on
+            the same bits, and a trajectory that is deterministic under a bare
+            ``torch.manual_seed`` needs a non-bf16 ``z`` (``"float32"`` for the exact
+            one). See "Reproducibility" in the module docstring.
         momentum_4bit_block: block size for ``momentum_dtype="4bit"`` (default
             ``128``).
         bf16_method: low-precision **weight**-write strategy for the ``y`` write-back
