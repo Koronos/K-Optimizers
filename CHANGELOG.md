@@ -118,6 +118,34 @@ All notable changes to this project will be documented in this file.
   differ from the resuming instance's constructor arguments; a resume from a complete
   checkpoint is bit-identical to an uninterrupted run.
 
+- **Lion silently dropped the update of a non-contiguous 2-D weight.** Its pre-plan
+  bucket flattened the write-back target with `p.data.reshape(length)`; for a
+  non-contiguous tensor `reshape` returns a **copy**, so `_foreach_sub_` wrote the copy
+  and the weight never moved — while its momentum kept advancing, so nothing looked
+  wrong from the state. Only `ndim > 2` was guarded by a contiguity check, so this
+  landed on any weight someone rebound to a transposed view (`p.data = p.data.t()` on a
+  square matrix — an in-place transpose keeps `id`, `data_ptr` **and** `shape`). The
+  shared plan keeps the identity view for a 2-D bucket and `param_witness` rebuilds the
+  plan when contiguity moves, which fixes it. This is the only behaviour difference in
+  the Lion migration below.
+- **A bucket mixing conv kernels with the same matrixized shape raised.** A factored
+  bucket is keyed on the *effective* 2-D shape, so `(16,8,3,3)` and `(16,24,3,1)` (both
+  `(16,72)`) share it — but `ForeachChunk.grad_stack`'s fast path stacked the **raw**
+  gradients (one `view` of the stack instead of N per-param views), and `torch.stack`
+  refuses to mix sizes. Every shared-plan optimizer — Adakaon, AdaMuon, AdaBelief,
+  AdamP, ADOPT, ScheduleFree — raised `RuntimeError: stack expects each tensor to be
+  equal size` on such a group. The fast path now requires a common raw shape and falls
+  back to the per-param views otherwise.
+- `KProdigy(second_moment="factored", factor_conv_as_matrix=False)` raised
+  `ValueError: too many values to unpack` on any `ndim > 2` weight — in **both** passes,
+  so that configuration (with `foreach=True`, the default) could not take a single step.
+  It keeps an N-D Adafactor pair (`row` is `[O, I, kh]` for a 4-D kernel), and both the
+  pass-2 bucket and the pass-1 second-moment EMA unpacked `R, C = eff` on a rank-4
+  tuple. Pass 2 now routes those weights to the per-parameter path, which has always
+  handled them; pass 1's reductions already worked on the last two axes for any rank, so
+  it only had to stop unpacking. Bit-identical for `factor_conv_as_matrix=True`
+  (`reshape(eff)` is `reshape(R, C)` there).
+
 ### Changed
 - **The three pointer-witness "scan stays in C" locks no longer measure wall time.**
   `test_param_witness_scans_in_c` (both witness copies) and
@@ -130,6 +158,43 @@ All notable changes to this project will be documented in this file.
   fused case is now also exercised with `ft.SHAPE_WITNESS` **on**, which pins the
   fourth (`strides`) field's scan as well. The timed checks survive as opt-in smoke tests
   (`KAON_PERF_TESTS=1`), out of the default suite.
+
+- **Lion and KProdigy moved onto the shared foreach plan** (`kaon._foreach_plan`),
+  which now covers every batched optimizer in kaon. Both reconstructed their buckets and
+  every derived view list from scratch on each step and passed `views=None` to the
+  momentum codec; they now consume `ForeachChunk` (`pviews`, `state_views`,
+  `param_stack()`, `grad_stack()`) and
+  `codec.*_stacked(..., views=chunk.momentum_views(codec))`. Lion additionally loses its
+  private `_dequant_stacked` / `_store_stacked` / `_dequant_one` / `_store_one` and its
+  hand-rolled `m` / `m_scale` / `m_numel` / `m_block` allocation — the codec owns that
+  layout and there is now one copy of it.
+- `ForeachSpec` gains four additive, default-off bucketing flags — `matrixize`,
+  `raw_shape_key`, `scalar_bucket`, `insertion_order` — for the same reason `key_major`
+  exists: the *partition* and the *order* of the buckets decide the order the
+  stochastic-rounding draws are consumed in, so they are wire-visible in bf16 weights,
+  and an optimizer that bucketed differently before the migration has to keep doing so.
+  Lion pins the last three (one dict keyed by exact shape, first-appearance order);
+  KProdigy declares two specs and picks between them per group via the new
+  `_foreach_spec(group)` hook, because its bucketing depends on `second_moment`.
+  `ForeachChunk` now accepts an `eff` of arbitrary rank when `matrixize` is off (which
+  is how `second_moment="full"` keeps a conv — and a channels_last conv — in the
+  weight's own layout), and `_build_foreach_plan` builds one insertion-ordered dict of
+  which the default family order is a **stable** sort, so the six already-migrated
+  optimizers do not move a bit.
+- **Bit-identical to `bugfix/follow-ups-0-7-13` @ f88face** apart from the two Lion/
+  KProdigy bugs above: 512 configurations × 2 devices (CPU and CUDA, 5 steps each, every
+  weight and every state buffer compared exactly, plus KProdigy's `d` / `d_max` /
+  `d_numerator` / `k` / `d_hat` step by step) — fp32/bf16 params × momentum
+  `float32`/`bfloat16`/`int8`/`4bit` × `bf16_method` `none`/`stochastic_rounding` ×
+  mixed (0-D/(1,)/1-D/2-D/two same-`eff` convs/square) / 448 × 0-D / 428-tensor LoRA /
+  conv bags, KProdigy over both `second_moment` modes and a `beta1`/`slice_p`/`decouple`/
+  `use_bias_correction`/`d_update_freq`/`cautious` sweep, plus intermittent `p.grad=None`,
+  a `p.data` rebind to fresh storage, an in-place transpose of a square weight,
+  `load_state_dict` into the SAME optimizer with plans already cached,
+  `add_param_group`, a whole-group per-parameter fallback, a stack-budget re-chunk, and
+  MSAM / SAM wrapping both. 504/512 identical on each device; the 8 that differ are all
+  the `transpose` scenario, i.e. the Lion fix. The harness's own floor was established
+  by running the reference tree against itself twice: 512/512.
 - **Adakaon's foreach bucketing/view plan is now the shared one** (`kaon._foreach_plan`).
   `ForeachPlanMixin` plus a three-line `ForeachSpec` (`factored_state=("row", "col")`,
   `flat_state=("v",)`) replace
@@ -170,6 +235,70 @@ All notable changes to this project will be documented in this file.
   bucket bodies now pass `views=chunk.momentum_views(codec)` to `ema_stacked`. Measured
   per step (RTX 3000 Ada Laptop, bf16 params + SR, `torch.profiler`, medians of 3
   interleaved repeats):
+
+- **Lion's batched step stops rebuilding its bucketing and every view list on each step.**
+  Per step (RTX 3000 Ada Laptop, bf16 params + `stochastic_rounding`, `torch.profiler`),
+  base → now:
+
+  | bag | codec | `aten::view` | `aten::reshape` | `aten::copy_` |
+  |---|---|---|---|---|
+  | 448 × 0-D | int8 | 3147 → **9** | 2693 → **2** | 453 → **5** |
+  | 448 × 0-D | bf16 | 1799 → **6** | 1347 → **1** | 4 → 4 |
+  | 448 × 0-D | 4-bit | 1364 → **18** | 1355 → **9** | 454 → **6** |
+  | 428-tensor LoRA | int8 | 3031 → **29** | 2583 → **6** | 446 → **18** |
+  | 428-tensor LoRA | bf16 | 1737 → **20** | 1293 → **3** | 12 → 12 |
+  | 300 convs + 128 × 0-D | int8 | 3031 → **31** | 2583 → **6** | 443 → **15** |
+  | 24 × (256,256) | int8 | 180 → **10** | 149 → **2** | 29 → **5** |
+
+  `aten::select` (the `stack`/`unbind` residue) does not move and the CUDA launch count
+  moves by `+0 … +3` — the one `_foreach_copy_` that replaces N per-parameter `m_scale`
+  writes. One counter goes the *other* way and is worth stating plainly: on the quantized
+  codecs `aten::as_strided` **rises** by about one per parameter (448 × 0-D int8
+  1345 → **1793**, 4-bit 1351 → **1799**; 428-tensor LoRA int8 1571 → **1715**), the
+  price of routing the momentum through the codec's cached scale views. It buys
+  `view`+`reshape` **5840 → 11** on that same bag, so the net dispatch count is down by
+  ~5.4 k ops per step; on the float codecs `as_strided` does not move at all.
+
+  Unprofiled host wall time per step: **−29 … −78 %** (median of 80). That figure is
+  supporting evidence only: the same harness with the reference tree as *both* arms
+  reported −23 … +22 % on this shared GPU, so the clock resolves ~±25 % here and the
+  counters are what rules out a regression. `max_memory_allocated` **never rises** and in
+  several configurations falls — measured over 48 (Lion + KProdigy × 4 bags × 4 momentum
+  dtypes): 0 higher, 14 lower, 34 identical, the largest being −11 % on Lion's
+  24 × (256,256) bag and −4 % on the 428-tensor LoRA one. Resident state is byte-for-byte
+  identical either way; what moves is the transient peak, and only downward.
+- **KProdigy's share is much smaller** and only its *pass 2* is on the plan; pass 1 (the
+  global D reduction and the two `d`-scaled EMAs) keeps its own bucketing, which spans
+  param groups and covers parameters pass 2 sends to the per-parameter loop. Pass 1 is
+  where most of the view traffic lives, so: 448 × 0-D int8 `aten::view` 3148 → **2706** /
+  `reshape` 2245 → **1797**; 300 convs + 128 × 0-D factored int8 3936 → **2614** /
+  1551 → **1123**, bf16 2384 → **1489**; 428-tensor LoRA int8 2474 → **2052** /
+  1299 → **871**. On bags whose buckets are already in their effective layout (all-2-D
+  LoRA, float codecs) it is **+4 … +5** views per step — one `aten::view` per bucket, the
+  single reshape of the gradient *stack* that replaces N per-param gradient views. That
+  cost is per bucket, not per parameter, so it does not scale; pass 1 is the largest
+  remaining opportunity there and is untouched. See `docs/foreach-batching.md`
+  ("Lion and KProdigy's migration").
+- No measurable change on any path, which is the intended result: the migration moves
+  host-side bookkeeping between modules and changes no kernel and no dispatch. Verified
+  contention-immune first — the CUDA launch count and the
+  `aten::view`/`reshape`/`select`/`as_strided`/`unbind`/`flatten` count for one step are
+  **identical** between 0.7.12 and this branch on every bag and both kernel modes (e.g.
+  428 LoRA-shaped adapters 194 launches / 4328 view-ops, 448 0-D scalars 77 / 3150,
+  300 matrixized convs + 128 scalars 167 / 3935, 128×(512,512)+64×(1024,) 486 / 1790).
+- The host-side call the two implementations actually disagree about — one cached-plan
+  retrieval — costs **+0.15 … +0.8%** of a 57–96 µs call (paired, order-alternating,
+  n=1500 pairs on CPU), i.e. **≤ 0.6 µs per step** on a 4.5–35 ms step. The same harness
+  run against the reference tree twice (a null A/B) reports −0.5 … +0.4%, its own bias
+  floor.
+- Paired GPU wall clock (both trees in one process over *shared* parameter bags, 5
+  interleaved repeats × 100 pairs per bag per mode, RTX 3000 Ada Laptop, bf16 params /
+  bf16 momentum): every bag and both kernel modes inside ±1.8%, none significant except a
+  1.0% *win* on 128×(512,512)+64×(1024,) foreach. Caveat, and the reason the control
+  matters: the same harness with the reference tree as BOTH arms reported a "significant"
+  +3.1% on one bag, so on a shared laptop GPU this design resolves ~3% and not 2% — the
+  identical counters above, not the clock, are what rules out a regression.
+  See `docs/foreach-batching.md` ("Adakaon's migration onto the shared module").
 
   | bag (foreach) | codec | `aten::view` | `aten::copy_` |
   |---|---|---|---|

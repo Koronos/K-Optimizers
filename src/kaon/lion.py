@@ -65,7 +65,6 @@ it drops into per-parameter / gradient-release training loops unchanged.
 
 from __future__ import annotations
 
-import math
 import warnings
 from collections.abc import Iterable
 from typing import Any, Literal
@@ -85,12 +84,11 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
 )
+from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
-    _dequant_4bit,
-    _dequant_4bit_stacked,
     _make_codec,
-    fourbit_block_size,
+    _MomentumCodec,
     load_state_dict_preserving_dtypes,
     warn_if_4bit_high_beta1,
 )
@@ -106,7 +104,7 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 _STACK_BYTES_PER_ELEM = 48
 
 
-class Lion(AutoLRMixin, Optimizer):
+class Lion(AutoLRMixin, ForeachPlanMixin, Optimizer):
     """Lion sign-momentum optimizer on Adakaon's quantized-momentum backend.
 
     Args:
@@ -229,91 +227,21 @@ class Lion(AutoLRMixin, Optimizer):
     def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
         """Allocate the single momentum buffer in the configured storage layout.
 
-        Layout matches :mod:`kaon._momentum_codec` exactly (per-row int8 scale,
-        per-block 4-bit scale, zero == nibble 8) so checkpoint resume and
-        ``load_state_dict_preserving_dtypes`` behave identically to Adakaon.
+        The layout IS :mod:`kaon._momentum_codec`'s (per-row int8 scale, per-block 4-bit
+        scale, zero == nibble 8), so the codec allocates it — there is one owner of that
+        layout and Lion is not it. Checkpoint resume and
+        ``load_state_dict_preserving_dtypes`` therefore behave identically to Adakaon.
         """
-        grad = p.grad
-        md = group["momentum_dtype"]
-        if md in ("bfloat16", "float32"):
-            dtype = torch.bfloat16 if md == "bfloat16" else torch.float32
-            state["m"] = torch.zeros_like(grad, dtype=dtype)
-        elif md == "int8":
-            state["m"] = torch.zeros_like(grad, dtype=torch.int8)
-            state["m_scale"] = torch.ones(
-                (grad.shape[0],) + (1,) * (grad.ndim - 1) if grad.ndim >= 2 else (),
-                dtype=torch.float32, device=grad.device,
-            )
-        else:  # 4bit
-            numel = grad.numel()
-            bs = fourbit_block_size(grad, group)
-            nblocks = (numel + bs - 1) // bs
-            # zero momentum -> nibble 8 (zero level after the +8 shift); 0x88 byte.
-            state["m"] = torch.full(
-                ((numel + 1) // 2,), 0x88, dtype=torch.uint8, device=grad.device
-            )
-            state["m_scale"] = torch.ones(nblocks, dtype=torch.float32, device=grad.device)
-            state["m_numel"] = numel
-            state["m_block"] = bs
+        self._codec(group["momentum_dtype"]).init_state(state, p.grad, group)
         if is_low_precision(p) and group["bf16_method"] == "kahan":
             state["shift"] = torch.zeros_like(p)
 
     # -------------------------------------------------------- momentum (codec)
-    def _codec(self, md: str):
+    def _codec(self, md: str) -> _MomentumCodec:
         codec = self._codecs.get(md)
         if codec is None:
             codec = self._codecs[md] = _make_codec(md)
         return codec
-
-    @staticmethod
-    def _dequant_one(state: dict[str, Any], md: str, like: Tensor) -> Tensor:
-        """Read the stored momentum back as a fresh fp32 tensor shaped like ``like``."""
-        if md in ("bfloat16", "float32"):
-            return state["m"].float()
-        if md == "int8":
-            return state["m"].float().mul_(state["m_scale"])
-        m = _dequant_4bit(state["m"], state["m_scale"], state["m_numel"], state["m_block"])
-        return m.view_as(like)
-
-    def _store_one(self, state: dict[str, Any], md: str, m_fp32: Tensor) -> None:
-        """Write an updated fp32 momentum back into the configured storage layout.
-
-        Delegates to the shared codec so codes/scales are written **in place**
-        (MSAM caches ``data_ptr`` of ``m`` / ``m_scale``).
-        """
-        self._codec(md).store_one(state, m_fp32)
-
-    @staticmethod
-    def _dequant_stacked(states: list[dict[str, Any]], md: str, shape: tuple[int, ...]) -> Tensor:
-        """Stacked fp32 momentum ``[N, *shape]`` from the per-param storage.
-
-        Reductions are arranged to be element-for-element identical to the
-        per-param path: int8 collapses to a per-row (dim-0 of the param) scale
-        — a stacked ``[N, R, rest]`` view reduces its trailing axis, which is the
-        same value set the per-param ``_quant_int8`` reduces over dims ``>= 1``.
-        4-bit uses the flat per-param block layout (block boundaries match).
-        """
-        n = len(states)
-        per = math.prod(shape)
-        if md in ("bfloat16", "float32"):
-            return torch.stack([s["m"] for s in states]).float()
-        if md == "int8":
-            # Per-param int8 uses a per-row (dim-0) scale for ndim >= 2 and a
-            # single scalar scale for ndim == 1 (see _quant_int8). Mirror both:
-            # ndim >= 2 -> [N, R, rest] (R rows), ndim == 1 -> [N, 1, L] (1 row).
-            row = shape[0] if len(shape) >= 2 else 1
-            rest = max(per // row, 1)
-            m = torch.stack([s["m"].reshape(row, rest) for s in states]).float()  # [N, R, rest]
-            scale = torch.stack([s["m_scale"].reshape(row, 1) for s in states])    # [N, R, 1]
-            return m.mul_(scale).reshape((n, *shape))
-        packed = torch.stack([s["m"] for s in states])
-        sc = torch.stack([s["m_scale"] for s in states])
-        bs = states[0]["m_block"]
-        return _dequant_4bit_stacked(packed, sc, per, bs).reshape((n, *shape))
-
-    def _store_stacked(self, states: list[dict[str, Any]], md: str, m_fp32: Tensor) -> None:
-        """Write stacked fp32 momentum ``[N, *shape]`` back into per-param storage."""
-        self._codec(md).store_stacked(states, m_fp32)
 
     # -------------------------------------------------------------------- step
     # step() is the AutoLRMixin router (drives Mechanic when auto_lr is on, else
@@ -343,9 +271,13 @@ class Lion(AutoLRMixin, Optimizer):
                     for p in slow:
                         self._step_one_param(p, group)
                 else:
+                    # The whole group steps per-parameter: drop any cached plan for it, so
+                    # a cached plan only ever describes a group the foreach path stepped.
+                    self._drop_foreach_plan(group)
                     for p in params:
                         self._step_one_param(p, group)
             else:
+                self._drop_foreach_plan(group)
                 for p in params:
                     self._step_one_param(p, group)
         return loss
@@ -370,8 +302,42 @@ class Lion(AutoLRMixin, Optimizer):
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)
+        # The loader REPLACES every state tensor the cached views alias (and every group
+        # dict, which the plan is keyed on), so the plan cannot survive it.
+        self._clear_foreach_plans()
+
+    def _autolr_reset_base_state(self) -> None:
+        """Reset the base optimizer after an AutoLR rollback: the cleared state is
+        reallocated by the next step, so the cached view plan must go with it."""
+        super()._autolr_reset_base_state()
+        self._clear_foreach_plans()
 
     # ----------------------------------------------------------------- foreach
+
+    # Lion has NO state of its own to cache: its single buffer is the momentum, and the
+    # codec's own cached view lists (``ForeachChunk.momentum_views``) cover it — hence
+    # no ``factored_state`` and no ``flat_state`` at all.
+    #
+    # The four bucketing flags reproduce the bucketing Lion carried before it moved onto
+    # the shared plan — ONE dict keyed by ``(exact shape, dtype)``, stepped in
+    # first-appearance order — because that partition and that order are what the
+    # stochastic-rounding draws are consumed in, and therefore reach bf16 weights
+    # (``tests/test_foreach_plan.py::test_pinned_bf16_sr_vector_matches_the_pre_plan_tree``
+    # is the anchor). Concretely: ``raw_shape_key`` keeps two convs that matrixize to the
+    # same ``[R, C]`` apart, ``scalar_bucket`` keeps 0-D params out of the ``L == 1``
+    # bucket shared with shape-``(1,)`` params, and ``insertion_order`` emits the buckets
+    # in first-appearance order instead of all-factored-then-all-flat.
+    #
+    # Lion's update is fully per-coordinate, so it does not *need* any of those splits —
+    # merging would be a (small) win it forgoes to keep bf16+SR runs reproducible. What it
+    # does keep is ``matrixize``: a conv bucket works in ``[N, R, C]``, which is exactly
+    # the layout the int8 per-row scale is defined on (``R`` = dim 0 of the weight), so
+    # the quantized momentum matches the per-parameter path row for row.
+    _FOREACH_SPEC = ForeachSpec(
+        raw_shape_key=True,
+        scalar_bucket=True,
+        insertion_order=True,
+    )
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
@@ -393,54 +359,35 @@ class Lion(AutoLRMixin, Optimizer):
         ):
             return False
         if p.ndim > 2:
-            # Write-back flattens via reshape; a channels_last (or otherwise
-            # non-contiguous) conv would reshape to a COPY and the update would
-            # land on a temporary — silent no-op. Fall back to per-param.
+            # A matrixized conv bucket writes back through a ``view(R, C)``; a
+            # channels_last (or otherwise non-contiguous) conv has no such view.
+            # Fall back to per-param.
             return p.data.is_contiguous() and p.grad.is_contiguous()
         return True
 
     @torch.no_grad()
     def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
-        """Batched Lion step.
+        """Batched Lion step over the shared plan's cached chunks.
 
-        Lion's update is fully per-coordinate (no factoring), so params are
-        bucketed by exact shape (and dtype) and each bucket stacks to ``[N, L]``
-        (flattened) for the sign/EMA/cautious/WD math — element-for-element the
-        same as :meth:`_step_one_param`. The momentum helpers recover the param's
-        row structure internally so the int8 per-row scale matches the per-param
-        path exactly.
+        Lion's update is fully per-coordinate (no factoring), so a chunk's effective
+        layout is irrelevant to the sign/EMA/cautious/WD math — it is element-for-element
+        :meth:`_step_one_param`'s either way. What the layout DOES decide is the int8
+        per-row scale, which is why a conv bucket is worked in ``[N, R, C]`` (``R`` = dim
+        0 of the weight, the axis ``_quant_int8`` reduces around).
         """
         beta1, beta2 = group["betas"]
         lr = group["lr"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
-        md = group["momentum_dtype"]
-
-        buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        for p in params:
-            state = self.state[p]
-            if not state:
-                self._init_state(p, state, group)
-            buckets.setdefault((tuple(p.shape), p.dtype), []).append(p)
-
-        for (shape, _dtype), plist in buckets.items():
-            length = 1
-            for d in shape:
-                length *= d
-            chunk = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), chunk):
-                self._bucket(
-                    plist[i:i + chunk], shape, length, md,
-                    beta1, beta2, lr, wd, cautious, bf16_method,
-                )
+        codec = self._codec(group["momentum_dtype"])
+        for chunk in self._foreach_chunks(params, group, budget):
+            self._bucket(chunk, codec, beta1, beta2, lr, wd, cautious, bf16_method)
 
     @torch.no_grad()
     def _bucket(
         self,
-        plist: list[Tensor],
-        shape: tuple[int, ...],
-        length: int,
-        md: str,
+        chunk: ForeachChunk,
+        codec: _MomentumCodec,
         beta1: float,
         beta2: float,
         lr: float,
@@ -448,10 +395,14 @@ class Lion(AutoLRMixin, Optimizer):
         cautious: bool,
         bf16_method: str,
     ) -> None:
-        n = len(plist)
-        states = [self.state[p] for p in plist]
-        grad = torch.stack([p.grad.reshape(length) for p in plist]).float()  # [N, L]
-        m = self._dequant_stacked(states, md, shape).reshape(n, length)      # [N, L] fp32
+        # ``[N, R, C]`` for a matrix/conv bucket, ``[N, L]`` for the flat one (0-D params
+        # ride it as length-1 rows).
+        eff = chunk.eff if chunk.eff is not None else (chunk.length,)
+        states = chunk.states
+        views = chunk.momentum_views(codec)
+
+        grad = chunk.grad_stack()                                            # [N, *eff]
+        m = codec.dequant_stacked(states, chunk.view, eff, views=views)      # [N, *eff] fp32
 
         # Lion direction: sign of the beta1-interpolated momentum.
         c = m.mul(beta1).add_(grad, alpha=1.0 - beta1)
@@ -459,17 +410,16 @@ class Lion(AutoLRMixin, Optimizer):
 
         # Momentum EMA with beta2 (on the raw gradient), then requant + store.
         m.mul_(beta2).add_(grad, alpha=1.0 - beta2)
-        self._store_stacked(states, md, m.reshape((n, *shape)))
+        codec.store_stacked(states, m, views=views)
 
         if wd != 0:
-            p_fp32 = torch.stack([p.data.reshape(length) for p in plist]).float()
-            delta = delta.add_(p_fp32, alpha=wd)
+            delta = delta.add_(chunk.param_stack(), alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
         delta.mul_(lr)
-        subtract_batched_([p.data.reshape(length) for p in plist], delta, bf16_method)
+        subtract_batched_(chunk.pviews, delta, bf16_method)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
@@ -478,22 +428,23 @@ class Lion(AutoLRMixin, Optimizer):
         lr = group["lr"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
-        md = group["momentum_dtype"]
+        codec = self._codec(group["momentum_dtype"])
 
         state = self.state[p]
         if not state:
             self._init_state(p, state, group)
 
         grad = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
-        m = self._dequant_one(state, md, grad)                  # fp32, grad-shaped
+        m = codec.dequant_one(state, grad)                      # fp32, grad-shaped
 
         # Lion direction: sign(beta1 * m + (1 - beta1) * g).
         c = m.mul(beta1).add_(grad, alpha=1.0 - beta1)
         delta = torch.sign(c)
 
-        # Momentum EMA with beta2, then requant + store.
+        # Momentum EMA with beta2, then requant + store. The codec writes codes and
+        # scales IN PLACE (MSAM caches ``data_ptr`` of ``m`` / ``m_scale``).
         m.mul_(beta2).add_(grad, alpha=1.0 - beta2)
-        self._store_one(state, md, m)
+        codec.store_one(state, m)
 
         if wd != 0:
             p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()

@@ -604,3 +604,96 @@ def test_scalar_0d_checkpoint_roundtrip_across_paths():
                 opt.step()
         for a, b in zip(pa, pb, strict=True):
             torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+def test_nd_adafactor_conv_falls_back_to_the_per_param_path():
+    """``second_moment="factored"`` + ``factor_conv_as_matrix=False`` on an ``ndim > 2``
+    weight must step, and match the per-parameter path.
+
+    That configuration keeps an **N-D** Adafactor pair (``row`` is ``[O, I, kh]`` for a
+    4-D kernel, not ``[R]``), which the batched bucket cannot work in — it operates on
+    the matrixized ``[N, R, C]`` layout. Regression: the parameter was admitted to the
+    batched path anyway and the bucket unpacked ``R, C = eff`` on a rank-4 tuple,
+    raising ``ValueError: too many values to unpack``. It now takes the per-parameter
+    path, which has always handled it.
+    """
+    torch.manual_seed(0)
+    shape = (2, 2, 3, 3)
+    base = [torch.randn(shape) for _ in range(3)]
+    fast = [torch.nn.Parameter(t.clone()) for t in base]
+    ref = [torch.nn.Parameter(t.clone()) for t in base]
+    kw = dict(lr=1.0, d0=1e-2, second_moment="factored", factor_conv_as_matrix=False,
+              weight_decay=0.01, bf16_method="none")
+    opt = KProdigy(fast, foreach=True, **kw)
+    opt_ref = KProdigy(ref, foreach=False, **kw)
+    for step in range(1, 4):
+        g = torch.Generator().manual_seed(100 + step)
+        for p, r in zip(fast, ref, strict=True):
+            raw = torch.randn(shape, generator=g).mul_(0.1)
+            p.grad, r.grad = raw.clone(), raw.clone()
+        opt.step()
+        opt_ref.step()
+    assert opt._foreach_plans == {}, "the N-D Adafactor conv must not be batched"
+    # Pass 1 stays batched (it is a global reduction, not this bucketing), and its
+    # ``[B, ...]`` reduction tree is not the per-tensor one — the module's contract is
+    # agreement to 1e-6 relative, which is what is checked here.
+    assert math.isclose(opt.get_d(), opt_ref.get_d(), rel_tol=1e-6)
+    for p, r in zip(fast, ref, strict=True):
+        torch.testing.assert_close(p.detach(), r.detach(), rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("layout", ["channels_last", "permute"])
+def test_non_contiguous_conv_falls_back_under_factored(layout):
+    """A non-contiguous 4-D weight must not take the *factored* batched path.
+
+    ``second_moment="factored"`` + ``factor_conv_as_matrix=True`` matrixizes a conv, so
+    the bucket reads and writes through ``p.data.view(R, C)`` — which a channels_last or
+    permuted kernel does not have (``view`` raises ``view size is not compatible with
+    input tensor's size and stride``). The ``ndim > 2`` contiguity guard in
+    ``_param_foreach_eligible`` is what keeps them on the per-parameter path.
+
+    **Three params minimum**: ``_apply_updates`` only calls ``_update_foreach`` when the
+    eligible list has >= 2 entries, so a smaller bag would pass with the guard deleted.
+
+    ``second_moment="full"`` is deliberately NOT guarded — its bucket keeps the weight in
+    its own layout (``ForeachSpec(matrixize=False)``) and batches it fine; that is
+    covered by ``test_foreach_plan.py::test_non_contiguous_conv_still_batches_without_matrixize``.
+    """
+    torch.manual_seed(0)
+    if layout == "channels_last":
+        def make():
+            return torch.randn(4, 8, 3, 3).to(memory_format=torch.channels_last)
+    else:
+        def make():
+            return torch.randn(8, 4, 3, 3).permute(1, 0, 2, 3)
+
+    base = [make() for _ in range(3)]
+    for t in base:
+        assert not t.is_contiguous()
+    fast = [torch.nn.Parameter(t.clone()) for t in base]
+    ref = [torch.nn.Parameter(t.clone()) for t in base]
+    kw = dict(lr=1.0, d0=1e-2, second_moment="factored", factor_conv_as_matrix=True,
+              weight_decay=0.01, bf16_method="none")
+    opt = KProdigy(fast, foreach=True, **kw)
+    opt_ref = KProdigy(ref, foreach=False, **kw)
+    before = [p.detach().clone() for p in fast]
+    for step in range(1, 4):
+        g = torch.Generator().manual_seed(200 + step)
+        for p, r in zip(fast, ref, strict=True):
+            gr = torch.randn(p.shape, generator=g).mul_(0.1)
+            gr = (gr.to(memory_format=torch.channels_last) if layout == "channels_last"
+                  else gr.permute(1, 0, 2, 3).contiguous().permute(1, 0, 2, 3))
+            assert not gr.is_contiguous()
+            p.grad, r.grad = gr.clone(), gr.clone()
+        opt.step()
+        opt_ref.step()
+    # The guard sent every param to the per-parameter loop, so no plan was ever built.
+    assert opt._foreach_plans == {}, "a non-contiguous factored conv must not be batched"
+    for p, b in zip(fast, before, strict=True):
+        assert float((p.detach() - b).abs().max()) > 0, "the weight was left unchanged"
+    # Pass 1 stays batched here (a global reduction, not this bucketing) and its
+    # [B, ...] reduction tree is not the per-tensor one; the module's contract is
+    # agreement to 1e-6 relative.
+    assert math.isclose(opt.get_d(), opt_ref.get_d(), rel_tol=1e-6)
+    for p, r in zip(fast, ref, strict=True):
+        torch.testing.assert_close(p.detach(), r.detach(), rtol=1e-5, atol=1e-7)

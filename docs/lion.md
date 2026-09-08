@@ -60,7 +60,11 @@ Lion's strongest axis versus Adakaon (factored second moment) and AdamW (8 B).
 - **Foreach batching** (`foreach`, `foreach_batch_cutoff`, `foreach_stack_budget`): stacked
   multi-tensor ops bucketed by shape — **bit-exact vs the per-parameter path** (verified). This
   is the decisive win for **LoRA/LoKr** (hundreds of tiny adapter tensors → one stacked op
-  instead of a kernel launch per tensor).
+  instead of a kernel launch per tensor). The bucketing and every view the bucket writes
+  through come from the shared, cached plan (`kaon._foreach_plan`); Lion keeps its own
+  *partition* (one bucket per exact shape, in first-appearance order) because that is what
+  its bf16 + stochastic-rounding draw order is pinned to. See
+  [foreach-batching.md](foreach-batching.md).
 - **dtype-safe checkpointing** (`load_state_dict_preserving_dtypes`) — quantized momentum is not
   upcast to fp32 on resume.
 

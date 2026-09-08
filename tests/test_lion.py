@@ -551,28 +551,101 @@ def test_int8_stacked_store_keeps_per_param_scale_layout():
         assert all(torch.isfinite(p).all() for p in batched), shape
 
 
-def test_foreach_channels_last_conv_updates_like_per_param():
-    """channels_last 4-D weights must not take the foreach path (reshape would copy).
+@pytest.mark.parametrize("layout", ["channels_last", "permute"])
+def test_foreach_non_contiguous_conv_updates_like_per_param(layout):
+    """A non-contiguous 4-D weight must not take the foreach path.
 
-    Regression: ``subtract_batched_`` wrote into a reshape-copy of a non-contiguous
-    conv, so ``Lion(foreach=True)`` left the live weight untouched (max|dw|=0).
+    A matrixized conv bucket reads and writes through ``p.data.view(R, C)``, and a
+    channels_last (or permuted) kernel has no such view — ``view`` raises
+    ``view size is not compatible with input tensor's size and stride``. The
+    ``ndim > 2`` contiguity guard in ``_param_foreach_eligible`` is what keeps those
+    weights on the per-parameter path.
+
+    **The bag must hold at least three params.** ``_step_impl`` only enters
+    ``_step_foreach`` when the *eligible* list has >= 2 entries, so a one- or
+    two-parameter bag would pass with the guard deleted: the whole group would fall to
+    the per-parameter loop for a completely different reason and the guard would never
+    be exercised. With three, deleting the guard makes this raise.
+
+    (The historical regression this file also pins: ``subtract_batched_`` used to write
+    into a reshape-*copy* of a non-contiguous conv, so ``Lion(foreach=True)`` left the
+    live weight untouched — max|dw| = 0.)
     """
     torch.manual_seed(0)
-    shape = (4, 8, 3, 3)
-    base = torch.randn(shape).to(memory_format=torch.channels_last)
-    assert not base.is_contiguous()
-    pa = torch.nn.Parameter(base.clone())
-    pb = torch.nn.Parameter(base.clone())
-    assert not pa.is_contiguous() and not pb.is_contiguous()
-    oa = Lion([pa], foreach=True, lr=1e-2, momentum_dtype="float32", bf16_method="none")
-    ob = Lion([pb], foreach=False, lr=1e-2, momentum_dtype="float32", bf16_method="none")
-    before = pa.detach().clone()
+    n = 3
+    if layout == "channels_last":
+        def make():
+            return torch.randn(4, 8, 3, 3).to(memory_format=torch.channels_last)
+    else:
+        def make():
+            return torch.randn(8, 4, 3, 3).permute(1, 0, 2, 3)
+
+    base = [make() for _ in range(n)]
+    for t in base:
+        assert not t.is_contiguous()
+    batched = [torch.nn.Parameter(t.clone()) for t in base]
+    per_param = [torch.nn.Parameter(t.clone()) for t in base]
+    kw = dict(lr=1e-2, momentum_dtype="float32", bf16_method="none")
+    oa = Lion(batched, foreach=True, **kw)
+    ob = Lion(per_param, foreach=False, **kw)
+    before = [p.detach().clone() for p in batched]
     for seed in range(3):
         g = torch.Generator().manual_seed(seed)
-        gr = torch.randn(shape, generator=g).to(memory_format=torch.channels_last)
-        pa.grad = gr.clone()
-        pb.grad = gr.clone()
+        for pa, pb in zip(batched, per_param, strict=True):
+            gr = torch.randn(pa.shape, generator=g)
+            gr = (gr.to(memory_format=torch.channels_last) if layout == "channels_last"
+                  else gr.permute(1, 0, 2, 3).contiguous().permute(1, 0, 2, 3))
+            assert not gr.is_contiguous()
+            pa.grad, pb.grad = gr.clone(), gr.clone()
         oa.step()
         ob.step()
-    assert float((pa.detach() - before).abs().max()) > 0, "foreach left channels_last weight unchanged"
-    torch.testing.assert_close(pa.detach(), pb.detach(), rtol=0, atol=0)
+    # The guard sent every param to the per-parameter loop, so no plan was ever built.
+    assert oa._foreach_plans == {}, "a non-contiguous conv must not be batched"
+    for pa, b in zip(batched, before, strict=True):
+        assert float((pa.detach() - b).abs().max()) > 0, "the weight was left unchanged"
+    for pa, pb in zip(batched, per_param, strict=True):
+        torch.testing.assert_close(pa.detach(), pb.detach(), rtol=0, atol=0)
+
+
+def test_transposed_2d_weight_actually_gets_its_update():
+    """A non-contiguous ``ndim == 2`` weight must be updated by the batched path.
+
+    Regression: the pre-plan bucket flattened its write-back target with
+    ``p.data.reshape(length)``. For a transposed (or otherwise non-contiguous) 2-D
+    weight ``reshape`` hands back a **copy**, so ``_foreach_sub_`` wrote the copy and the
+    weight silently never moved — while its momentum kept advancing, because the momentum
+    path never went through that reshape. Only ``ndim > 2`` was guarded by the
+    contiguity check, so this landed on any square weight someone transposed in place.
+    The shared plan's ``chunk.pviews`` keep the identity view for a 2-D bucket (and
+    ``param_witness`` rebuilds the plan when contiguity moves), which fixes it.
+    """
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(7)
+    params = [torch.nn.Parameter(torch.randn(4, 4, generator=g)) for _ in range(3)]
+    ref = [torch.nn.Parameter(p.detach().clone()) for p in params]
+    kw = dict(lr=0.1, momentum_dtype="float32", bf16_method="none",
+              gradient_centralization=False)
+    opt = Lion(params, foreach=True, **kw)
+    opt_ref = Lion(ref, foreach=False, **kw)
+
+    def grads(step):
+        gg = torch.Generator().manual_seed(100 + step)
+        for p, r in zip(params, ref, strict=True):
+            raw = torch.randn(4, 4, generator=gg) * 0.1
+            p.grad, r.grad = raw.clone(), raw.clone()
+
+    grads(1)
+    opt.step()
+    opt_ref.step()
+    params[0].data = params[0].data.t()
+    ref[0].data = ref[0].data.t()
+    before = params[0].detach().clone()
+    for step in (2, 3):
+        grads(step)
+        opt.step()
+        opt_ref.step()
+    assert float((params[0].detach() - before).abs().max()) > 0, (
+        "the batched path left the transposed weight unchanged"
+    )
+    for p, r in zip(params, ref, strict=True):
+        torch.testing.assert_close(p.detach(), r.detach(), rtol=0, atol=0)

@@ -30,6 +30,7 @@ caches in one call.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Hashable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -109,6 +110,33 @@ class ForeachSpec:
     ``single_alias`` reproduces AdaMuon's ``_stack_fp32``: a one-element bucket is
     ``unsqueeze``d instead of stacked, aliasing the param's storage rather than copying it.
 
+    The last four flags exist for the same reason as ``key_major``: an optimizer that
+    bucketed differently *before* it moved onto this module has to keep doing so, because
+    the partition and the order of the buckets decide how the stochastic-rounding draws
+    are consumed and therefore reach bf16 weights (see the ``key_major`` note above).
+    They are declarative on purpose — the bucketing an optimizer is pinned to should be
+    readable from its class, not reverse-engineered from an override.
+
+    ``matrixize`` (default on) reshapes an ``ndim > 2`` weight to its 2-D effective shape
+    ``[R, C]``. Turn it OFF for an optimizer whose ``ndim >= 2`` state is per-coordinate in
+    the param's own layout rather than factored: the bucket's ``eff`` is then the raw
+    shape (any rank), :attr:`ForeachChunk.view` is the identity, and nothing needs the
+    weight to be contiguous. KProdigy's ``second_moment="full"`` is that case.
+
+    ``raw_shape_key`` adds ``tuple(g.shape)`` to the factored-family bucket key, so two
+    conv kernels that matrixize to the *same* ``[R, C]`` (e.g. ``(16,8,3,3)`` and
+    ``(16,24,3,1)``) stay in separate buckets. Only Lion needs it: its update is fully
+    per-coordinate, so it bucketed by exact shape and never merged them.
+
+    ``scalar_bucket`` keeps 0-D params out of the ``L == 1`` bucket they would otherwise
+    share with real shape-``(1,)`` params (both are one element). Lion and KProdigy
+    bucketed by exact shape and so kept them apart; the merge is a (small) win they do
+    not get, in exchange for their bf16+SR weights not moving.
+
+    ``insertion_order`` emits the buckets in first-appearance order across both families
+    instead of all-factored-then-all-flat. Lion and KProdigy's full-second-moment path
+    each kept ONE bucket dict keyed by shape, so that is the order they stepped in.
+
     HISTORY — a ``momentum_cache(group)`` flag used to ask a chunk to prebuild the
     identity-keyed ``{state["m"]: view(state["m"])}`` lookup the momentum codec called
     per param per step. It is gone: every optimizer on this plan now hands the codec
@@ -117,7 +145,8 @@ class ForeachSpec:
     torch) was a strictly worse cache of the very same views.
     """
 
-    __slots__ = ("extra_key", "factored_state", "flat_state", "key_major",
+    __slots__ = ("extra_key", "factored_state", "flat_state", "insertion_order",
+                 "key_major", "matrixize", "raw_shape_key", "scalar_bucket",
                  "single_alias")
 
     def __init__(
@@ -128,12 +157,20 @@ class ForeachSpec:
         extra_key: Callable[[dict[str, Any], dict[str, Any]], Hashable] | None = None,
         key_major: bool = False,
         single_alias: bool = False,
+        matrixize: bool = True,
+        raw_shape_key: bool = False,
+        scalar_bucket: bool = False,
+        insertion_order: bool = False,
     ) -> None:
         self.factored_state = factored_state
         self.flat_state = flat_state
         self.extra_key = extra_key
         self.key_major = key_major
         self.single_alias = single_alias
+        self.matrixize = matrixize
+        self.raw_shape_key = raw_shape_key
+        self.scalar_bucket = scalar_bucket
+        self.insertion_order = insertion_order
 
 
 class ForeachChunk:
@@ -188,12 +225,21 @@ class ForeachChunk:
         self.grad_uniform = cached
         self.grad_reshape: tuple[int, ...] | None = None
         if eff is not None:                                   # factored bucket
-            R, C = eff  # noqa: N806 — matrix dims (the stacked tensor is [N, R, C])
-            self.view = (lambda t: t.view(R, C)) if matrixize else _identity
+            if matrixize:                                     # conv [N,O,I,kh,kw] -> [N,R,C]
+                R, C = eff  # noqa: N806 — matrix dims (the stacked tensor is [N, R, C])
+                self.view = lambda t: t.view(R, C)
+                self.grad_reshape = (n, R, C)
+                # A matrixized bucket is keyed on the EFFECTIVE shape, so it can hold
+                # kernels whose raw shapes differ — (16,8,3,3) and (16,24,3,1) both
+                # matrixize to (16,72). Those cannot be raw-stacked (``torch.stack``
+                # wants one size), so such a bucket keeps the per-param view path.
+                self.grad_uniform = cached and len({p.shape for p in plist}) == 1
+            else:
+                # ``eff`` is already the tensor's own layout — 2-D for a matrix bucket,
+                # and any rank at all under ``ForeachSpec(matrixize=False)``.
+                self.view = _identity
             keys = spec.factored_state
             self.state_views = tuple([s[k] for s in states] for k in keys)
-            if matrixize:                                     # conv [N,O,I,kh,kw] -> [N,R,C]
-                self.grad_reshape = (n, R, C)
         else:                                                 # non-factored bucket
             ndims = {p.ndim for p in plist}
             self.view = _identity if ndims == {1} else flat_view
@@ -359,6 +405,18 @@ class ForeachPlanMixin:
     _FOREACH_SPEC: ForeachSpec = ForeachSpec()
     _foreach_cache_enabled: bool = True
 
+    def _foreach_spec(self, group: dict[str, Any]) -> ForeachSpec:
+        """The spec that governs ``group``'s bucketing. Normally the class attribute.
+
+        Overridable because one optimizer's bucketing is a per-GROUP property: KProdigy's
+        ``second_moment`` decides whether an ``ndim >= 2`` weight carries a factored
+        ``row``/``col`` pair or a full per-coordinate ``v``, and those need different
+        state keys and a different effective layout. ``second_moment`` is fixed for the
+        life of a group (the state was allocated from it), so a cached plan can never
+        outlive the spec that built it.
+        """
+        return self._FOREACH_SPEC
+
     @property
     def _foreach_plans(self) -> dict[int, ForeachPlan]:
         """group id -> :class:`ForeachPlan`. Lazy: ``Optimizer.__init__`` routes the
@@ -405,7 +463,7 @@ class ForeachPlanMixin:
         invalidate it is event-driven: :meth:`_clear_foreach_plans` and
         :meth:`_drop_foreach_plan`.
         """
-        spec = self._FOREACH_SPEC
+        spec = self._foreach_spec(group)
         cached = self._foreach_cache_enabled
         witness = param_witness(params)
         plan = self._foreach_plans.get(id(group)) if cached else None
@@ -431,14 +489,19 @@ class ForeachPlanMixin:
     ) -> tuple[ForeachPlan, list[Hashable]]:
         """Bucket ``params`` so each bucket stacks into one tensor, and init their state.
 
-        * ``ndim >= 2`` -> factored bucket, keyed by effective 2-D shape ``[N, R, C]``.
+        * ``ndim >= 2`` -> factored bucket, keyed by effective 2-D shape ``[N, R, C]``
+          (or by the raw shape, any rank, under ``ForeachSpec(matrixize=False)``).
         * ``ndim <= 1`` (biases/norms, 0-D scalars) -> non-factored bucket, keyed by
           element count ``[N, L]`` (a 0-D scalar is a length-1 row, sharing the ``L == 1``
-          bucket with shape-``(1,)`` params).
+          bucket with shape-``(1,)`` params unless the spec sets ``scalar_bucket``).
 
         DEVICE is part of every bucket key: a bucket is stacked with ``torch.stack``,
         which refuses to mix devices, so a group holding a CPU and a CUDA weight of the
         same shape used to crash the whole step rather than step each on its own device.
+
+        Buckets come out of ONE insertion-ordered dict, so ``insertion_order`` is the
+        natural order and the default (all factored buckets, then all flat, each in
+        first-appearance order) is a *stable* sort of it by family.
         """
         state_map = self.state
         init_state = self._init_state
@@ -446,8 +509,9 @@ class ForeachPlanMixin:
         seen: dict[Hashable, int] = {}
         values: list[Hashable] = []
         signature: list[int] = []
-        factored: dict[tuple[Any, ...], tuple[list, list]] = {}
-        flat: dict[tuple[Any, ...], tuple[list, list]] = {}
+        # key -> (size, plist, states, eff, matrixize, length, ki) — the tuple
+        # ``ForeachPlan.rechunk`` consumes, with the two lists filled in place.
+        found: dict[tuple[Any, ...], tuple] = {}
         for p in params:
             state = state_map[p]
             if not state:
@@ -463,17 +527,29 @@ class ForeachPlanMixin:
                 signature.append(ki)
             g = p.grad
             if g.ndim >= 2:
-                matrixize = g.ndim > 2  # conv kernels always reshape to 2-D before factoring
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                bucket = factored.setdefault((eff, p.dtype, p.device, matrixize, ki), ([], []))
+                # conv kernels reshape to 2-D before factoring; ``matrixize=False``
+                # specs keep every rank in the tensor's own layout instead.
+                matrixize = spec.matrixize and g.ndim > 2
+                eff = ((g.shape[0], g.numel() // g.shape[0]) if matrixize
+                       else tuple(g.shape))
+                key: tuple[Any, ...] = (0, eff, p.dtype, p.device, matrixize, ki,
+                                        tuple(g.shape) if spec.raw_shape_key else None)
+                entry = found.get(key)
+                if entry is None:
+                    entry = found[key] = (max(math.prod(eff), 1), [], [], eff,
+                                          matrixize, 0, ki)
             else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                bucket = flat.setdefault((g.numel(), p.dtype, p.device, ki), ([], []))
-            bucket[0].append(p)
-            bucket[1].append(state)
-        buckets = [(max(eff[0] * eff[1], 1), pl, st, eff, matrixize, 0, ki)
-                   for (eff, _dt, _dev, matrixize, ki), (pl, st) in factored.items()]
-        buckets += [(max(length, 1), pl, st, None, False, length, ki)
-                    for (length, _dt, _dev, ki), (pl, st) in flat.items()]
+                length = g.numel()
+                key = (1, length, p.dtype, p.device, ki,
+                       spec.scalar_bucket and g.ndim == 0)
+                entry = found.get(key)
+                if entry is None:
+                    entry = found[key] = (max(length, 1), [], [], None, False, length, ki)
+            entry[1].append(p)
+            entry[2].append(state)
+        buckets = list(found.values())
+        if not spec.insertion_order:
+            buckets.sort(key=lambda b: b[3] is None)  # factored family first (stable)
         if spec.key_major:
             # Stable sort: key 0's factored buckets, then its flat ones, then key 1's, ...
             buckets.sort(key=lambda b: b[6])
