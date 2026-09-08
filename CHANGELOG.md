@@ -62,7 +62,13 @@ All notable changes to this project will be documented in this file.
   fused/native x foreach/per-param, over four bags (428 LoRA factors, 448 0-D scalars, a
   mixed bag with 3x3 and 1x1 convs plus 1-D/0-D, and a UNet/DiT-shaped bag of distinct
   big shapes plus a same-shape batched bucket), hashing final weights and every state
-  tensor after N steps. Zero differences.
+  tensor after N steps. **732 of 736 hash-identical, zero differences.** The remaining 4
+  are the UNet bag on AdaPNM's batched-big fused route with fp32 parameters (all four
+  momentum dtypes), which is not reproducible against *itself* on either tree — its
+  column/rms reductions accumulate with fp32 `tl.atomic_add`, so the summation order
+  varies per run. Compared by envelope instead, 4 interleaved runs of each tree: the
+  base-vs-branch spread is 2.384e-07, exactly equal to base-vs-base and
+  branch-vs-branch (1 ULP at that magnitude).
 - **Fused path: a `p.data` rebind that changes the SHAPE can no longer step a plan that
   disagrees with the optimizer state.** Every fused pointer cache
   (`PointerArrayCache`, `BigPointerCache`, `AdaPnmCache`, `OneDimPointerCache`,
@@ -369,18 +375,21 @@ All notable changes to this project will be documented in this file.
   is unchanged from 0.7.12 (both trees NaN identically) and is not addressed here: the
   `floor` fix above is unsound for these callers because they do not cap the
   reconstruction, so the right fix is either input validation or adding a cap.
-- **`ScheduleFree` is not reproducible against itself.** Two identical runs (same seed,
-  same grads, GC off, fp32 params and momentum) give different weights, on this branch
-  and on ea46330 alike, for fan-in >= 2 as well as fan-in 1 — measured diverging at the
-  second step on a `(6, 1)` and a `(6, 3)` bag. Unrelated to the GC fix (found while
-  building its control-paired tests, which is why
-  `test_fanin_1_matches_gc_off_native` measures against a same-config repeat instead of
-  demanding bit equality); not diagnosed or addressed here.
+- **`ScheduleFree` is not reproducible against itself at its DEFAULT `bfloat16`
+  momentum.** Two identical runs (same seed, same grads, GC off, fp32 params) give
+  different weights — measured diverging at the second step on a `(6, 1)` bag, 7.8e-3
+  apart, and the same on a `(6, 3)` bag, on this branch and on ea46330 alike. It is the
+  stochastically-rounded `z` write drawing from a global noise stream that is not reseeded
+  between runs; at `momentum_dtype` `float32`, `int8` or `4bit` the repeat noise floor is
+  exactly 0. Unrelated to the GC fix (found while building its tests); not diagnosed or
+  addressed here.
 - **`AdaMuon` leaves some `(1, 1)` parameters untouched**, with GC on and off
-  identically — its Newton-Schulz orthogonalization on a 1x1 matrix. Pre-existing and
-  independent of GC; pinned only in the sense that
-  `test_fanin_1_trains_with_gc_native` compares against the GC-off control rather than
-  asserting movement outright.
+  identically — its orthogonalized update on a 1x1 matrix has constant module (`0.2 * lr`)
+  and the cautious mask then cancels it exactly over the step sequence, so the weight
+  returns to its starting value rather than never moving. Not a defect, and independent of
+  GC; noted because `test_fanin_1_trains_with_gc_native` therefore compares which params
+  moved against the GC-off control instead of asserting movement outright (an
+  `init != final` check cannot tell a frozen param from an exactly-cancelling one).
 
 ## [0.7.12]
 

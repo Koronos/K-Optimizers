@@ -80,8 +80,10 @@ launch serves one bucket, so **whether GC applies must be decided on the host, p
 agree with what `centralize_grads_` does on the native route** — otherwise the same weight takes a
 different step depending on which route it landed on. The contract:
 
-1. **The predicate is `kaon._backend.gc_applies(shape)` — `ndim >= 2 and numel // shape[0] > 1` —
-   and nothing else.** GC is undefined for a fan-in of 1: the mean of a one-element row *is* the
+1. **The predicate is `kaon._backend.gc_applies(shape)` — `len(shape) >= 2 and
+   math.prod(shape[1:]) > 1` — and nothing else.** It is written as a product over the fan-in dims,
+   not as `numel // shape[0]`, so that an empty output dim (`shape[0] == 0`) answers instead of
+   raising `ZeroDivisionError`. GC is undefined for a fan-in of 1: the mean of a one-element row *is* the
    element, so `g - mean(g)` is identically zero, which froze `(out, 1)` / `(out, 1, 1, 1)` weights
    silently until 0.7.13. Every host site resolves the flag through that function; no site open-codes
    `C > 1`. `tests/test_gc_fanin_1.py::test_gc_applies_is_the_only_definition` walks the sources and

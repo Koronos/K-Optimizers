@@ -67,17 +67,45 @@ def test_gc_applies_is_true_for_real_fan_in(shape) -> None:
 
 
 def test_gc_applies_skips_empty_fan_in() -> None:
-    """A zero-width fan-in has no mean at all; centralizing it manufactured NaN."""
+    """A zero-width fan-in falls on the skip side of the same ``fan_in > 1`` comparison.
+
+    Nothing stronger is claimed, and nothing stronger is assertable: the pre-fix code was
+    already harmless on ``(5, 0)`` because the NaN mean it computed was subtracted into a
+    zero-element destination and wrote nothing. Any assertion about that grad's *values*
+    is vacuously true on an empty tensor, so what is pinned is the predicate plus the fact
+    that an empty weight still steps through ``centralize_grads_`` without raising.
+    """
     assert gc_applies((5, 0)) is False
+    assert gc_applies((0, 3)) is True         # fan-in 3; empty only in the output dim
     p = torch.nn.Parameter(torch.zeros(5, 0))
     p.grad = torch.zeros(5, 0)
     centralize_grads_([p])
-    assert not p.grad.isnan().any()
+    assert p.grad.numel() == 0
 
 
 def test_gc_applies_accepts_torch_size_and_tuple() -> None:
     assert gc_applies(torch.empty(4, 1).shape) is False
     assert gc_applies(torch.empty(4, 3).shape) is True
+
+
+def test_bucket_gc_ok_refuses_a_mixed_bucket() -> None:
+    """A bucket whose members disagree on the predicate has NO correct constexpr.
+
+    ``GC`` is one ``tl.constexpr`` per launch, so a mixed bucket would either freeze its
+    fan-in-1 members or strip GC from its healthy ones. No bucket key in use produces one
+    (the big routes key on exact shape; the one-block routes key on the padded tile, where
+    ``BC == 1`` iff ``C == 1``), so this can only be reached by a future change to a bucket
+    key — which is exactly why it must raise instead of silently picking a side. Called
+    directly, because no supported configuration can build such a bucket.
+    """
+    import kaon._fused_triton as ft
+
+    assert ft.bucket_gc_ok([torch.zeros(5, 2), torch.zeros(5, 3)]) is True
+    assert ft.bucket_gc_ok([torch.zeros(5, 1), torch.zeros(9, 1, 1, 1)]) is False
+    with pytest.raises(RuntimeError, match="Gradient Centralization"):
+        ft.bucket_gc_ok([torch.zeros(5, 1), torch.zeros(5, 2)])
+    with pytest.raises(RuntimeError, match="gc_applies"):
+        ft.bucket_gc_ok([torch.zeros(5, 2), torch.zeros(5, 1, 1, 1)])
 
 
 def _code_lines(fn) -> list[str]:
@@ -316,35 +344,31 @@ def _gc_on_off_run(name, *, gc, foreach, shape=(6, 1), steps=6):
     return [p.detach().clone() for p in params]
 
 
-def _worst(a, b) -> float:
-    return max(float((x - y).abs().max()) for x, y in zip(a, b, strict=True))
-
-
 @pytest.mark.parametrize("name", _GC_DEFAULT_ON)
 @pytest.mark.parametrize("foreach", [True, False])
 def test_fanin_1_matches_gc_off_native(name, foreach) -> None:
-    """GC-on and GC-off must now be the SAME run for a fan-in-1 param.
+    """GC-on and GC-off must be the SAME run, BIT FOR BIT, for a fan-in-1 param.
 
     Not merely "it moves": skipping GC has to be a true no-op there, i.e. the optimizer sees
     the raw gradient. This is the discriminating test against a fix that, say, centralized
     over dim 0 instead, or that scaled the gradient rather than leaving it alone.
 
-    Measured against a same-config REPEAT rather than demanding bit equality outright,
-    because one optimizer here is not reproducible against itself: ``ScheduleFree`` gives
-    different weights on two identical GC-off runs, on this branch and on ea46330 alike, and
-    for fan-in >= 2 as well as fan-in 1 (out of scope here, but it means an exact-equality
-    assertion would flake rather than catch anything). Every other optimizer's repeat noise
-    floor is exactly 0, so for them this IS bit equality.
+    ``_gc_on_off_run`` pins ``momentum_dtype="float32"``, which makes bit equality the right
+    assertion for all eight optimizers including ``ScheduleFree``: its run-to-run
+    irreproducibility (noted under Known in the CHANGELOG) comes from the *default*
+    ``bfloat16`` momentum, whose stochastically-rounded ``z`` writes draw from a global noise
+    stream that is not reseeded between runs — measured at fp32/int8/4bit momentum the repeat
+    noise floor is exactly 0, and only ``bfloat16`` moves (7.8e-3 on this bag). The repeat run
+    below asserts that floor in-test rather than trusting this paragraph.
     """
     kw = dict(foreach=foreach)
     on = _gc_on_off_run(name, gc=True, **kw)
     off = _gc_on_off_run(name, gc=False, **kw)
     off2 = _gc_on_off_run(name, gc=False, **kw)
-    noise = _worst(off, off2)
-    gap = _worst(on, off)
-    assert gap <= max(noise, 0.0), (
-        f"{name}: GC still perturbs fan-in 1 (gap {gap:.3e} > repeat noise {noise:.3e})"
-    )
+    for a, b in zip(off, off2, strict=True):
+        assert torch.equal(a, b), f"{name}: not reproducible at fp32 momentum — bad fixture"
+    for a, b in zip(on, off, strict=True):
+        assert torch.equal(a, b), f"{name}: GC still perturbs a fan-in-1 param"
 
 
 # ------------------------------------------------------- fused <-> native parity
@@ -472,6 +496,74 @@ def test_fused_fanin_1_matches_gc_off(name) -> None:
     on, oon = _run(cls, shapes, device="cuda", gradient_centralization=True, **kw, **extra)
     off, ooff = _run(cls, shapes, device="cuda", gradient_centralization=False, **kw, **extra)
     _assert_same(on, oon, off, ooff, atol=0, rtol=0, label=f"{name} fused gc-on vs gc-off")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_flipping_gc_midrun_rebuilds_only_the_buckets_it_moves() -> None:
+    """A scheduler flipping ``gradient_centralization`` mid-run must rebuild the caches
+    whose EFFECTIVE flag moved — and only those.
+
+    ``BigPointerCache`` aliases ``rowmean`` onto ``rowsum`` when GC is off, so its validity
+    includes the flag; the caller compares against ``group_flag and cache.gc_ok``. That
+    makes a fan-in-1 bucket's cache stable across the flip (its effective flag is already
+    ``False`` and cannot change), while a healthy bucket's must be rebuilt. Both halves are
+    asserted, because getting the second one wrong is a silent 1.1e-3 divergence and getting
+    the first one wrong would rebuild the pointer arrays of every degenerate bucket on every
+    flip. ``tests/test_fused_safety.py::test_big_bucket_memo_is_invalidated[gc_flipped]``
+    covers the healthy-only bag; this adds the mixed one.
+    """
+    shapes = [(512, 512), (512, 512), (9000, 1), (9000, 1)]
+    cfg = dict(lr=1e-3, weight_decay=0.011, momentum_dtype="float32", bf16_method="none")
+    gen = torch.Generator().manual_seed(211)
+    pv = [torch.nn.Parameter(torch.randn(s, generator=gen).cuda()) for s in shapes]
+    pn = [torch.nn.Parameter(p.detach().clone()) for p in pv]
+    ov = kaon.Adakaon(pv, fused=True, deterministic_reductions=True, **cfg)
+    on = kaon.Adakaon(pn, **cfg)
+
+    def drive(steps):
+        g = torch.Generator().manual_seed(223)
+        for _ in range(steps):
+            for a, b in zip(pv, pn, strict=True):
+                grad = (torch.randn(a.shape, generator=g) * 0.05).cuda()
+                a.grad, b.grad = grad, grad.clone()
+            ov.step()
+            on.step()
+
+    drive(2)
+    warm = dict(ov._fused_big_caches)
+    healthy = [k for k in warm if k[1] == (512, 512)]
+    degenerate = [k for k in warm if k[1] == (9000, 1)]
+    assert len(healthy) == 1 and len(degenerate) == 1, list(warm)
+    assert warm[healthy[0]].gc_ok is True
+    assert warm[degenerate[0]].gc_ok is False
+    assert warm[healthy[0]].gc is True and warm[degenerate[0]].gc is False
+
+    # STEADY STATE, GC still on: neither cache may be rebuilt. This is the cost half —
+    # comparing the cache's stored flag against the raw group flag instead of the effective
+    # one leaves the fan-in-1 bucket permanently mismatched (stored False, group True) and
+    # reallocates its pointer arrays and scratch on every single step.
+    drive(3)
+    before = dict(ov._fused_big_caches)
+    for key, label in ((healthy[0], "GC-applicable"), (degenerate[0], "fan-in-1")):
+        assert before[key] is warm[key], (
+            f"the {label} big bucket's cache is rebuilt every step with GC unchanged"
+        )
+
+    for g in ov.param_groups + on.param_groups:      # the mid-run flip
+        g["gradient_centralization"] = False
+    drive(3)
+
+    after = ov._fused_big_caches
+    assert after[healthy[0]] is not before[healthy[0]], (
+        "the GC-applicable bucket kept a cache whose rowmean alias is now wrong"
+    )
+    assert after[degenerate[0]] is before[degenerate[0]], (
+        "the fan-in-1 bucket was rebuilt although its effective GC flag never moved"
+    )
+    assert after[healthy[0]].gc is False
+    d = max(float((a.detach() - b.detach()).abs().max())
+            for a, b in zip(pv, pn, strict=True))
+    assert d < 1e-4, f"fused drifted from native across the flip: {d:.2e}"
 
 
 # ------------------------------------------------------ does GC still help fan-in >= 2?

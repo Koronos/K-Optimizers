@@ -249,8 +249,10 @@ def gc_applies(shape: torch.Size | tuple[int, ...]) -> bool:
       destroys the update signal and freezes the parameter. Shapes that hit it are
       ordinary — a rank-1 LoRA up-projection ``(out, 1)``, a one-input 1x1 conv
       ``(out, 1, 1, 1)``, some projections — so GC is skipped there (0.7.13; before that
-      those params silently never moved). ``fan_in == 0`` (an empty weight) falls out on
-      the same side, where GC used to manufacture NaN from ``mean()`` of nothing.
+      those params silently never moved). ``fan_in == 0`` (an empty weight) falls on the
+      skip side of the very same comparison, which is all that is claimed for it: the
+      pre-fix code was already harmless there, because the NaN mean it computed was
+      subtracted into a zero-element destination and wrote nothing.
 
     GC is implemented at nine host sites and sixteen Triton kernels, and a skip applied at
     fewer than all of them makes the fused and native routes disagree. So every one of them
