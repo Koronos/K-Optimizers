@@ -177,12 +177,14 @@ def test_late_grads_reuse_fused_caches_by_group_and_lag(monkeypatch):
     def count_init(cls, category):
         original = cls.__init__
 
-        def wrapped(cache, plist, state_for):
+        def wrapped(cache, plist, state_for, *args, **kwargs):
+            # ``*args``/``**kwargs``: the cache constructors also take the state-identity
+            # generation (``gen=``) — see ``_WitnessedCache``.
             group_step = fused.param_groups[0]["step"]
             lag = group_step - fused.state[plist[0]]["step"]
             counts = constructions[category]
             counts[lag] = counts.get(lag, 0) + 1
-            original(cache, plist, state_for)
+            original(cache, plist, state_for, *args, **kwargs)
 
         return wrapped
 

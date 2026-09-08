@@ -270,7 +270,10 @@ def check_state_geometry(plist, state_of, factored: bool) -> None:
             "shapes differ; neither is supported, because the second moment is allocated for the "
             "old geometry and an EMA cannot be migrated onto a different factorization. "
             "RECOVERY: reshape before constructing the optimizer, or drop that parameter's state "
-            "(``del opt.state[p]``) to restart its second moment from the new shape. NOTE this "
+            "(``del opt.state[p]``) to restart its second moment from the new shape -- that drop "
+            "is now OBSERVED (kaon._foreach_plan.WatchedState), so every pointer table and cached "
+            "view over it is rebuilt on the next step instead of being left addressing the buffers "
+            "you just dropped. NOTE this "
             "step may be PARTIALLY APPLIED: the fused subsets are dispatched in order "
             "(native, one-block, big, 1-D) and the ones before this one already launched, so do "
             "not retry the step -- fix the state and carry on from the next one."
@@ -2141,23 +2144,44 @@ class _WitnessedCache:
     buffers and read past them. The native plan guards itself with the same three base fields
     (``kaon._foreach_plan.param_witness``) and MSAM with ``_plan_addrs_valid``; the grad side is
     already covered per step by ``refresh_grads``.
+
+    ``gen`` IS THE SECOND HALF OF THE WITNESS, and it watches what no parameter field can:
+    the identity of the STATE. The tables above bake ``data_ptr``s of ``m``/``m_scale``/
+    ``row``/``col``/``v`` at build; the fields above observe the PARAMS. So a state buffer
+    retired while every param stood still left the tables addressing a dead tensor and the
+    step wrote it — measured on all four routes for ``del opt.state[p]`` (the recovery
+    :func:`check_state_geometry` documents), for ``opt.state[p].clear()`` (worse: the same
+    dict is refilled with fresh buffers, so both generations are live at once) and for
+    ``opt.state[p]["m"] = ...`` (an external EMA, a partial ``load_state_dict`` that bypasses
+    the optimizer's own loader, a requant that does not follow the in-place codec contract).
+    ``gen`` is ``kaon._foreach_plan.state_generation(opt.state)`` — a counter the state mapping
+    itself moves on every such rebinding (:class:`~kaon._foreach_plan.WatchedState`), so the
+    check costs ONE integer compare instead of a per-param sweep and never fires in steady
+    state. It is checked BEFORE the tuple compare in every method here, and it defaults to
+    ``_foreach_plan._NO_GENERATION`` (0) so a caller that does not watch its state — or a
+    test building a cache directly — behaves exactly as before.
     """
 
-    def _witness(self, plist) -> None:
+    #: Overwritten per instance by :meth:`_witness`; a class default keeps a cache built
+    #: through an older code path comparable.
+    gen: int = 0
+
+    def _witness(self, plist, gen: int = 0) -> None:
         """Record the witness for ``plist`` (call once, at cache build)."""
         self.witness = param_witness(plist)
         self.ids, self.ptrs = self.witness[0], self.witness[1]
         self.src = plist
+        self.gen = gen
 
-    def stale(self, plist) -> bool:
-        """True when the cached pointer arrays no longer describe ``plist``.
+    def stale(self, plist, gen: int = 0) -> bool:
+        """True when the cached pointer arrays no longer describe ``plist`` or its state.
 
         Called per step by callers that build ``plist`` fresh each time (the big-tensor shape
         buckets): see :func:`param_witness` for what it observes and what each field costs.
         """
-        return self.witness != param_witness(plist)
+        return self.gen != gen or self.witness != param_witness(plist)
 
-    def built_from(self, plist) -> bool:
+    def built_from(self, plist, gen: int = 0) -> bool:
         """O(1) alternative to :meth:`stale` for a caller that ALREADY revalidated the witness.
 
         ``Adakaon._fused_partition`` compares ids and ``data_ptr``s across the whole group
@@ -2167,10 +2191,15 @@ class _WitnessedCache:
         recomparing the tuples — and skips a second witness sweep per step (~131 µs on the
         428-param bag). Callers without that contract must use :meth:`stale` — or
         :meth:`revalidate`, which is that combination done without desynchronising.
-        """
-        return plist is self.src
 
-    def revalidate(self, plist) -> bool:
+        List identity says nothing about the STATE, so ``gen`` is checked here too — see the
+        class docstring. It is not redundant with the caller's own generation check even where
+        one exists (``Adakaon._fused_partition`` has it): that one makes the partition hand
+        back fresh lists, which is a route from the check to this cache, not the check itself.
+        """
+        return plist is self.src and self.gen == gen
+
+    def revalidate(self, plist, gen: int = 0) -> bool:
         """True when this cache still describes ``plist``, ADOPTING a fresh list object
         that describes the same parameters. False means the tables must be rebuilt.
 
@@ -2189,7 +2218,18 @@ class _WitnessedCache:
         next step hit the O(1) identity path again.
 
         One witness sweep at most, and only when identity misses.
+
+        ``gen`` IS LOAD-BEARING HERE AND NOWHERE MORE SO. This method deliberately ADOPTS a
+        fresh list whenever the param witness agrees — which is precisely what stopped a
+        caller's own state check from ever reaching AdaPNM's routes: the partition rebuilt,
+        handed the route a brand-new list, and ``revalidate`` said "same parameters, take it"
+        while the tables still addressed the retired ``m_pos``/``row`` (measured: 4/4 buffers
+        written on the one-block route, 3/3 on 1-D). Checking the generation FIRST is what
+        closes it, and it must stay first: adopting the list before refusing would mark the
+        stale tables as describing the current generation.
         """
+        if self.gen != gen:
+            return False
         if plist is self.src:
             return True
         witness = param_witness(plist)
@@ -2299,8 +2339,8 @@ class PointerArrayCache(_WitnessedCache):
     tensor is reallocated (identity check), so the steady-state per-step host cost is ~0.
     """
 
-    def __init__(self, plist, state_of, mom_dtype):
-        self._witness(plist)
+    def __init__(self, plist, state_of, mom_dtype, gen: int = 0):
+        self._witness(plist, gen)
         check_state_geometry(plist, state_of, factored=True)
         # The device is part of the bucket key (and every index array is built ON that device):
         # one launch owns one device, and a group holding params on two of them would otherwise
@@ -2433,8 +2473,8 @@ class BigPointerCache(_WitnessedCache):
     ``rms`` accumulator, which removes the ``grid=1`` ``_finish_rms`` launch as well.
     """
 
-    def __init__(self, plist, state_of, R, C, gc=True):  # noqa: N803
-        self._witness(plist)
+    def __init__(self, plist, state_of, R, C, gc=True, gen: int = 0):  # noqa: N803
+        self._witness(plist, gen)
         check_state_geometry(plist, state_of, factored=True)
         self.plist = plist
         self.N, self.R, self.C = len(plist), R, C  # noqa: N806
@@ -2506,8 +2546,8 @@ class AdaPnmCache(_WitnessedCache):
     Bucketed by padded tile, grad pointers refreshed on realloc — same plumbing as the single-momentum
     cache."""
 
-    def __init__(self, plist, state_of):
-        self._witness(plist)
+    def __init__(self, plist, state_of, gen: int = 0):
+        self._witness(plist, gen)
         check_state_geometry(plist, state_of, factored=True)
         groups: dict[tuple[int, int, torch.dtype, torch.device], list] = {}
         for p in plist:
@@ -2574,8 +2614,8 @@ class OneDimPointerCache(_WitnessedCache):
     ``v_addr`` as a harmless valid pointer. Same plumbing as :class:`PointerArrayCache` (grad
     pointers refreshed on realloc)."""
 
-    def __init__(self, plist, state_of):
-        self._witness(plist)
+    def __init__(self, plist, state_of, gen: int = 0):
+        self._witness(plist, gen)
         check_state_geometry(plist, state_of, factored=False)
         groups: dict[tuple[int, int, int, torch.dtype, torch.device], list] = {}
         for p in plist:
@@ -2616,8 +2656,8 @@ class OneDimPnmCache(_WitnessedCache):
     both physical buffers' address arrays + ``v``; the optimizer passes them (positive, negative) by
     step parity. fp32/bf16 only (quant 1-D and ams_bound route to native). Bucketed by ``next_pow2(L)``."""
 
-    def __init__(self, plist, state_of):
-        self._witness(plist)
+    def __init__(self, plist, state_of, gen: int = 0):
+        self._witness(plist, gen)
         check_state_geometry(plist, state_of, factored=False)
         groups: dict[tuple[int, torch.dtype, torch.device], list] = {}
         for p in plist:
@@ -2657,8 +2697,8 @@ class BigPnmCache(_WitnessedCache):
     building their own per-step arrays — only ``p``/``grad``/the scratch are reused there.
     """
 
-    def __init__(self, plist, state_of, R, C):  # noqa: N803
-        self._witness(plist)
+    def __init__(self, plist, state_of, R, C, gen: int = 0):  # noqa: N803
+        self._witness(plist, gen)
         check_state_geometry(plist, state_of, factored=True)
         self.plist = plist
         self.N, self.R, self.C = len(plist), R, C  # noqa: N806

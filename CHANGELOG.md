@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **No route can step a RETIRED state buffer any more.** Every cross-step cache in kaon
+  was validated against a *parameter* witness (ids, `data_ptr`s, contiguity) and nothing
+  observed `self.state`. The fused pointer tables bake the `data_ptr()` of
+  `m`/`m_scale`/`row`/`col`/`v` at build; the native foreach plan caches *views* of the
+  same buffers (`ForeachChunk.state_views`, plus the codec's `m`/`m_scale` lists). So a
+  state buffer swapped out while every parameter stood still left them addressing a dead
+  tensor and the next step **wrote** it. Confirmed on all four fused routes (one-block,
+  big, 1-D, 0-D) *and* on the native plan, for three ordinary operations:
+
+  - **`del opt.state[p]`** — the recovery `check_state_geometry` itself documents. It was
+    safe only *after* a refused rebind (the refusing cache had never finished building)
+    and silently unsafe from a steady state: on the big route the retired momentum was
+    written (`max|Δp|` vs the per-parameter reference 5.24e-4), and the fresh state never
+    went through `_init_state` at all.
+  - **`opt.state[p].clear()`** — same, and the same dict is then refilled with fresh
+    buffers by the next `_init_state`, so both generations are live at once.
+  - **`opt.state[p]["m"] = …` / `["row"] = …`** — an external EMA, a partial
+    `load_state_dict` that bypasses the optimizer's own loader, a checkpoint tool that
+    casts one buffer, a requant that does not follow the in-place codec contract.
+
+  `Adakaon.load_state_dict`, `AdaPNM.load_state_dict` and the AutoLR base-state reset were
+  always safe (they call `_invalidate_fused_caches` explicitly) and still are; the fix is
+  for the paths that never go through the optimizer. The per-parameter path never had the
+  blind spot — it re-reads `self.state[p]` every step — and is the reference the tests
+  compare against.
+
+  **The fix is a counter, not a witness field**, because no field is both cheap enough and
+  complete. `Adakaon.state` / `AdaPNM.state` are now a `kaon._foreach_plan.WatchedState`:
+  the mapping counts every rebinding of a key some cache bakes, and `_fused_partition`,
+  `_foreach_chunks`, `_WitnessedCache.{built_from,stale,revalidate}` and
+  `MSAM._momentum_params` all carry the count they were built at. Priced against the
+  three-field parameter witness on the 428-parameter LoRA bag
+  (`benchmarks/fused/bench_state_witness.py`, 25 pairs, 95% CI):
+
+  | candidate | added host / step | % of the fused step | `del` | `state[p]["m"] = …` | `state[p].clear()` |
+  |---|---|---|---|---|---|
+  | state `m` `data_ptr` field | +144 µs [+112,+176] | 9.2% | yes | yes | **no** |
+  | state dict `id` field | +95 µs [+73,+117] | 6.0% | yes | **no** | **no** |
+  | **generation counter (shipped)** | **0.13-0.80 µs** | **0.01-0.09%** | yes | yes | yes |
+
+  Read 1×/step on a native step and 2-6× on a fused one, at 133 ns/call. Populating a key
+  that was *absent* does not move it, so `_init_state` stays free and a parameter's first
+  step costs no rebuild on its second. `torch.profiler` counts are identical to the
+  pre-fix tree on every bag — no new CUDA kernel, launch, `aten::` call or
+  synchronisation — and the Python bytecode executed per step moves by +0.05…+0.68%
+  (Adakaon) and +0.34…+1.25% (AdaPNM).
+
+  **The one cost that is not free**, reported rather than hidden: with the watch installed
+  every `state[key] = value` goes through a Python-level `__setitem__`. Adakaon makes no
+  per-step state write and pays nothing. AdaPNM makes one per parameter
+  (`state["step"] += 1`), measured +107 µs [+93,+120] on the 428-parameter bag through the
+  hook, so that single write now goes through `dict.__setitem__` instead: +46 µs
+  [+36,+56], i.e. ~0.5-0.9% of that bag's AdaPNM fused step, of which the whole remainder
+  is the unbound-method call form and not the dict being a subclass. This is above the
+  0.5% budget for AdaPNM and is the price of covering the `state[p]["m"] = …` and
+  `state[p].clear()` rows above; `"step"` is not a baked key, and
+  `tests/test_state_identity_witness.py` pins the invariant that keeps the bypass legal.
+
+  Verified **bit-identical** to the pre-fix tree across 240 configurations (Adakaon /
+  AdaPNM / MSAM / Nekaon / Lookahead × fused/native × fp32/bf16 parameters ×
+  fp32/bf16/int8/4bit momentum × LoRA-428 / 448×0-D / mixed / UNet-chunked-big bags),
+  plus 40 more with `deterministic_reductions=True`. The only 56 configurations that
+  differ are exactly the 56 the pre-fix tree does not reproduce **against itself** (the
+  chunked-big route's fp32 atomics — the reason `deterministic_reductions` exists); with
+  that switch on they are bit-identical, and AdaPNM's big route, which has no such switch,
+  shows the same worst `|Δ|` as the pre-fix tree's own run-to-run spread (3.9e-3 bf16 /
+  2.4e-7 fp32, i.e. 1 ULP of the parameter dtype).
+
+  `MSAM._momentum_params` gained the same field: its `(id(state), len(state), group
+  sizes)` key saw `del opt.state[p]` but not `opt.state[p].clear()`, which left its cached
+  plan holding the emptied dicts and raised a bare `KeyError: 'm'` from inside the wrapper.
+  A rebound `st["m"]` was already caught by `_plan_addrs_valid`.
 - **Fused path: a `p.data` rebind that changes the SHAPE can no longer step a plan that
   disagrees with the optimizer state.** Every fused pointer cache
   (`PointerArrayCache`, `BigPointerCache`, `AdaPnmCache`, `OneDimPointerCache`,

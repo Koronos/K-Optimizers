@@ -287,7 +287,44 @@ buffer, so the plan is rebuilt or dropped on all of:
 | `p.data = p.data.t()` on a square weight (id, pointer and shape all unchanged) | `param_witness` — `is_contiguous` |
 | parameters fall out of lockstep (per-parameter clocks split into several buckets) | the plan's key *partition* signature |
 | the stack budget moves | `ForeachPlan.rechunk` |
+| **a state buffer is retired while every parameter stands still** — `del opt.state[p]`, `opt.state[p].clear()`, `opt.state[p]["m"] = ...`, `["row"] = ...` | `state_generation` — the state mapping's own counter (`WatchedState`) |
 | `load_state_dict` (it **replaces** the state tensors), `add_param_group`, an AutoLR base-state reset, a group falling back to the per-parameter loop | dropped explicitly |
+
+The state-identity row is 0.7.14 and it closes a hole no parameter field can see. Every
+row above it observes the *parameters*; the plan caches views of the *state*
+(`ForeachChunk.state_views` aliases `row`/`col`/`v`, and the codec's own lists alias
+`m`/`m_scale`). `del opt.state[p]` moves no parameter at all, so the plan was reused, the
+chunk kept stepping the retired buffers **and** the fresh state never went through
+`_init_state` — confirmed writing every retired buffer on the native plan and on all four
+fused routes, byte for byte identically with the caches on and off.
+
+It is a counter and not a witness field because a witness field cannot be made cheap
+enough *or* complete. `self.state` is a `WatchedState` whose per-param dicts count every
+rebinding of a key some cache bakes (`WATCHED_STATE_KEYS`), so a cache compares ONE
+integer and there is no per-step sweep at all. Priced against the three-field parameter
+witness on the reference bags
+(`benchmarks/fused/bench_state_witness.py --case field`, 25 pairs, 95% CI):
+
+| candidate | 428-param LoRA bag | sees `del` | sees `state[p]["m"] = ...` | sees `state[p].clear()` |
+|---|---|---|---|---|
+| (a) `+ tuple(map(Tensor.data_ptr, m buffers))` | +144 µs, 9.2% of the fused step | yes | yes | **no** (dict, params and pointers can all come back identical) |
+| (b) `+ tuple(map(id, state dicts))` | +95 µs, 6.0% | yes | **no** | **no** |
+| (c) `state_generation()` — **shipped** | 133 ns/call × 1-6 calls/step = 0.13-0.80 µs, **0.01-0.09%** | yes | yes | yes |
+
+The counter is read once per group per step in `_foreach_chunks` and once per group plus
+once per fused route/bucket in `Adakaon._fused_partition` and the pointer caches —
+1 call/step on a native step, 2-6 on a fused one (`--case calls`). It moves only when a
+baked key is *rebound*: populating a key that was absent does not count (nothing could
+have cached it), which is what keeps `_init_state` free and stops a parameter's first step
+from costing a rebuild on its second. Optimizers that do not install the watch read a
+constant, so nothing outside Adakaon/AdaPNM changes at all.
+
+The one place the guard is not free is the WRITE side: every `state[key] = value` now goes
+through a Python-level `__setitem__`. Adakaon makes no per-step state write, so it pays
+nothing. AdaPNM writes one per parameter (`state["step"] += 1`), which is why that write
+alone goes through `dict.__setitem__` — see `AdaPNM._prepare_param_steps` for the +107 µs
+vs +46 µs measurement, and `tests/test_state_identity_witness.py` for the invariant that
+keeps the bypass legal.
 
 The `load_state_dict` row is why a **wrapper** (`Lookahead`, `SAM`, `MSAM`, `Nekaon`)
 must restore its inner optimizer through the inner's *own* `load_state_dict` and never
@@ -337,7 +374,11 @@ build-time check closes that; what does in practice is the narrowing also moving
 storage, which is the ordinary case and is caught by default.
 
 The recovery is always the same: reshape *before* constructing the optimizer, or
-`del opt.state[p]` to restart that parameter's second moment at its new shape. Note the
+`del opt.state[p]` to restart that parameter's second moment at its new shape. That
+recovery is only *sound* because of the state-identity row above: before 0.7.14 it
+happened to work after a refused rebind (the refusing cache had never finished building)
+and silently did not work from a steady state, where the tables were already there and
+went on writing the buffers the user had just dropped. Note the
 refusing step may be **partially applied** — the fused subsets dispatch in order (native,
 one-block, big, 1-D) and the ones ahead of the failing one already launched — so carry on
 from the next step rather than retrying it.
@@ -366,6 +407,19 @@ caller can hand back **the same list object** it was built from:
   list I was built from" is therefore exactly as strong as recomparing the tuples.
 - `_WitnessedCache.stale(plist)` — the full witness tuple, for a caller that cannot
   offer that guarantee.
+- `_WitnessedCache.revalidate(plist)` — the same tuple, but it **adopts** a fresh list
+  object that describes the same parameters (AdaPNM's routes, where a mixed-lag group
+  re-splits every step).
+
+All three also compare the state-identity generation, and they compare it **first** — one
+integer against `len(plist)` element compares. That is not redundant with
+`_fused_partition`'s own check: the partition's check makes the routing hand back fresh
+lists, which is a *route* from a state change to a cache, and `revalidate` is precisely
+the method that severs it — it takes the fresh list and says "same parameters, keep the
+tables". Measured before the caches carried the generation themselves: 4/4 retired
+`m_pos` buffers written on AdaPNM's one-block route and 3/3 on its 1-D route, with the
+partition rebuilding correctly on every one of those steps. The generation therefore lives
+where the dangling pointers live.
 
 The one-block and 1-D routes always took the first path. The **big** route could not:
 `_fused_big` re-derived its same-shape/dtype/device buckets on every step, so the lists

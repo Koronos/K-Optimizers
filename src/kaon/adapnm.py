@@ -132,6 +132,7 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._foreach_plan import WatchedStateMixin, state_generation
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _make_codec,
@@ -154,6 +155,10 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 # Performance / memory knobs mirror Adakaon (see that module for the rationale).
 _STACK_BYTES_PER_ELEM = 64  # two momenta + factored v: a touch above Adakaon's 48
 
+#: ``dict.__setitem__``, i.e. a per-param state write that SKIPS the state-identity
+#: hook (:class:`kaon._foreach_plan.WatchedParamState`). Legal for scalar bookkeeping
+#: keys ONLY — never for a tensor buffer. See :meth:`AdaPNM._prepare_param_steps`.
+_set_unwatched = dict.__setitem__
 
 
 def _rms_clip_one_(u: Tensor, clip: float) -> Tensor:
@@ -273,7 +278,7 @@ def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
     return out
 
 
-class AdaPNM(AutoLRMixin, Optimizer):
+class AdaPNM(AutoLRMixin, WatchedStateMixin, Optimizer):
     """AdaPNM (Adam + Positive-Negative Momentum) on Adakaon's memory backend.
 
     Args:
@@ -410,6 +415,10 @@ class AdaPNM(AutoLRMixin, Optimizer):
             "step": 0,
         }
         super().__init__(params, defaults)
+        # ``self.state`` reports every change of state IDENTITY, so no cross-step cache can
+        # keep stepping a retired momentum / second moment (see
+        # ``kaon._foreach_plan.WatchedState``). Zero cost per step.
+        self._install_state_watch()
         self._foreach = foreach
         self._foreach_batch_cutoff = foreach_batch_cutoff
         self._foreach_stack_budget = foreach_stack_budget
@@ -545,7 +554,32 @@ class AdaPNM(AutoLRMixin, Optimizer):
         _make_codec(md).store_stacked(aliases, m_fp32)
 
     def _prepare_param_steps(self, params: list[Tensor], group: dict[str, Any]) -> None:
-        """Initialize state and advance each parameter's bias-correction counter."""
+        """Initialize state and advance each parameter's bias-correction counter.
+
+        The counter is written through ``dict.__setitem__``, NOT ``state[...] = ...``, and
+        that is a MEASURED choice. This is the only per-step state write anywhere in kaon
+        and it runs once per parameter, so it is the whole per-step cost of the state
+        identity guard on AdaPNM (Adakaon writes no state per step and pays nothing).
+        Paired against the pre-guard form on the 428-param bag, 31 pairs of 400 reps,
+        ``benchmarks/fused/bench_state_witness.py --case writes``:
+
+            through the hook (``state["step"] += 1``)   +107 µs [+93, +120]
+            ``dict.__setitem__`` (SHIPPED)               +46 µs [+36,  +56]
+
+        of which the whole remainder is the unbound-METHOD CALL, not the dict being a
+        subclass: the same call form on a PLAIN dict costs the same, and a subclass read or
+        C-level write is bit-for-bit the same slot as ``dict``'s. So +46 µs is the floor for
+        any per-param write once the hook exists; the only cheaper option is not having the
+        hook, which drops the ``state[p]["m"] = ...`` / ``state[p].clear()`` coverage the
+        guard exists for.
+
+        Bypassing the hook is sound *for this key and only for this key*: ``step`` is an
+        int, it is not in :data:`~kaon._foreach_plan.WATCHED_STATE_KEYS`, and no cache
+        anywhere bakes it, so the hook would have nothing to report.
+        ``tests/test_state_identity_witness.py`` pins that invariant, and a TENSOR buffer
+        must never be written this way.
+        """
+        set_raw = _set_unwatched            # LOAD_FAST in the per-param loop
         for p in params:
             state = self.state[p]
             if not state:
@@ -553,8 +587,8 @@ class AdaPNM(AutoLRMixin, Optimizer):
             elif "step" not in state:
                 # The group counter was already advanced for this update. A legacy
                 # state with moments therefore finished the preceding group step.
-                state["step"] = group["step"] - 1
-            state["step"] += 1
+                set_raw(state, "step", group["step"] - 1)
+            set_raw(state, "step", state["step"] + 1)
 
     @staticmethod
     def _pos_neg_prefixes(step: int) -> tuple[str, str]:
@@ -752,15 +786,28 @@ class AdaPNM(AutoLRMixin, Optimizer):
         wrote the whole step into the retired buffer. Same guard (and the same shape-rebind limit)
         as ``Adakaon._fused_partition``.
 
+        SECOND KEY FIELD — the STATE-identity generation
+        (:class:`~kaon._foreach_plan.WatchedState`). No parameter field can see a state buffer
+        being retired (``del opt.state[p]``, ``opt.state[p].clear()``,
+        ``opt.state[p]["m_pos"] = ...``), and the cached ``pos``/``neg``/``row``/``col`` tables
+        then keep writing it. The lag bucketing happened to cover the two whole-state cases
+        already (a re-initialised state restarts at ``step == 1``, so its lag moves and
+        ``_prune_lag_caches`` drops the old key), but nothing covered a single buffer being
+        rebound — measured writing the retired ``row`` on the one-block route. One integer
+        compare here covers every fused route, for the same reason as in
+        ``Adakaon._fused_partition``: a rebuild hands back fresh route lists and every
+        downstream memo and ``_WitnessedCache`` revalidates by list identity.
+
         Grad properties deliberately stay OUT of this key: a gradient is a new tensor every
         backward, so its contiguity is re-checked per step in
         :func:`kaon.adakaon._demote_non_contiguous_grads` rather than frozen into the routing.
         """
         gid = id(group)
         witness = ft.param_witness(params)
+        gen = state_generation(self.state)
         cached = self._fused_part.get(gid)
-        if cached is not None and cached[0] == witness:
-            return cached[1], cached[2], cached[3], cached[4]
+        if cached is not None and cached[1] == gen and cached[0] == witness:
+            return cached[2], cached[3], cached[4], cached[5]
         md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
         float_mom = md in ("bfloat16", "float32")  # the 1-D kernel handles only fp32/bf16 momentum
         no_ams = not group["ams_bound"]            # ams_bound 1-D (full max_v) -> native
@@ -804,7 +851,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
                 one_dim.append(p)
             else:
                 native.append(p)
-        self._fused_part[gid] = (witness, one_block, big, one_dim, native)
+        self._fused_part[gid] = (witness, gen, one_block, big, one_dim, native)
         if _PROBE_LOG:
             _probe_census(one_block, big, native, md, bf16m, cap, ft)
         return one_block, big, one_dim, native
@@ -874,8 +921,9 @@ class AdaPNM(AutoLRMixin, Optimizer):
         # moved. That adoption is the whole point: ``not built_from(...) and stale(...)`` left
         # ``src`` one generation behind and brought the per-bucket sweep back permanently (see
         # ``_WitnessedCache.revalidate``).
-        if cache is None or not cache.revalidate(plist):
-            cache = ft.AdaPnmCache(plist, lambda p: self.state[p])
+        gen = state_generation(self.state)
+        if cache is None or not cache.revalidate(plist, gen):
+            cache = ft.AdaPnmCache(plist, lambda p: self.state[p], gen=gen)
             self._fused_ob_caches[key] = cache
         cache.refresh_grads()
         odd = group["step"] % 2 == 1
@@ -924,8 +972,9 @@ class AdaPNM(AutoLRMixin, Optimizer):
             )
         key = (id(group), lag)
         cache = self._fused_od_caches.get(key)
-        if cache is None or not cache.revalidate(plist):                # see _fused_one_block
-            cache = ft.OneDimPnmCache(plist, lambda p: self.state[p])
+        gen = state_generation(self.state)
+        if cache is None or not cache.revalidate(plist, gen):            # see _fused_one_block
+            cache = ft.OneDimPnmCache(plist, lambda p: self.state[p], gen=gen)
             self._fused_od_caches[key] = cache
         cache.refresh_grads()
         odd = group["step"] % 2 == 1
@@ -1080,8 +1129,9 @@ class AdaPNM(AutoLRMixin, Optimizer):
         # partition's witness holds. Its witness fallback covers the step after the memo
         # hands out a fresh list (a re-bucketing that moved nothing) and rebinds the cache
         # onto it, so the identity path keeps working from the next step on.
-        if cache is None or not cache.revalidate(plist):
-            cache = ft.BigPnmCache(plist, lambda p: self.state[p], R, C)  # see _fused_one_block
+        gen = state_generation(self.state)
+        if cache is None or not cache.revalidate(plist, gen):
+            cache = ft.BigPnmCache(plist, lambda p: self.state[p], R, C, gen=gen)  # see _fused_one_block
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()
         fused_red = self._fused_reductions
