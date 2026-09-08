@@ -50,6 +50,8 @@ from __future__ import annotations
 
 import torch
 
+from kaon._backend import gc_applies
+
 try:  # Triton is an optional, GPU-only dependency — keep ``import kaon`` working without it.
     import triton
     import triton.language as tl
@@ -292,6 +294,33 @@ def ptr_array(tensors: list, device) -> torch.Tensor:
     """int64 device array of the tensors' base addresses — the MultiTensorApply-style pointer array a
     batched kernel indexes by program id. Shared by every per-step host launch in the batched paths."""
     return torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64, device=device)
+
+
+def bucket_gc_ok(plist: list) -> bool:
+    """Whether Gradient Centralization applies to a WHOLE bucket, as one ``tl.constexpr``.
+
+    ``GC`` reaches every kernel as a ``tl.constexpr``: a Triton program cannot call
+    :func:`kaon._backend.gc_applies`, and one launch serves one bucket, so the predicate has
+    to be uniform across the bucket and resolved on the host. It *is* uniform for every
+    bucketing this module uses, but for different reasons, so this checks rather than assumes:
+
+    * the big routes bucket by EXACT shape, so the predicate is trivially constant;
+    * the one-block routes bucket by the PADDED tile ``(BR, BC) = next_pow2(R), next_pow2(C)``,
+      and ``BC == 1`` exactly when ``C == 1`` — i.e. the fan-in-1 tensors land in tiles of
+      their own and can never share one with a tensor GC applies to.
+
+    A mixed bucket has no correct answer (either the fan-in-1 members freeze or the healthy
+    ones lose GC), so it raises instead of silently picking one. Called at cache BUILD only —
+    a steady-state step reads the cached bool.
+    """
+    flags = {gc_applies(p.shape) for p in plist}
+    if len(flags) != 1:
+        raise RuntimeError(
+            "fused bucket mixes shapes Gradient Centralization does and does not apply to "
+            f"({[tuple(p.shape) for p in plist][:6]}); GC is one tl.constexpr per launch, so "
+            "the bucket key must separate them (see kaon._backend.gc_applies)"
+        )
+    return flags.pop()
 
 
 def reduction_tile(R: int, C: int, work: int = 16384) -> tuple[int, int, int]:
@@ -2369,6 +2398,9 @@ class PointerArrayCache(_WitnessedCache):
             self.buckets.append(dict(
                 plist=bl, BR=BR, BC=BC, mom=mom, momentum=momentum, dev=dev, blk=blk,
                 exact4=exact4, fblk=blk if exact4 else 0,
+                # GC's tl.constexpr for this tile, resolved ONCE here (see bucket_gc_ok):
+                # the caller ANDs it with the group flag, so a steady-state step reads a bool.
+                gc_ok=bucket_gc_ok(bl),
                 p_addr=i64([p.data_ptr() for p in bl]),
                 m_addr=m_addr, mscale_addr=mscale_addr, mscale_n=mscale_n,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
@@ -2427,6 +2459,11 @@ class BigPointerCache(_WitnessedCache):
       1.1e-3 relative divergence from the native path, silently. The param witness cannot
       catch it: no parameter moved.
 
+      ``gc`` is the EFFECTIVE flag: the constructor ANDs the group's flag with
+      :attr:`gc_ok`, this bucket's shape predicate (:func:`bucket_gc_ok` — GC is undefined
+      for a fan-in of 1). So a fan-in-1 bucket takes the aliased, cheaper layout for free,
+      and the caller's validity check is ``cache.gc != (group_flag and cache.gc_ok)``.
+
     Together those drop the per-bucket scratch from ``N*(3R + 2C) + 3N`` to
     ``N*(R + C) + 2N`` fp32 (``+ N*R`` with GC) — measured -3.07 MB across 1000 tensors of
     scratch. ``inv_rms`` is gone entirely: the consumer kernels derive it from the raw
@@ -2459,11 +2496,16 @@ class BigPointerCache(_WitnessedCache):
         self.keep = self._zeros[n_c + self.N:].view(torch.int32)
         self.rowsum = torch.empty(self.N * R, dtype=torch.float32, device=dev)
         self.rfac = self.rowsum                     # written in place
-        # Recorded so the caller can rebuild when the group flips it — see the class
-        # docstring; the alias below is correct ONLY while GC stays off.
-        self.gc = bool(gc)
+        # Whether GC is DEFINED for this bucket's shape (fan-in >= 2), resolved once here —
+        # the shape cannot change under a cache (a shape-rebind moves the witness, see
+        # Adakaon._fused_partition), so the caller gets the effective flag as
+        # ``group["gradient_centralization"] and cache.gc_ok`` at no per-step cost.
+        self.gc_ok = bucket_gc_ok(plist)
+        # The EFFECTIVE flag: recorded so the caller can rebuild when the group flips it —
+        # see the class docstring; the alias below is correct ONLY while GC stays off.
+        self.gc = bool(gc) and self.gc_ok
         self.rowmean = (
-            torch.empty(self.N * R, dtype=torch.float32, device=dev) if gc else self.rowsum
+            torch.empty(self.N * R, dtype=torch.float32, device=dev) if self.gc else self.rowsum
         )
 
     def zero_accumulators(self) -> None:
@@ -2550,6 +2592,7 @@ class AdaPnmCache(_WitnessedCache):
                 mscale_n = Rs
             self.buckets.append(dict(
                 plist=bl, BR=BR, BC=BC, mom=mom, dev=dev,
+                gc_ok=bucket_gc_ok(bl),        # see PointerArrayCache / bucket_gc_ok
                 p_addr=i64([p.data_ptr() for p in bl]),
                 pos_addr=pos_addr, neg_addr=neg_addr, posc_addr=posc, negc_addr=negc,
                 mscale_n=mscale_n,
@@ -2670,6 +2713,10 @@ class BigPnmCache(_WitnessedCache):
         self.neg_addr = ptr_array([s["m_neg"] for s in states], dev)
         self.g_addr = ptr_array([p.grad for p in plist], dev)
         self.grad_ptrs = tuple(p.grad.data_ptr() for p in plist)
+        # Whether GC is DEFINED for this bucket's shape — see BigPointerCache.gc_ok. This cache
+        # always allocates ``rowmean`` for real (no aliasing trick), so unlike Adakaon's it does
+        # not need the effective flag as part of its validity.
+        self.gc_ok = bucket_gc_ok(plist)
         self.rowmean = torch.empty(self.N * R, dtype=torch.float32, device=dev)
         self.rowsum = torch.empty(self.N * R, dtype=torch.float32, device=dev)
         self.colsum = torch.empty(self.N * C, dtype=torch.float32, device=dev)

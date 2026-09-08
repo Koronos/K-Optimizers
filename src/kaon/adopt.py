@@ -180,6 +180,10 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, Optimizer):
         gradient_centralization: subtract the per-output-row gradient mean on
             ``ndim>=2`` weights before the step (Yong et al. 2020). **On by default**
             (kaon-wide); pin ``False`` for an exact match to the reference ADOPT math.
+            Skipped where the fan-in is 1 (``(out, 1)``, ``(out, 1, 1, 1)``): a
+            one-element row minus its own mean is zero, which froze those weights and,
+            with ADOPT's ``eps1 == 0``, NaN'd them — see
+            ``kaon._backend.gc_applies``.
         momentum_dtype: storage for the first moment — ``"bfloat16"`` (default),
             ``"float32"``, ``"int8"`` (per-row absmax) or ``"4bit"`` (per-block
             absmax, nibble-packed). Same layout as Adakaon, so checkpoints resume

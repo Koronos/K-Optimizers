@@ -37,6 +37,7 @@ __all__ = [
     "centralize_grads_",
     "flat_view",
     "foreach_budget",
+    "gc_applies",
     "is_low_precision",
     "rms",
     "subtract_batched_",
@@ -235,6 +236,33 @@ def cautious_one_(delta: Tensor, grad: Tensor) -> Tensor:
 
 
 # ----------------------------- gradient preprocessing -----------------------------
+def gc_applies(shape: torch.Size | tuple[int, ...]) -> bool:
+    """Whether Gradient Centralization is DEFINED for a weight of this shape.
+
+    **The one definition of the predicate.** GC subtracts, per output row, the gradient's
+    mean over the fan-in dims (every dim but dim 0). That needs two things:
+
+    * ``ndim >= 2`` — a 1-D bias or norm scale has no fan-in dims at all (unchanged
+      behaviour: GC always skipped these);
+    * ``fan_in > 1`` — over a row of ONE element the mean *is* the element, so
+      ``g - mean(g)`` is identically zero. That is not centralization, it is erasure: it
+      destroys the update signal and freezes the parameter. Shapes that hit it are
+      ordinary — a rank-1 LoRA up-projection ``(out, 1)``, a one-input 1x1 conv
+      ``(out, 1, 1, 1)``, some projections — so GC is skipped there (0.7.13; before that
+      those params silently never moved). ``fan_in == 0`` (an empty weight) falls out on
+      the same side, where GC used to manufacture NaN from ``mean()`` of nothing.
+
+    GC is implemented at nine host sites and sixteen Triton kernels, and a skip applied at
+    fewer than all of them makes the fused and native routes disagree. So every one of them
+    resolves the flag through THIS function — the torch sites call it directly, the Triton
+    ones get it per shape/tile bucket as their ``GC`` ``tl.constexpr`` (see
+    :func:`kaon._fused_triton.bucket_gc_ok` and ``docs/FUSED_REDUCTIONS_DESIGN.md``).
+    It is called once per BUCKET, never per parameter per step: the callers evaluate it
+    where the plan/pointer cache is built, so a steady-state step pays nothing for it.
+    """
+    return len(shape) >= 2 and math.prod(shape[1:]) > 1
+
+
 @torch.no_grad()
 def centralize_grads_(params: list[Tensor]) -> None:
     """Gradient Centralization (Yong et al. 2020, arXiv:2004.01461), in place.
@@ -251,6 +279,12 @@ def centralize_grads_(params: list[Tensor]) -> None:
     **Batched by shape** so the LoRA many-tiny-tensor regime stays fast: a naive per-param Python
     loop here added ~1024 kernel launches/step on a 512-adapter bag (3x slower). Same-shape grads
     are stacked and centralized in a handful of ops; lone shapes go in place.
+
+    Weights GC is not defined for are skipped — see :func:`gc_applies`. The skip is applied to
+    the BUCKET, not to each parameter, for two reasons: the bucket key already carries the shape
+    so the predicate is a pure function of it (one call per distinct shape instead of one per
+    param per step — ~4 calls instead of 428 on the LoRA bag), and dropping a whole shape cannot
+    perturb any other bucket, which is what keeps fan-in >= 2 bit-identical.
     """
     by_key: dict[tuple[tuple[int, ...], torch.device, torch.dtype], list[Tensor]] = {}
     for p in params:
@@ -258,7 +292,9 @@ def centralize_grads_(params: list[Tensor]) -> None:
         if g is not None and g.ndim >= 2:
             key = (tuple(g.shape), g.device, g.dtype)
             by_key.setdefault(key, []).append(g)
-    for grads in by_key.values():
+    for (shape, _dev, _dtype), grads in by_key.items():
+        if not gc_applies(shape):
+            continue
         if len(grads) == 1:
             g = grads[0]
             g.sub_(g.mean(dim=tuple(range(1, g.ndim)), keepdim=True))

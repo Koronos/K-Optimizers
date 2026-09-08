@@ -126,6 +126,7 @@ from kaon._backend import (
     centralize_grads_,
     flat_view,
     foreach_budget,
+    gc_applies,
     is_low_precision,
     rms,
     subtract_batched_,
@@ -901,7 +902,12 @@ class AdaPNM(AutoLRMixin, Optimizer):
                     bk["col_addr"], bk["Rs"], bk["Cs"], bk["mscale_n"],
                     c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], sc, lr * wd, eps1,
                     clip_eff, group["step"], LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious,
-                    WD=wd != 0, GC=gc, SR=bk["lowp"], CLIP=clip > 0.0, BR=bk["BR"], BC=bk["BC"],
+                    # GC is PER BUCKET: a tile of fan-in-1 tensors (BC == 1) has no fan-in mean
+                    # to subtract and centralizing it would zero the gradient. Resolved at cache
+                    # build (``bucket_gc_ok``), so this is a bool AND — see
+                    # kaon._backend.gc_applies.
+                    WD=wd != 0, GC=gc and bk["gc_ok"],
+                    SR=bk["lowp"], CLIP=clip > 0.0, BR=bk["BR"], BC=bk["BC"],
                     num_warps=ft.warps_for(lanes),
                 )
 
@@ -976,7 +982,10 @@ class AdaPNM(AutoLRMixin, Optimizer):
     def _chunked_reductions(self, p: Tensor, group: dict[str, Any], st: dict[str, Any]) -> tuple:
         b2, eps1 = group["betas"][1], group["eps"]
         g = p.grad.float().reshape(p.shape[0], p.numel() // p.shape[0])  # conv -> matrixized (out, in*kh*kw)
-        if group["gradient_centralization"]:
+        # ``gc_applies``, not the raw flag: a fan-in-1 row has no mean to subtract and
+        # centralizing it zeroes the gradient (see kaon._backend.gc_applies). Once per tensor
+        # per step, on the lone-big route where each tensor is megabytes.
+        if group["gradient_centralization"] and gc_applies(p.shape):
             g = g - g.mean(dim=1, keepdim=True)
         g = g.contiguous()
         gsq = g * g
@@ -1021,16 +1030,22 @@ class AdaPNM(AutoLRMixin, Optimizer):
 
     # ----------------------------------------------- batched chunked (many same-shape big tensors)
     @torch.no_grad()
-    def _chunked_reductions_batched(self, plist: list[Tensor], group: dict[str, Any]) -> tuple:
+    def _chunked_reductions_batched(
+        self, plist: list[Tensor], group: dict[str, Any], gc: bool
+    ) -> tuple:
         """Stacked AdaPNM reductions for a same-shape big bucket: GC (on the fp32 copy) + row/col EMA.
         Returns the stacked fp32 grad ``[N, R, C]`` and the stacked r/c factors ``[N, R]``/``[N, C]``
         (contiguous). Mirrors :meth:`_chunked_reductions` per tensor (eps1 on the means; no rms — the
-        AdaPNM clip is computed separately, folded into ``sc`` in :meth:`_chunked_step_batched`)."""
+        AdaPNM clip is computed separately, folded into ``sc`` in :meth:`_chunked_step_batched`).
+
+        ``gc`` is the caller's EFFECTIVE per-bucket flag (``group["gradient_centralization"] and
+        cache.gc_ok``), not the raw group flag — GC is undefined on a fan-in-1 shape and a bucket
+        is one exact shape. See :func:`kaon._backend.gc_applies`."""
         b2, eps1 = group["betas"][1], group["eps"]
         states = [self.state[p] for p in plist]
         R, C = plist[0].shape[0], plist[0].numel() // plist[0].shape[0]    # noqa: N806 — conv -> matrixized
         g = torch.stack([p.grad.reshape(R, C) for p in plist]).float()     # [N, R, C]
-        if group["gradient_centralization"]:
+        if gc:
             g.sub_(g.mean(dim=-1, keepdim=True))
         gsq = g * g
         row = torch.stack([s["row"] for s in states])                    # [N, R]
@@ -1069,7 +1084,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
         md = group["momentum_dtype"]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
         clip = group["clip_threshold"]
-        gc = group["gradient_centralization"]
+        gc_flag = group["gradient_centralization"]
         lowp = plist[0].dtype == torch.bfloat16
         sr = lowp and (group["bf16_method"] == "stochastic_rounding")
         states = [self.state[p] for p in plist]
@@ -1084,13 +1099,20 @@ class AdaPNM(AutoLRMixin, Optimizer):
             cache = ft.BigPnmCache(plist, lambda p: self.state[p], R, C)  # see _fused_one_block
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()
+        # The bucket is ONE exact shape, so GC's shape predicate is a per-bucket constant the
+        # cache resolved at build (``gc_ok``): a fan-in-1 bucket has no fan-in mean to subtract
+        # and centralizing it would zero the gradient. This one value is handed to the reduction
+        # kernel AND to the mom/apply ``_g`` kernels, which is load-bearing — those re-apply GC
+        # from the ``rowmean`` the reductions wrote, so two different flags would centralize the
+        # update with a mean the reductions never subtracted. See kaon._backend.gc_applies.
+        gc = gc_flag and cache.gc_ok
         fused_red = self._fused_reductions
         if fused_red:  # grad via pointer array, no [N,R,C] stack (candidate #4); rowmean carries GC
             g_addr, rowmean, r, cfac = self._chunked_reductions_fused(
-                plist, group, ft, R, C, lowp, cache
+                plist, group, ft, R, C, lowp, cache, gc
             )
         else:
-            g, r, cfac = self._chunked_reductions_batched(plist, group)   # g [N,R,C], r [N,R], c [N,C]
+            g, r, cfac = self._chunked_reductions_batched(plist, group, gc)  # g [N,R,C], r, c
             gf = g.reshape(-1)
         sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
 
@@ -1147,13 +1169,16 @@ class AdaPNM(AutoLRMixin, Optimizer):
             )
 
     @torch.no_grad()
-    def _chunked_reductions_fused(self, plist, group, ft, R, C, lowp, cache):  # noqa: N803
+    def _chunked_reductions_fused(self, plist, group, ft, R, C, lowp, cache, gc):  # noqa: N803
         """Candidate #4 for AdaPNM: row/col EMA factors via the Triton reduction kernel reading grad
         from a pointer array (no [N,R,C] stack; GC in-kernel). No rms here — AdaPNM's clip is computed
         in the mom kernel. Returns (g_addr, rowmean, r_factor[N,R], c_factor[N,C]).
 
         ``cache`` supplies the grad pointer array and the three scratch buffers; they were
-        reallocated here on every step, which is exactly what the cache exists to avoid."""
+        reallocated here on every step, which is exactly what the cache exists to avoid.
+
+        ``gc`` is the caller's effective per-bucket flag and MUST be the same one the mom/apply
+        kernels get — they re-apply GC from the ``rowmean`` written here."""
         b2, eps1 = group["betas"][1], group["eps"]
         N = len(plist)  # noqa: N806
         states = [self.state[p] for p in plist]
@@ -1164,7 +1189,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
         colsum = cache.colsum.zero_()  # atomic target
         ft._reduce_rowcol[(N * RB,)](
             g_addr, rowmean, rowsum, colsum, R, C, RB,
-            LOWP=lowp, GC=group["gradient_centralization"], BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+            LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
         )
         rowsum = rowsum.view(N, R)
         colsum = colsum.view(N, C)

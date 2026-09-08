@@ -4,7 +4,65 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+**Behaviour changes**
+- **Parameters whose fan-in is 1 now TRAIN under Gradient Centralization, instead of
+  being frozen.** GC (`gradient_centralization=True`, the default for Adakaon, AdaPNM,
+  AdaBelief, AdamP, KProdigy, Lion, ADOPT and ScheduleFree) is now skipped for `ndim>=2`
+  weights whose fan-in (`numel // shape[0]`) is 1 — `(out, 1)`, `(out, 1, 1, 1)` — where
+  its definition degenerates to zeroing the gradient. See *Fixed* below. Any run with
+  such a parameter changes trajectory, in the direction of finally moving at all: a
+  rank-1 LoRA up-projection went from a flat loss of 3.633 (its random initialization) to
+  0 in the synthetic fit, for all 8 GC-on optimizers.
+- **A checkpoint written before this change resumes with that parameter's optimizer state
+  at zero and starts moving now.** Its momentum, `row`/`col` (or `v`) buffers accumulated
+  nothing but zeros while it was frozen, so on resume it begins from a cold second moment
+  — expect the usual warmup transient on those parameters, not a jump. Nothing needs
+  migrating and no state changes shape; `gradient_centralization=False` reproduces the old
+  numbers for any parameter, as it always did.
+- Parameters with fan-in >= 2 are **bit-identical** to 0.7.12/ea46330 — verified over 736
+  configurations (see *Fixed*). 1-D and 0-D parameters were never touched by GC and still
+  are not.
+
 ### Fixed
+- **Gradient Centralization silently froze every parameter whose fan-in was 1.** GC
+  subtracts, per output row, the gradient's mean over the fan-in dims; over a row of ONE
+  element that mean *is* the element, so `g - mean(g)` was identically zero and the
+  parameter never moved — on the native, foreach, one-block-fused, lone-big-fused and
+  batched-big-fused routes alike, at every momentum dtype. The shapes that hit it are
+  ordinary: rank-1 LoRA up-projections `(out, 1)`, one-input 1x1 convs
+  `(out, 1, 1, 1)`, some projections. It affected all eight optimizers that default GC on
+  (`AdaMuon` only when it is switched on), and it is what escalated to NaN in ADOPT
+  (fixed separately above). `fan_in == 0` (an empty weight) fell on the same cliff, where
+  GC manufactured a NaN out of `mean()` of nothing; it is skipped too.
+
+  **GC is now skipped where it is undefined**, which required one predicate rather than a
+  patch per site: GC lives at nine host sites and sixteen Triton kernels, and a
+  native-only skip makes fused and native disagree. `kaon._backend.gc_applies(shape)`
+  (`ndim >= 2 and fan_in > 1`) is the single definition; the torch sites call it, and the
+  Triton kernels — which cannot call Python — receive it per shape/tile bucket as their
+  existing `GC` `tl.constexpr`, via `kaon._fused_triton.bucket_gc_ok`. That is sound
+  because the predicate is uniform inside every bucket the fused paths build (the big
+  routes bucket by exact shape; the one-block routes bucket by the padded tile, and
+  `BC == next_pow2(C) == 1` exactly when `C == 1`), and `bucket_gc_ok` **raises** rather
+  than guessing if a future bucket key ever mixes the two. The AdaPNM/Adakaon batched-big
+  routes take particular care: their mom/apply kernels re-apply GC from the `rowmean` the
+  reduction kernel wrote, so the one resolved flag is threaded to both instead of being
+  re-derived, which is what keeps `rowmean` coherent with the reduction that produced it.
+
+  **Cost: zero per step.** The predicate is evaluated where plans and pointer caches are
+  built, not per step — `centralize_grads_` applies it once per distinct shape bucket
+  (~4 calls on a 428-adapter bag instead of 428), `PointerArrayCache`/`AdaPnmCache` store
+  it per tile bucket, and `BigPointerCache`/`BigPnmCache` store it per shape bucket, so a
+  launch site only ANDs two booleans. Measured with `torch.profiler` on bags with no
+  fan-in-1 parameter: identical kernel set, identical launch counts, and A/B-paired
+  wall time within run-to-run noise on LoRA-428 fused and foreach.
+
+  **Verified bit-identical for fan-in >= 2** against the pre-fix tree across 736
+  configurations — 7 optimizers x fp32/bf16 parameters x fp32/bf16/int8/4bit momentum x
+  fused/native x foreach/per-param, over four bags (428 LoRA factors, 448 0-D scalars, a
+  mixed bag with 3x3 and 1x1 convs plus 1-D/0-D, and a UNet/DiT-shaped bag of distinct
+  big shapes plus a same-shape batched bucket), hashing final weights and every state
+  tensor after N steps. Zero differences.
 - **Fused path: a `p.data` rebind that changes the SHAPE can no longer step a plan that
   disagrees with the optimizer state.** Every fused pointer cache
   (`PointerArrayCache`, `BigPointerCache`, `AdaPnmCache`, `OneDimPointerCache`,
@@ -311,23 +369,18 @@ All notable changes to this project will be documented in this file.
   is unchanged from 0.7.12 (both trees NaN identically) and is not addressed here: the
   `floor` fix above is unsound for these callers because they do not cap the
   reconstruction, so the right fix is either input validation or adding a cap.
-- **Gradient Centralization destroys fan-in-1 gradients.** `g - mean_fanin(g)` over a
-  one-element fan-in is identically zero, so every GC-enabled optimizer silently
-  freezes params shaped `(out, 1)` / `(out, 1, 1, 1)` — rank-1 LoRA up-projections
-  among them (`AdaMuon` is unaffected: GC defaults off). ADOPT was the one that
-  escalated this to NaN, which is fixed above; the freeze itself is not. Skipping
-  those params in `centralize_grads_` alone is *not* the fix: GC is implemented at
-  six-plus sites and they all have to move together —
-  `_backend.py:258-268` (native), `adakaon.py:978-979` and `:1044-1045`,
-  `adapnm.py:944-945` and `:998-999` (the per-param and batched
-  `_chunked_reductions*`), and `_fused_triton.py:417-423` (the in-kernel primitive,
-  fed by the rowmean reductions at `:768 :797 :843 :869 :968 :1022`). A native-only
-  skip makes fused and native disagree; measured, it breaks
-  `test_degenerate_2d_shapes_match_native` and
-  `test_pnm_extreme_aspect_shapes_compile_and_match_native`. Pinned as strict xfails
-  by `tests/test_degenerate_fanin.py::test_gc_leaves_fanin_1_grads_usable` and
-  `::test_gc_freezes_fanin_1_params` (the latter covering fused and native), so the
-  batch that fixes GC flips them to XPASS.
+- **`ScheduleFree` is not reproducible against itself.** Two identical runs (same seed,
+  same grads, GC off, fp32 params and momentum) give different weights, on this branch
+  and on ea46330 alike, for fan-in >= 2 as well as fan-in 1 — measured diverging at the
+  second step on a `(6, 1)` and a `(6, 3)` bag. Unrelated to the GC fix (found while
+  building its control-paired tests, which is why
+  `test_fanin_1_matches_gc_off_native` measures against a same-config repeat instead of
+  demanding bit equality); not diagnosed or addressed here.
+- **`AdaMuon` leaves some `(1, 1)` parameters untouched**, with GC on and off
+  identically — its Newton-Schulz orthogonalization on a 1x1 matrix. Pre-existing and
+  independent of GC; pinned only in the sense that
+  `test_fanin_1_trains_with_gc_native` compares against the GC-off control rather than
+  asserting movement outright.
 
 ## [0.7.12]
 
