@@ -115,13 +115,50 @@ All notable changes to this project will be documented in this file.
   fallback for a layout `stacked_views` declined (a non-contiguous buffer).
   `ForeachChunk.__init__` and `ForeachPlan.rechunk` lost their now-unused `group`
   argument.
+- **The fused big-tensor route stops rebuilding its bucket lists.** `Adakaon._fused_big`
+  re-derived the same-shape/dtype/device split of the "big" subset on every step, and a
+  fresh list is what made `BigPointerCache` unable to recognize itself (`built_from` is
+  list identity), so every step fell back to `stale()` — a full `param_witness` tuple over
+  the bucket, once per big shape bucket, *on top of* the sweep `_fused_partition` had
+  already run for the whole group. `Adakaon._big_shape_buckets` memoizes the split per
+  group and revalidates it by the identity of the route list, which the partition and the
+  non-contiguous-grad demotion already guarantee — the same contract `_fused_one_block` and
+  `_fused_one_dim` have used since 0.7.12. Witness sweeps **per step**, measured with
+  `torch.profiler` and a call counter:
+
+  | bag (fused) | partition | big pointer caches | total |
+  |---|---|---|---|
+  | 80 big tensors over 4 shapes | 1 | **4 → 0** | **5 → 1** |
+  | 200×(256,256) + 100×(512,) + 128×0-D | 1 | **1 → 0** | 2 → 1 |
+  | 24×(320,320,3,3) | 1 | **1 → 0** | 2 → 1 |
+  | 128×(512,512) + 64×(1024,) | 1 | **1 → 0** | 2 → 1 |
+
+  A sweep costs (measured directly, CPU-only, medians of 200 calls) 4.1 µs over 20
+  params, 15.8 µs over 80, 35.6 µs over 200 and 71.8 µs over 428 — so the 80-tensor bag
+  above drops ~16 µs of pure host work per step and the LoRA bag's 200-tensor big bucket
+  ~36 µs. Peak allocated memory unchanged (0.00 MiB on every bag and mode). **The wall
+  clock does not resolve this on a shared laptop GPU** and no claim is made from it. On
+  the 80-tensor bag, 200 timed steps × 6 interleaved repeats of base / arm / base: the arm
+  lands at −14.7 % (bf16 momentum) and −8.7 % (int8) of the base's host time while the
+  base-vs-base *control* lands at +6.4 % and −0.5 % — and the per-repeat spread of that
+  control against its paired base repeat is −42 … +83 %. So the direction is plausibly a
+  small win and certainly not a regression, but the sweep counts are the evidence.
+- `AdaPNM._fused_big` had the identical defect (it *called* `built_from` but always missed,
+  because it rebuilt the lists too, and then paid the `stale` compare); it gets the same
+  memo, keyed per `(group, lag)` and pruned by `_prune_lag_caches` with the pointer caches.
+  Witness sweeps on 80 big tensors over 4 shapes: **5 → 1** per step.
 - Bit-identity: 272 configurations (fp32/bf16 params × `float32`/`bfloat16`/`int8`/`4bit`
   momentum × foreach/fused × 5 bags — 428-tensor LoRA, 448 × 0-D, convs+1-D+0-D mixed,
   24×(320,320,3,3), 128×(512,512)+64×(1024,) — × 7 interference scenarios ×
   Adakaon/Nekaon/MSAM/Lookahead), 6 steps each, every weight and every state tensor of
   both the wrapper and the inner optimizer hashed byte-for-byte. **272/272 match** the
   reference tree, which also matched itself run-to-run (the control) with the chunked-big
-  fused route under `deterministic_reductions=True`.
+  fused route under `deterministic_reductions=True`. The same matrix was re-run after the
+  `_fused_big` memo: 272/272 again. For AdaPNM (which has no `deterministic_reductions`
+  knob, so its fused big reductions are not reproducible run to run on *either* tree) 512
+  configurations were hashed: all 352 reproducible ones match bit-for-bit, and the 160 that
+  do not are exactly the set the base tree already fails to reproduce against itself —
+  agreeing to rel ≤ 1.8e-7 against a base-vs-base spread of 1.3e-7.
 
 ## [0.7.12]
 

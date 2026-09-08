@@ -384,6 +384,8 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
         self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPointerCache (1-D)
         self._fused_big_caches: dict[tuple[int, tuple[int, ...], Any], Any] = {}
+        # group id -> (the ``big`` route list the buckets were split from, the buckets)
+        self._fused_big_buckets: dict[int, tuple[list[Tensor], list[list[Tensor]]]] = {}
         # The native foreach path's own cache — the bucketing + per-chunk view plan — is NOT
         # allocated here: it lives in ForeachPlanMixin as the lazy ``_foreach_plans``
         # property, keyed by group id (see _FOREACH_SPEC below).
@@ -471,6 +473,7 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         self._fused_ob_caches.clear()
         self._fused_od_caches.clear()
         self._fused_big_caches.clear()
+        self._fused_big_buckets.clear()
         self._clear_foreach_plans()
 
     def _autolr_reset_base_state(self) -> None:
@@ -609,7 +612,7 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
             return
         # Group by EXACT shape (and dtype and DEVICE); same-shape buckets of >=2 take the
         # batched chunked kernel, lone tensors take the per-tensor chunked kernel.
-        for plist in _same_shape_device_buckets(big).values():
+        for plist in self._big_shape_buckets(id(group), big):
             # One device scope per bucket, covering every launch inside the chunked steps (see
             # _fused_one_block): the bucket's pointer arrays and scratch live on plist[0].device,
             # and a Triton launch targets the CURRENT device. PLAUSIBLE, not verified — one GPU here.
@@ -619,6 +622,39 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
                     self._chunked_step_batched(plist, group, ft)
                 else:
                     self._chunked_step(plist[0], group, ft)
+
+    def _big_shape_buckets(self, gid: int, big: list[Tensor]) -> list[list[Tensor]]:
+        """``big`` split into same-shape/dtype/device buckets, memoized per group.
+
+        Same trick, and the same contract, as :meth:`_fused_demote`'s memo. Rebuilding
+        these lists every step was not the cost — it is what the cost was *made of*: a
+        fresh list means :class:`~kaon._fused_triton.BigPointerCache` cannot recognize
+        it (``built_from`` is identity), so it had to revalidate with ``stale()``, i.e.
+        a full :func:`~kaon._foreach_plan.param_witness` tuple over the bucket, once per
+        bucket per step, on top of the one :meth:`_fused_partition` already ran for the
+        whole group. On an 80-param UNet-shaped bag with four big shapes that is five
+        witness sweeps per step where one suffices; on the 428-param LoRA bag the sweep
+        alone is ~25 µs.
+
+        VALIDITY is ``big``'s list IDENTITY, which is exactly as strong as recomparing
+        the witness because of what produces that object: :meth:`_fused_partition`
+        returns the very same list only while ids, ``data_ptr``s and contiguity all
+        hold for the group's whole param set (so a rebind to fresh storage, a dtype or
+        device change, a ``p.data.t()``, a param entering or leaving the set — including
+        via ``p.grad = None`` — all hand back a FRESH list), and :meth:`_fused_demote`
+        rebuilds its lists whenever the non-contiguous-grad set moves. Shape is the one
+        field neither watches, and a shape-changing rebind is unsupported for the same
+        reason everywhere else (see :meth:`_fused_partition`). Event-driven drops
+        (checkpoint load, state reset) go through :meth:`_invalidate_fused_caches`,
+        which clears this memo with the rest — and the cached list is held here, so its
+        ``id`` cannot be reused by a new list while the entry lives.
+        """
+        cached = self._fused_big_buckets.get(gid)
+        if cached is not None and cached[0] is big:
+            return cached[1]
+        buckets = list(_same_shape_device_buckets(big).values())
+        self._fused_big_buckets[gid] = (big, buckets)
+        return buckets
 
     def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
         """Split a group's params into (one-block, chunked-big, one-dim, native), cached per param-set.
@@ -929,11 +965,17 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         states = [self.state[p] for p in plist]
         cache_key = (id(group), tuple(plist[0].shape), plist[0].dtype, plist[0].device)
         cache = self._fused_big_caches.get(cache_key)
+        # ``built_from`` (identity), not ``stale`` (a second witness tuple over the bucket):
+        # ``plist`` comes from :meth:`_big_shape_buckets`, which hands back the same list
+        # object only while :meth:`_fused_partition`'s witness — ids + ``data_ptr``s +
+        # contiguity over the whole group, already computed this step — holds. Same contract
+        # as _fused_one_block; see _big_shape_buckets and _WitnessedCache.built_from.
+        #
         # ``cache.gc`` is part of the validity, not only the param witness: with GC off the
         # cache aliases ``rowmean`` onto ``rowsum`` to save N*R floats, and a group dict
         # flipped mid-run (schedulers do this) would then have the reduction kernel write
-        # the row means over the row sums. Nothing moved, so ``stale()`` cannot see it.
-        if cache is None or cache.stale(plist) or cache.gc != gc:
+        # the row means over the row sums. Nothing moved, so no witness could see it.
+        if cache is None or not cache.built_from(plist) or cache.gc != gc:
             cache = ft.BigPointerCache(plist, lambda p: self.state[p], R, C, gc=gc)
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()

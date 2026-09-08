@@ -299,6 +299,57 @@ induces does not — so the plan survives it. Only a parameter that actually ski
 splits a bucket, and once split the two halves advance in lockstep again and the plan is
 reused as before.
 
+### The fused side: one witness sweep, not one per bucket
+
+Adakaon's Triton routing keeps its own caches next to this plan, guarded by the same
+three fields (`Adakaon._fused_partition` calls the very same `param_witness`). Those
+caches are validated in one of two ways, and which one applies is decided by whether the
+caller can hand back **the same list object** it was built from:
+
+- `_WitnessedCache.built_from(plist)` — O(1) list identity. Legitimate only because
+  `_fused_partition` re-derives the witness across the whole group *every step* and
+  returns the very same route lists while nothing moved, and `_fused_demote` rebuilds
+  them into fresh objects the moment the non-contiguous-grad set changes. "This is the
+  list I was built from" is therefore exactly as strong as recomparing the tuples.
+- `_WitnessedCache.stale(plist)` — the full witness tuple, for a caller that cannot
+  offer that guarantee.
+
+The one-block and 1-D routes always took the first path. The **big** route could not:
+`_fused_big` re-derived its same-shape/dtype/device buckets on every step, so the lists
+were new objects and `BigPointerCache` had to re-sweep. `Adakaon._big_shape_buckets`
+memoizes the split per group, so the big route validates by identity too — and when the
+memo does hand out a fresh list (something moved), a rebuilt pointer cache is the correct
+and conservative outcome, so Adakaon needs no `stale` fallback at all.
+`AdaPNM._big_shape_buckets` is the same memo keyed per `(group, lag)`, but AdaPNM keeps
+its `stale` fallback: a genuinely mixed-lag group gets fresh sub-lists from
+`_local_step_buckets` every step, and there only the full compare can tell a `p.data`
+rebind from a harmless re-bucketing. Measured witness sweeps per step:
+
+| bag (fused) | partition | per-bucket | total |
+|---|---|---|---|
+| 80 big tensors over four shapes | 1 | 4 → **0** | 5 → **1** |
+| 200×(256,256) + 100×(512,) + 128×0-D | 1 | 1 → **0** | 2 → **1** |
+| 24×(320,320,3,3) | 1 | 1 → **0** | 2 → **1** |
+| 128×(512,512) + 64×(1024,) | 1 | 1 → **0** | 2 → **1** |
+
+The memo is dropped by `_invalidate_fused_caches` with the pointer caches, and holds a
+reference to the route list it split — so that list's `id` cannot be recycled underneath
+it while the entry lives. What it does **not** watch is the one thing nothing here
+watches: a shape-changing `p.data = p.data.view(...)` rebind (see the note above).
+
+What a sweep costs, measured directly (CPU-only, medians of 200 calls on this machine):
+4.1 µs over 20 params, 15.8 µs over 80, 35.6 µs over 200, 71.8 µs over 428. So the
+80-tensor / four-shape bag above sheds ~16 µs of host work per step, and the LoRA bag's
+200-tensor big bucket ~36 µs.
+
+The GPU wall clock does not resolve any of this on a shared laptop card, and nothing is
+claimed from it. Best attempt, on the 80-tensor / four-shape bag with 200 timed steps per
+measurement and six interleaved base / arm / base repeats: the arm sits at −14.7 %
+(bf16 momentum) and −8.7 % (int8) of the base's host time — but the base-vs-base
+*control* sits at +6.4 % and −0.5 %, and its per-repeat deviation from the paired base
+repeat spans −42 … +83 %. The sweep counts and the microbenchmark above are the
+measurement; the clock only rules out a large regression.
+
 ### Measured
 
 `optimizer._foreach_cache_enabled = False` drops the cross-step cache (numerically a

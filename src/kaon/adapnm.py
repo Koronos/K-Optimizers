@@ -427,6 +427,8 @@ class AdaPNM(AutoLRMixin, Optimizer):
         self._fused_ob_caches: dict[tuple[int, int], Any] = {}
         self._fused_od_caches: dict[tuple[int, int], Any] = {}
         self._fused_big_caches: dict[tuple, Any] = {}
+        # (group id, lag) -> (the ``big`` list the buckets were split from, the buckets)
+        self._fused_big_buckets: dict[tuple[int, int], tuple[list, list]] = {}
         self._fused_demoted: dict[int, tuple] = {}
         if self._fused:
             from kaon._fused_triton import HAS_TRITON, TILE_CAP
@@ -444,6 +446,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
         self._fused_ob_caches.clear()
         self._fused_od_caches.clear()
         self._fused_big_caches.clear()
+        self._fused_big_buckets.clear()
         self._fused_demoted.clear()
 
     def _autolr_reset_base_state(self) -> None:
@@ -645,6 +648,8 @@ class AdaPNM(AutoLRMixin, Optimizer):
                 self._fused_od_caches, gid, set(one_dim_buckets))
             self._fused_big_caches = self._prune_lag_caches(
                 self._fused_big_caches, gid, set(big_buckets))
+            self._fused_big_buckets = self._prune_lag_caches(
+                self._fused_big_buckets, gid, set(big_buckets))
             for lag, plist in one_block_buckets.items():
                 c = self._coeffs(group, group_step - lag)
                 self._fused_one_block(plist, group, ft, lag, c)
@@ -681,6 +686,33 @@ class AdaPNM(AutoLRMixin, Optimizer):
         seen, each pinning a bucket's index tensors (and, through them, device memory).
         """
         return {k: c for k, c in caches.items() if k[0] != gid or k[1] in active}
+
+    def _big_shape_buckets(
+        self, gid: int, lag: int, big: list[Tensor]
+    ) -> list[list[Tensor]]:
+        """``big`` split into same-shape/dtype/device buckets, memoized per (group, lag).
+
+        Rebuilding these lists every step is what made the witness expensive rather than
+        what cost the time: a fresh list means :class:`~kaon._fused_triton.BigPnmCache`
+        cannot recognize it (``built_from`` is identity), so every step fell through to
+        the full ``stale`` compare — a :func:`~kaon._fused_triton.param_witness` tuple
+        over the bucket, once per big shape bucket, on top of the sweep
+        :meth:`_fused_partition` already ran for the whole group. Same fix, same
+        contract and the same argument as ``Adakaon._big_shape_buckets``: the list
+        IDENTITY of ``big`` is as strong as recomparing the witness, because ``big``
+        only survives while the partition's own witness (ids + ``data_ptr``s +
+        contiguity over the group's whole param set) held AND
+        :meth:`~kaon.adakaon.Adakaon._fused_demote`'s demoted set and
+        :meth:`_local_step_buckets`' lag partition were unchanged. The ``lag`` is in the
+        key because a mixed-lag group hands each lag its own sub-list; the entries are
+        pruned with the pointer caches by :meth:`_prune_lag_caches`.
+        """
+        cached = self._fused_big_buckets.get((gid, lag))
+        if cached is not None and cached[0] is big:
+            return cached[1]
+        buckets = list(_same_shape_device_buckets(big).values())
+        self._fused_big_buckets[gid, lag] = (big, buckets)
+        return buckets
 
     def _local_step_buckets(
         self, params: list[Tensor], group_step: int
@@ -928,7 +960,7 @@ class AdaPNM(AutoLRMixin, Optimizer):
         # Group by EXACT shape, dtype AND DEVICE: a bucket is launched as one grid against pointer
         # arrays built on ``plist[0].device``, so two CUDA devices sharing a shape would run the
         # second one's tensors against index tensors from the first.
-        for plist in _same_shape_device_buckets(big).values():
+        for plist in self._big_shape_buckets(id(group), lag, big):
             # One device scope per bucket, covering every launch inside the chunked steps (see
             # _fused_one_block): the bucket's pointer arrays and scratch live on plist[0].device,
             # and a Triton launch targets the CURRENT device. PLAUSIBLE, not verified — one GPU here.
@@ -1040,6 +1072,10 @@ class AdaPNM(AutoLRMixin, Optimizer):
         states = [self.state[p] for p in plist]
         cache_key = (id(group), lag, tuple(plist[0].shape), plist[0].dtype, dev)
         cache = self._fused_big_caches.get(cache_key)
+        # ``built_from`` (identity) now actually HITS: ``plist`` comes from
+        # :meth:`_big_shape_buckets`, which hands back the same list object while the
+        # partition's witness holds. ``stale`` stays as the fallback for the first step
+        # after the memo hands out a fresh list (a re-bucketing that moved nothing).
         if cache is None or (not cache.built_from(plist) and cache.stale(plist)):
             cache = ft.BigPnmCache(plist, lambda p: self.state[p], R, C)  # see _fused_one_block
             self._fused_big_caches[cache_key] = cache
