@@ -5,13 +5,14 @@ from __future__ import annotations
 import copy
 import io
 import math
+import os
 
 import pytest
 import torch
 
 from kaon import Adakaon
 
-from .conftest import train_steps
+from .conftest import assert_scan_runs_in_c, train_steps
 
 
 def test_conv_factoring_reduces_state():
@@ -1199,11 +1200,17 @@ def test_adakaon_no_warning_on_4bit_low_beta1():
 # ------------------------------------------------------- witness cost (perf regression lock)
 # Every cached fused/foreach plan revalidates itself with a per-parameter
 # ``(id, data_ptr, is_contiguous)`` witness, once or twice per step. On a 428-parameter bag
-# that is ~47 µs of pure Python call overhead — 4-11% of the step — and the ONLY thing
+# that is ~47 us of pure Python call overhead — 4-11% of the step — and the ONLY thing
 # keeping it there is that both copies of the witness scan with ``map`` (the loop runs in C)
-# rather than with generator expressions, which measured 75 µs for the same work. The two
+# rather than with generator expressions, which measured 75 us for the same work. The two
 # copies are deliberate duplicates (see their docstrings: one guards the native path in a
 # build without Triton, the other lives inside the Triton module); this locks both.
+#
+# The lock is STRUCTURAL, not timed: it counts the Python bytecode a witness call executes
+# (``conftest.assert_scan_runs_in_c``) and requires that count to be flat in the number of
+# parameters. A ``map`` over unbound C methods is flat by construction; every Python-level
+# rewrite scales. The wall-clock version this replaced flaked under CPU contention — it is
+# kept as an opt-in smoke test below, off by default.
 
 def _witness_impls():
     from kaon._foreach_plan import param_witness as foreach_plan_witness
@@ -1219,21 +1226,72 @@ def _witness_impls():
 
 
 _WITNESS_IMPLS = _witness_impls()
+_FUSED_WITNESS_AVAILABLE = len(_WITNESS_IMPLS) > 1
 
 
+def _witness_params(n):
+    """``n`` distinct CPU tensors — only their identity/pointer/strides are ever read."""
+    return [torch.empty(4) for _ in range(n)]
+
+
+@pytest.mark.parametrize("shape_witness", [False, True],
+                         ids=["shape_witness_off", "shape_witness_on"])
 @pytest.mark.parametrize("name,witness", _WITNESS_IMPLS,
                          ids=[n.split(".")[1] for n, _ in _WITNESS_IMPLS])
-def test_param_witness_scans_in_c(name, witness):
-    """The witness must build its tuples with ``map``, not generator expressions.
+def test_param_witness_scans_in_c(name, witness, shape_witness, monkeypatch):
+    """The witness must build its tuples with ``map``, not with a Python-level loop.
 
-    Compared against a genexpr reference timed in the same loop, so the bound tracks the
-    machine rather than an absolute number; the measured margin is ~1.6x, well clear of
-    the 0.90 asserted here.
+    Two properties, neither of them timed:
 
-    The reference follows ``ft.SHAPE_WITNESS``: with that flag on, the FUSED witness carries a
-    fourth per-param field (strides) and the shared/native one still does not — that plan
-    re-stacks by effective shape every step and needs no shape field. So this also pins which
-    witness grows the field.
+    1. **The fields.** Checked against an explicit reference. Which witness grows the
+       fourth field (per-param strides) under ``ft.SHAPE_WITNESS`` is part of the contract:
+       the FUSED one does, the shared/native one does NOT — that plan re-stacks by
+       effective shape every step and needs no shape field — so the flag is set both ways
+       here and the reference follows the impl, not the module global.
+
+    2. **The scan stays in C.** The number of Python bytecode instructions one call
+       executes must not depend on ``len(plist)``: with ``tuple(map(Tensor.data_ptr, ...))``
+       the per-element loop lives inside ``map``/``tuple`` and the count is a constant
+       (20 opcodes for the native witness, 24/34 for the fused one with the flag off/on) at
+       8 params and at 512 alike. Any Python-level rewrite — generator expression, list
+       comprehension or inlined ``for`` — executes ~15 opcodes per parameter and the count
+       scales, which is exactly the ~2x per-step cost this guards against.
+
+    Replaces a wall-clock comparison against a genexpr reference (kaon 0.7.12-0.7.13),
+    which measured the right thing but flaked on loaded machines: it failed in 2-3 of 12
+    runs under CPU contention even with no code change. The timed check survives as
+    ``test_param_witness_beats_genexpr_on_the_clock``, opt-in via ``KAON_PERF_TESTS=1``.
+    """
+    if _FUSED_WITNESS_AVAILABLE:
+        monkeypatch.setattr("kaon._fused_triton.SHAPE_WITNESS", shape_witness)
+    elif shape_witness:
+        pytest.skip("Triton unavailable: ft.SHAPE_WITNESS has no witness to widen")
+    strides = shape_witness and "_fused_triton" in name
+
+    def reference(pl):
+        base = (tuple(id(p) for p in pl), tuple(p.data_ptr() for p in pl),
+                tuple(p.is_contiguous() for p in pl))
+        return (*base, tuple(p.stride() for p in pl)) if strides else base
+
+    plist = _witness_params(16)
+    assert witness(plist) == reference(plist), f"{name} changed the witness fields"
+
+    assert_scan_runs_in_c(witness, _witness_params(8), _witness_params(512), name)
+
+
+@pytest.mark.skipif(os.environ.get("KAON_PERF_TESTS") != "1",
+                    reason="wall-clock smoke test; set KAON_PERF_TESTS=1 to run")
+@pytest.mark.parametrize("name,witness", _WITNESS_IMPLS,
+                         ids=[n.split(".")[1] for n, _ in _WITNESS_IMPLS])
+def test_param_witness_beats_genexpr_on_the_clock(name, witness):
+    """Opt-in wall-clock smoke test for the margin ``test_param_witness_scans_in_c`` locks
+    structurally: on a 428-param bag the shipped ``map`` scan should beat a genexpr
+    reference by ~1.6x.
+
+    NOT part of the default suite — it measures elapsed time and therefore flakes under
+    CPU contention (a shared GPU box, a parallel build), which is why the real lock counts
+    bytecode instead. Run it by hand on an idle machine when changing the witness:
+    ``KAON_PERF_TESTS=1 pytest tests/test_adakaon.py -k beats_genexpr``.
     """
     import time
 
@@ -1249,8 +1307,6 @@ def test_param_witness_scans_in_c(name, witness):
         base = (tuple(id(p) for p in pl), tuple(p.data_ptr() for p in pl),
                 tuple(p.is_contiguous() for p in pl))
         return (*base, tuple(p.stride() for p in pl)) if strides else base
-
-    assert witness(plist) == genexpr_reference(plist), f"{name} changed the witness fields"
 
     def best_of(fn, reps=7, inner=20):
         out = []

@@ -108,6 +108,17 @@ All notable changes to this project will be documented in this file.
   [0.986, 1.027], not significant.
 
 ### Changed
+- **The three pointer-witness "scan stays in C" locks no longer measure wall time.**
+  `test_param_witness_scans_in_c` (both witness copies) and
+  `test_plan_witness_scan_stays_c_level` now count the Python bytecode one witness call
+  executes and require that count to be flat in the number of parameters — a `map` over
+  unbound C methods is flat by construction, while a generator expression, a list
+  comprehension *or* an inlined `for` loop each execute ~15 opcodes per parameter. Same
+  mutant killed, deterministically: the old wall-clock comparison against a genexpr
+  reference failed in 2-3 of 12 runs on a contended machine with no code change. The
+  fused case is now also exercised with `ft.SHAPE_WITNESS` **on**, which pins the
+  fourth (`strides`) field's scan as well. The timed checks survive as opt-in smoke tests
+  (`KAON_PERF_TESTS=1`), out of the default suite.
 - **Adakaon's foreach bucketing/view plan is now the shared one** (`kaon._foreach_plan`).
   `ForeachPlanMixin` plus a five-line `ForeachSpec` (`factored_state=("row", "col")`,
   `flat_state=("v",)`, `momentum_cache=beta1 > 0 and momentum_dtype != "4bit"`) replace

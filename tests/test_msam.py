@@ -18,6 +18,7 @@ Covers:
 from __future__ import annotations
 
 import math
+import os
 
 import pytest
 import torch
@@ -25,6 +26,8 @@ import torch
 from kaon import Adakaon, AdaPNM, Lookahead
 from kaon._wrappers import CodecBuffer
 from kaon.msam import MSAM
+
+from .conftest import assert_scan_runs_in_c
 
 
 def _params(seed=0):
@@ -366,13 +369,49 @@ def test_plan_witness_ignores_an_in_place_requant():
     assert MSAM._plan_addrs_valid(cache)
 
 
-def test_plan_witness_scan_stays_c_level():
+@pytest.mark.parametrize("quantized", [True, False], ids=["three_tables", "two_tables"])
+def test_plan_witness_scan_stays_c_level(quantized):
     """The witness must scan the addresses with ``map`` (the loop runs in C), not with a
     generator expression: at 428 parameters and three address tables the genexpr form
     measured ~1.4x the wall time, ~0.1 ms of pure CPU per optimizer step.
 
-    Compared against a genexpr reference timed in the same loop, so the bound tracks the
-    machine instead of an absolute number.
+    Structural, not timed. The number of Python bytecode instructions one full validation
+    executes must not depend on how many parameters a bucket holds: the only Python loop
+    in ``_plan_addrs_valid`` is over BUCKETS, and each bucket's address tables are read
+    with ``tuple(map(_data_ptr, ...))``. Both caches here hold the same NUMBER of buckets
+    (two) and differ only in how many parameters each one holds, so a flat opcode count
+    means the per-parameter loops are still in C — 104 opcodes with the ``m_scale`` table,
+    82 without it — while any Python-level rewrite executes ~15 opcodes per parameter per
+    table and scales. ``quantized=False`` drops the ``m_scale`` table, so both the
+    two-table and the three-table shape of the scan are covered.
+
+    The cache is asserted valid first: a witness that short-circuited on a mismatch would
+    not scan everything, and the count has to cover the whole scan.
+
+    Replaces a wall-clock comparison against a genexpr reference (kaon 0.7.12-0.7.13),
+    which flaked under CPU contention — 2-3 failures in 12 runs on a loaded machine with
+    no code change. The timed variant survives as
+    ``test_plan_witness_beats_genexpr_on_the_clock``, opt-in via ``KAON_PERF_TESTS=1``.
+    """
+    small = _witness_cache(n_conv=4, n_scalar=4, quantized=quantized)
+    big = _witness_cache(n_conv=256, n_scalar=256, quantized=quantized)
+    assert MSAM._plan_addrs_valid(small) and MSAM._plan_addrs_valid(big), (
+        "the synthetic caches must be valid, or the scan short-circuits and is not measured"
+    )
+
+    assert_scan_runs_in_c(MSAM._plan_addrs_valid, small, big, "MSAM._plan_addrs_valid")
+
+
+@pytest.mark.skipif(os.environ.get("KAON_PERF_TESTS") != "1",
+                    reason="wall-clock smoke test; set KAON_PERF_TESTS=1 to run")
+def test_plan_witness_beats_genexpr_on_the_clock():
+    """Opt-in wall-clock smoke test for the margin ``test_plan_witness_scan_stays_c_level``
+    locks structurally: on a 428-param, three-table cache the shipped ``map`` scan should
+    beat a genexpr reference by ~1.4x.
+
+    NOT part of the default suite — it measures elapsed time and flakes under CPU
+    contention, which is why the real lock counts bytecode instead. Run it by hand on an
+    idle machine: ``KAON_PERF_TESTS=1 pytest tests/test_msam.py -k beats_genexpr``.
     """
     import time
 
