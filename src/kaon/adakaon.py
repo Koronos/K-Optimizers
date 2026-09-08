@@ -1046,6 +1046,19 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
             # Batched: dequant_stacked runs the whole bucket's codec in a handful of kernels.
             # The per-tensor dequant_one loop was ~8 tiny torch ops x N tensors, CPU-dispatch
             # bound: measured ~87 ms/step on a 528-tensor LoRA-r32 fleet (4080), vs <2 ms batched.
+            #
+            # NO ``views=`` HERE, deliberately. The native path hands the codec cached view
+            # lists (``ForeachChunk.momentum_views``) because it walks them once per param
+            # per step on bags of hundreds of TINY tensors. This is the opposite regime: it
+            # is the fallback of the *big* route, so N is small (one shape bucket of weights
+            # each above the tile cap) and every one of them is megabytes — the N views the
+            # codec rebuilds are noise next to the dequant/requant traffic. It is also cold
+            # on top of that: it runs only when the in-Triton momentum routes decline the
+            # alignment (int8 with C > 1024 or C not dividing it, 4-bit with m_block > 1024
+            # or not dividing a chunk), or with ``_fused_reductions=False``. And ``mat``
+            # here is identity, not the ``(R, C)`` layout ``eff`` names, so a cached
+            # ``_StackedViews`` would have to be built with a different callback than the
+            # one passed — a second, subtly different contract for no measurable gain.
             temp = self._codec(group).dequant_stacked(
                 states, lambda t: t, (R, C)
             ).reshape(N, R, C).contiguous()
@@ -1222,11 +1235,17 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         if fused_step < 0:
             raise ValueError("Adakaon checkpoint has an invalid fused step counter")
         self._autolr_load(copied, lambda sd: load_state_dict_preserving_dtypes(self, sd))
-        # torch restores param_groups from the CHECKPOINT's dicts, so a checkpoint written
-        # before a group key existed comes back without it and the next step raises KeyError.
-        # Back-fill the constructor default (the historical behaviour for ``cautious_wd``).
+        # torch restores param_groups from the CHECKPOINT's dicts (only ``params`` is carried
+        # over from the live optimizer), so a checkpoint written before a group key existed
+        # comes back without it and the next step raises KeyError. Back-fill EVERY missing
+        # key from the constructor defaults, as the rest of the optimizers do since 0.7.12:
+        # this used to name ``cautious_wd`` alone — the one key that had bitten — which left
+        # every other key added after a checkpoint was written (``momentum_4bit_block``,
+        # ``bf16_method``, ``clip_threshold``, ...) a first-step KeyError on resume.
+        # ``setdefault``, so a value the checkpoint DOES carry always wins.
         for g in self.param_groups:
-            g.setdefault("cautious_wd", self.defaults.get("cautious_wd", "masked"))
+            for key, value in self.defaults.items():
+                g.setdefault(key, value)
         self._t = fused_step
         if int(meta.get("momentum_units", 1)) < 2:
             self._migrate_momentum_to_direction_units()

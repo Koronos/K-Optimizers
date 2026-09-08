@@ -160,6 +160,18 @@ All notable changes to this project will be documented in this file.
   do not are exactly the set the base tree already fails to reproduce against itself —
   agreeing to rel ≤ 1.8e-7 against a base-vs-base spread of 1.3e-7.
 
+### Fixed
+- **`Adakaon.load_state_dict` now back-fills *every* missing param-group key** from
+  `self.defaults`, like the other nine optimizers have since 0.7.12. It named
+  `cautious_wd` alone — the one key that had bitten — so a checkpoint written before any
+  other group key existed (`momentum_4bit_block`, `bf16_method`, `clip_threshold`,
+  `gradient_centralization`, `cautious`, `eps`, `momentum_dtype`, `betas`,
+  `weight_decay`) came back without it (torch restores `param_groups` from the
+  *checkpoint's* dicts) and died with `KeyError` on the first resumed step. Values the
+  checkpoint does carry still win (`setdefault`), including per-group overrides that
+  differ from the resuming instance's constructor arguments; a resume from a complete
+  checkpoint is bit-identical to an uninterrupted run.
+
 ## [0.7.12]
 
 This release is a full correctness and performance audit of the 0.7.11 fused/Triton
