@@ -33,6 +33,7 @@ from kaon import (
     Adakaon,
     AdamP,
     AdaMuon,
+    Lion,
     ScheduleFree,
     reseed_stochastic_rounding,
 )
@@ -45,11 +46,24 @@ OPTIMIZERS = {
     "AdamP": (AdamP, {}),
     "ADOPT": (ADOPT, {}),
     "ScheduleFree": (ScheduleFree, {}),
+    "Lion": (Lion, {}),
 }
 NAMES = list(OPTIMIZERS)
-AUTOLR = ["Adakaon", "AdaMuon", "AdaBelief", "AdamP", "ADOPT"]  # ScheduleFree: no AutoLR mixin
-NO_EXTRA_KEY = ["Adakaon", "ScheduleFree"]        # coefficients are per group, not per param
+# ScheduleFree: no AutoLR mixin.
+AUTOLR = ["Adakaon", "AdaMuon", "AdaBelief", "AdamP", "ADOPT", "Lion"]
+# Coefficients are per group, not per param -> no per-parameter clock in the bucket key.
+NO_EXTRA_KEY = ["Adakaon", "ScheduleFree", "Lion"]
 EXTRA_KEY = [n for n in NAMES if n not in NO_EXTRA_KEY]
+# Lion bucketed by exact shape before it moved onto the shared plan, so it keeps 0-D
+# params out of the ``L == 1`` bucket (``ForeachSpec.scalar_bucket``) — that partition is
+# what its frozen bf16+SR vectors are anchored to.
+SCALAR_SPLIT = ["Lion"]
+SCALAR_MERGED = [n for n in NAMES if n not in SCALAR_SPLIT]
+MATRIXIZE = list(NAMES)
+# Optimizers whose non-factored bucket walks exactly one cached state view. Lion's only
+# state IS the momentum, which it reads through the codec's own cached view lists.
+NO_FLAT_STATE = ["Lion"]
+FLAT_STATE = [n for n in NAMES if n not in NO_FLAT_STATE]
 
 
 def make_bag(dtype=torch.float32, *, seed=0):
@@ -161,7 +175,7 @@ def test_disabled_cache_stores_nothing(name):
 
 
 # ------------------------------------------------------------------- bucket keys
-@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("name", SCALAR_MERGED)
 def test_scalar_and_shape_one_share_a_bucket(name):
     """0-D params ride the ``L == 1`` bucket as length-1 views of the same storage."""
     torch.manual_seed(11)
@@ -178,6 +192,28 @@ def test_scalar_and_shape_one_share_a_bucket(name):
     assert chunk.pviews[0].data_ptr() == bag[0].data.data_ptr()
 
 
+@pytest.mark.parametrize("name", SCALAR_SPLIT)
+def test_scalar_bucket_keeps_0d_apart_from_shape_one(name):
+    """Lion bucketed by exact shape, so 0-D and ``(1,)`` stay separate.
+
+    Two ``L == 1`` buckets instead of one is a (small) missed merge; it is the price of
+    its bf16+SR draw order not moving, which the frozen vectors below pin down. The
+    0-D param still rides its bucket as a length-1 *view* of its own storage.
+    """
+    torch.manual_seed(11)
+    bag = [torch.nn.Parameter(torch.randn(())), torch.nn.Parameter(torch.randn(1))]
+    opt = build(name, bag)
+    set_grads(bag, 1)
+    opt.step()
+    chunks = only_plan(opt).chunks
+    assert len(chunks) == 2
+    assert [c.n for c in chunks] == [1, 1]
+    assert all(c.eff is None and c.length == 1 for c in chunks)
+    scalar = chunks[0]
+    assert scalar.pviews[0].shape == (1,)
+    assert scalar.pviews[0].data_ptr() == bag[0].data.data_ptr()
+
+
 @pytest.mark.parametrize("name", NAMES)
 def test_dtype_splits_buckets(name):
     torch.manual_seed(11)
@@ -189,7 +225,7 @@ def test_dtype_splits_buckets(name):
     assert len(only_plan(opt).chunks) == 2
 
 
-@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("name", MATRIXIZE)
 def test_conv_bucket_is_matrixized(name):
     torch.manual_seed(11)
     bag = [torch.nn.Parameter(torch.randn(2, 2, 3, 3)) for _ in range(2)]
@@ -200,6 +236,7 @@ def test_conv_bucket_is_matrixized(name):
     assert chunk.matrixize and chunk.eff == (2, 18)
     assert chunk.pviews[0].shape == (2, 18)
     assert chunk.grad_stack().shape == (2, 2, 18)
+
 
 
 # ------------------------------------------------------- invalidation 1: param set
@@ -469,11 +506,32 @@ def test_param_witness_fields_are_independent():
 def test_mixin_is_in_every_optimizer_mro():
     for cls, _ in OPTIMIZERS.values():
         assert issubclass(cls, ForeachPlanMixin), cls.__name__
-        assert cls._FOREACH_SPEC.factored_state == ("row", "col")
-        assert len(cls._FOREACH_SPEC.flat_state) == 1
+
+
+# The state keys each optimizer's bucket bodies walk. Everything factored keeps an
+# Adafactor row/col pair; the exception is Lion, which has no second moment at all —
+# only the codec-owned momentum.
+STATE_KEYS = {
+    "Adakaon": (("row", "col"), 1),
+    "AdaMuon": (("row", "col"), 1),
+    "AdaBelief": (("row", "col"), 1),
+    "AdamP": (("row", "col"), 1),
+    "ADOPT": (("row", "col"), 1),
+    "ScheduleFree": (("row", "col"), 1),
+    "Lion": ((), 0),
+}
 
 
 @pytest.mark.parametrize("name", NAMES)
+def test_spec_declares_the_state_keys_its_buckets_walk(name):
+    factored, n_flat = STATE_KEYS[name]
+    spec = build(name, [torch.nn.Parameter(torch.randn(4, 3))])._foreach_spec(
+        {"second_moment": OPTIMIZERS[name][1].get("second_moment", "full")})
+    assert spec.factored_state == factored
+    assert len(spec.flat_state) == n_flat
+
+
+@pytest.mark.parametrize("name", FLAT_STATE)
 def test_chunk_state_views_alias_the_state_buffers(name):
     """The cached state views must write THROUGH to ``self.state``, 0-D included."""
     torch.manual_seed(11)
@@ -484,10 +542,27 @@ def test_chunk_state_views_alias_the_state_buffers(name):
     chunk = only_plan(opt).chunks[0]
     assert isinstance(chunk, ForeachChunk)
     (views,) = chunk.state_views
-    key = OPTIMIZERS[name][0]._FOREACH_SPEC.flat_state[0]
+    key = opt._foreach_spec(opt.param_groups[0]).flat_state[0]
     for view, state in zip(views, chunk.states, strict=True):
         assert view.shape == (1,)
         assert view.data_ptr() == state[key].data_ptr()
+
+
+@pytest.mark.parametrize("name", NO_FLAT_STATE)
+def test_lion_caches_only_param_and_codec_views(name):
+    """Lion declares no state keys: its single buffer is the codec-owned momentum, whose
+    cached view lists live on ``chunk.momentum_views(codec)``, not ``state_views``."""
+    torch.manual_seed(11)
+    bag = [torch.nn.Parameter(torch.randn(())) for _ in range(2)]
+    opt = build(name, bag, momentum_dtype="int8")
+    set_grads(bag, 1)
+    opt.step()
+    chunk = only_plan(opt).chunks[0]
+    assert chunk.state_views == ()
+    views = chunk.momentum_views(opt._codec("int8"))
+    assert views is not None and views.eff == (1,)
+    for m, state in zip(views.m, chunk.states, strict=True):
+        assert m.data_ptr() == state["m"].data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -631,3 +706,116 @@ def test_frozen_bf16_sr_vector_matches_the_pre_refactor_tree(name, cache):
     host-side cache on and off, since neither may move a single draw."""
     cls, extra = OPTIMIZERS[name]
     assert _frozen_sr_run(cls, cache=cache, **extra) == _FROZEN_SR_BITS[name]
+
+
+# ============================================ Lion: the bucketing it is pinned to
+# Lion carried its OWN bucketing before this module: one dict keyed by the parameter's
+# exact shape, stepped in first-appearance order. That partition and that order are
+# wire-visible through the stochastic-rounding draws (a bucket draws its rounding noise
+# in one shot, sized by the bucket), so the migration had to keep them: hence
+# ``ForeachSpec(scalar_bucket=..., raw_shape_key=..., insertion_order=..., matrixize=...)``.
+# The bag below is built so every one of those flags matters — read the comments on
+# ``_PINNED_BAG`` — and the two tests are the partition/order anchor and its
+# observable consequence.
+#
+# ``(2, 2, 3, 3)`` and ``(2, 6, 1, 3)`` matrixize to the SAME ``(2, 18)``: the canonical
+# plan merges them, Lion never did (``raw_shape_key``). ``()`` before ``(1,)`` and both
+# before any matrix: the canonical plan would emit all matrices first and merge the two
+# one-element buckets (``insertion_order``, ``scalar_bucket``).
+_PINNED_BAG = [(), (4, 3), (1,), (2, 2, 3, 3), (5,), (2, 6, 1, 3), (4, 3)]
+_PINNED_LAGGING = (0, 3)          # no gradient on step 2
+
+# (name, factored?, n) per chunk, in order.
+_PINNED_ORDER = {
+    "Lion": [(None, False, 1), ((4, 3), True, 2), (None, False, 1),
+             ((2, 18), True, 1), (None, False, 1), ((2, 18), True, 1)],
+}
+
+
+@pytest.mark.parametrize("name", SCALAR_SPLIT)
+def test_pinned_bucket_partition_and_order(name):
+    """The exact chunk list — eff, family and size — Lion stepped pre-plan."""
+    torch.manual_seed(11)
+    bag = [torch.nn.Parameter(torch.randn(s)) for s in _PINNED_BAG]
+    opt = build(name, bag)
+    set_grads(bag, 1)
+    opt.step()
+    chunks = only_plan(opt).chunks
+    got = [(c.eff, c.eff is not None, c.n) for c in chunks]
+    assert got == _PINNED_ORDER[name]
+
+
+_PINNED_SR_BITS = {
+    ("Lion", "bfloat16"): [
+        49192, 15723, 16293, 49039, 15973, 16022, 48999, 16242, 49044, 16308, 48796,
+        48915, 15919, 48798, 48816, 16299, 49025, 48914, 48764, 15970, 49063, 48971,
+        16132, 48759, 16137, 48885, 16355, 48853, 49124, 15933, 48881, 15849, 16188,
+        15861, 49056, 16365, 16339, 49074, 16027, 49068, 16248, 48866, 48942, 48432,
+        49078, 16141, 48692, 48921, 48832, 16065, 15939, 15872, 49100, 16149, 49089,
+        16045, 49019, 16020, 49095, 16086, 48955, 48941, 15941, 49123, 16217, 16288,
+        16343, 48888, 48760, 16234, 15882, 48882, 16157, 48865, 16166, 49167, 49004,
+        49092, 48951, 16120, 16012, 16271, 49013, 48298, 16292, 48970, 48893, 16135,
+        16187, 16208, 49168, 16249, 49184, 16259, 48819, 48945, 16177, 49134, 16312,
+        16187, 49086, 48878, 15951],
+    ("Lion", "int8"): [
+        49192, 15723, 16293, 49039, 15973, 16022, 48999, 16242, 49044, 16308, 48796,
+        48915, 15919, 48798, 48816, 16299, 49025, 48914, 48764, 15970, 49063, 48971,
+        16132, 48759, 16137, 48885, 16355, 48853, 49124, 15933, 48881, 15849, 16188,
+        15861, 49056, 16365, 16339, 49074, 16027, 49068, 16248, 48866, 48942, 48432,
+        49078, 16141, 48692, 48921, 48832, 16065, 15939, 15872, 49100, 16149, 49089,
+        16045, 49019, 16020, 49095, 16086, 48955, 48941, 15941, 49123, 16217, 16288,
+        16343, 48888, 48760, 16234, 15882, 48882, 16157, 48865, 16166, 49167, 49004,
+        49092, 48951, 16120, 16012, 16271, 49013, 48298, 16292, 48970, 48893, 16135,
+        16187, 16208, 49168, 16249, 49184, 16259, 48819, 48945, 16177, 49134, 16312,
+        16187, 49086, 48878, 15951],
+    ("Lion", "4bit"): [
+        49192, 15723, 16293, 49039, 15973, 16022, 48999, 16242, 49044, 16308, 48796,
+        48915, 15919, 48798, 48816, 16299, 49025, 48914, 48764, 15971, 49063, 48971,
+        16132, 48759, 16137, 48885, 16355, 48853, 49124, 15932, 48882, 15849, 16188,
+        15861, 49056, 16365, 16338, 49074, 16032, 49068, 16248, 48866, 48942, 48434,
+        49078, 16141, 48692, 48921, 48832, 16066, 15939, 15872, 49100, 16149, 49089,
+        16044, 49019, 16020, 49095, 16086, 48955, 48941, 15940, 49123, 16217, 16288,
+        16343, 48888, 48760, 16237, 15883, 48881, 16157, 48866, 16167, 49167, 49004,
+        49092, 48952, 16120, 16012, 16271, 49013, 48300, 16292, 48970, 48893, 16135,
+        16187, 16208, 49168, 16249, 49184, 16259, 48819, 48945, 16177, 49134, 16312,
+        16187, 49086, 48878, 15951],
+}
+
+
+def _pinned_sr_run(name, md, *, cache=True):
+    """Five steps of bf16 + stochastic rounding over ``_PINNED_BAG``."""
+    torch.manual_seed(0x51D)
+    reseed_stochastic_rounding()
+    g = torch.Generator().manual_seed(4242)
+    params = [torch.nn.Parameter(torch.randn(s, generator=g).bfloat16())
+              for s in _PINNED_BAG]
+    cls, extra = OPTIMIZERS[name]
+    kwargs = {"lr": 1e-2, "weight_decay": 0.01, "momentum_dtype": md,
+              "bf16_method": "stochastic_rounding", **extra}
+    opt = cls(params, **kwargs)
+    opt._foreach_cache_enabled = cache
+    for step in range(1, 6):
+        gg = torch.Generator().manual_seed(500 + step)
+        for i, p in enumerate(params):
+            if step == 2 and i in _PINNED_LAGGING:
+                p.grad = None
+                continue
+            p.grad = (torch.randn(p.shape, generator=gg) * 0.05).bfloat16()
+        opt.step()
+    if cache:
+        assert opt._foreach_plans, "the frozen vector must come from the cached path"
+    return [int(b) for p in params
+            for b in p.detach().view(torch.uint16).reshape(-1).tolist()]
+
+
+@pytest.mark.parametrize("md", ["bfloat16", "int8", "4bit"])
+@pytest.mark.parametrize("name", SCALAR_SPLIT)
+@pytest.mark.parametrize("cache", [True, False])
+def test_pinned_bf16_sr_vector_matches_the_pre_plan_tree(name, md, cache):
+    """bf16 weights, bit for bit, against values captured from f88face (pre-migration).
+
+    Sensitivity check that justifies this being the anchor: on this bag the foreach and
+    per-parameter paths disagree on 59-74 of the 103 bf16 words, so the draw order the
+    bucketing induces is very much visible here.
+    """
+    assert _pinned_sr_run(name, md, cache=cache) == _PINNED_SR_BITS[(name, md)]

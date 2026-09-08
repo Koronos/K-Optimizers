@@ -576,3 +576,47 @@ def test_foreach_channels_last_conv_updates_like_per_param():
         ob.step()
     assert float((pa.detach() - before).abs().max()) > 0, "foreach left channels_last weight unchanged"
     torch.testing.assert_close(pa.detach(), pb.detach(), rtol=0, atol=0)
+
+
+def test_transposed_2d_weight_actually_gets_its_update():
+    """A non-contiguous ``ndim == 2`` weight must be updated by the batched path.
+
+    Regression: the pre-plan bucket flattened its write-back target with
+    ``p.data.reshape(length)``. For a transposed (or otherwise non-contiguous) 2-D
+    weight ``reshape`` hands back a **copy**, so ``_foreach_sub_`` wrote the copy and the
+    weight silently never moved — while its momentum kept advancing, because the momentum
+    path never went through that reshape. Only ``ndim > 2`` was guarded by the
+    contiguity check, so this landed on any square weight someone transposed in place.
+    The shared plan's ``chunk.pviews`` keep the identity view for a 2-D bucket (and
+    ``param_witness`` rebuilds the plan when contiguity moves), which fixes it.
+    """
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(7)
+    params = [torch.nn.Parameter(torch.randn(4, 4, generator=g)) for _ in range(3)]
+    ref = [torch.nn.Parameter(p.detach().clone()) for p in params]
+    kw = dict(lr=0.1, momentum_dtype="float32", bf16_method="none",
+              gradient_centralization=False)
+    opt = Lion(params, foreach=True, **kw)
+    opt_ref = Lion(ref, foreach=False, **kw)
+
+    def grads(step):
+        gg = torch.Generator().manual_seed(100 + step)
+        for p, r in zip(params, ref, strict=True):
+            raw = torch.randn(4, 4, generator=gg) * 0.1
+            p.grad, r.grad = raw.clone(), raw.clone()
+
+    grads(1)
+    opt.step()
+    opt_ref.step()
+    params[0].data = params[0].data.t()
+    ref[0].data = ref[0].data.t()
+    before = params[0].detach().clone()
+    for step in (2, 3):
+        grads(step)
+        opt.step()
+        opt_ref.step()
+    assert float((params[0].detach() - before).abs().max()) > 0, (
+        "the batched path left the transposed weight unchanged"
+    )
+    for p, r in zip(params, ref, strict=True):
+        torch.testing.assert_close(p.detach(), r.detach(), rtol=0, atol=0)
