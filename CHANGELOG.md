@@ -7,37 +7,66 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - **ADOPT turned a finite gradient into NaN through the factored second moment.**
   The Adafactor reconstruction divides the row stats by their own mean. That mean is
-  zero only when the whole row vector is zero, which needs `eps1 == 0` — and ADOPT is
-  the only optimizer here that passes `eps1 == 0` (to match the official
-  implementation, which adds no eps inside `g ** 2`). An all-zero gradient therefore
-  left `row == 0` and the reconstruction computed `0 / 0`; the NaN survived the
-  `clamp(max=1/eps)` cap and poisoned the momentum and the weights, permanently.
-  Reported for 2-D params whose fan-in is 1 (`(5, 1)`, `(129, 1)`, `(1, 1)`,
-  `(R, 1, 1, 1)`), where Gradient Centralization zeroes the gradient by construction,
-  but reachable on **any** shape from a genuinely zero gradient (a dead branch, a
-  frozen slice, a masked loss term). Both routes were affected (`foreach` and
-  per-param). The row-mean divisor is now floored at the smallest normal fp32, so the
-  degenerate case saturates at the same `1 / eps` cap the non-factored path already
-  produced for `v == 0` (`denom = max(sqrt(0), eps)`) instead of going NaN — verified
-  to give the identical step to the 1-D path. NaNs arriving *from* the gradient still
-  propagate. Bit-identical to 0.7.12 for every non-degenerate shape (240 dumped
-  cases per device across all 10 optimizers, CPU + CUDA + the fused big route), and
-  the hot `foreach` path costs one extra elementwise op per shape bucket per step —
-  +10 aten ops on a 428-tensor LoRA bag, paired A/B 1.006x [0.986, 1.027], n.s.
+  zero only when the whole row vector is zero, which needs `eps1 == 0` — and with the
+  shipped defaults ADOPT is the only optimizer here that passes `eps1 == 0` (to match
+  the official implementation, which adds no eps inside `g ** 2`). An all-zero
+  gradient therefore left `row == 0` and the reconstruction computed `0 / 0`; the NaN
+  survived the `clamp(max=1/eps)` cap and poisoned the momentum and the weights,
+  permanently. Reported for 2-D params whose fan-in is 1 (`(5, 1)`, `(129, 1)`,
+  `(1, 1)`, `(R, 1, 1, 1)`), where Gradient Centralization zeroes the gradient by
+  construction, but reachable on **any** shape from a genuinely zero gradient (a dead
+  branch, a frozen slice, a masked loss term). Both routes were affected (`foreach`
+  and per-param).
+
+  `factored_inv_sqrt_factors` grew a `floor` keyword that bounds the row-mean divisor
+  from below, and **only ADOPT passes it** (`_MIN_NORMAL`, the smallest normal fp32);
+  its inlined copy in `ADOPT._factored_bucket` does the same. The degenerate case then
+  saturates at the same `1 / eps` cap the non-factored path already produced for
+  `v == 0` (`denom = max(sqrt(0), eps)`) — verified to give the bit-identical step to
+  the 1-D path. NaNs arriving *from* the gradient still propagate.
+
+  The floor is deliberately **not** unconditional. `+inf` is only useful to a caller
+  that caps the reconstruction afterwards; ADOPT and KProdigy do, while Adakaon,
+  AdaPNM, AdaBelief, AdamP, AdaMuon and ScheduleFree do not, and for them a subnormal
+  row mean (reachable with a large `beta2` and tiny gradients) is a legitimate finite
+  update that a floor would move rather than rescue. With the `floor=0.0` default no
+  clamp executes at all, so those six run byte-for-byte the same code as 0.7.12.
+
+  Bit-identity vs 0.7.12: 240 dumped cases per configuration across all 10 optimizers
+  (4 momentum dtypes x 3 weight-dtype/bf16 combos x 2 stack budgets, 12 params, 6
+  steps, checkpoint round-trip) — **0 differences** on CPU, on CUDA, and on the fused
+  big route. In an adversarial subnormal-row-mean dump (`beta2 = 1-1e-8`/`1-1e-10`,
+  gradients down to 1e-38 and 0, plus explicit `eps=0.0` where the constructor allows
+  it) the only differences are 36 ADOPT tensors, every one of them `base NaN ->
+  finite`. Cost on the hot `foreach` path: one extra elementwise op per *shape bucket*
+  per step, i.e. +10 aten ops on a 428-tensor LoRA bag; paired A/B 1.006x
+  [0.986, 1.027], not significant.
 
 ### Known
+- **A zero `eps` still NaNs the non-capping factored optimizers.** `AdaBelief`,
+  `AdamP`, `AdaPNM` and `ScheduleFree` accept `eps=0.0`, and `Adakaon` accepts
+  `eps=(0.0, ...)`; that makes their `eps1` zero, so a zero gradient reaches the same
+  `0 / 0` in the reconstruction. Only `ADOPT` and `KProdigy` validate `eps > 0`. This
+  is unchanged from 0.7.12 (both trees NaN identically) and is not addressed here: the
+  `floor` fix above is unsound for these callers because they do not cap the
+  reconstruction, so the right fix is either input validation or adding a cap.
 - **Gradient Centralization destroys fan-in-1 gradients.** `g - mean_fanin(g)` over a
   one-element fan-in is identically zero, so every GC-enabled optimizer silently
   freezes params shaped `(out, 1)` / `(out, 1, 1, 1)` — rank-1 LoRA up-projections
   among them (`AdaMuon` is unaffected: GC defaults off). ADOPT was the one that
   escalated this to NaN, which is fixed above; the freeze itself is not. Skipping
-  those params in `centralize_grads_` alone is *not* the fix — the Triton path
-  centralizes in-kernel and both `_chunked_reductions_batched` copies do it in torch,
-  so a native-only skip makes fused and native disagree (measured: it breaks
+  those params in `centralize_grads_` alone is *not* the fix: GC is implemented at
+  six-plus sites and they all have to move together —
+  `_backend.py:258-268` (native), `adakaon.py:978-979` and `:1044-1045`,
+  `adapnm.py:944-945` and `:998-999` (the per-param and batched
+  `_chunked_reductions*`), and `_fused_triton.py:417-423` (the in-kernel primitive,
+  fed by the rowmean reductions at `:768 :797 :843 :869 :968 :1022`). A native-only
+  skip makes fused and native disagree; measured, it breaks
   `test_degenerate_2d_shapes_match_native` and
-  `test_pnm_extreme_aspect_shapes_compile_and_match_native`). All four GC sites have
-  to move together. Pinned by
-  `tests/test_degenerate_fanin.py::test_gc_zeroes_fanin_1_grads_known_limitation`.
+  `test_pnm_extreme_aspect_shapes_compile_and_match_native`. Pinned as strict xfails
+  by `tests/test_degenerate_fanin.py::test_gc_leaves_fanin_1_grads_usable` and
+  `::test_gc_freezes_fanin_1_params` (the latter covering fused and native), so the
+  batch that fixes GC flips them to XPASS.
 
 ## [0.7.12]
 
