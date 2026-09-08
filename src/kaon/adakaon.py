@@ -48,6 +48,7 @@ from kaon._backend import (
     cautious_one_,
     centralize_grads_,
     foreach_budget,
+    gc_applies,
     is_low_precision,
     rms,
     subtract_batched_,
@@ -844,7 +845,12 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
                     bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["row_addr"],
                     bk["col_addr"], bk["Rs"], bk["Cs"], bk["mscale_n"],
                     lr, b1, b2, eps1, clip, wd, self._t, bk["blk"],
-                    LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0, GC=gc,
+                    # GC is PER BUCKET: a tile of fan-in-1 tensors (BC == 1) has no fan-in
+                    # mean to subtract, and centralizing it would zero the gradient. The
+                    # predicate is resolved at cache build (``bucket_gc_ok``), so this is a
+                    # bool AND, not a shape walk. See kaon._backend.gc_applies.
+                    LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0,
+                    GC=gc and bk["gc_ok"],
                     SR=bk["lowp"], MOMENTUM=bk["momentum"], WDFULL=wd_full,
                     BR=bk["BR"], BC=bk["BC"], EXACT=bk["exact4"], FBLK=bk["fblk"],
                     num_warps=ft.warps_for(lanes),
@@ -887,7 +893,10 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         b2, eps1 = group["betas"][1], group["eps"][0]
         clip = group["clip_threshold"]
         g = p.grad.float().reshape(R, n // R)
-        if group["gradient_centralization"]:
+        # ``gc_applies`` (not the raw flag): a fan-in-1 row has no mean to subtract — see
+        # kaon._backend.gc_applies. Once per tensor per step on the LONE-big fallback route,
+        # where each tensor is megabytes.
+        if group["gradient_centralization"] and gc_applies(p.shape):
             g = g - g.mean(dim=1, keepdim=True)
         g = g.contiguous()
         gsq = g * g
@@ -940,12 +949,19 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
     # ----------------------------------------------- batched chunked (many same-shape big tensors)
     @torch.no_grad()
-    def _chunked_reductions_batched(self, plist: list[Tensor], group: dict[str, Any]) -> tuple:
+    def _chunked_reductions_batched(
+        self, plist: list[Tensor], group: dict[str, Any], gc: bool
+    ) -> tuple:
         """Stacked torch reductions for a same-shape big bucket: GC (on the fp32 copy) + row/col EMA
         + per-tensor rms (matvec, no [N,R,C] beyond grad/gsq). Returns the stacked fp32 grad ``[N,n]``,
         the stacked r/c factors ``[N,R]``/``[N,C]`` (contiguous), and ``inv_rms`` ``[N]`` — the same
         quantities ``_chunked_reductions`` returns per tensor. Mirrors that math exactly (eps1 added to
-        the row/col means; rms uses raw gsq)."""
+        the row/col means; rms uses raw gsq).
+
+        ``gc`` is the EFFECTIVE per-bucket flag the caller resolved
+        (``group["gradient_centralization"] and cache.gc_ok``), not the raw group flag: GC is
+        undefined on a fan-in-1 shape and a bucket is one exact shape — see
+        :func:`kaon._backend.gc_applies`."""
         b2, eps1 = group["betas"][1], group["eps"][0]
         clip = group["clip_threshold"]
         N = len(plist)  # noqa: N806
@@ -953,7 +969,7 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         n = R * C
         states = [self.state[p] for p in plist]
         g = torch.stack([p.grad.reshape(R, C) for p in plist]).float()     # [N, R, C]
-        if group["gradient_centralization"]:
+        if gc:
             g.sub_(g.mean(dim=-1, keepdim=True))                          # GC on the fp32 copy
         gsq = g * g                                                       # raw (eps1 goes on the means)
         row = torch.stack([s["row"] for s in states])                    # [N, R]
@@ -992,7 +1008,7 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         md, b1 = group["momentum_dtype"], group["betas"][0]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
-        gc = group["gradient_centralization"]
+        gc_flag = group["gradient_centralization"]
         lowp = plist[0].dtype == torch.bfloat16
         sr = lowp and (group["bf16_method"] == "stochastic_rounding")
         states = [self.state[p] for p in plist]
@@ -1008,14 +1024,21 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         # cache aliases ``rowmean`` onto ``rowsum`` to save N*R floats, and a group dict
         # flipped mid-run (schedulers do this) would then have the reduction kernel write
         # the row means over the row sums. Nothing moved, so no witness could see it.
-        if cache is None or not cache.built_from(plist) or cache.gc != gc:
-            cache = ft.BigPointerCache(plist, lambda p: self.state[p], R, C, gc=gc)
+        #
+        # The comparison is against the EFFECTIVE flag: the cache resolves GC's shape
+        # predicate once (``cache.gc_ok``, a fan-in-1 bucket has no GC to do — see
+        # kaon._backend.gc_applies), so ``gc_flag and cache.gc_ok`` costs a bool AND per
+        # step instead of a shape walk, and a fresh cache is built with the raw flag and
+        # applies the predicate itself.
+        if cache is None or not cache.built_from(plist) or cache.gc != (gc_flag and cache.gc_ok):
+            cache = ft.BigPointerCache(plist, lambda p: self.state[p], R, C, gc=gc_flag)
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()
+        gc = cache.gc          # the per-bucket constexpr every launch below is given
 
         if b1 == 0.0:
             self._chunked_step_batched_nomom(
-                plist, group, ft, R, C, n, lowp, sr, states, cache
+                plist, group, ft, R, C, n, lowp, sr, states, cache, gc
             )
             return
 
@@ -1027,11 +1050,11 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             # into the clip factor itself, and ``zero_accumulators`` has already cleared
             # ``keep`` along with it (one launch for the three).
             g_addr, rowmean, r, c, rms = self._chunked_reductions_fused(
-                plist, group, ft, R, C, n, lowp, cache
+                plist, group, ft, R, C, n, lowp, cache, gc
             )
             keep = cache.keep
         else:
-            g, r, c, inv_rms = self._chunked_reductions_batched(plist, group)
+            g, r, c, inv_rms = self._chunked_reductions_batched(plist, group, gc)
             keep = cache.keep.zero_()
 
         p_addr = cache.p_addr
@@ -1142,9 +1165,12 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             )
 
     def _chunked_step_batched_nomom(
-        self, plist, group, ft, R, C, n, lowp, sr, states, cache  # noqa: N803
+        self, plist, group, ft, R, C, n, lowp, sr, states, cache, gc  # noqa: N803
     ) -> None:
-        """Chunked big-tensor path for beta1=0 with no momentum allocation."""
+        """Chunked big-tensor path for beta1=0 with no momentum allocation.
+
+        ``gc`` is the caller's effective per-bucket flag (``cache.gc``); the native fallback
+        below goes through ``centralize_grads_``, which applies the same predicate itself."""
         if not self._fused_reductions:
             if group["gradient_centralization"]:
                 centralize_grads_(plist)
@@ -1154,10 +1180,9 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         lr, wd = group["lr"], group["weight_decay"]
         cautious = group["cautious"]
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
-        gc = group["gradient_centralization"]
         clip = group["clip_threshold"]
         g_addr, rowmean, r, c, rms = self._chunked_reductions_fused(
-            plist, group, ft, R, C, n, lowp, cache
+            plist, group, ft, R, C, n, lowp, cache, gc
         )
         p_addr = cache.p_addr
         K = (n + 1023) // 1024  # noqa: N806
@@ -1175,7 +1200,7 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         )
 
     @torch.no_grad()
-    def _chunked_reductions_fused(self, plist, group, ft, R, C, n, lowp, cache):  # noqa: N803
+    def _chunked_reductions_fused(self, plist, group, ft, R, C, n, lowp, cache, gc):  # noqa: N803
         """Candidate #4: row/col EMA factors + the rms accumulator via Triton reduction kernels
         reading grad from a pointer array (NO [N,R,C] stack; GC in-kernel). Returns
         ``(g_addr, rowmean, r, c, rms)`` — the mom/apply ``_g`` kernels re-read grad via
@@ -1193,9 +1218,13 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         Those four launches were a FIXED per-bucket cost (measured 62-94 us for the set),
         which is what dominates a step over many small-ish big buckets: a 40-bucket step
         paid it 40 times, 1.2-1.9 ms/step of pure launch overhead.
+
+        ``gc`` is the caller's effective per-bucket flag (``cache.gc``), and it MUST be the
+        same value the mom/apply ``_g`` kernels get: those re-apply GC from the ``rowmean``
+        this function's reduction kernel writes, so a disagreement would centralize the update
+        with a mean the reductions never subtracted. See :func:`kaon._backend.gc_applies`.
         """
         b2, eps1 = group["betas"][1], group["eps"][0]
-        gc = group["gradient_centralization"]
         N = len(plist)  # noqa: N806
         g_addr = cache.g_addr
         BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806

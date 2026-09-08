@@ -144,7 +144,10 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             Pin ``False`` to recover the literal official AdamP step.
         gradient_centralization: subtract the per-output-row gradient mean for
             ``ndim >= 2`` weights before the step (Yong et al. 2020). **On by
-            default**; pin ``False`` for the literal official step.
+            default**; pin ``False`` for the literal official step. Skipped where the
+            fan-in is 1 (``(out, 1)``, ``(out, 1, 1, 1)``), because subtracting a
+            one-element row's own mean zeroes the gradient — see
+            ``kaon._backend.gc_applies``.
         momentum_dtype: storage for the first moment — ``"bfloat16"`` (default,
             ~2 B/param), ``"float32"`` (4 B/param), ``"int8"`` (~1 B/param, per-row
             absmax), or ``"4bit"`` (~0.5 B/param, per-block absmax, nibble-packed).

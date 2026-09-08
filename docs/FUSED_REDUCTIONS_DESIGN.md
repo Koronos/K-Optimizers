@@ -73,6 +73,42 @@ needs the row/col-sum kernel + GC-in-mom/apply). Conv (#3) rides this unchanged 
   fp32; reuse the existing `_run_parity` net (exact fp32, bounded bf16).
 - Padded-lane masking in the mean (padded cols must not bias the per-row mean).
 
+### GC is a PER-BUCKET constexpr, and the predicate has one definition (0.7.13)
+
+`GC` reaches every kernel above as a `tl.constexpr`. A Triton program cannot call Python, and one
+launch serves one bucket, so **whether GC applies must be decided on the host, per bucket, and must
+agree with what `centralize_grads_` does on the native route** — otherwise the same weight takes a
+different step depending on which route it landed on. The contract:
+
+1. **The predicate is `kaon._backend.gc_applies(shape)` — `len(shape) >= 2 and
+   math.prod(shape[1:]) > 1` — and nothing else.** It is written as a product over the fan-in dims,
+   not as `numel // shape[0]`, so that an empty output dim (`shape[0] == 0`) answers instead of
+   raising `ZeroDivisionError`. GC is undefined for a fan-in of 1: the mean of a one-element row *is* the
+   element, so `g - mean(g)` is identically zero, which froze `(out, 1)` / `(out, 1, 1, 1)` weights
+   silently until 0.7.13. Every host site resolves the flag through that function; no site open-codes
+   `C > 1`. `tests/test_gc_fanin_1.py::test_gc_applies_is_the_only_definition` walks the sources and
+   fails if one does.
+2. **It is uniform inside every bucket, and that is checked, not assumed.**
+   `kaon._fused_triton.bucket_gc_ok(plist)` evaluates `gc_applies` over the bucket and **raises** if
+   the members disagree. It holds today for two different reasons: the big routes bucket by exact
+   shape, and the one-block routes bucket by the padded tile where `BC = next_pow2(C) == 1` exactly
+   when `C == 1`, so a fan-in-1 tensor can never share a tile with a tensor GC applies to. A future
+   change to a bucket key that broke that gets an error, not a divergence.
+3. **The reduction and the mom/apply kernels must be given the SAME resolved flag.** On the
+   batched-big routes (`_chunked_mom_batched_g` / `_chunked_apply_batched_g` and their AdaPNM,
+   4-bit, int8 and nomom variants) GC is re-applied downstream from the `rowmean` that
+   `_reduce_rowcol` wrote. Two independently-derived flags would centralize the update with a mean
+   the reductions never subtracted — so `Adakaon._chunked_step_batched` and
+   `AdaPNM._chunked_step_batched` compute it once and thread it through
+   `_chunked_reductions_fused` / `_chunked_reductions_batched` / `_chunked_step_batched_nomom`
+   instead of re-reading the group dict.
+4. **Zero per-step cost.** The predicate is evaluated where the plan or pointer cache is built:
+   `centralize_grads_` per distinct shape bucket, `PointerArrayCache`/`AdaPnmCache` per tile bucket
+   (`bucket["gc_ok"]`), `BigPointerCache`/`BigPnmCache` per shape bucket (`cache.gc_ok`). A launch
+   site only ANDs two booleans. `BigPointerCache.gc` stays the *effective* flag, because its
+   `rowmean`-onto-`rowsum` alias is only valid while GC is off — the caller compares against
+   `group["gradient_centralization"] and cache.gc_ok` and rebuilds when that moves.
+
 ## How to resume
 Implement the three kernel changes above on this branch behind a `self._fused_reductions` toggle
 (default False until it beats 5.4 ms with parity, then True), add parity tests mirroring the #1

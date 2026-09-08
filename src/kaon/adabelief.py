@@ -147,7 +147,10 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             gradient. **On by default.**
         gradient_centralization: subtract each ``ndim>=2`` gradient's fan-in mean
             before the step (Yong et al. 2020). **On by default.** 1-D params
-            untouched.
+            untouched, and so are ``ndim>=2`` params whose fan-in is 1 (``(out, 1)``,
+            ``(out, 1, 1, 1)``): the mean of a one-element row IS the element, so GC
+            there would zero the gradient and freeze the weight (it did, before
+            0.7.13 — see ``kaon._backend.gc_applies``).
         momentum_dtype: storage for the first moment ``m`` — ``"bfloat16"``
             (default, ~2 B/param), ``"float32"`` (4 B/param), ``"int8"`` (~1 B/param,
             per-row absmax), or ``"4bit"`` (~0.5 B/param, per-block absmax,

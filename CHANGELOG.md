@@ -4,45 +4,6 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-**Behaviour changes** (numeric trajectories that move as a result of the
-stochastic-rounding seed fix below):
-- The bf16 SR noise stream is now **per optimizer** instead of process-global. A run with a
-  single stream owner on one device is **bit-identical to 0.7.12** — stream 0 on `cuda:0`
-  reproduces the old counter exactly, and seeds the torch reference path's generator with
-  the same value the shared one used. Only runs with **two or more owners that actually
-  round** move, because their draws no longer interleave in one counter: `Lookahead` (the
-  `phi` sync is its own owner on top of the inner optimizer), `SAM` (its climb), and any
-  process holding more than one rounding optimizer or writing on more than one CUDA device
-  (two devices used to draw the *same* sequence over their different shards —
-  `manual_seed_all` gives them the same base). An optimizer that never rounds (fp32 params,
-  `bf16_method="kahan"`, Adakaon's fused path) takes no identity, so a mixed fp32 + bf16 run
-  keeps the 0.7.12 sequence for its bf16 half — **with one exception: `ScheduleFree`, whose
-  default `momentum_dtype="bfloat16"` rounds its `z` write-back and therefore claims an
-  identity even over fp32 weights** (see the `### Known` entry below). Still unbiased, and
-  `kaon.reseed_stochastic_rounding()` still resets everything.
-- Checkpoints gain a top-level `_sr_meta` key (`_sr_wrap_meta_<wrapper>` for a wrapper's own
-  stream — one per level, so a nested `SAM(base_optimizer=Lookahead)` writes three): two
-  integers, plus the torch-path generator state only when that path was used (~5 KB per CPU
-  device, 16 B per CUDA one; absent on the Triton path, and absent entirely for an optimizer
-  that never rounds). 0.7.12 ignores unknown top-level keys, so new checkpoints still load
-  there — minus the resume guarantee.
-- **Known limitation / follow-up.** A stream identity is allocated in order of *first draw*.
-  Across a resume it is preserved for every owner that had already drawn when the checkpoint
-  was written (its id travels in the checkpoint) and an owner that draws for the *first* time
-  after the resume takes the next free id, which the allocator's watermark makes the same one
-  the continuous run gave it. What is **not** stable is a **new** run's trajectory when the
-  draw order itself changes: reordering optimizer construction, adding a second rounding
-  optimizer, or calling `kaon.tune()` first (it builds and steps optimizers) shifts the ids
-  and therefore the noise. 0.7.12's global counter was strictly more order-sensitive (its
-  noise depended on the interleaving of *every* optimizer's writes), so this is an
-  improvement rather than a regression, but an identity derived from something stable about
-  the owner instead of from allocation order would remove the sensitivity altogether. Not
-  done here.
-- **The unreleased intermediate layout is not read back.** The wrapper key was briefly a
-  single shared `_sr_wrap_meta`; a checkpoint carrying it is loaded, but that one blob is
-  dropped rather than adopted (guessing which level of a nested stack it belonged to is
-  worse than resuming it from draw 0). Only 0.7.13 development checkpoints are affected.
-
 ### Fixed
 - **`Lookahead` + `bf16_method="kahan"` on bf16/fp16 parameters no longer dies with
   `KeyError: 'shift'` at the first slow-weight sync.** The sync's `theta <- phi` reset goes
@@ -114,6 +75,51 @@ stochastic-rounding seed fix below):
   `map_location="cpu"` resume is bit-identical to the uninterrupted run over
   `slow_dtype` x `momentum_dtype` (16 arms).
 
+- **Gradient Centralization silently froze every parameter whose fan-in was 1.** GC
+  subtracts, per output row, the gradient's mean over the fan-in dims; over a row of ONE
+  element that mean *is* the element, so `g - mean(g)` was identically zero and the
+  parameter never moved — on the native, foreach, one-block-fused, lone-big-fused and
+  batched-big-fused routes alike, at every momentum dtype. The shapes that hit it are
+  ordinary: rank-1 LoRA up-projections `(out, 1)`, one-input 1x1 convs
+  `(out, 1, 1, 1)`, some projections. It affected all eight optimizers that default GC on
+  (`AdaMuon` only when it is switched on), and it is what escalated to NaN in ADOPT
+  (fixed separately above). `fan_in == 0` (an empty weight) fell on the same cliff, where
+  GC manufactured a NaN out of `mean()` of nothing; it is skipped too.
+
+  **GC is now skipped where it is undefined**, which required one predicate rather than a
+  patch per site: GC lives at nine host sites and sixteen Triton kernels, and a
+  native-only skip makes fused and native disagree. `kaon._backend.gc_applies(shape)`
+  (`ndim >= 2 and fan_in > 1`) is the single definition; the torch sites call it, and the
+  Triton kernels — which cannot call Python — receive it per shape/tile bucket as their
+  existing `GC` `tl.constexpr`, via `kaon._fused_triton.bucket_gc_ok`. That is sound
+  because the predicate is uniform inside every bucket the fused paths build (the big
+  routes bucket by exact shape; the one-block routes bucket by the padded tile, and
+  `BC == next_pow2(C) == 1` exactly when `C == 1`), and `bucket_gc_ok` **raises** rather
+  than guessing if a future bucket key ever mixes the two. The AdaPNM/Adakaon batched-big
+  routes take particular care: their mom/apply kernels re-apply GC from the `rowmean` the
+  reduction kernel wrote, so the one resolved flag is threaded to both instead of being
+  re-derived, which is what keeps `rowmean` coherent with the reduction that produced it.
+
+  **Cost: zero per step.** The predicate is evaluated where plans and pointer caches are
+  built, not per step — `centralize_grads_` applies it once per distinct shape bucket
+  (~4 calls on a 428-adapter bag instead of 428), `PointerArrayCache`/`AdaPnmCache` store
+  it per tile bucket, and `BigPointerCache`/`BigPnmCache` store it per shape bucket, so a
+  launch site only ANDs two booleans. Measured with `torch.profiler` on bags with no
+  fan-in-1 parameter: identical kernel set, identical launch counts, and A/B-paired
+  wall time within run-to-run noise on LoRA-428 fused and foreach.
+
+  **Verified bit-identical for fan-in >= 2** against the pre-fix tree across 736
+  configurations — 7 optimizers x fp32/bf16 parameters x fp32/bf16/int8/4bit momentum x
+  fused/native x foreach/per-param, over four bags (428 LoRA factors, 448 0-D scalars, a
+  mixed bag with 3x3 and 1x1 convs plus 1-D/0-D, and a UNet/DiT-shaped bag of distinct
+  big shapes plus a same-shape batched bucket), hashing final weights and every state
+  tensor after N steps. **732 of 736 hash-identical, zero differences.** The remaining 4
+  are the UNet bag on AdaPNM's batched-big fused route with fp32 parameters (all four
+  momentum dtypes), which is not reproducible against *itself* on either tree — its
+  column/rms reductions accumulate with fp32 `tl.atomic_add`, so the summation order
+  varies per run. Compared by envelope instead, 4 interleaved runs of each tree: the
+  base-vs-branch spread is 2.384e-07, exactly equal to base-vs-base and
+  branch-vs-branch (1 ULP at that magnitude).
 - **Fused path: a `p.data` rebind that changes the SHAPE can no longer step a plan that
   disagrees with the optimizer state.** Every fused pointer cache
   (`PointerArrayCache`, `BigPointerCache`, `AdaPnmCache`, `OneDimPointerCache`,
@@ -633,23 +639,21 @@ stochastic-rounding seed fix below):
   is unchanged from 0.7.12 (both trees NaN identically) and is not addressed here: the
   `floor` fix above is unsound for these callers because they do not cap the
   reconstruction, so the right fix is either input validation or adding a cap.
-- **Gradient Centralization destroys fan-in-1 gradients.** `g - mean_fanin(g)` over a
-  one-element fan-in is identically zero, so every GC-enabled optimizer silently
-  freezes params shaped `(out, 1)` / `(out, 1, 1, 1)` — rank-1 LoRA up-projections
-  among them (`AdaMuon` is unaffected: GC defaults off). ADOPT was the one that
-  escalated this to NaN, which is fixed above; the freeze itself is not. Skipping
-  those params in `centralize_grads_` alone is *not* the fix: GC is implemented at
-  six-plus sites and they all have to move together —
-  `_backend.py:258-268` (native), `adakaon.py:978-979` and `:1044-1045`,
-  `adapnm.py:944-945` and `:998-999` (the per-param and batched
-  `_chunked_reductions*`), and `_fused_triton.py:417-423` (the in-kernel primitive,
-  fed by the rowmean reductions at `:768 :797 :843 :869 :968 :1022`). A native-only
-  skip makes fused and native disagree; measured, it breaks
-  `test_degenerate_2d_shapes_match_native` and
-  `test_pnm_extreme_aspect_shapes_compile_and_match_native`. Pinned as strict xfails
-  by `tests/test_degenerate_fanin.py::test_gc_leaves_fanin_1_grads_usable` and
-  `::test_gc_freezes_fanin_1_params` (the latter covering fused and native), so the
-  batch that fixes GC flips them to XPASS.
+- **`ScheduleFree` is not reproducible against itself at its DEFAULT `bfloat16`
+  momentum.** Two identical runs (same seed, same grads, GC off, fp32 params) give
+  different weights — measured diverging at the second step on a `(6, 1)` bag, 7.8e-3
+  apart, and the same on a `(6, 3)` bag, on this branch and on ea46330 alike. It is the
+  stochastically-rounded `z` write drawing from a global noise stream that is not reseeded
+  between runs; at `momentum_dtype` `float32`, `int8` or `4bit` the repeat noise floor is
+  exactly 0. Unrelated to the GC fix (found while building its tests); not diagnosed or
+  addressed here.
+- **`AdaMuon` leaves some `(1, 1)` parameters untouched**, with GC on and off
+  identically — its orthogonalized update on a 1x1 matrix has constant module (`0.2 * lr`)
+  and the cautious mask then cancels it exactly over the step sequence, so the weight
+  returns to its starting value rather than never moving. Not a defect, and independent of
+  GC; noted because `test_fanin_1_trains_with_gc_native` therefore compares which params
+  moved against the GC-off control instead of asserting movement outright (an
+  `init != final` check cannot tell a frozen param from an exactly-cancelling one).
 
 ## [0.7.12]
 

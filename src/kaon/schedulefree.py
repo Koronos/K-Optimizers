@@ -215,6 +215,9 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
             ``d`` vs the raw gradient. On by default.
         gradient_centralization: Gradient Centralization (Yong et al. 2020) on
             ``ndim>=2`` grads. On by default (pin ``False`` for reference parity).
+            Skipped where the fan-in is 1 (``(out, 1)``, ``(out, 1, 1, 1)``), where it
+            would zero the gradient rather than centralize it — see
+            ``kaon._backend.gc_applies``.
         momentum_dtype: storage dtype for the full-size ``z`` (and optional
             ``exp_avg``) buffers — ``"bfloat16"`` (default), ``"float32"``,
             ``"int8"`` or ``"4bit"``. **This is not a "small per-step error" knob.**

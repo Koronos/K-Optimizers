@@ -29,12 +29,14 @@ divisor would move it instead of rescuing a NaN. So the default has to be inert,
 **How this was found (and the separate defect that triggers it).** Gradient
 Centralization subtracts the per-output-row mean over the fan-in dims; for a weight
 whose fan-in is a single element (a rank-1 LoRA up-projection ``(out, 1)``, a
-``(out, 1, 1, 1)`` conv) that mean *is* the element, so the centralized gradient is
-identically zero. Every GC-enabled optimizer therefore sees ``g == 0`` on those shapes
-and silently freezes the parameter — and ADOPT, alone, turned the freeze into NaN. The
-freeze is a real second defect but a *separate* one: GC is implemented at six-plus
-sites (see ``test_gc_freezes_fanin_1_params``) and they all have to move together or
-fused and native diverge. It is pinned as a strict xfail at the bottom of this file.
+``(out, 1, 1, 1)`` conv) that mean *is* the element, so the centralized gradient was
+identically zero. Every GC-enabled optimizer therefore saw ``g == 0`` on those shapes
+and silently froze the parameter — and ADOPT, alone, turned the freeze into NaN. The
+freeze was a real second defect but a *separate* one, fixed in its own batch: GC lives
+at nine host sites feeding sixteen Triton kernels and they all had to move together or
+fused and native diverge. It is now ONE predicate, ``kaon._backend.gc_applies``,
+evaluated per shape/tile bucket; the two tests at the bottom of this file were strict
+xfails until then, and ``tests/test_gc_fanin_1.py`` carries the full matrix.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors
 
 _MOMENTUM_DTYPES = ("float32", "bfloat16", "int8", "4bit")
 
-# 2-D+ shapes whose fan-in (numel // shape[0]) is exactly 1 — the shapes GC zeroes.
+# 2-D+ shapes whose fan-in (numel // shape[0]) is exactly 1 — the shapes GC used to zero.
 _FANIN1_SHAPES = [(5, 1), (1, 1), (129, 1), (5, 1, 1, 1), (1, 1, 1, 1)]
 
 # Shapes with a real fan-in, plus the 0-D / 1-D params GC never touches.
@@ -253,8 +255,8 @@ def test_adopt_fanin_1_trains_without_gc(shape, foreach, momentum_dtype) -> None
     """With GC off, a fan-in-1 param gets a real gradient and must actually train.
 
     Separates the two defects: this proves ADOPT's *factored* path is healthy on
-    these shapes once GC is not nulling the gradient (with GC on the param is frozen
-    for every optimizer in the repo — see the xfail pin at the bottom of this file).
+    these shapes once GC is not nulling the gradient (before the GC fix, GC on froze it
+    for every optimizer in the repo — see the two tests at the bottom of this file).
     """
     torch.manual_seed(23)
     params = _bag(shape, 3)
@@ -407,28 +409,21 @@ def test_no_optimizer_manufactures_nan_on_fanin_1(name, shape, foreach) -> None:
     assert _all_finite(opt, params), f"{name} produced non-finite values for {shape}"
 
 
-# ---------------------------------------------------- known limitation (xfail pin)
-_GC_SITES = """GC is implemented at six-plus sites, all of which have to change together:
-  kaon/_backend.py:258-268        centralize_grads_ (native, batched by shape)
-  kaon/adakaon.py:978-979         _chunked_reductions (per-param fused)
-  kaon/adakaon.py:1044-1045       _chunked_reductions_batched
-  kaon/adapnm.py:944-945          _chunked_reductions (per-param fused)
-  kaon/adapnm.py:998-999          _chunked_reductions_batched
-  kaon/_fused_triton.py:417-423   in-kernel GC primitive, fed by the rowmean
-                                  reductions at :768 :797 :843 :869 :968 :1022
-A native-only skip makes fused and native disagree: measured, it breaks
-tests/test_fused_safety.py::test_degenerate_2d_shapes_match_native and
-tests/test_adapnm_fused.py::test_pnm_extreme_aspect_shapes_compile_and_match_native."""
+# ------------------------------------------- the GC half of the defect (fixed, pinned)
+# GC used to zero every fan-in-1 gradient at nine host sites plus sixteen Triton kernels,
+# so a native-only skip made fused and native disagree. It is now ONE predicate,
+# ``kaon._backend.gc_applies``, evaluated per shape/tile bucket and handed to the kernels
+# as the ``GC`` ``tl.constexpr``. The two tests below were strict xfails until then;
+# ``tests/test_gc_fanin_1.py`` carries the full matrix (every optimizer, every route,
+# every momentum dtype, fused<->native parity, and fan-in >= 2 bit-identity).
 
 
-@pytest.mark.xfail(strict=True, reason=f"GC destroys fan-in-1 gradients. {_GC_SITES}")
 @pytest.mark.parametrize("shape", _FANIN1_SHAPES)
 def test_gc_leaves_fanin_1_grads_usable(shape) -> None:
-    """**Desired** behaviour, not current: GC must not annihilate a fan-in-1 gradient.
+    """GC must not annihilate a fan-in-1 gradient.
 
-    ``g - mean_fanin(g)`` over a one-element fan-in is identically zero, so GC destroys
-    the update signal instead of decorrelating it. Strict xfail: whoever fixes GC flips
-    this to XPASS.
+    ``g - mean_fanin(g)`` over a one-element fan-in is identically zero, so GC destroyed
+    the update signal instead of decorrelating it. GC is skipped there now.
     """
     p = torch.nn.Parameter(torch.randn(shape))
     p.grad = torch.randn(shape)
@@ -436,15 +431,14 @@ def test_gc_leaves_fanin_1_grads_usable(shape) -> None:
     assert torch.count_nonzero(p.grad) > 0
 
 
-@pytest.mark.xfail(strict=True, reason=f"GC freezes fan-in-1 params. {_GC_SITES}")
 @pytest.mark.parametrize("name", ["Adakaon", "AdaPNM"])
 @pytest.mark.parametrize("fused", [False, True])
 def test_gc_freezes_fanin_1_params(name, fused) -> None:
-    """**Desired** behaviour, not current: a ``(out, 1)`` weight must train under GC.
+    """A ``(out, 1)`` weight must train under GC.
 
     Covers the fused route as well as the native one, because GC is reimplemented
     inside the Triton path and in both ``_chunked_reductions*`` copies — a fix that
-    only touches ``centralize_grads_`` would make this XPASS natively and keep failing
+    only touched ``centralize_grads_`` would pass this natively and keep failing
     fused, which is exactly the divergence to avoid.
     """
     if fused and not torch.cuda.is_available():
