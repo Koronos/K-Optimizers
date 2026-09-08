@@ -267,6 +267,13 @@ def test_matrixized_bucket_may_mix_raw_conv_shapes(name):
     when the sizes differ — every shared-plan optimizer raised
     ``stack expects each tensor to be equal size`` on such a bucket. The fast path now
     requires a common raw shape and falls back to per-param views otherwise.
+
+    The reference arm is compared to a **tolerance**, not bit-exactly, and deliberately
+    so: the batched and per-parameter paths are not bit-identical for every optimizer
+    here (AdaBelief and ScheduleFree were not before this module either — a pre-existing
+    property of their reductions, not something this bucket changes). What the assertion
+    pins is that a mixed-raw-shape bucket computes the *right* update, which is the half
+    the crash was hiding.
     """
     torch.manual_seed(11)
     shapes = [(2, 2, 3, 3), (2, 6, 1, 3)]
@@ -490,6 +497,31 @@ def test_per_param_fallback_drops_the_plan(name):
     opt.step()
     assert opt._foreach_plans
     opt._foreach_batch_cutoff = 1           # every param is now too big to stack
+    set_grads(bag, 2)
+    opt.step()
+    assert opt._foreach_plans == {}
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_group_level_fallback_drops_the_plan(name):
+    """The *group*-level rejection has to drop the plan too, not just the per-param one.
+
+    A param group is a mutable dict and a scheduler can flip a hyperparameter mid-run.
+    Every optimizer here refuses the batched path for ``bf16_method="kahan"`` (it needs a
+    per-parameter compensation buffer), so flipping it in place moves the whole group to
+    the per-parameter loop — and a cached plan must only ever describe a group the
+    foreach path actually stepped. fp32 params on purpose: kahan is a no-op for them
+    (``subtract_one_`` only compensates low-precision weights), so the per-parameter
+    step works without the ``shift`` buffer the group never allocated.
+    """
+    torch.manual_seed(11)
+    bag = [torch.nn.Parameter(torch.randn(4, 3)) for _ in range(3)]
+    opt = build(name, bag)
+    set_grads(bag, 1)
+    opt.step()
+    assert opt._foreach_plans
+    for group in opt.param_groups:
+        group["bf16_method"] = "kahan"
     set_grads(bag, 2)
     opt.step()
     assert opt._foreach_plans == {}

@@ -121,11 +121,21 @@ All notable changes to this project will be documented in this file.
 
   `aten::select` (the `stack`/`unbind` residue) does not move and the CUDA launch count
   moves by `+0 … +3` — the one `_foreach_copy_` that replaces N per-parameter `m_scale`
-  writes. Unprofiled host wall time per step: **−29 … −78 %** (median of 80). That last
-  figure is supporting evidence only: the same harness with the reference tree as *both*
-  arms reported −23 … +22 % on this shared GPU, so the clock resolves ~±25 % here and the
-  counters are what rules out a regression. `max_memory_allocated` is unchanged (the
-  caches hold only views of tensors the optimizer already owns).
+  writes. One counter goes the *other* way and is worth stating plainly: on the quantized
+  codecs `aten::as_strided` **rises** by about one per parameter (448 × 0-D int8
+  1345 → **1793**, 4-bit 1351 → **1799**; 428-tensor LoRA int8 1571 → **1715**), the
+  price of routing the momentum through the codec's cached scale views. It buys
+  `view`+`reshape` **5840 → 11** on that same bag, so the net dispatch count is down by
+  ~5.4 k ops per step; on the float codecs `as_strided` does not move at all.
+
+  Unprofiled host wall time per step: **−29 … −78 %** (median of 80). That figure is
+  supporting evidence only: the same harness with the reference tree as *both* arms
+  reported −23 … +22 % on this shared GPU, so the clock resolves ~±25 % here and the
+  counters are what rules out a regression. `max_memory_allocated` **never rises** and in
+  several configurations falls — measured over 48 (Lion + KProdigy × 4 bags × 4 momentum
+  dtypes): 0 higher, 14 lower, 34 identical, the largest being −11 % on Lion's
+  24 × (256,256) bag and −4 % on the 428-tensor LoRA one. Resident state is byte-for-byte
+  identical either way; what moves is the transient peak, and only downward.
 - **KProdigy's share is much smaller** and only its *pass 2* is on the plan; pass 1 (the
   global D reduction and the two `d`-scaled EMAs) keeps its own bucketing, which spans
   param groups and covers parameters pass 2 sends to the per-parameter loop. Pass 1 is

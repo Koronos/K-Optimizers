@@ -310,11 +310,20 @@ N per-parameter scale writes):
 | 300 convs + 128 × 0-D | int8 | 3031 → **31** | 2583 → **6** | 443 → **15** |
 | 24 × (256,256) | int8 | 180 → **10** | 149 → **2** | 29 → **5** |
 
+One counter moves the *other* way: on the quantized codecs `aten::as_strided` rises by
+about one per parameter (448 × 0-D int8 1345 → 1793, 4-bit 1351 → 1799; 428-tensor LoRA
+int8 1571 → 1715) — the price of routing the momentum through the codec's cached scale
+views. Against `view`+`reshape` going 5840 → 11 on that same bag it is a net ~5.4 k fewer
+dispatched ops per step, and on the float codecs `as_strided` does not move at all.
+
 Unprofiled host wall time per step follows: **−29 … −78 %** (median of 80, Lion). Treat
 that number as supporting evidence only — the same harness with the *reference* tree as
 both arms reported −23 … +22 % on this (shared) GPU, so the clock here resolves ~±25 %
-and the counters above are what actually rules out a regression. Peak allocated memory is
-unchanged, as everywhere else in this plan: the caches hold only views.
+and the counters above are what actually rules out a regression. Peak allocated memory
+**never rises**: over 48 configurations (both optimizers × 4 bags × 4 momentum dtypes) 34
+are identical and 14 fall, by up to 11 % on Lion's 24 × (256,256) bag. Resident state is
+byte-identical either way — the caches hold only views — so what moves is the transient
+peak, and only downward.
 
 **KProdigy's share is much smaller, and it is worth being precise about why.** Only its
 *pass 2* (the weight update) runs on this plan; *pass 1* — the global D reduction plus the
