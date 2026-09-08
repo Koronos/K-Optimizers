@@ -1031,14 +1031,19 @@ _BIG_MIXED = [(512, 512)] * 2 + [(384, 384)] * 2 + [(8, 16)] * 3 + [(32,)] * 2 +
 
 
 class _WitnessSpy:
-    """Counts ``param_witness`` calls per call site (each module namespace is one)."""
+    """Counts ``param_witness`` calls per module namespace.
+
+    ``_fused_partition`` and the pointer caches both go through ``kaon._fused_triton``'s
+    witness (the partition switched to it with the shape-witness flag), so the ``fused``
+    count is the partition's one sweep per step PLUS any per-bucket sweep a cache re-ran;
+    steady state is therefore exactly ``steps`` sweeps. ``plan`` is the native path's.
+    """
 
     def __init__(self):
         import kaon._foreach_plan as fp
         import kaon._fused_triton as ftm
-        import kaon.adakaon as ak
 
-        self.sites = {"plan": fp, "partition": ak, "pointer_cache": ftm}
+        self.sites = {"plan": fp, "fused": ftm}
         self.counts = dict.fromkeys(self.sites, 0)
         self._orig = {}
 
@@ -1077,11 +1082,10 @@ def test_big_bucket_lists_are_reused_between_steps():
 
     with _WitnessSpy() as spy:
         _drive([(pv, ov)], 4, gen)
-    assert spy.counts["pointer_cache"] == 0, (
-        "the big pointer caches re-ran the witness over 4 steady-state steps: "
-        f"{spy.counts}"
+    assert spy.counts["fused"] == 4, (
+        "expected the partition's 4 sweeps and none from the big pointer caches over 4 "
+        f"steady-state steps: {spy.counts}"
     )
-    assert spy.counts["partition"] == 4, f"_fused_partition witness sweeps: {spy.counts}"
     after = _big_caches(ov)
     assert after.keys() == first.keys()
     assert all(after[k] is first[k] for k in first), "a big pointer cache was rebuilt"
@@ -1098,8 +1102,7 @@ def test_big_bucket_memo_leaves_the_mixed_routes_alone():
 
     with _WitnessSpy() as spy:
         _drive([(pv, ov)], 4, gen)
-    assert spy.counts["pointer_cache"] == 0, spy.counts
-    assert spy.counts["partition"] == 4, spy.counts
+    assert spy.counts["fused"] == 4, spy.counts       # the partition's only
     assert spy.counts["plan"] == 0, spy.counts        # nothing fell to the native plan
 
 
@@ -1231,4 +1234,4 @@ def test_persistent_strided_grad_does_not_rebuild_the_big_buckets():
     assert all(after[k] is first[k] for k in first), (
         "the big pointer caches were rebuilt on a stable demoted set"
     )
-    assert spy.counts["pointer_cache"] == 0, spy.counts
+    assert spy.counts["fused"] == 3, spy.counts       # the partition's only, 3 steps
