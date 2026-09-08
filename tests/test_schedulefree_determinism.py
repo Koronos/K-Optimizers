@@ -93,6 +93,7 @@ def _run(
     reseed: bool,
     steps: int = STEPS,
     stream: SRStream | None = None,
+    bf16_method: str = "stochastic_rounding",
 ) -> tuple[list[list[torch.Tensor]], ScheduleFree]:
     """One run; returns the fp32 weight snapshot after every step, plus the optimizer.
 
@@ -104,7 +105,8 @@ def _run(
     if reseed:
         reseed_stochastic_rounding()
     params = _bag(device, param_dtype)
-    opt = ScheduleFree(params, lr=1e-2, momentum_dtype=momentum_dtype, foreach=foreach)
+    opt = ScheduleFree(params, lr=1e-2, momentum_dtype=momentum_dtype, foreach=foreach,
+                       bf16_method=bf16_method)
     if stream is not None:
         opt.__dict__["sr_stream"] = stream
     opt.train()
@@ -196,9 +198,12 @@ def test_a_non_bf16_z_needs_no_reseed_and_claims_no_stream(device, foreach, mome
 
 
 # ==================================================== the cause: the bf16 z's SR identity
+@pytest.mark.parametrize("bf16_method", ["stochastic_rounding", "none"])
 @pytest.mark.parametrize("foreach", [True, False], ids=["foreach", "per_param"])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_a_bf16_z_makes_an_fp32_model_stochastic_from_the_second_step(device, foreach):
+def test_a_bf16_z_makes_an_fp32_model_stochastic_from_the_second_step(
+    device, foreach, bf16_method
+):
     """THE reported symptom, and its mechanism, pinned.
 
     fp32 weights, fp32 gradients, no reseed between the runs — the harness the report used.
@@ -212,12 +217,19 @@ def test_a_bf16_z_makes_an_fp32_model_stochastic_from_the_second_step(device, fo
     different noise offsets. Documented as a known limitation of the 0.7.13 per-owner
     streams ("allocated in order of first draw"), and invisible for every other optimizer
     with fp32 weights because they never draw at all.
+
+    ``bf16_method`` is parameterized to pin that it does NOT govern ``z``: the divergence
+    is identical with the weight write's SR turned off (``"none"``), which is what rules
+    out the ``y`` write-back as the source. With fp32 weights that branch is never taken
+    anyway — every draw in this run belongs to ``_store_z``.
     """
     if device == "cuda":
         skip_if_no_cuda()
     reseed_stochastic_rounding()      # hermetic: run 1 must be the allocator's first
-    a, oa = _run(device=device, momentum_dtype="bfloat16", foreach=foreach, reseed=False)
-    b, ob = _run(device=device, momentum_dtype="bfloat16", foreach=foreach, reseed=False)
+    a, oa = _run(device=device, momentum_dtype="bfloat16", foreach=foreach,
+                 reseed=False, bf16_method=bf16_method)
+    b, ob = _run(device=device, momentum_dtype="bfloat16", foreach=foreach,
+                 reseed=False, bf16_method=bf16_method)
     assert oa.sr_stream.stream_id == 0
     assert ob.sr_stream.stream_id == 1, (
         "the second run must have taken the next free identity; if this changed, the "
