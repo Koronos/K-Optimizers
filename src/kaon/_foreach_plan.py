@@ -31,7 +31,9 @@ caches in one call.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Hashable, Mapping
+from collections import defaultdict
+from collections.abc import Callable, Hashable, Iterable, Mapping
+from itertools import count
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -83,6 +85,319 @@ def param_witness(plist: list[Tensor]) -> tuple:
     has to keep working in a build without Triton.
     """
     return (tuple(map(id, plist)), tuple(map(_DATA_PTR, plist)), tuple(map(_IS_CONTIG, plist)))
+
+
+# ============================================================ state-identity watch
+# :func:`param_witness` is the whole staleness story for the PARAMETERS and says nothing
+# about the STATE. Every cross-step cache in kaon bakes state buffers — the fused pointer
+# tables (``m``/``m_scale``/``row``/``col``/``v`` addresses, frozen at build) and this
+# module's :attr:`ForeachChunk.state_views` (views of the same buffers) — and revalidates
+# them against the params alone. So a state buffer swapped out from under a cache while
+# every param stood still left the tables addressing a RETIRED tensor, and the step wrote
+# it: confirmed on all four fused routes and on the native plan for ``del opt.state[p]``,
+# ``opt.state[p].clear()`` and ``opt.state[p]["m"] = ...``.
+#
+# WHY A COUNTER AND NOT A WITNESS FIELD. A state witness is another per-param host sweep,
+# and the three param fields already cost 3.0-3.6% of the 428-param step (see
+# ``kaon._fused_triton.SHAPE_WITNESS``); one state-tensor field measured +19-25 µs there,
+# ~1.2% of the step, against a 0.5% budget — and it would still be blind to
+# ``state[p].clear()`` followed by a refill (same dict, same everything, new buffers).
+# Making the change UNMISSABLE instead costs nothing per step: ``self.state`` is a
+# :class:`WatchedState` whose per-param dicts count every rebinding of a baked key, and a
+# cache holds the count it was built at. Nothing in a steady-state step rebinds one
+# (AdaPNM's per-param ``state["step"] += 1`` is not a baked key), so the counter never
+# moves and no cache is ever rebuilt for it — asserted in
+# ``tests/test_state_identity_witness.py``, which is what keeps the cost at zero.
+#
+# The CELL is per mapping (each :class:`WatchedState` owns one, shared with its per-param
+# dicts); the VALUES come from one process-wide counter and are therefore never reused. Both
+# halves matter. Per-mapping is what keeps two optimizers in the same process from
+# invalidating each other's caches — a shared cell would make every AdaPNM state write bump
+# Adakaon's number too. Globally unique values are what close ABA: a reinstalled watch
+# (``__setattr__``, or ``__setstate__`` after ``load_state_dict`` / unpickling / ``deepcopy``)
+# starts from a number no cache anywhere can already be holding, instead of restarting at 0
+# and colliding with a cache built by the mapping it replaced.
+_next_epoch = count(1).__next__
+_MISSING = object()
+
+#: The ``self.state`` keys whose VALUE a cross-step cache bakes. A rebinding of any of them
+#: retires a buffer some pointer table or cached view may still be addressing; everything
+#: else in a state dict is either a scalar (``step``, ``m_numel``, ``m_block``) or is read
+#: fresh every step, so rebinding it invalidates nothing and must stay free.
+WATCHED_STATE_KEYS = frozenset({
+    "m", "m_scale",                                  # momentum (every codec) + its scales
+    "m_pos", "m_neg", "m_pos_scale", "m_neg_scale",  # AdaPNM's two momenta
+    "row", "col",                                    # factored second moment
+    "v", "max_v",                                    # non-factored second moment (+ AMSGrad)
+    "shift",                                         # Kahan compensation
+})
+
+
+class WatchedParamState(dict):
+    """One parameter's optimizer state, counting every change of buffer IDENTITY.
+
+    Only a rebinding of a :data:`WATCHED_STATE_KEYS` entry to a DIFFERENT object counts:
+    an in-place write (the codec's requant contract, ``row.lerp_``, ``copy_``) keeps every
+    cached pointer valid and must not invalidate anything, and neither must a scalar
+    counter. Storing the very same object back is likewise a no-op.
+
+    Serialises as a PLAIN dict (:meth:`__reduce__`). ``Optimizer.state_dict`` hands these
+    dicts to the caller by reference, so a checkpoint would otherwise embed this class and
+    its generation cell — unloadable without kaon, and meaningless once loaded.
+    """
+
+    __slots__ = ("_gen",)
+
+    def __init__(self, items: Any = (), *, gen: list[int]) -> None:
+        # ``gen`` is KEYWORD-ONLY on purpose. With it first and positional,
+        # ``WatchedParamState({"m": ...})`` — the shape every dict subclass is expected to
+        # take, and the shape ``dict.__init__`` itself takes — bound the MAPPING to
+        # ``_gen`` and left the instance with a generation cell that is a dict: every later
+        # bump then wrote ``self._gen[0] = ...`` into that dict and the state's counter was
+        # silently dead. Keyword-only makes that call a ``TypeError`` instead.
+        dict.__init__(self, items)
+        if type(gen) is not list:
+            raise TypeError(
+                f"WatchedParamState needs the mapping's generation CELL (a one-element "
+                f"list), got {type(gen).__name__} — see WatchedState.gen"
+            )
+        self._gen = gen
+
+    # -- mutation: bump the generation when a baked buffer is retired ------------
+    def __setitem__(self, key: str, value: Any) -> None:
+        # Only a key that was ALREADY THERE can retire anything: a cache dereferences
+        # ``state["m"]`` / ``state["row"]`` at build time, so a key that was absent was in
+        # no cache. That is what makes ``_init_state`` free — a parameter's first step
+        # populates five watched keys and moves the generation zero times, so neither the
+        # first step nor the one after it pays a rebuild for having allocated state.
+        if key in WATCHED_STATE_KEYS:
+            old = dict.get(self, key, _MISSING)
+            if old is not _MISSING and old is not value:
+                self._gen[0] = _next_epoch()
+        dict.__setitem__(self, key, value)
+
+    def __delitem__(self, key: str) -> None:
+        if key in WATCHED_STATE_KEYS:
+            self._gen[0] = _next_epoch()
+        dict.__delitem__(self, key)
+
+    def clear(self) -> None:
+        if self:
+            self._gen[0] = _next_epoch()
+        dict.clear(self)
+
+    def pop(self, key: str, *default: Any) -> Any:
+        if key in WATCHED_STATE_KEYS and key in self:
+            self._gen[0] = _next_epoch()
+        return dict.pop(self, key, *default)
+
+    def popitem(self) -> tuple[str, Any]:
+        self._gen[0] = _next_epoch()
+        return dict.popitem(self)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        # ``dict.update`` is C and would bypass ``__setitem__`` entirely.
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def __ior__(self, other: Any) -> WatchedParamState:  # type: ignore[misc]
+        # ``st |= {...}`` lands on ``nb_inplace_or``, a DIFFERENT C slot from
+        # ``mp_ass_subscript`` and from ``update`` — so hooking those two left it wide
+        # open: ``opt.state[p] |= {"m": fresh}`` retired the buffer, moved nothing, and the
+        # next step wrote the retired tensor (measured 4/4 on every fused route, on the
+        # foreach plan and through MSAM / Nekaon / Lookahead / SAM). It must mutate in
+        # place and return ``self``, which is what ``dict.__ior__`` does.
+        self.update(other)
+        return self
+
+    def setdefault(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        # ``dict.setdefault`` is C and would bypass ``__setitem__``. Inserting a key that
+        # was absent retires nothing, so this never bumps — it is here for the write path,
+        # not for the generation.
+        if key in self:
+            return dict.__getitem__(self, key)
+        self[key] = default
+        return default
+
+    def __reduce__(self) -> tuple:
+        return (dict, (list(self.items()),))
+
+
+class WatchedState(defaultdict):
+    """``parameter -> per-param state``, with a generation every cache can compare against.
+
+    ``self.gen`` is a one-element list shared with every :class:`WatchedParamState` this
+    mapping owns, so ONE integer read tells a cache whether any state buffer anywhere in
+    the optimizer has been retired since it was built. A cache that keys on it needs no
+    per-step sweep at all.
+
+    Materialising an EMPTY state (``__missing__``, i.e. a parameter's first step) does NOT
+    move the generation: no cache can hold an empty state — the pointer tables dereference
+    ``state["row"]``/``state["m"]`` at build and ``check_state_geometry`` skips a state
+    that is not there — so there is nothing to invalidate, and bumping would cost every new
+    parameter an extra full rebuild on its second step.
+    """
+
+    __slots__ = ("gen",)
+
+    def __init__(self, items: Iterable[tuple[Any, Any]] = ()) -> None:
+        # ``default_factory`` is kept at ``dict`` for anything that introspects it; the
+        # ``__missing__`` override below is what actually builds a per-param state.
+        super().__init__(dict)
+        self.gen = [_next_epoch()]
+        for key, value in items:
+            dict.__setitem__(self, key, self._adopt(value))
+
+    def _adopt(self, state: Any) -> Any:
+        """A per-param state, watched by THIS mapping's generation cell."""
+        if type(state) is WatchedParamState and state._gen is self.gen:
+            return state
+        return WatchedParamState(state, gen=self.gen)
+
+    def __missing__(self, key: Any) -> WatchedParamState:
+        state = WatchedParamState(gen=self.gen)
+        dict.__setitem__(self, key, state)      # no bump — see the class docstring
+        return state
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self.gen[0] = _next_epoch()
+        dict.__setitem__(self, key, self._adopt(value))
+
+    def __delitem__(self, key: Any) -> None:
+        self.gen[0] = _next_epoch()
+        dict.__delitem__(self, key)
+
+    def clear(self) -> None:
+        if self:
+            self.gen[0] = _next_epoch()
+        dict.clear(self)
+
+    def pop(self, key: Any, *default: Any) -> Any:
+        if key in self:
+            self.gen[0] = _next_epoch()
+        return dict.pop(self, key, *default)
+
+    def popitem(self) -> tuple[Any, Any]:
+        self.gen[0] = _next_epoch()
+        return dict.popitem(self)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def __ior__(self, other: Any) -> WatchedState:  # type: ignore[misc]
+        # See :meth:`WatchedParamState.__ior__`. On this mapping the leak had a second
+        # half: ``opt.state |= {p: {...}}`` also left the incoming plain dict UNADOPTED, so
+        # the mapping looked watched while one of its entries was not and every later
+        # ``state[p]["m"] = ...`` through it was invisible.
+        self.update(other)
+        return self
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:  # type: ignore[override]
+        if key in self:
+            return dict.__getitem__(self, key)
+        self[key] = default
+        return dict.__getitem__(self, key)
+
+    def __reduce__(self) -> tuple:
+        return (_plain_state, (list(self.items()),))
+
+    # ``defaultdict.copy``/``__copy__`` reconstruct as ``type(self)(default_factory, self)``,
+    # which this ``__init__`` does not take (and a shallow copy sharing the generation cell
+    # would be a trap anyway: a write through the copy would invalidate the ORIGINAL's
+    # caches). Hand back the plain mapping, exactly as :meth:`__reduce__` does.
+    def copy(self) -> defaultdict:
+        return _plain_state(list(self.items()))
+
+    __copy__ = copy
+
+
+def _plain_state(items: list[tuple[Any, Any]]) -> defaultdict:
+    """Unpickle/deepcopy target for :class:`WatchedState` — a plain ``defaultdict(dict)``.
+
+    A watched mapping is REINSTALLED by ``WatchedStateMixin.__setstate__`` on the way in, so
+    nothing is lost by keeping the serialised form free of kaon's classes.
+    """
+    return defaultdict(dict, items)
+
+
+#: What :func:`state_generation` reports for an optimizer whose state is not watched — a
+#: constant, so a cache built by one keeps validating for free.
+_NO_GENERATION = 0
+
+
+def state_generation(state: Any) -> int:
+    """``state``'s identity generation, or :data:`_NO_GENERATION` if it is not watched.
+
+    One ``getattr`` plus one list index per call, and every caller is once per group per
+    step — this is the whole per-step cost of the state-identity guard.
+    """
+    gen = getattr(state, "gen", None)
+    return _NO_GENERATION if gen is None else gen[0]
+
+
+def _as_watched(value: Any) -> Any:
+    """``value`` as a :class:`WatchedState`, if it is a mapping at all (idempotent)."""
+    if type(value) is WatchedState:
+        return value
+    items = getattr(value, "items", None)
+    return WatchedState(items()) if callable(items) else value
+
+
+class WatchedStateMixin:
+    """Make ``self.state`` a :class:`WatchedState` and keep it one, on EVERY route in.
+
+    There are three, and each one needed its own answer:
+
+    * **Assignment** — ``opt.state = defaultdict(dict)``, which user code and
+      ``torch.optim.Optimizer.__init__`` both do. Caught by :meth:`__setattr__`, which
+      re-wraps whatever mapping is handed in. Without it that assignment reopened the
+      blind spot *silently and permanently*: the generation went from N to 0, which
+      invalidated every cache exactly once (so the next step looked fine) and then left a
+      counter-less mapping behind, after which a ``state[p]["m"] = …`` was invisible again
+      — measured 4/4 retired buffers written on the step after.
+
+      ``__setattr__`` and not a ``state`` PROPERTY on purpose: a property getter is a
+      Python-level call on every ``self.state`` READ, and there are far more of those than
+      the per-parameter loops suggest — counted by installing a counting property, an
+      AdaPNM fused step on the 428-parameter bag performs 1687-1884 (two machines) and an
+      Adakaon fused step 631, against 1 on an Adakaon native step. A property access
+      measures 21-42 ns more than a plain instance attribute (73 vs 31 ns here), so that is
+      +40…+71 µs/step for AdaPNM — one to two orders of magnitude above the 0.13-0.80 µs the
+      whole guard costs. Interception belongs on the WRITE, which the same step does 1-4
+      times.
+    * **``__dict__`` writes** — ``Optimizer.__setstate__`` does ``self.__dict__.update(...)``
+      and so bypasses ``__setattr__`` entirely. That is the path ``load_state_dict``,
+      unpickling and ``deepcopy`` all funnel through, which is why :meth:`__setstate__`
+      reinstalls afterwards.
+    * **Construction** — the optimizer's own ``__init__`` calls
+      :meth:`_install_state_watch` once, so the watch is in place before the first step
+      even if a future torch stops assigning ``self.state`` at all.
+
+    A reinstalled mapping carries a fresh generation value, which is itself the correct
+    outcome: a load replaces every state tensor, and a number no cache can have recorded
+    is exactly the invalidation that wants.
+    """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "state":
+            value = _as_watched(value)
+        super().__setattr__(name, value)
+
+    def _install_state_watch(self) -> None:
+        """Wrap ``self.state`` (idempotent)."""
+        current = self.state                                # type: ignore[attr-defined]
+        if type(current) is WatchedState:
+            return
+        self.state = _as_watched(current)                   # type: ignore[attr-defined]
+
+    def _state_generation(self) -> int:
+        """The state-identity generation, or :data:`_NO_GENERATION` when unwatched."""
+        return state_generation(self.state)                 # type: ignore[attr-defined]
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)                         # type: ignore[misc]
+        self._install_state_watch()
 
 
 class ForeachSpec:
@@ -337,12 +652,20 @@ class ForeachPlan:
     — each param's key mapped to the index of the key's first appearance. It stays put
     while every param advances in lockstep (the normal case) even though the key VALUES
     change every step; :meth:`refresh` re-hangs the current values on the chunks.
+
+    ``gen`` is the state-identity generation the plan was built at (see
+    :class:`WatchedState`). ``witness`` covers the params; ``gen`` covers the STATE, whose
+    buffers :attr:`ForeachChunk.state_views` aliases and which no param field can see —
+    ``del opt.state[p]`` moves nothing else, and the chunk then steps the retired
+    ``row``/``col``/``v`` (and never runs ``_init_state`` on the fresh state at all).
     """
 
-    __slots__ = ("buckets", "chunks", "signature", "steps", "witness")
+    __slots__ = ("buckets", "chunks", "gen", "signature", "steps", "witness")
 
-    def __init__(self, witness: tuple, signature: tuple[int, ...], buckets: list[tuple]) -> None:
+    def __init__(self, witness: tuple, signature: tuple[int, ...], buckets: list[tuple],
+                 gen: int = _NO_GENERATION) -> None:
         self.witness, self.signature, self.buckets = witness, signature, buckets
+        self.gen = gen
         self.chunks: list[ForeachChunk] | None = None
         self.steps: tuple[int, ...] = ()
 
@@ -458,18 +781,22 @@ class ForeachPlanMixin:
 
         The plan is rebuilt whenever :func:`param_witness` moves (the param set, the
         storage a param points at — which also covers dtype and device — or its
-        contiguity) or whenever the spec's extra key stops inducing the same partition
-        (a param that skipped a step and fell out of lockstep). Everything else that can
-        invalidate it is event-driven: :meth:`_clear_foreach_plans` and
-        :meth:`_drop_foreach_plan`.
+        contiguity), whenever the STATE-identity generation moves (a state buffer this
+        plan's :attr:`ForeachChunk.state_views` alias was retired — see
+        :class:`WatchedState`; a constant for an optimizer whose state is not watched, so
+        this costs one integer compare), or whenever the spec's extra key stops inducing
+        the same partition (a param that skipped a step and fell out of lockstep).
+        Everything else that can invalidate it is event-driven:
+        :meth:`_clear_foreach_plans` and :meth:`_drop_foreach_plan`.
         """
         spec = self._foreach_spec(group)
         cached = self._foreach_cache_enabled
         witness = param_witness(params)
+        gen = state_generation(self.state)
         plan = self._foreach_plans.get(id(group)) if cached else None
         values: list[Hashable] = []
         if plan is not None:
-            if plan.witness != witness:
+            if plan.witness != witness or plan.gen != gen:
                 plan = None
             elif spec.extra_key is not None:
                 indices, values = _canonical_keys(params, group, self.state, spec.extra_key)
@@ -477,6 +804,15 @@ class ForeachPlanMixin:
                     plan = None
         if plan is None:
             plan, values = self._build_foreach_plan(params, group, witness, spec)
+            # Read AFTER the build, which is free either way: ``_build_foreach_plan``
+            # allocates state for any param that has none yet, and allocating it does NOT
+            # move the counter (populating an absent key retires nothing — see
+            # ``WatchedParamState.__setitem__``; verified 0 movement across 12
+            # optimizer x route x bag combinations). Taking it here rather than reusing the
+            # value read above is simply the tighter thing to do: it is the generation the
+            # plan's views were actually built against, so no future write inside the build
+            # can leave the plan claiming a generation older than its own contents.
+            plan.gen = state_generation(self.state)
             if cached:
                 self._foreach_plans[id(group)] = plan
         chunks = plan.rechunk(budget, spec, cached)

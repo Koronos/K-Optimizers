@@ -64,6 +64,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._foreach_plan import state_generation
 from kaon._wrappers import CodecBuffer, WrapsInnerOptimizer
 
 __all__ = ["MSAM"]
@@ -195,9 +196,18 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         """Every (param, inner_state, momentum_dtype, group) that has a momentum buffer."""
         owner = self._momentum_owner()
         owner_state = owner.state
+        # ``state_generation`` is the base's state-IDENTITY counter (a constant for a base
+        # that does not watch its state, so this costs one ``getattr``). The other three
+        # fields see a state dict being added or removed; none of them sees a per-param
+        # state being emptied or a single buffer being rebound. ``opt.state[p].clear()``
+        # left this cache holding the emptied dicts and ``_apply``'s stacked read raised a
+        # bare ``KeyError: 'm'`` from inside the wrapper; a rebound ``st["m"]`` was caught
+        # only on the FUSED plan (``_plan_addrs_valid`` re-reads the dicts) and only after
+        # the bucket regrouping had already been skipped.
         key = (
             id(owner_state),
             len(owner_state),
+            state_generation(owner_state),
             tuple(len(group["params"]) for group in self.param_groups),
         )
         if key == self._momentum_cache_key:

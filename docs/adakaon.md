@@ -102,6 +102,51 @@ Two caches are Adakaon-specific:
   in [foreach-batching.md](foreach-batching.md); `tests/test_fused_safety.py` asserts
   both halves (no witness call in the steady state, a rebuilt cache after every event).
 
+### What the pointer caches are keyed on, and the state they bake
+
+Every fused route caches *pointer tables*: the `data_ptr()` of `p`, `p.grad`, and of the
+state buffers `m` / `m_scale` / `row` / `col` / `v`, frozen into device `int64` arrays at
+build time. Their validity has **two** halves, and neither implies the other.
+
+1. **The parameters** — `param_witness`: ids, `data_ptr`s, contiguity, plus per-param
+   strides under the opt-in `kaon._fused_triton.SHAPE_WITNESS`. This is what catches
+   `p.data = <fresh storage>` (an external EMA, `.to(dtype/device)`, an offloader's block
+   swap) and `p.data = p.data.t()`. Every route also validates the *state geometry*
+   against the parameter at build (`check_state_geometry`), so a rebuilt plan can never
+   point a new `R`/`C` at the old `row`/`col`.
+2. **The state** — `kaon._foreach_plan.state_generation(opt.state)`, since 0.7.14. No
+   parameter field can see a state buffer being retired, and three ordinary things retire
+   one while every parameter stands still:
+
+   | you do | before 0.7.14 | now |
+   |---|---|---|
+   | `del opt.state[p]` (the recovery `check_state_geometry` documents) | the tables kept addressing the dropped `m`/`row`/`col`/`v` and the step **wrote** them; the fresh state never went through `_init_state` | the generation moves → the partition, every route list and every pointer table rebuild, and the fresh state is initialised |
+   | `opt.state[p].clear()` | same, and the same dict is refilled with new buffers, so both generations are live at once | same rebuild |
+   | `opt.state[p]["m"] = …` / `["row"] = …` (a partial `load_state_dict` that bypasses `Adakaon.load_state_dict`, a checkpoint tool that casts one buffer, a requant that ignores the in-place codec contract) | same | same rebuild |
+
+   Confirmed on all four fused routes **and** on the native foreach plan (whose chunks
+   cache views of the same buffers), byte for byte identically with the caches on and off.
+   `Adakaon.load_state_dict` and the AutoLR base-state reset were always safe — they call
+   `_invalidate_fused_caches` explicitly — and still are; the guard is for the paths that
+   do not go through the optimizer at all.
+
+   Cost: the generation is one integer read from `self.state`, 133 ns/call, taken 1 time
+   per step on a native step and 2-6 on a fused one — **0.01-0.09% of the fused step** on
+   the reference bags, with no new CUDA kernel, launch or synchronisation (identical
+   `torch.profiler` counts) and Python bytecode per step up **+0.05…+0.74%**. The two
+   witness *fields* that were the alternative cost 2.9-6.0% and 7.0-9.2% of the same step
+   (two machines) and are each blind to at least one of the three rows above. Full table:
+   `benchmarks/fused/bench_state_witness.py`.
+
+   `AdaPNM` is the one optimizer that pays anything on the WRITE side (one
+   `state["step"]` per parameter per step, 0.35-0.9% of its fused step even after that
+   write was routed around the hook) — see `AdaPNM._prepare_param_steps`. Adakaon writes
+   no state per step and pays nothing.
+
+   The supported way to drop state is still `load_state_dict` or, if you must reach in,
+   `del opt.state[p]` — which is now genuinely safe from a steady state and not only after
+   a refused rebind.
+
 ## On `torch.compile`
 
 `Adakaon` intentionally exposes **no** `compile` flag. A whole-step

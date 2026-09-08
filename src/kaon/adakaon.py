@@ -55,7 +55,13 @@ from kaon._backend import (
     subtract_one_,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
-from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
+from kaon._foreach_plan import (
+    ForeachChunk,
+    ForeachPlanMixin,
+    ForeachSpec,
+    WatchedStateMixin,
+    state_generation,
+)
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _dequant_4bit,
@@ -170,7 +176,7 @@ def _demote_non_contiguous_grads(
     return kept[0], kept[1], kept[2], native + demoted
 
 
-class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
+class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     """Conv-aware factored optimizer with optional bf16 momentum.
 
     Args:
@@ -337,6 +343,11 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             "bf16_method": bf16_method,
         }
         super().__init__(params, defaults)
+        # ``self.state`` reports every change of state IDENTITY, so no cross-step cache can
+        # keep stepping a retired ``m``/``row``/``col``/``v`` (see
+        # ``kaon._foreach_plan.WatchedState``). Zero cost per step; reinstalled by
+        # ``WatchedStateMixin.__setstate__`` on every load / unpickle / deepcopy.
+        self._install_state_watch()
         # Multi-tensor (foreach) batching of the factored fast path. Collapses the
         # per-parameter Python loop + per-tensor kernel launches into a handful of
         # stacked-tensor ops per (shape, dtype) bucket — the decisive win when many
@@ -381,7 +392,10 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         # off this marker; optimizers without it keep lr-scaled momentum.
         self._momentum_is_unscaled = True
         self._t = 0
-        self._fused_part: dict[int, tuple] = {}          # group id -> (witness, one_block, big, one_dim, native)
+        # group id -> (param witness, state-identity generation, one_block, big, one_dim,
+        # native). The two leading fields are the cache KEY; read the routes off the END
+        # (``entry[-4:]``) so a future field cannot silently break a positional consumer.
+        self._fused_part: dict[int, tuple] = {}
         self._fused_demoted: dict[int, tuple] = {}       # group id -> memo of the non-contiguous-grad demotion
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
         self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPointerCache (1-D)
@@ -688,6 +702,22 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         ``ft.check_state_geometry``), so this key moving is what turns a shape-changing rebind
         into a clear error instead of a plan pointed at the wrong buffers.
 
+        SECOND KEY FIELD — the STATE-identity generation
+        (:class:`~kaon._foreach_plan.WatchedState`), and it is checked FIRST because it is one
+        integer compare against a witness tuple's ``len(params)`` element compares. The param
+        witness cannot see a state buffer being retired: ``del opt.state[p]``,
+        ``opt.state[p].clear()`` and ``opt.state[p]["m"] = ...`` move no parameter at all, and
+        every route's pointer tables went on addressing the retired ``m``/``row``/``col``/``v``
+        and writing them (measured on all four routes, and on the native plan through
+        ``ForeachChunk.state_views``). ONE check here covers every fused route, because a
+        rebuild hands back FOUR FRESH LISTS: ``_fused_demote``'s memo, ``_big_shape_buckets``'
+        memo and every ``_WitnessedCache.built_from`` downstream all revalidate by list
+        IDENTITY, so they rebuild together — the same argument that lets them skip a second
+        witness sweep, now carrying the state as well. The generation is read once per group
+        per step and never moves in steady state (``_init_state`` populating a fresh state
+        does not move it — see ``WatchedParamState.__setitem__``), so nothing here rebuilds
+        for it and the cost is a ``getattr`` plus a list index.
+
         SHAPE-REBIND LIMIT — ``p.data = p.data.view(...)`` mid-training is REFUSED, never
         supported. ``state["row"]``/``state["col"]`` were allocated for the old effective 2-D
         shape and an EMA has no meaningful migration onto a different factorization. What 0.7.13
@@ -725,9 +755,10 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         """
         gid = id(group)
         witness = ft.param_witness(params)
+        gen = state_generation(self.state)
         cached = self._fused_part.get(gid)
-        if cached is not None and cached[0] == witness:
-            return cached[1], cached[2], cached[3], cached[4]
+        if cached is not None and cached[1] == gen and cached[0] == witness:
+            return cached[2], cached[3], cached[4], cached[5]
         md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
         one_block: list[Tensor] = []
         big: list[Tensor] = []
@@ -788,7 +819,7 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
                     f"[census] one_block={len(one_block)} big={len(big)} one_dim={len(one_dim)} "
                     f"native={len(native)} noncontig_grads={noncontig[:8]} disable={sorted(_FUSED_DISABLE)}\n"
                 )
-        self._fused_part[gid] = (witness, one_block, big, one_dim, native)
+        self._fused_part[gid] = (witness, gen, one_block, big, one_dim, native)
         return one_block, big, one_dim, native
 
     def _fused_demote(self, gid: int, parts: tuple) -> tuple:
@@ -824,8 +855,14 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         # ``built_from`` (identity), not ``stale`` (tuple rebuild): _fused_partition already
         # revalidated ids+data_ptrs for the whole group this step and only returns this exact
         # list object while nothing moved. See _WitnessedCache.built_from.
-        if cache is None or not cache.built_from(plist):
-            cache = ft.PointerArrayCache(plist, lambda p: self.state[p], None)
+        #
+        # ``gen`` is the state-identity generation the tables were baked at, checked here as
+        # well as in _fused_partition: this cache is what holds the ``m``/``row``/``col``
+        # pointers, so it is where the check belongs (and AdaPNM's ``revalidate`` routes prove
+        # the partition's own check does not reach every cache on its own).
+        gen = state_generation(self.state)
+        if cache is None or not cache.built_from(plist, gen):
+            cache = ft.PointerArrayCache(plist, lambda p: self.state[p], None, gen=gen)
             self._fused_ob_caches[gid] = cache
         cache.refresh_grads()
         b1, b2 = group["betas"]
@@ -866,8 +903,9 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
                 self._init_state(p, st, group)
         gid = id(group)
         cache = self._fused_od_caches.get(gid)
-        if cache is None or not cache.built_from(plist):   # see _fused_one_block
-            cache = ft.OneDimPointerCache(plist, lambda p: self.state[p])
+        gen = state_generation(self.state)
+        if cache is None or not cache.built_from(plist, gen):   # see _fused_one_block
+            cache = ft.OneDimPointerCache(plist, lambda p: self.state[p], gen=gen)
             self._fused_od_caches[gid] = cache
         cache.refresh_grads()
         b1, b2 = group["betas"]
@@ -1029,9 +1067,12 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         # predicate once (``cache.gc_ok``, a fan-in-1 bucket has no GC to do — see
         # kaon._backend.gc_applies), so ``gc_flag and cache.gc_ok`` costs a bool AND per
         # step instead of a shape walk, and a fresh cache is built with the raw flag and
-        # applies the predicate itself.
-        if cache is None or not cache.built_from(plist) or cache.gc != (gc_flag and cache.gc_ok):
-            cache = ft.BigPointerCache(plist, lambda p: self.state[p], R, C, gc=gc_flag)
+        # applies the predicate itself. ``gen`` is the state generation the tables were
+        # baked against (see kaon._foreach_plan.state_generation).
+        gen = state_generation(self.state)
+        if (cache is None or not cache.built_from(plist, gen)
+                or cache.gc != (gc_flag and cache.gc_ok)):
+            cache = ft.BigPointerCache(plist, lambda p: self.state[p], R, C, gc=gc_flag, gen=gen)
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()
         gc = cache.gc          # the per-bucket constexpr every launch below is given
