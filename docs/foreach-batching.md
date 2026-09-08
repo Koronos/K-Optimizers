@@ -267,6 +267,12 @@ buffer, so the plan is rebuilt or dropped on all of:
 | the stack budget moves | `ForeachPlan.rechunk` |
 | `load_state_dict` (it **replaces** the state tensors), `add_param_group`, an AutoLR base-state reset, a group falling back to the per-parameter loop | dropped explicitly |
 
+The `load_state_dict` row is why a **wrapper** (`Lookahead`, `SAM`, `MSAM`, `Nekaon`)
+must restore its inner optimizer through the inner's *own* `load_state_dict` and never
+through a lower-level loader: that drop is the inner's, so bypassing it leaves a plan
+(and, on Adakaon, the fused pointer tables) cached under a dead `id(group)`, aliasing
+state tensors the load replaced.
+
 A rebind that changes the *shape* is deliberately not supported (the factored second
 moment is bound to the effective 2-D shape and there is no meaningful migration of an
 EMA onto a different factorization); the stale bucketing raises a size mismatch on the

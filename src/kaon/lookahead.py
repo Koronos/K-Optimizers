@@ -63,7 +63,7 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kaon._backend import foreach_budget, subtract_batched_, subtract_one_
-from kaon._momentum_codec import _FOURBIT_BLOCK, load_state_dict_preserving_dtypes
+from kaon._momentum_codec import _FOURBIT_BLOCK
 from kaon._wrappers import CodecBuffer, TrainEvalWeights, WrapsInnerOptimizer
 from kaon.adakaon import Adakaon
 
@@ -231,16 +231,26 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
 
     # ================================================================= state_dict glue
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Restore the inner optimizer (dtype-preserving) and the phi buffers.
+        """Restore the inner Adakaon (through ITS OWN loader) and the phi buffers.
+
+        Delegating to ``inner.load_state_dict`` — the same thing SAM and MSAM do — is
+        what makes a resume through this wrapper equivalent to one through a bare
+        Adakaon. It still gets the dtype-exact restore this used to call directly
+        (``Adakaon.load_state_dict`` delegates to ``load_state_dict_preserving_dtypes``),
+        and additionally the three things only the inner's loader does: consume
+        ``_adakaon_meta`` (restore ``_t``, the Triton kernels' stochastic-rounding seed
+        counter, and migrate a pre-0.7.11 lr-scaled momentum to direction units),
+        back-fill the inner's own group defaults, and — load-bearing —
+        ``_invalidate_fused_caches``: the loader REPLACES every state tensor, so the
+        fused pointer tables and foreach plans must not survive it. Calling the
+        preserving helper directly skipped all three, leaking one plan per load under a
+        dead ``id(group)`` and restarting the fused SR seed at 0 on every resume.
 
         Backfill Lookahead's own per-group keys (``k``/``alpha``/``slow_dtype``/
         ``slow_4bit_block``/``la_step``/``train_mode``) the checkpoint predates, from
         ``self.defaults`` — same rationale as every other kaon ``load_state_dict``.
-        ``load_state_dict_preserving_dtypes`` here loads the inner Adakaon directly (not
-        via its own ``load_state_dict``), so this is also the only place its defaults
-        get backfilled through this wrapper's path.
         """
-        self._load_wrapped(state_dict, load_state_dict_preserving_dtypes)
+        self._load_wrapped(state_dict, lambda inner, sd: inner.load_state_dict(sd))
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)

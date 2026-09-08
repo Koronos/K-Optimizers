@@ -183,6 +183,20 @@ int8/4bit *codes* round-trip through fp32 losslessly).
 > deliberately do **not** deep-copy inside `state_dict()` so checkpointing never
 > doubles peak VRAM (the case `Adakaon` is built for).
 
+`Adakaon.load_state_dict` does three more things beyond that dtype-exact restore, and
+all three matter for a resume to reproduce an uninterrupted run: it restores the fused
+path's stochastic-rounding seed counter (and migrates a pre-0.7.11 lr-scaled momentum to
+direction units) from the `_adakaon_meta` blob, back-fills a group key the checkpoint
+predates, and drops every host-side cache that aliases the state tensors the load just
+replaced (the fused pointer tables and the foreach plans). Wrapping optimizers
+(`Lookahead`, `SAM`, `MSAM`, `Nekaon`) therefore restore their inner Adakaon by calling
+*its* `load_state_dict`, so a checkpoint resumed through a wrapper restores the inner
+Adakaon exactly as a bare one would. One caveat is the wrapper's own writes: `Lookahead`'s
+slow-weight sync goes through the shared stochastic-rounding kernel, whose per-process
+seed counter is not part of any checkpoint, so a `Lookahead` resume is bit-identical
+within one process but not across a fresh one — the same limit the bf16 *native* path
+has for every optimizer.
+
 ## See also
 
 - [foreach-batching.md](foreach-batching.md) — the multi-tensor batching design

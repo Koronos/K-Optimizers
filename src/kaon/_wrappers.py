@@ -269,7 +269,20 @@ class WrapsInnerOptimizer:
         return inner
 
     def _load_wrapped(self, state_dict: dict[str, Any], inner_loader: Any) -> None:
-        """Restore the inner optimizer (via ``inner_loader``) and the wrapper's per-param state."""
+        """Restore the inner optimizer (via ``inner_loader``) and the wrapper's per-param state.
+
+        ``inner_loader(inner, sd)`` MUST be the inner optimizer's own ``load_state_dict``
+        (``lambda inner, sd: inner.load_state_dict(sd)``), never a lower-level loader such
+        as :func:`kaon._momentum_codec.load_state_dict_preserving_dtypes`. A kaon
+        optimizer's ``load_state_dict`` is not a thin shell over torch's: it also consumes
+        its own ``_..._meta`` blob (Adakaon's fused SR seed counter and its pre-0.7.11
+        momentum-unit migration), back-fills group keys the checkpoint predates from its
+        ``defaults``, and — load-bearing — drops every host-side cache holding pointers or
+        views into the state tensors the load just REPLACED (``_invalidate_fused_caches`` /
+        ``_clear_foreach_plans``). Bypassing it leaks one cache entry per load under a dead
+        ``id(group)`` and desynchronises the fused path's noise stream on resume — which is
+        exactly what Lookahead did until it was switched to delegate here.
+        """
         sd = dict(state_dict)
         wrapped = sd.pop(self._wrap_state_key, {})
         inner_loader(self.inner, sd)
