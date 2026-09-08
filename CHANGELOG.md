@@ -107,6 +107,17 @@ All notable changes to this project will be documented in this file.
   per step, i.e. +10 aten ops on a 428-tensor LoRA bag; paired A/B 1.006x
   [0.986, 1.027], not significant.
 
+- **`Adakaon.load_state_dict` now back-fills *every* missing param-group key** from
+  `self.defaults`, like the other nine optimizers have since 0.7.12. It named
+  `cautious_wd` alone — the one key that had bitten — so a checkpoint written before any
+  other group key existed (`momentum_4bit_block`, `bf16_method`, `clip_threshold`,
+  `gradient_centralization`, `cautious`, `eps`, `momentum_dtype`, `betas`,
+  `weight_decay`) came back without it (torch restores `param_groups` from the
+  *checkpoint's* dicts) and died with `KeyError` on the first resumed step. Values the
+  checkpoint does carry still win (`setdefault`), including per-group overrides that
+  differ from the resuming instance's constructor arguments; a resume from a complete
+  checkpoint is bit-identical to an uninterrupted run.
+
 ### Changed
 - **The three pointer-witness "scan stays in C" locks no longer measure wall time.**
   `test_param_witness_scans_in_c` (both witness copies) and
@@ -120,8 +131,8 @@ All notable changes to this project will be documented in this file.
   fourth (`strides`) field's scan as well. The timed checks survive as opt-in smoke tests
   (`KAON_PERF_TESTS=1`), out of the default suite.
 - **Adakaon's foreach bucketing/view plan is now the shared one** (`kaon._foreach_plan`).
-  `ForeachPlanMixin` plus a five-line `ForeachSpec` (`factored_state=("row", "col")`,
-  `flat_state=("v",)`, `momentum_cache=beta1 > 0 and momentum_dtype != "4bit"`) replace
+  `ForeachPlanMixin` plus a three-line `ForeachSpec` (`factored_state=("row", "col")`,
+  `flat_state=("v",)`) replace
   `kaon.adakaon._ForeachPlan` / `_ForeachChunk` / `_identity` / `_foreach_buckets` /
   `_foreach_plan` / `_param_witness` — **−175 lines** of duplicated machinery. Adakaon is
   the optimizer this design was extracted *from* and the last one still carrying its own
@@ -154,52 +165,98 @@ All notable changes to this project will be documented in this file.
   layouts to keep in step).
 
 ### Performance
-- No measurable change on any path, which is the intended result: the migration moves
-  host-side bookkeeping between modules and changes no kernel and no dispatch. Verified
-  contention-immune first — the CUDA launch count and the
-  `aten::view`/`reshape`/`select`/`as_strided`/`unbind`/`flatten` count for one step are
-  **identical** between 0.7.12 and this branch on every bag and both kernel modes (e.g.
-  428 LoRA-shaped adapters 194 launches / 4328 view-ops, 448 0-D scalars 77 / 3150,
-  300 matrixized convs + 128 scalars 167 / 3935, 128×(512,512)+64×(1024,) 486 / 1790).
-- The host-side call the two implementations actually disagree about — one cached-plan
-  retrieval — costs **+0.15 … +0.8%** of a 57–96 µs call (paired, order-alternating,
-  n=1500 pairs on CPU), i.e. **≤ 0.6 µs per step** on a 4.5–35 ms step. The same harness
-  run against the reference tree twice (a null A/B) reports −0.5 … +0.4%, its own bias
-  floor.
-- Paired GPU wall clock (both trees in one process over *shared* parameter bags, 5
-  interleaved repeats × 100 pairs per bag per mode, RTX 3000 Ada Laptop, bf16 params /
-  bf16 momentum): every bag and both kernel modes inside ±1.8%, none significant except a
-  1.0% *win* on 128×(512,512)+64×(1024,) foreach. Caveat, and the reason the control
-  matters: the same harness with the reference tree as BOTH arms reported a "significant"
-  +3.1% on one bag, so on a shared laptop GPU this design resolves ~3% and not 2% — the
-  identical counters above, not the clock, are what rules out a regression.
-  See `docs/foreach-batching.md` ("Adakaon's migration onto the shared module").
+- **Adakaon's foreach path hands the momentum codec its cached view lists too.** It was
+  the last user of the codec's stacked entry points still rebuilding them per step: both
+  bucket bodies now pass `views=chunk.momentum_views(codec)` to `ema_stacked`. Measured
+  per step (RTX 3000 Ada Laptop, bf16 params + SR, `torch.profiler`, medians of 3
+  interleaved repeats):
 
-- **The momentum codec's stacked paths take cached view lists.** `ema_stacked`,
-  `store_stacked` and `dequant_stacked` rebuilt, on **every step**, lists that are
-  pure functions of tensors the optimizer already owns — `[mat(state["m"]) …]`, the
-  per-row `[state["m_scale"].view(rowshape) …]`, the write-back targets. Each codec
-  now exposes `stacked_views(states, view, eff)`, a `ForeachChunk` builds it once
-  (`chunk.momentum_views(codec)`), and AdaBelief, AdamP, ADOPT and AdaMuon hand it
-  back through the new optional `views=` argument. The per-parameter `m_scale`
-  write-back loop becomes a single `_foreach_copy_` at the same time. Measured per
-  step (RTX 3000 Ada Laptop, bf16 params + SR, `torch.profiler`):
-
-  | bag | `aten::view` | `aten::reshape` | `aten::copy_` |
+  | bag (foreach) | codec | `aten::view` | `aten::copy_` |
   |---|---|---|---|
-  | AdaBelief, 448 × 0-D, int8 | 1802 → **10** | 1348 → **3** | 452 → **4** |
-  | AdaBelief, 428-tensor LoRA, bf16 | 874 → **18** | 432 → **4** | 6 → 6 |
-  | ADOPT, 428-tensor LoRA, int8 | 874 → **18** | 2 → 2 | 436 → **8** |
-  | AdamP, 448 × 0-D, 4-bit | 19 → 19 | 10 → 10 | 453 → **5** |
+  | 448 × 0-D | int8 | 905 → **9** | 453 → **5** |
+  | 428-tensor LoRA | int8 | 897 → **41** | 448 → **20** |
+  | 128×(512,512)+64×(1024,) | int8 | 449 → **65** | 222 → **30** |
+  | 24×(320,320,3,3) | int8 | 85 → **37** | 39 → **15** |
+  | 448 × 0-D | 4-bit | 6 → 6 | 454 → **6** |
+  | 428-tensor LoRA | 4-bit | 24 → 24 | 452 → **24** |
+  | 128×(512,512)+64×(1024,) | 4-bit | 36 → 36 | 228 → **36** |
+  | 24×(320,320,3,3) | 4-bit | 18 → 18 | 42 → **18** |
 
-  Wall time on an idle card follows the host work it removes (−30 … −60 % on the
-  quantized codecs' launch-bound bags); it is neutral where the bucket never needed
-  a real view. Peak allocated memory is unchanged — the cache holds only *views*
-  of `state["m"]` / `state["m_scale"]`, never a stacked scratch buffer.
-- Numerically invisible: bit-identical to 0.7.12 for AdaBelief, AdamP, ADOPT,
-  AdaMuon, KProdigy and Lion over fp32/bf16 parameters × fp32/bf16/int8/4-bit
-  momentum, mixed 0-D/1-D/2-D/conv bags, multi-chunk buckets and a mid-run
-  checkpoint reload.
+  The removed per-parameter `m_scale` write-back becomes 1–6 more `_foreach_copy_` calls,
+  and for 4-bit that collapse is the *whole* gain: its `m` is a nibble-packed byte string
+  with no effective layout, so it never had per-parameter `view`s to cache (that column
+  does not move) but it did write every parameter's scale with its own `copy_`. Only the
+  **float codecs (`float32` and `bfloat16`) are count-for-count unchanged** — their lists
+  were already served by the plan's identity-keyed `mat` lookup (see below) and the cached
+  views replace it at the same cost. Peak allocated memory unchanged (0.00 MiB on every
+  bag and both kernel modes) — the lists are views of `state["m"]` / `state["m_scale"]`.
+- `ForeachSpec.momentum_cache` and `ForeachChunk.mat` are **gone**. The flag prebuilt an
+  identity-keyed `{state["m"]: view(state["m"])}` lookup for the codec's `mat` callback;
+  now that every optimizer on the shared plan passes `views=`, the codec's stacked path
+  never calls `mat` at all, so the dict was a strictly worse cache (`Tensor.__hash__` is
+  a Python-level call in torch) of the very same views. Adakaon was its last user.
+  Call sites pass `chunk.view` — the same callback — which the codec keeps only as the
+  fallback for a layout `stacked_views` declined (a non-contiguous buffer).
+  `ForeachChunk.__init__` and `ForeachPlan.rechunk` lost their now-unused `group`
+  argument.
+- **The fused big-tensor route stops rebuilding its bucket lists.** `Adakaon._fused_big`
+  re-derived the same-shape/dtype/device split of the "big" subset on every step, and a
+  fresh list is what made `BigPointerCache` unable to recognize itself (`built_from` is
+  list identity), so every step fell back to `stale()` — a full `param_witness` tuple over
+  the bucket, once per big shape bucket, *on top of* the sweep `_fused_partition` had
+  already run for the whole group. `Adakaon._big_shape_buckets` memoizes the split per
+  group and revalidates it by the identity of the route list, which the partition and the
+  non-contiguous-grad demotion already guarantee — the same contract `_fused_one_block` and
+  `_fused_one_dim` have used since 0.7.12. Witness sweeps **per step**, measured with
+  `torch.profiler` and a call counter:
+
+  | bag (fused) | partition | big pointer caches | total |
+  |---|---|---|---|
+  | 80 big tensors over 4 shapes | 1 | **4 → 0** | **5 → 1** |
+  | 200×(256,256) + 100×(512,) + 128×0-D | 1 | **1 → 0** | 2 → 1 |
+  | 24×(320,320,3,3) | 1 | **1 → 0** | 2 → 1 |
+  | 128×(512,512) + 64×(1024,) | 1 | **1 → 0** | 2 → 1 |
+
+  A sweep costs (measured directly, CPU-only, medians of 200 calls) 4.1 µs over 20
+  params, 15.8 µs over 80, 35.6 µs over 200 and 71.8 µs over 428 — so the 80-tensor bag
+  above drops ~16 µs of pure host work per step and the LoRA bag's 200-tensor big bucket
+  ~36 µs. Peak allocated memory unchanged (0.00 MiB on every bag and mode). **The wall
+  clock does not resolve this on a shared laptop GPU** and no claim is made from it. On
+  the 80-tensor bag, 200 timed steps × 6 interleaved repeats of base / arm / base: the arm
+  lands at −14.7 % (bf16 momentum) and −8.7 % (int8) of the base's host time while the
+  base-vs-base *control* lands at +6.4 % and −0.5 % — and the per-repeat spread of that
+  control against its paired base repeat is −42 … +83 %. So the direction is plausibly a
+  small win and certainly not a regression, but the sweep counts are the evidence.
+- `AdaPNM._fused_big` had the identical defect (it *called* `built_from` but always missed,
+  because it rebuilt the lists too, and then paid the `stale` compare); it gets the same
+  memo, keyed per `(group, lag)` and pruned by `_prune_lag_caches` with the pointer caches.
+  Witness sweeps on 80 big tensors over 4 shapes: **5 → 1** per step.
+- **`_WitnessedCache.revalidate`** (new, additive) replaces AdaPNM's
+  `not cache.built_from(plist) and cache.stale(plist)` on all three of its fused routes.
+  That combination had a hole that opened once and never closed: one step with a
+  non-contiguous gradient anywhere in the group makes `_fused_demote` rebuild all four
+  route lists, so the caches are handed a *fresh list over unchanged parameters* —
+  `built_from` misses, `stale` correctly says nothing moved, the branch is skipped, and
+  the cache is left holding `src` from the previous generation. From then on `built_from`
+  misses on **every** step and the per-bucket `param_witness` sweep is back for good:
+  measured **1.0 → 3.17** sweeps per step after a single strided-grad step, permanently.
+  `revalidate` is the same two checks plus the rebind they were missing — it adopts the
+  fresh list when the witness agrees, so the next step is back on the O(1) identity path,
+  and still rebuilds the tables when the witness actually moved. At most one sweep, only
+  when identity misses. Adakaon was never affected (its routes use a bare
+  `not built_from`, so a fresh list simply rebuilds).
+- Bit-identity: 272 configurations (fp32/bf16 params × `float32`/`bfloat16`/`int8`/`4bit`
+  momentum × foreach/fused × 5 bags — 428-tensor LoRA, 448 × 0-D, convs+1-D+0-D mixed,
+  24×(320,320,3,3), 128×(512,512)+64×(1024,) — × 7 interference scenarios ×
+  Adakaon/Nekaon/MSAM/Lookahead), 6 steps each, every weight and every state tensor of
+  both the wrapper and the inner optimizer hashed byte-for-byte. **272/272 match** the
+  reference tree, which also matched itself run-to-run (the control) with the chunked-big
+  fused route under `deterministic_reductions=True`. The same matrix was re-run after the
+  `_fused_big` memo: 272/272 again. For AdaPNM (which has no `deterministic_reductions`
+  knob, so its fused big reductions are not reproducible run to run on *either* tree) 512
+  configurations were hashed: all 352 reproducible ones match bit-for-bit, and the 160 that
+  do not are exactly the set the base tree already fails to reproduce against itself —
+  agreeing to rel ≤ 1.8e-7 against a base-vs-base spread of 1.3e-7.
 
 ### Added
 

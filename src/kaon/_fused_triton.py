@@ -2165,9 +2165,38 @@ class _WitnessedCache:
         (or the per-step non-contiguous-grad demotion) rebuilds them into FRESH list objects.
         Under that contract, "this is the list I was built from" is exactly as strong as
         recomparing the tuples — and skips a second witness sweep per step (~131 µs on the
-        428-param bag). Callers without that contract must use :meth:`stale`.
+        428-param bag). Callers without that contract must use :meth:`stale` — or
+        :meth:`revalidate`, which is that combination done without desynchronising.
         """
         return plist is self.src
+
+    def revalidate(self, plist) -> bool:
+        """True when this cache still describes ``plist``, ADOPTING a fresh list object
+        that describes the same parameters. False means the tables must be rebuilt.
+
+        For callers whose ``plist`` is *usually* the list the cache was built from but
+        can legitimately be re-derived into a new object over unchanged parameters —
+        AdaPNM's routes, where a mixed-lag group re-splits every step and a
+        non-contiguous-grad demotion rebuilds all four route lists for one step.
+
+        The naive combination ``not built_from(plist) and stale(plist)`` looks
+        equivalent and is not: it leaves the cache holding ``src`` from the PREVIOUS
+        generation whenever the witness agrees, so ``built_from`` fails from then on and
+        the ``param_witness`` sweep comes back **permanently** — measured on AdaPNM as
+        1.0 → 3.17 sweeps per step after a single strided-grad step, and it never
+        recovers. The missing half is the rebind on this line: when the witness says
+        nothing moved, the fresh list is as good as the old one, so take it and let the
+        next step hit the O(1) identity path again.
+
+        One witness sweep at most, and only when identity misses.
+        """
+        if plist is self.src:
+            return True
+        witness = param_witness(plist)
+        if witness != self.witness:
+            return False
+        self.src = plist            # same parameters, new list object: adopt it
+        return True
 
 
 # ============================================================ Triton bf16 SR weight write

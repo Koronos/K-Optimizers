@@ -1092,3 +1092,232 @@ def test_big_batched_shape_rebind_hits_the_bigpnmcache_guard():
     assert exc is not None, "the batched big route stepped a plan that disagreed with the state"
     msg = str(exc)
     assert "shape" in msg.lower() and "row/col are 256/1024" in msg, msg
+
+
+# ----------------------------------------------------------------- 9. big bucket lists memoized
+# ``_fused_big`` split its subset into same-shape/dtype/device buckets on every step, so the
+# fresh list objects made ``BigPnmCache.built_from`` miss every time and every step fell
+# through to the full ``stale`` compare — a ``param_witness`` tuple per big shape bucket on
+# top of the one ``_fused_partition`` already ran for the group. ``_big_shape_buckets``
+# memoizes the split per (group, lag); these tests pin the reuse and the invalidation.
+
+_PNM_BIG_BAG = [(512, 512)] * 3 + [(384, 384)] * 2          # two big shape buckets
+
+
+class _PnmWitnessSpy:
+    """Counts ``param_witness`` calls per call site (each module namespace is one)."""
+
+    def __init__(self):
+        import kaon._fused_triton as ftm
+
+        self.sites = {"pointer_cache": ftm}
+        self.counts = dict.fromkeys(self.sites, 0)
+        self._orig = {}
+
+    def __enter__(self):
+        for name, mod in self.sites.items():
+            orig = mod.param_witness
+            self._orig[name] = orig
+
+            def wrapped(plist, _n=name, _o=orig):
+                self.counts[_n] += 1
+                return _o(plist)
+
+            mod.param_witness = wrapped
+        return self
+
+    def __exit__(self, *exc):
+        for name, mod in self.sites.items():
+            mod.param_witness = self._orig[name]
+
+
+def test_pnm_big_bucket_lists_are_reused_between_steps():
+    """Steady state: the big pointer caches stop re-running the witness entirely.
+
+    ``_fused_partition`` runs it once per group per step through ``ft.param_witness`` too, so
+    the count here is the partition's sweeps only — one per step, not one more per bucket.
+    """
+    pv = _bag(_PNM_BIG_BAG, torch.float32, seed=181)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(191)
+    _drive([(pv, ov)], 3, gen)
+    _ob, big, _od, _nat = _parts(ov)
+    assert len(big) == len(_PNM_BIG_BAG), "the bag did not take the big route"
+    first = dict(ov._fused_big_caches)
+    assert len(first) == 2, f"expected 2 big shape buckets, got {len(first)}"
+
+    with _PnmWitnessSpy() as spy:
+        _drive([(pv, ov)], 4, gen)
+    assert spy.counts["pointer_cache"] == 4, (
+        f"expected 4 partition sweeps and no per-bucket ones, got {spy.counts}"
+    )
+    after = dict(ov._fused_big_caches)
+    assert after.keys() == first.keys()
+    assert all(after[k] is first[k] for k in first), "a big pointer cache was rebuilt"
+
+
+@pytest.mark.parametrize("event", ["rebind_fresh_storage", "transpose_square",
+                                   "load_state_dict", "autolr_reset"])
+def test_pnm_big_bucket_memo_is_invalidated(event):
+    """The memoized lists must not outlive anything that moves the partition."""
+    pv = _bag(_PNM_BIG_BAG, torch.float32, seed=193)
+    pn = _clone(pv)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    on = AdaPNM(pn, fused=False, **_SAFE_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(197)
+    _drive([(pv, ov), (pn, on)], 2, gen)
+    before = dict(ov._fused_big_caches)
+    assert before, "no big pointer cache was built"
+
+    def mutate(step, pairs):
+        if step != 2:
+            return
+        for plist, opt in pairs:
+            if event == "rebind_fresh_storage":
+                plist[0].data = plist[0].data.clone()
+            elif event == "transpose_square":
+                plist[0].data = plist[0].data.t()
+            elif event == "load_state_dict":
+                opt.load_state_dict(opt.state_dict())
+            else:
+                opt._autolr_reset_base_state()
+
+    _drive([(pv, ov), (pn, on)], 4, gen, mutate=mutate)
+    after = dict(ov._fused_big_caches)
+    assert not (after.keys() == before.keys()
+                and all(after[k] is before[k] for k in before)), (
+        f"{event}: the big pointer caches survived the event unchanged"
+    )
+    scale = max(p.detach().abs().max().item() for p in pn)
+    d = _maxdiff(pv, pn)
+    assert d / scale < 1e-4, f"{event}: rel={d / scale:.2e} vs native"
+
+
+def test_pnm_big_bucket_memo_survives_a_mixed_lag_group():
+    """A param that skips a step splits the big subset into two lag buckets; each lag keeps
+    its own memo entry, and a lag that disappears is pruned with the pointer caches."""
+    pv = _bag(_PNM_BIG_BAG, torch.float32, seed=199)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(211)
+
+    for step in range(6):
+        for i, p in enumerate(pv):
+            skip = step == 2 and i == 0
+            p.grad = None if skip else torch.randn(
+                tuple(p.shape), generator=gen, device=DEV, dtype=p.dtype)
+        ov.step()
+        if step == 3:                       # lag 1 for pv[0], lag 0 for the rest
+            lags = {lag for _gid, lag in ov._fused_big_buckets}
+            assert lags == {0, 1}, f"expected two lag buckets, got {lags}"
+    torch.cuda.synchronize()
+    lags = {lag for _gid, lag in ov._fused_big_buckets}
+    assert lags == {0, 1}, f"the memo lost or grew a lag entry: {lags}"
+    assert all(torch.isfinite(p).all() for p in pv)
+
+
+# ------------------------------------------------- 10. a rebucketing must not desync the cache
+# ``if cache is None or (not cache.built_from(plist) and cache.stale(plist))`` had a hole that
+# only opens once and then never closes. One step with a non-contiguous grad anywhere in the
+# group makes ``_fused_demote`` rebuild all four route lists; the memos then hand out fresh
+# bucket lists over the SAME parameters. ``built_from`` fails (new object) and ``stale`` says
+# nothing moved, so the branch is not taken and the cache is left holding ``src`` from the
+# PREVIOUS generation — after which ``built_from`` fails on every subsequent step and the
+# ``param_witness`` sweep per bucket comes back permanently. Adakaon never had it (it uses a
+# bare ``not built_from``, so a fresh list simply rebuilds); AdaPNM's three routes did.
+
+
+def _witness_sweeps(opt, steps, gen, grads_for=_plain_grads):
+    """param_witness calls per step over ``steps`` steps (partition's included)."""
+    plist = [p for g in opt.param_groups for p in g["params"]]
+    with _PnmWitnessSpy() as spy:
+        _drive([(plist, opt)], steps, gen, grads_for=grads_for)
+    return spy.counts["pointer_cache"] / steps
+
+
+_REBUCKET_BAG = ([(512, 512)] * 3 + [(384, 384)] * 2      # two big shape buckets
+                 + [(8, 16)] * 4 + [(32,)] * 3)           # plus one_block and one_dim
+
+
+@pytest.mark.parametrize("route", ["big", "one_block", "one_dim"])
+def test_pnm_rebucketing_after_a_grad_toggle_resyncs_the_cache(route):
+    """A single strided-grad step must not cost a witness sweep per bucket forever after.
+
+    The toggle is applied to a param of ``route`` so that route's own lists are the ones
+    rebuilt; the demotion rebuilds all four route lists either way, so every route's cache
+    sees a fresh list and every route has to resynchronise.
+    """
+    pv = _bag(_REBUCKET_BAG, torch.float32, seed=223)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    idx = {"big": 0, "one_block": 5, "one_dim": 9}[route]
+    shape = tuple(pv[idx].shape)
+    gen = torch.Generator(device=DEV).manual_seed(227)
+
+    def strided(g, plist):
+        gs = _plain_grads(g, plist)
+        if len(shape) == 2:
+            gs[idx] = torch.randn(shape[::-1], generator=g, device=DEV,
+                                  dtype=torch.float32).t()
+        else:
+            gs[idx] = torch.randn((shape[0] * 2,), generator=g, device=DEV,
+                                  dtype=torch.float32)[::2]
+        return gs
+
+    _drive([(pv, ov)], 3, gen)                                  # warm, everything contiguous
+    before = _witness_sweeps(ov, 3, gen)
+    assert before == pytest.approx(1.0), (
+        f"steady state should be one sweep per step (the partition's), got {before}"
+    )
+
+    _drive([(pv, ov)], 1, gen, grads_for=strided)               # the toggle
+    _drive([(pv, ov)], 1, gen)                                  # contiguous again
+    after = _witness_sweeps(ov, 4, gen)
+    assert after == pytest.approx(1.0), (
+        f"{route}: after one strided-grad step the sweeps stayed at {after}/step — the "
+        "pointer cache never resynchronised with the rebuilt route lists"
+    )
+
+
+def test_pnm_rebucketing_resync_still_matches_native():
+    """The resync must adopt the new list, never keep stale pointer tables: a strided-grad
+    toggle followed by ordinary steps has to track the native path."""
+    pv = _bag(_REBUCKET_BAG, torch.float32, seed=229)
+    pn = _clone(pv)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    on = AdaPNM(pn, fused=False, **_SAFE_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(233)
+
+    def strided(g, plist):
+        gs = _plain_grads(g, plist)
+        gs[0] = torch.randn((512, 512), generator=g, device=DEV, dtype=torch.float32).t()
+        return gs
+
+    _drive([(pv, ov), (pn, on)], 2, gen)
+    _drive([(pv, ov), (pn, on)], 1, gen, grads_for=strided)
+    _drive([(pv, ov), (pn, on)], 3, gen)
+    scale = max(p.detach().abs().max().item() for p in pn)
+    d = _maxdiff(pv, pn)
+    assert d / scale < 1e-4, f"rel={d / scale:.2e} vs native after a rebucketing resync"
+
+
+def test_pnm_rebind_still_rebuilds_when_something_actually_moved():
+    """The resync must not swallow a real change: a fresh list whose params were REBOUND
+    has to rebuild the pointer tables, not adopt the list."""
+    pv = _bag(_REBUCKET_BAG, torch.float32, seed=239)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(241)
+    _drive([(pv, ov)], 3, gen)
+    before = dict(ov._fused_big_caches)
+    retired = [(pv[0].data, pv[0].data.clone())]
+
+    def mutate(step, _pairs):
+        if step == 0:
+            pv[0].data = pv[0].data.clone()
+
+    _drive([(pv, ov)], 3, gen, mutate=mutate)
+    after = dict(ov._fused_big_caches)
+    assert not (after.keys() == before.keys()
+                and all(after[k] is before[k] for k in before)), (
+        "the rebind was swallowed: the big pointer cache was never rebuilt"
+    )
+    for old, snapshot in retired:
+        assert torch.equal(old, snapshot), "the step wrote the RETIRED storage"

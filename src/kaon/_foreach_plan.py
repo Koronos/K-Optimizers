@@ -106,21 +106,19 @@ class ForeachSpec:
     its own (buckets touch disjoint params and disjoint state), but it decides the order
     stochastic-rounding draws are consumed in, so reordering would move bf16+SR weights.
 
-    ``momentum_cache(group)`` says whether a chunk should prebuild the ``mat`` lookup the
-    momentum codec calls per param per step; ``None`` for optimizers that do not hand a
-    ``mat`` callback to the codec. **No shared-plan optimizer sets it any more**: the
-    codec's stacked path takes its per-param view lists from
-    :meth:`ForeachChunk.momentum_views`, so it never calls ``mat``, and a dict keyed on
-    ``Tensor.__hash__`` is a strictly worse cache of the same views. It is kept for
-    Adakaon, which still hands the codec a bare ``mat`` and is being migrated onto this
-    plan separately.
-
     ``single_alias`` reproduces AdaMuon's ``_stack_fp32``: a one-element bucket is
     ``unsqueeze``d instead of stacked, aliasing the param's storage rather than copying it.
+
+    HISTORY — a ``momentum_cache(group)`` flag used to ask a chunk to prebuild the
+    identity-keyed ``{state["m"]: view(state["m"])}`` lookup the momentum codec called
+    per param per step. It is gone: every optimizer on this plan now hands the codec
+    :meth:`ForeachChunk.momentum_views`, so the codec's stacked path never calls
+    ``view`` at all, and a dict keyed on ``Tensor.__hash__`` (a Python-level call in
+    torch) was a strictly worse cache of the very same views.
     """
 
     __slots__ = ("extra_key", "factored_state", "flat_state", "key_major",
-                 "momentum_cache", "single_alias")
+                 "single_alias")
 
     def __init__(
         self,
@@ -129,14 +127,12 @@ class ForeachSpec:
         flat_state: tuple[str, ...] = (),
         extra_key: Callable[[dict[str, Any], dict[str, Any]], Hashable] | None = None,
         key_major: bool = False,
-        momentum_cache: Callable[[dict[str, Any]], bool] | None = None,
         single_alias: bool = False,
     ) -> None:
         self.factored_state = factored_state
         self.flat_state = flat_state
         self.extra_key = extra_key
         self.key_major = key_major
-        self.momentum_cache = momentum_cache
         self.single_alias = single_alias
 
 
@@ -152,12 +148,10 @@ class ForeachChunk:
     * :attr:`pviews` — ``[view(p.data) for p in plist]``, the list the weight decay,
       the projection stack and the final subtract all walk.
     * :attr:`state_views` — one list per key named in the spec, in spec order.
-    * :attr:`mat` — what to hand the momentum codec. Usually :attr:`view`; when the view
-      is a real reshape, an identity-keyed lookup of prebuilt momentum views is cheaper,
-      because the codec calls it once (float) or twice (int8) per param per step. Only
-      the *uncached* codec path calls it — see :meth:`momentum_views`.
     * :meth:`momentum_views` — the codec's own stacked-path view lists, built on first
-      use and kept for the chunk's lifetime.
+      use and kept for the chunk's lifetime. :attr:`view` is also what the codec's
+      ``mat`` argument is for: it is the *uncached* fallback the codec keeps for a
+      layout :meth:`momentum_views` declined, and nothing else calls it.
 
     Gradient views are deliberately **not** cached: a retained view of ``p.grad`` keeps
     the previous step's gradient storage alive (``set_to_none=True`` allocates a fresh
@@ -169,7 +163,7 @@ class ForeachChunk:
     """
 
     __slots__ = ("eff", "grad_reshape", "grad_uniform", "key", "key_index", "length",
-                 "mat", "matrixize", "momentum_view_cache", "n", "plist", "pviews",
+                 "matrixize", "momentum_view_cache", "n", "plist", "pviews",
                  "single_alias", "state_views", "states", "view")
 
     def __init__(
@@ -177,7 +171,6 @@ class ForeachChunk:
         plist: list[Tensor],
         states: list[dict[str, Any]],
         spec: ForeachSpec,
-        group: dict[str, Any],
         eff: tuple[int, int] | None,
         matrixize: bool,
         length: int,
@@ -211,15 +204,6 @@ class ForeachChunk:
             view = self.view
             self.state_views = tuple([view(s[k]) for s in states] for k in keys)
         self.pviews = [self.view(p.data) for p in plist]
-        # An identity-keyed lookup of prebuilt views only pays when there is a view to
-        # save — ``Tensor.__hash__`` is a Python-level call in torch, so a dict hit is
-        # *more* expensive than ``_identity``. 4bit is excluded by the optimizer's
-        # ``momentum_cache`` predicate: its ``m`` is a packed byte string, not a momentum
-        # in the effective layout (``view`` would raise), and its codec never calls ``mat``.
-        self.mat = self.view
-        if (cached and self.view is not _identity and spec.momentum_cache is not None
-                and spec.momentum_cache(group)):
-            self.mat = {s["m"]: self.view(s["m"]) for s in states}.__getitem__
         self.momentum_view_cache: tuple[_MomentumCodec, _StackedViews | None] | None = None
 
     def momentum_views(self, codec: _MomentumCodec) -> _StackedViews | None:
@@ -253,12 +237,19 @@ class ForeachChunk:
     # KNOWN CEILING (measured on a 448x 0-D bag, after this cache): the residue is three
     # ``stack`` + three ``unbind`` per step (~1344 ``aten::select``). Only ONE of each pair
     # lives here (the flat state stack and its write-back); the other two are inside
-    # ``_momentum_codec.ema_stacked`` and ``_backend.subtract_batched_``. Persistent
-    # ``cat(out=)`` scratch buffers with cached unbind slices would therefore buy only the
-    # local pair (~10% of the remaining step) while pinning a stacked fp32 buffer per bucket
-    # for the process's lifetime — a bad trade for optimizers whose pitch is memory, and it
-    # would feed back into the free-VRAM-adaptive chunk budget. Removing the other two needs
-    # the codec to hand back a reusable buffer: follow-up work.
+    # ``_momentum_codec.ema_stacked`` and ``_backend.subtract_batched_``.
+    #
+    # NO VIEW CACHE CAN REMOVE THEM — not this module's, not the codec's. They select
+    # into tensors that are FRESHLY ALLOCATED every step (the stacked update, the delta),
+    # so there is no cross-step view to hold: what the caches here alias is state the
+    # optimizer owns *across* steps. Removing the residue needs a persistent stacked
+    # ``cat(out=)`` scratch buffer with cached unbind slices, which would buy only the
+    # local pair (~10% of the remaining step) while pinning a stacked fp32 buffer per
+    # bucket for the process's lifetime — a bad trade for optimizers whose pitch is
+    # memory, and it would feed back into the free-VRAM-adaptive chunk budget. The two
+    # outside would additionally need the codec / the backend to hand that buffer back.
+    # Follow-up work, deliberately not attempted; see "Known ceiling" in
+    # docs/foreach-batching.md.
     def grad_stack(self) -> Tensor:
         """This step's stacked fp32 gradient ``[N, *eff]``. Never cached — see the class
         docstring.
@@ -309,14 +300,13 @@ class ForeachPlan:
         self.chunks: list[ForeachChunk] | None = None
         self.steps: tuple[int, ...] = ()
 
-    def rechunk(self, budget: int, spec: ForeachSpec, group: dict[str, Any],
-                cached: bool) -> list[ForeachChunk]:
+    def rechunk(self, budget: int, spec: ForeachSpec, cached: bool) -> list[ForeachChunk]:
         steps = tuple(max(1, budget // size) for size, *_ in self.buckets)
         if self.chunks is not None and steps == self.steps:
             return self.chunks
         self.steps = steps
         self.chunks = chunks = [
-            ForeachChunk(plist[i:i + n], states[i:i + n], spec, group,
+            ForeachChunk(plist[i:i + n], states[i:i + n], spec,
                          eff, matrixize, length, ki, cached)
             for n, (_size, plist, states, eff, matrixize, length, ki) in zip(
                 steps, self.buckets, strict=True)
@@ -431,7 +421,7 @@ class ForeachPlanMixin:
             plan, values = self._build_foreach_plan(params, group, witness, spec)
             if cached:
                 self._foreach_plans[id(group)] = plan
-        chunks = plan.rechunk(budget, spec, group, cached)
+        chunks = plan.rechunk(budget, spec, cached)
         if spec.extra_key is not None:
             plan.refresh(values)
         return chunks

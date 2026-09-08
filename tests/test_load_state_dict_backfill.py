@@ -21,6 +21,11 @@ Plus two dedicated tests for :class:`~kaon.sam.SAM` (which drives ``first_step``
 own per-group keys (``k``/``alpha``/... are not part of the wrapped Adakaon's
 ``defaults``, only of the wrapper's own ``self.defaults`` added by this batch).
 
+Adakaon joined this battery later (it only ever backfilled ``cautious_wd``, the one key
+that had bitten, so every key added after a checkpoint was written still raised on the
+first resumed step) and has its own section at the bottom covering every group key and a
+checkpoint that is missing several at once.
+
 MSAM and Nekaon need no changes here: both keep their own hyperparameters (``rho``,
 ``norm``) as instance attributes, not per-group keys, and fully delegate
 ``load_state_dict`` to the inner optimizer — so there is nothing of their own to
@@ -32,7 +37,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kaon import ADOPT, AdaBelief, AdamP, AdaPNM, KProdigy, Lion, Lookahead, ScheduleFree
+from kaon import (
+    ADOPT,
+    AdaBelief,
+    Adakaon,
+    AdamP,
+    AdaPNM,
+    KProdigy,
+    Lion,
+    Lookahead,
+    ScheduleFree,
+)
 from kaon.sam import SAM
 
 # (name, optimizer class, base kwargs, group key to probe, non-default value for it)
@@ -47,6 +62,7 @@ _STANDALONE_SPECS = [
     # k=1 forces a sync on every step, so a missing/backfilled ``alpha`` is exercised
     # immediately (Lookahead's default k=5 would only touch it every 5th step).
     pytest.param("Lookahead", Lookahead, dict(lr=1e-2, k=1), "alpha", 0.9, id="Lookahead"),
+    pytest.param("Adakaon", Adakaon, dict(lr=1e-2), "weight_decay", 0.07, id="Adakaon"),
 ]
 
 
@@ -178,3 +194,119 @@ def test_resume_from_full_checkpoint_is_bit_identical(name, cls, base_kwargs, ke
         opt_r2.step()
 
     torch.testing.assert_close(control.detach(), resumed.detach(), rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------- Adakaon
+
+# Adakaon backfilled exactly ONE key (``cautious_wd``, the one that had bitten) instead of
+# looping over ``self.defaults`` like every other optimizer in this file. Every group key
+# added after a checkpoint was written was therefore still a first-step ``KeyError`` on
+# resume — ``momentum_4bit_block``, ``bf16_method``, ``clip_threshold``,
+# ``gradient_centralization``, ``cautious`` and the rest.
+
+_ADAKAON_GROUP_KEYS = [
+    "betas", "bf16_method", "cautious", "cautious_wd", "clip_threshold", "eps",
+    "gradient_centralization", "momentum_4bit_block", "momentum_dtype", "weight_decay",
+]
+
+
+@pytest.mark.parametrize("key", _ADAKAON_GROUP_KEYS)
+def test_adakaon_backfills_every_group_key(key):
+    """Whichever key a checkpoint predates, the resume must work and take the default."""
+    p = torch.nn.Parameter(torch.randn(6, 6))
+    opt = Adakaon([p], lr=1e-2)
+    p.grad = torch.randn(6, 6)
+    opt.step()
+    sd = opt.state_dict()
+    for pg in sd["param_groups"]:
+        pg.pop(key, None)
+
+    q = torch.nn.Parameter(torch.randn(6, 6))
+    opt2 = Adakaon([q], lr=1e-2)
+    opt2.load_state_dict(sd)                      # must not raise
+
+    assert opt2.param_groups[0][key] == opt2.defaults[key]
+    q.grad = torch.randn(6, 6)
+    opt2.step()                                   # the first post-resume step either
+
+
+def test_adakaon_backfills_several_missing_keys_at_once():
+    """A checkpoint several versions old is missing several keys, not one."""
+    p = torch.nn.Parameter(torch.randn(6, 6))
+    opt = Adakaon([p], lr=1e-2)
+    p.grad = torch.randn(6, 6)
+    opt.step()
+    sd = opt.state_dict()
+    dropped = ["cautious_wd", "momentum_4bit_block", "bf16_method", "clip_threshold",
+               "gradient_centralization"]
+    for pg in sd["param_groups"]:
+        for key in dropped:
+            pg.pop(key, None)
+
+    q = torch.nn.Parameter(torch.randn(6, 6))
+    opt2 = Adakaon([q], lr=1e-2)
+    opt2.load_state_dict(sd)
+
+    g = opt2.param_groups[0]
+    for key in dropped:
+        assert g[key] == opt2.defaults[key], key
+    q.grad = torch.randn(6, 6)
+    opt2.step()
+
+
+def test_adakaon_backfill_keeps_checkpoint_values():
+    """The loop must not clobber what the checkpoint carries, including a per-group
+    override that differs from the resuming instance's constructor defaults."""
+    p = torch.nn.Parameter(torch.randn(6, 6))
+    q = torch.nn.Parameter(torch.randn(6, 6))
+    opt = Adakaon([{"params": [p], "weight_decay": 0.07, "cautious_wd": "full"},
+                   {"params": [q], "weight_decay": 0.0}], lr=1e-2, clip_threshold=0.5)
+    p.grad = torch.randn(6, 6)
+    q.grad = torch.randn(6, 6)
+    opt.step()
+    sd = opt.state_dict()
+    sd["param_groups"][0].pop("momentum_4bit_block", None)   # this one IS missing
+
+    a = torch.nn.Parameter(torch.randn(6, 6))
+    b = torch.nn.Parameter(torch.randn(6, 6))
+    opt2 = Adakaon([{"params": [a]}, {"params": [b]}], lr=1e-3)   # different defaults
+    opt2.load_state_dict(sd)
+
+    g0, g1 = opt2.param_groups
+    assert g0["weight_decay"] == 0.07
+    assert g0["cautious_wd"] == "full"
+    assert g0["clip_threshold"] == 0.5
+    assert g1["weight_decay"] == 0.0
+    assert g0["momentum_4bit_block"] == opt2.defaults["momentum_4bit_block"]
+
+
+def test_adakaon_resume_from_full_checkpoint_is_bit_identical():
+    """The backfill must be a true no-op when every key is already present."""
+    kwargs = dict(lr=1e-2, momentum_dtype="float32", weight_decay=0.02)
+    torch.manual_seed(0)
+    base = torch.randn(6, 6)
+    grads = [torch.randn(6, 6) * 0.1 for _ in range(6)]
+
+    control = torch.nn.Parameter(base.clone())
+    opt_c = Adakaon([control], **kwargs)
+    resumed = torch.nn.Parameter(base.clone())
+    opt_r = Adakaon([resumed], **kwargs)
+    for g in grads[:3]:
+        control.grad = g.clone()
+        resumed.grad = g.clone()
+        opt_c.step()
+        opt_r.step()
+
+    sd = opt_r.state_dict()
+    opt_r2 = Adakaon([resumed], **kwargs)
+    opt_r2.load_state_dict(sd)
+    for g in grads[3:]:
+        control.grad = g.clone()
+        resumed.grad = g.clone()
+        opt_c.step()
+        opt_r2.step()
+
+    torch.testing.assert_close(control.detach(), resumed.detach(), rtol=0, atol=0)
+    for key in opt_c.param_groups[0]:
+        if key != "params":
+            assert opt_r2.param_groups[0][key] == opt_c.param_groups[0][key], key

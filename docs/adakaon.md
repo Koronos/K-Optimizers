@@ -74,6 +74,34 @@ leaves the one-block route (its nibble packing pairs adjacent columns).
 `Adakaon` is a standard `torch.optim.Optimizer` that works one parameter at a
 time, so it drops into per-parameter / gradient-release training loops unchanged.
 
+### Host-side cost of a step
+
+Both of Adakaon's batched routes are launch-bound on the bags it is built for
+(hundreds of small adapters, thousands of biases/norms), so the host work per step is
+part of the design and is measured with counters rather than the clock — see
+[foreach-batching.md](foreach-batching.md) for the full method and the shared plan.
+Two caches are Adakaon-specific:
+
+- **The codec's per-parameter view lists** (`ema_stacked(..., views=…)`). Built once
+  per stacked chunk, not per step. With int8 momentum this removes 896 `aten::view` +
+  448 `aten::copy_` per step on a 448 × 0-D bag and 856 + 428 on a 428-tensor LoRA bag.
+  4-bit keeps its `view` count (its `m` is nibble-packed, with no effective layout to
+  view) but loses the same per-parameter scale write-back: `aten::copy_` 454 → 6 and
+  452 → 24 on those two bags. The **float codecs (`float32`/`bfloat16`) are unchanged** —
+  their lists were already served by the plan's old identity-keyed `mat` lookup. Peak
+  allocated memory does not move — the lists are *views* of `state["m"]` /
+  `state["m_scale"]`.
+- **The fused big-tensor bucket lists** (`_big_shape_buckets`). The
+  same-shape/dtype/device partition of the "big" route is memoized per group and
+  revalidated by list identity, so the per-step staleness witness (`param_witness`, a
+  tuple over every parameter of the bucket — 4.1 µs over 20 params, 35.6 µs over 200)
+  runs **once per group per step** instead of once for the group plus once per big shape
+  bucket: 5 sweeps → 1 on 80 big tensors spread over four shapes, 2 → 1 on a
+  single-shape bag.
+  Invalidated by exactly what invalidates the partition itself — see the staleness table
+  in [foreach-batching.md](foreach-batching.md); `tests/test_fused_safety.py` asserts
+  both halves (no witness call in the steady state, a rebuilt cache after every event).
+
 ## On `torch.compile`
 
 `Adakaon` intentionally exposes **no** `compile` flag. A whole-step

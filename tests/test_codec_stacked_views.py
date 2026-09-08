@@ -24,7 +24,7 @@ import io
 import pytest
 import torch
 
-from kaon import ADOPT, AdaBelief, AdamP, AdaMuon
+from kaon import ADOPT, AdaBelief, Adakaon, AdamP, AdaMuon
 from kaon._backend import flat_view
 from kaon._foreach_plan import ForeachChunk
 from kaon._momentum_codec import _make_codec, _StackedViews
@@ -261,7 +261,8 @@ def test_hand_crafted_eff_mismatch_is_ignored(md):
 
 
 # -------------------------------------------------------- ForeachChunk cache
-OPTIMIZERS = {"AdaBelief": AdaBelief, "AdamP": AdamP, "ADOPT": ADOPT, "AdaMuon": AdaMuon}
+OPTIMIZERS = {"AdaBelief": AdaBelief, "AdamP": AdamP, "ADOPT": ADOPT,
+              "AdaMuon": AdaMuon, "Adakaon": Adakaon}
 NAMES = list(OPTIMIZERS)
 
 
@@ -315,5 +316,102 @@ def test_step_after_load_state_dict_moves_the_live_momentum(name, md):
     set_grads(bag, 2)
     opt.step()
     assert any(not torch.equal(a, b.clone()) for a, b in zip(before, live, strict=True)), (
+        "the step did not reach the reloaded momentum buffers"
+    )
+
+
+# ------------------------------------------------- Adakaon: the EMA entry point
+# Adakaon is the only shared-plan optimizer that reaches the codec through
+# ``ema_stacked`` (the others ``dequant``/``store``), and it was the last one still
+# rebuilding those lists every step. The three assertions below are what "it is wired
+# to the cache" means, as opposed to "the cache exists": the views are BUILT once per
+# chunk (not per step), they are HANDED to every call, and the codec therefore never
+# falls back to the per-param ``mat`` sweep.
+
+
+def spy_codec(opt, md, group_defaults=None):
+    """Install a counting codec on ``opt`` for ``md`` and return its call log."""
+    codec = _make_codec(md)
+    log = {"views": 0, "handed": [], "mat": 0}
+    real_views, real_ema = codec.stacked_views, codec.ema_stacked
+
+    def stacked_views(states, view, eff):
+        log["views"] += 1
+        return real_views(states, view, eff)
+
+    def ema_stacked(states, update, mat, eff, beta1, views=None):
+        log["handed"].append(views)
+
+        def counting_mat(t):
+            log["mat"] += 1
+            return mat(t)
+
+        return real_ema(states, update, counting_mat, eff, beta1, views=views)
+
+    codec.stacked_views = stacked_views
+    codec.ema_stacked = ema_stacked
+    opt._codecs[md] = codec
+    return log
+
+
+def adakaon_bag():
+    """A bag that produces exactly two Adakaon buckets: factored (4,3) and flat 0-D."""
+    torch.manual_seed(19)
+    return ([torch.nn.Parameter(torch.randn(4, 3)) for _ in range(3)]
+            + [torch.nn.Parameter(torch.randn(())) for _ in range(2)])
+
+
+@pytest.mark.parametrize("md", MDS)
+def test_adakaon_hands_the_codec_its_cached_views(md):
+    """Both Adakaon bucket bodies must pass ``views=`` on every step, from one build."""
+    bag = adakaon_bag()
+    opt = Adakaon(bag, lr=1e-2, weight_decay=0.01, momentum_dtype=md,
+                  momentum_4bit_block=8)
+    log = spy_codec(opt, md)
+    for step in range(4):
+        set_grads(bag, step)
+        opt.step()
+
+    assert len(log["handed"]) == 8, "expected 2 buckets x 4 steps of ema_stacked calls"
+    assert all(v is not None for v in log["handed"]), (
+        f"{md}: the codec was called with views=None ({log['handed'].count(None)}/8)"
+    )
+    assert log["views"] == 2, (
+        f"{md}: stacked_views ran {log['views']} times for 2 chunks over 4 steps"
+    )
+    assert log["mat"] == 0, (
+        f"{md}: the codec still rebuilt {log['mat']} per-param views through mat()"
+    )
+    # One object per chunk, reused: two distinct views objects across the eight calls.
+    assert len({id(v) for v in log["handed"]}) == 2
+
+
+@pytest.mark.parametrize("md", MDS)
+def test_adakaon_load_state_dict_drops_the_cached_views(md):
+    """``load_state_dict`` replaces ``state["m"]``; the chunk's views must be rebuilt."""
+    bag = adakaon_bag()
+    opt = Adakaon(bag, lr=1e-2, momentum_dtype=md, momentum_4bit_block=8)
+    log = spy_codec(opt, md)
+    for step in range(2):
+        set_grads(bag, step)
+        opt.step()
+    assert log["views"] == 2
+
+    buf = io.BytesIO()
+    torch.save(opt.state_dict(), buf)
+    buf.seek(0)
+    opt.load_state_dict(torch.load(buf, weights_only=False))
+    log = spy_codec(opt, md)          # a fresh log; the codec is re-looked-up either way
+    set_grads(bag, 2)
+    opt.step()
+
+    assert log["views"] == 2, "the plan (and its views) survived a load_state_dict"
+    assert all(v is not None for v in log["handed"])
+    # The live (reloaded) buffers are what the step must reach.
+    live = [opt.state[p]["m"] for p in bag]
+    snapshot = [m.clone() for m in live]
+    set_grads(bag, 3)
+    opt.step()
+    assert any(not torch.equal(a, b) for a, b in zip(snapshot, live, strict=True)), (
         "the step did not reach the reloaded momentum buffers"
     )

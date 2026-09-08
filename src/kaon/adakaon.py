@@ -384,6 +384,8 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         self._fused_ob_caches: dict[int, Any] = {}       # group id -> PointerArrayCache (one-block)
         self._fused_od_caches: dict[int, Any] = {}       # group id -> OneDimPointerCache (1-D)
         self._fused_big_caches: dict[tuple[int, tuple[int, ...], Any], Any] = {}
+        # group id -> (the ``big`` route list the buckets were split from, the buckets)
+        self._fused_big_buckets: dict[int, tuple[list[Tensor], list[list[Tensor]]]] = {}
         # The native foreach path's own cache — the bucketing + per-chunk view plan — is NOT
         # allocated here: it lives in ForeachPlanMixin as the lazy ``_foreach_plans``
         # property, keyed by group id (see _FOREACH_SPEC below).
@@ -471,6 +473,7 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         self._fused_ob_caches.clear()
         self._fused_od_caches.clear()
         self._fused_big_caches.clear()
+        self._fused_big_buckets.clear()
         self._clear_foreach_plans()
 
     def _autolr_reset_base_state(self) -> None:
@@ -609,7 +612,7 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
             return
         # Group by EXACT shape (and dtype and DEVICE); same-shape buckets of >=2 take the
         # batched chunked kernel, lone tensors take the per-tensor chunked kernel.
-        for plist in _same_shape_device_buckets(big).values():
+        for plist in self._big_shape_buckets(id(group), big):
             # One device scope per bucket, covering every launch inside the chunked steps (see
             # _fused_one_block): the bucket's pointer arrays and scratch live on plist[0].device,
             # and a Triton launch targets the CURRENT device. PLAUSIBLE, not verified — one GPU here.
@@ -619,6 +622,50 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
                     self._chunked_step_batched(plist, group, ft)
                 else:
                     self._chunked_step(plist[0], group, ft)
+
+    def _big_shape_buckets(self, gid: int, big: list[Tensor]) -> list[list[Tensor]]:
+        """``big`` split into same-shape/dtype/device buckets, memoized per group.
+
+        Same trick, and the same contract, as :meth:`_fused_demote`'s memo. Rebuilding
+        these lists every step was not the cost — it is what the cost was *made of*: a
+        fresh list means :class:`~kaon._fused_triton.BigPointerCache` cannot recognize
+        it (``built_from`` is identity), so it had to revalidate with ``stale()``, i.e.
+        a full :func:`~kaon._foreach_plan.param_witness` tuple over the bucket, once per
+        bucket per step, on top of the one :meth:`_fused_partition` already ran for the
+        whole group. On an 80-param UNet-shaped bag with four big shapes that is five
+        witness sweeps per step where one suffices; on the 428-param LoRA bag the sweep
+        alone is ~25 µs.
+
+        VALIDITY is ``big``'s list IDENTITY, which is exactly as strong as recomparing
+        the witness because of what produces that object: :meth:`_fused_partition`
+        returns the very same list only while ids, ``data_ptr``s and contiguity all
+        hold for the group's whole param set (so a rebind to fresh storage, a dtype or
+        device change, a ``p.data.t()``, a param entering or leaving the set — including
+        via ``p.grad = None`` — all hand back a FRESH list), and :meth:`_fused_demote`
+        rebuilds its lists whenever the non-contiguous-grad set moves. Shape is the one
+        field neither watches, and a shape-changing rebind is unsupported for the same
+        reason everywhere else (see :meth:`_fused_partition`). Event-driven drops
+        (checkpoint load, state reset) go through :meth:`_invalidate_fused_caches`,
+        which clears this memo with the rest — and the cached list is held here, so its
+        ``id`` cannot be reused by a new list while the entry lives.
+
+        WHAT THE ARGUMENT DOES NOT COVER: it is made entirely over PARAMETER identity
+        and says nothing about the identity of the STATE. Deleting a parameter's state
+        behind the optimizer's back (``del opt.state[p]``, then stepping) leaves every
+        route's pointer tables addressing the retired ``row``/``col``/``m`` buffers and
+        the step writes them, because no witness anywhere observes ``self.state``. That
+        predates this memo and is byte-for-byte identical with and without it (the
+        native plan has the same blind spot, via ``ForeachChunk``'s state views); it is
+        tracked as its own item, not fixed here. The supported way to discard state is
+        :meth:`_invalidate_fused_caches` — which is what ``load_state_dict`` and the
+        AutoLR reset call.
+        """
+        cached = self._fused_big_buckets.get(gid)
+        if cached is not None and cached[0] is big:
+            return cached[1]
+        buckets = list(_same_shape_device_buckets(big).values())
+        self._fused_big_buckets[gid] = (big, buckets)
+        return buckets
 
     def _fused_partition(self, group: dict[str, Any], params: list[Tensor], ft: Any) -> tuple:
         """Split a group's params into (one-block, chunked-big, one-dim, native), cached per param-set.
@@ -950,11 +997,17 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         states = [self.state[p] for p in plist]
         cache_key = (id(group), tuple(plist[0].shape), plist[0].dtype, plist[0].device)
         cache = self._fused_big_caches.get(cache_key)
+        # ``built_from`` (identity), not ``stale`` (a second witness tuple over the bucket):
+        # ``plist`` comes from :meth:`_big_shape_buckets`, which hands back the same list
+        # object only while :meth:`_fused_partition`'s witness — ids + ``data_ptr``s +
+        # contiguity over the whole group, already computed this step — holds. Same contract
+        # as _fused_one_block; see _big_shape_buckets and _WitnessedCache.built_from.
+        #
         # ``cache.gc`` is part of the validity, not only the param witness: with GC off the
         # cache aliases ``rowmean`` onto ``rowsum`` to save N*R floats, and a group dict
         # flipped mid-run (schedulers do this) would then have the reduction kernel write
-        # the row means over the row sums. Nothing moved, so ``stale()`` cannot see it.
-        if cache is None or cache.stale(plist) or cache.gc != gc:
+        # the row means over the row sums. Nothing moved, so no witness could see it.
+        if cache is None or not cache.built_from(plist) or cache.gc != gc:
             cache = ft.BigPointerCache(plist, lambda p: self.state[p], R, C, gc=gc)
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()
@@ -1025,6 +1078,19 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
             # Batched: dequant_stacked runs the whole bucket's codec in a handful of kernels.
             # The per-tensor dequant_one loop was ~8 tiny torch ops x N tensors, CPU-dispatch
             # bound: measured ~87 ms/step on a 528-tensor LoRA-r32 fleet (4080), vs <2 ms batched.
+            #
+            # NO ``views=`` HERE, deliberately. The native path hands the codec cached view
+            # lists (``ForeachChunk.momentum_views``) because it walks them once per param
+            # per step on bags of hundreds of TINY tensors. This is the opposite regime: it
+            # is the fallback of the *big* route, so N is small (one shape bucket of weights
+            # each above the tile cap) and every one of them is megabytes — the N views the
+            # codec rebuilds are noise next to the dequant/requant traffic. It is also cold
+            # on top of that: it runs only when the in-Triton momentum routes decline the
+            # alignment (int8 with C > 1024 or C not dividing it, 4-bit with m_block > 1024
+            # or not dividing a chunk), or with ``_fused_reductions=False``. And ``mat``
+            # here is identity, not the ``(R, C)`` layout ``eff`` names, so a cached
+            # ``_StackedViews`` would have to be built with a different callback than the
+            # one passed — a second, subtly different contract for no measurable gain.
             temp = self._codec(group).dequant_stacked(
                 states, lambda t: t, (R, C)
             ).reshape(N, R, C).contiguous()
@@ -1201,11 +1267,17 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         if fused_step < 0:
             raise ValueError("Adakaon checkpoint has an invalid fused step counter")
         self._autolr_load(copied, lambda sd: load_state_dict_preserving_dtypes(self, sd))
-        # torch restores param_groups from the CHECKPOINT's dicts, so a checkpoint written
-        # before a group key existed comes back without it and the next step raises KeyError.
-        # Back-fill the constructor default (the historical behaviour for ``cautious_wd``).
+        # torch restores param_groups from the CHECKPOINT's dicts (only ``params`` is carried
+        # over from the live optimizer), so a checkpoint written before a group key existed
+        # comes back without it and the next step raises KeyError. Back-fill EVERY missing
+        # key from the constructor defaults, as the rest of the optimizers do since 0.7.12:
+        # this used to name ``cautious_wd`` alone — the one key that had bitten — which left
+        # every other key added after a checkpoint was written (``momentum_4bit_block``,
+        # ``bf16_method``, ``clip_threshold``, ...) a first-step KeyError on resume.
+        # ``setdefault``, so a value the checkpoint DOES carry always wins.
         for g in self.param_groups:
-            g.setdefault("cautious_wd", self.defaults.get("cautious_wd", "masked"))
+            for key, value in self.defaults.items():
+                g.setdefault(key, value)
         self._t = fused_step
         if int(meta.get("momentum_units", 1)) < 2:
             self._migrate_momentum_to_direction_units()
@@ -1279,20 +1351,18 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
     # ``L == 1`` bucket as length-1 views. There is no ``extra_key``: every coefficient here
     # is per group per step (fixed beta2, no bias correction), so nothing per-parameter
     # enters the bucket key and the plan survives every step that keeps the param set.
-    # ``momentum_cache`` asks the chunk to prebuild the ``mat`` lookup the codec calls once
-    # (float) or twice (int8) per param per step — worth it only when the bucket's view is a
-    # real reshape AND the momentum is a tensor in that layout, so beta1 == 0 (no ``m`` at
-    # all) and 4bit (``m`` is a packed byte string) opt out. Invalidation is the mixin's
-    # witness plus :meth:`_invalidate_fused_caches` (state reset / checkpoint load) and the
+    # The momentum goes through the codec's stacked EMA, whose own per-param view lists
+    # (``mat(state["m"])``, the per-row ``m_scale`` views, the requant's write-back
+    # targets) come from ``chunk.momentum_views``; ``chunk.view`` is handed over as the
+    # codec's ``mat`` argument only as the fallback for a layout those views declined (a
+    # non-contiguous buffer). Invalidation is the mixin's witness plus
+    # :meth:`_invalidate_fused_caches` (state reset / checkpoint load) and the
     # per-parameter fallback in :meth:`_native_dispatch`. Set ``_foreach_cache_enabled =
     # False`` on an instance to rebuild the plan every step — the A/B switch the cache's
     # speedup is measured with; it is numerically a no-op either way.
     _FOREACH_SPEC = ForeachSpec(
         factored_state=("row", "col"),
         flat_state=("v",),
-        momentum_cache=lambda group: (
-            group["betas"][0] > 0 and group["momentum_dtype"] != "4bit"
-        ),
     )
 
     @torch.no_grad()
@@ -1402,7 +1472,10 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         if beta1 > 0:
             # The codec owns every dtype's dequant → fp32 EMA → requant detail; this
             # block is identical for fp32/bf16/int8/4bit (and to _step_one_param).
-            delta = codec.ema_stacked(chunk.states, update, chunk.mat, (R, C), beta1)  # [N, R, C]
+            # ``views`` hands it this chunk's cached per-param view lists (built once);
+            # ``chunk.view`` is the ``mat`` fallback for a layout it declined.
+            delta = codec.ema_stacked(chunk.states, update, chunk.view, (R, C), beta1,
+                                      views=chunk.momentum_views(codec))       # [N, R, C]
         else:
             delta = update
 
@@ -1477,11 +1550,12 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1))
 
         if beta1 > 0:
-            # Same codec entry point as the factored bucket; mat flattens a 0-D
-            # ``m`` to its length-1 view (identity on 1-D) and the effective
+            # Same codec entry point as the factored bucket; ``chunk.view`` flattens a
+            # 0-D ``m`` to its length-1 view (identity on 1-D) and the effective
             # per-param shape is the 1-D length (so int8 reduces the whole L axis
             # to one scalar scale, 4bit blocks over L).
-            delta = codec.ema_stacked(chunk.states, update, chunk.mat, (length,), beta1)  # [N, L]
+            delta = codec.ema_stacked(chunk.states, update, chunk.view, (length,), beta1,
+                                      views=chunk.momentum_views(codec))          # [N, L]
         else:
             delta = update
 

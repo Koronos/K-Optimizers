@@ -1015,3 +1015,220 @@ def test_degenerate_2d_shapes_match_native(shapes):
     assert (ob or big) and not nat, "these are 2-D and must stay on a fused route"
     d = _maxdiff(pv, pn)
     assert d < 1e-5, f"{shapes[0]}: max|Delta p|={d:.2e}"
+
+
+# --------------------------------------------- 16. the big route's bucket lists are memoized
+# ``_fused_big`` partitions its subset into same-shape/dtype/device buckets. Those lists were
+# rebuilt every step, so ``BigPointerCache`` could only revalidate itself with ``stale()`` —
+# a full ``param_witness`` tuple over the bucket, once per bucket per step, on top of the one
+# ``_fused_partition`` already ran for the whole group. The lists are memoized per group and
+# revalidated by identity (``built_from``) like the one-block / 1-D routes; the tests below
+# pin BOTH halves: that the witness stops running in the steady state, and that every event
+# which can move the partition still rebuilds the pointer arrays.
+
+_BIG_BAG = [(512, 512)] * 3 + [(384, 384)] * 2          # two big shape buckets
+_BIG_MIXED = [(512, 512)] * 2 + [(384, 384)] * 2 + [(8, 16)] * 3 + [(32,)] * 2 + [()] * 2
+
+
+class _WitnessSpy:
+    """Counts ``param_witness`` calls per call site (each module namespace is one)."""
+
+    def __init__(self):
+        import kaon._foreach_plan as fp
+        import kaon._fused_triton as ftm
+        import kaon.adakaon as ak
+
+        self.sites = {"plan": fp, "partition": ak, "pointer_cache": ftm}
+        self.counts = dict.fromkeys(self.sites, 0)
+        self._orig = {}
+
+    def __enter__(self):
+        for name, mod in self.sites.items():
+            orig = mod.param_witness
+            self._orig[name] = orig
+
+            def wrapped(plist, _n=name, _o=orig):
+                self.counts[_n] += 1
+                return _o(plist)
+
+            mod.param_witness = wrapped
+        return self
+
+    def __exit__(self, *exc):
+        for name, mod in self.sites.items():
+            mod.param_witness = self._orig[name]
+
+
+def _big_caches(opt):
+    return dict(opt._fused_big_caches)
+
+
+def test_big_bucket_lists_are_reused_between_steps():
+    """Steady state: ONE witness sweep per group per step (the partition's), not one more
+    per big shape bucket, and the same ``BigPointerCache`` objects throughout."""
+    pv = _bag(_BIG_BAG, torch.float32, seed=131)
+    ov = Adakaon(pv, fused=True, deterministic_reductions=True, **_FP32_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(137)
+    _drive([(pv, ov)], 3, gen)                              # warm every cache
+    _ob, big, _od, _nat = _parts(ov)
+    assert len(big) == len(_BIG_BAG), "the bag did not take the big route"
+    first = _big_caches(ov)
+    assert len(first) == 2, f"expected 2 big shape buckets, got {len(first)}"
+
+    with _WitnessSpy() as spy:
+        _drive([(pv, ov)], 4, gen)
+    assert spy.counts["pointer_cache"] == 0, (
+        "the big pointer caches re-ran the witness over 4 steady-state steps: "
+        f"{spy.counts}"
+    )
+    assert spy.counts["partition"] == 4, f"_fused_partition witness sweeps: {spy.counts}"
+    after = _big_caches(ov)
+    assert after.keys() == first.keys()
+    assert all(after[k] is first[k] for k in first), "a big pointer cache was rebuilt"
+
+
+def test_big_bucket_memo_leaves_the_mixed_routes_alone():
+    """A group that also feeds the one-block / 1-D / 0-D routes keeps ONE witness sweep."""
+    pv = _bag(_BIG_MIXED, torch.float32, seed=139)
+    ov = Adakaon(pv, fused=True, deterministic_reductions=True, **_FP32_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(149)
+    _drive([(pv, ov)], 3, gen)
+    ob, big, od, nat = _parts(ov)
+    assert ob and big and od and not nat, f"routing: {len(ob)}/{len(big)}/{len(od)}/{len(nat)}"
+
+    with _WitnessSpy() as spy:
+        _drive([(pv, ov)], 4, gen)
+    assert spy.counts["pointer_cache"] == 0, spy.counts
+    assert spy.counts["partition"] == 4, spy.counts
+    assert spy.counts["plan"] == 0, spy.counts        # nothing fell to the native plan
+
+
+def _rebind_fresh(step, pairs):
+    if step == 2:
+        for plist, _opt in pairs:
+            plist[0].data = plist[0].data.clone()
+
+
+def _rebind_transpose(step, pairs):
+    if step == 2:
+        for plist, _opt in pairs:
+            plist[0].data = plist[0].data.t()
+
+
+def _drop_a_param(step, pairs):
+    if step == 2:
+        for _plist, opt in pairs:
+            opt.param_groups[0]["params"] = opt.param_groups[0]["params"][1:]
+
+
+def _reload_state(step, pairs):
+    if step == 2:
+        for _plist, opt in pairs:
+            opt.load_state_dict(opt.state_dict())
+
+
+def _add_group(step, pairs):
+    if step == 2:
+        for plist, opt in pairs:
+            extra = torch.zeros(384, 384, device=DEV, requires_grad=True)
+            plist.append(extra)
+            opt.add_param_group({"params": [extra]})
+
+
+def _autolr_reset(step, pairs):
+    if step == 2:
+        for _plist, opt in pairs:
+            opt._autolr_reset_base_state()
+
+
+def _flip_gc(step, pairs):
+    if step == 2:
+        for _plist, opt in pairs:
+            for g in opt.param_groups:
+                g["gradient_centralization"] = not g["gradient_centralization"]
+
+
+_INVALIDATORS = {
+    "rebind_fresh_storage": _rebind_fresh,
+    "transpose_square": _rebind_transpose,
+    "param_leaves_the_group": _drop_a_param,
+    "load_state_dict": _reload_state,
+    "add_param_group": _add_group,
+    "autolr_reset": _autolr_reset,
+    "gc_flipped": _flip_gc,
+}
+
+
+@pytest.mark.parametrize("event", list(_INVALIDATORS))
+def test_big_bucket_memo_is_invalidated(event):
+    """Every event that can move the big partition must rebuild its pointer arrays.
+
+    A memoized list revalidated by identity is only as safe as the identity contract, so
+    this asserts the OBSERVABLE consequence: after the event the caches are different
+    objects (nothing kept addressing the retired plan) and the weights still track the
+    native step.
+    """
+    pv = _bag(_BIG_BAG, torch.float32, seed=151)
+    pn = _clone(pv)
+    ov = Adakaon(pv, fused=True, deterministic_reductions=True, **_FP32_CFG)
+    on = Adakaon(pn, **_FP32_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(157)
+    _drive([(pv, ov), (pn, on)], 2, gen)
+    before = _big_caches(ov)
+    assert before, "no big pointer cache was built"
+
+    _drive([(pv, ov), (pn, on)], 4, gen, mutate=_INVALIDATORS[event])
+    after = _big_caches(ov)
+    assert not (after.keys() == before.keys()
+                and all(after[k] is before[k] for k in before)), (
+        f"{event}: the big pointer caches survived the event unchanged"
+    )
+    # Every mutation is applied to BOTH arms, so the two lists stay comparable (a param
+    # dropped from the group simply stops being stepped on both sides).
+    d = _maxdiff(pv, pn)
+    assert d < 1e-4, f"{event}: max|Delta p| vs native = {d:.2e}"
+
+
+def test_intermittent_grad_rebuilds_the_big_buckets():
+    """``p.grad = None`` changes the params the partition sees, so the memoized lists (and
+    the pointer arrays derived from them) must not be reused across that change."""
+    pv = _bag(_BIG_BAG, torch.float32, seed=163)
+    pn = _clone(pv)
+    ov = Adakaon(pv, fused=True, deterministic_reductions=True, **_FP32_CFG)
+    on = Adakaon(pn, **_FP32_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(167)
+    for step in range(6):
+        seed = int(torch.randint(0, 2 ** 31 - 1, (1,), generator=gen, device=DEV).item())
+        for plist, opt in ((pv, ov), (pn, on)):
+            draw = torch.Generator(device=DEV).manual_seed(seed)
+            gs = _plain_grads(draw, plist)
+            for i, (p, g) in enumerate(zip(plist, gs, strict=True)):
+                p.grad = None if (step % 2 == 1 and i == 0) else g
+            opt.step()
+    torch.cuda.synchronize()
+    d = _maxdiff(pv, pn)
+    assert d < 1e-4, f"max|Delta p| vs native = {d:.2e} with intermittent grads"
+
+
+def test_persistent_strided_grad_does_not_rebuild_the_big_buckets():
+    """A big tensor demoted for a strided grad rebuilds the route lists once; while the
+    demoted SET is unchanged the memo must keep handing back the same buckets."""
+    pv = _bag(_BIG_BAG, torch.float32, seed=173)
+    ov = Adakaon(pv, fused=True, deterministic_reductions=True, **_FP32_CFG)
+
+    def grads(gen, plist):
+        gs = _plain_grads(gen, plist)
+        gs[0] = torch.randn((512, 512), generator=gen, device=DEV,
+                            dtype=torch.float32).t()
+        return gs
+
+    gen = torch.Generator(device=DEV).manual_seed(179)
+    _drive([(pv, ov)], 3, gen, grads_for=grads)
+    first = _big_caches(ov)
+    with _WitnessSpy() as spy:
+        _drive([(pv, ov)], 3, gen, grads_for=grads)
+    after = _big_caches(ov)
+    assert all(after[k] is first[k] for k in first), (
+        "the big pointer caches were rebuilt on a stable demoted set"
+    )
+    assert spy.counts["pointer_cache"] == 0, spy.counts

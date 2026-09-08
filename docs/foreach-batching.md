@@ -190,8 +190,8 @@ computes them once and caches them per param group:
 
 - `ForeachSpec` — declared once per optimizer class: which state keys the bucket
   bodies walk, the optimizer-specific extra bucket key (the per-parameter step for
-  AdaBelief / AdamP / ADOPT, `t` for AdaMuon with `bias_correction`), whether to
-  prebuild the codec's `mat` lookup.
+  AdaBelief / AdamP / ADOPT, `t` for AdaMuon with `bias_correction`), and whether a
+  one-element bucket may alias instead of stacking (AdaMuon).
 - `ForeachPlan` — one group's bucket list plus the chunk split; re-chunked only when
   `budget // bucket_size` actually moves (the VRAM-adaptive budget wobbles every step,
   the chunk length almost never does).
@@ -207,20 +207,27 @@ them on every step, once per *use site*: an int8 bucket cost four such lists per
 
 Each codec therefore exposes `stacked_views(states, view, eff) -> _StackedViews | None`,
 built **once per chunk** by `ForeachChunk.momentum_views(codec)` and handed to every
-stacked call as `views=`. **AdaBelief, AdamP, ADOPT and AdaMuon pass them; nobody else
-does** — `views=None` runs the original code, so Lion, KProdigy and AdaPNM (which do
-their own bucketing, not this plan) and **Adakaon** (which has its own plan and is
-being migrated onto this one separately) are unaffected, and the argument is
-bit-identical either way. The gains measured below are therefore those four
-optimizers' only; Adakaon is not in the table.
+stacked call as `views=`. **Every optimizer on this plan passes them** — AdaBelief,
+AdamP, ADOPT, AdaMuon and, since the follow-up below, Adakaon. `views=None` still runs
+the original code, so Lion, KProdigy and AdaPNM (which do their own bucketing, not this
+plan) are unaffected, and the argument is bit-identical either way.
+
+Because nothing calls the codec's `mat` argument on the cached path any more, the
+plan's old `ForeachSpec(momentum_cache=…)` flag — which prebuilt an identity-keyed
+`{state["m"]: view(state["m"])}` dict for exactly that callback — is gone, together
+with `ForeachChunk.mat`. Callers pass `chunk.view`, which is the same callback and is
+only reached when `stacked_views` declined the layout.
 
 `stacked_views` returns `None` for a layout it cannot alias — a
 non-contiguous `m` or `m_scale`, where a `reshape` would hand back a detached copy —
 and the codec's existing per-parameter fallbacks take over. Passing a views object
 built for another bucket is *ignored*, not misread: every consumer checks its `eff`.
-That check is defense in depth — the four callers always pass the `eff` they built the
-views with, and a re-chunk hands out fresh chunks — but the failure it prevents (a read
-in another bucket's shape, a write into another bucket's buffers) would be silent.
+That check is defense in depth — every caller passes the `eff` it built the views
+with, and a re-chunk hands out fresh chunks — but the failure it prevents (a read in
+another bucket's shape, a write into another bucket's buffers) would be silent. It is
+also what makes the guard worth its one tuple compare: a *per-codec* rather than
+per-chunk cache was tried as a deliberate mutant and every bucket after the first
+either stepped the wrong slice or raised a shape error.
 
 Two things follow from the lists being views:
 
@@ -246,6 +253,21 @@ move):
 | AdaBelief, 428-tensor LoRA | bf16 | 874 → **18** | 432 → **4** | 6 → 6 |
 | ADOPT, 428-tensor LoRA | int8 | 874 → **18** | 2 → 2 | 436 → **8** |
 | AdaMuon, 448 × 0-D | 4-bit | 20 → 20 | 8 → 8 | 454 → **6** |
+| **Adakaon**, 448 × 0-D | int8 | 905 → **9** | — | 453 → **5** |
+| **Adakaon**, 428-tensor LoRA | int8 | 897 → **41** | — | 448 → **20** |
+| **Adakaon**, 128×(512,512)+64×(1024,) | int8 | 449 → **65** | — | 222 → **30** |
+| **Adakaon**, 24×(320,320,3,3) | int8 | 85 → **37** | — | 39 → **15** |
+| **Adakaon**, 448 × 0-D | 4-bit | 6 → 6 | — | 454 → **6** |
+| **Adakaon**, 428-tensor LoRA | 4-bit | 24 → 24 | — | 452 → **24** |
+| **Adakaon**, 128×(512,512)+64×(1024,) | 4-bit | 36 → 36 | — | 228 → **36** |
+| **Adakaon**, 24×(320,320,3,3) | 4-bit | 18 → 18 | — | 42 → **18** |
+
+The Adakaon rows are the follow-up (against the pre-change tree; the counts are
+deterministic and identical across repeats). Only its **float codecs (`float32` and
+`bfloat16`) are count-for-count unchanged** — those lists were already served by the
+`momentum_cache` dict that this change deletes, and the cached views replace them at the
+same cost. int8 wins on both columns (the scale views *and* the write-back); 4-bit wins
+on `copy_` alone, for the reason spelled out just below.
 
 The `copy_` column is the second half of the change: the quantized codecs wrote each
 parameter's new `m_scale` with its own `copy_` (the scale shapes differ per parameter
@@ -329,6 +351,57 @@ Note that the per-parameter clock's *value* changes every step while the *partit
 induces does not — so the plan survives it. Only a parameter that actually skips a step
 splits a bucket, and once split the two halves advance in lockstep again and the plan is
 reused as before.
+
+### The fused side: one witness sweep, not one per bucket
+
+Adakaon's Triton routing keeps its own caches next to this plan, guarded by the same
+three fields (`Adakaon._fused_partition` calls the very same `param_witness`). Those
+caches are validated in one of two ways, and which one applies is decided by whether the
+caller can hand back **the same list object** it was built from:
+
+- `_WitnessedCache.built_from(plist)` — O(1) list identity. Legitimate only because
+  `_fused_partition` re-derives the witness across the whole group *every step* and
+  returns the very same route lists while nothing moved, and `_fused_demote` rebuilds
+  them into fresh objects the moment the non-contiguous-grad set changes. "This is the
+  list I was built from" is therefore exactly as strong as recomparing the tuples.
+- `_WitnessedCache.stale(plist)` — the full witness tuple, for a caller that cannot
+  offer that guarantee.
+
+The one-block and 1-D routes always took the first path. The **big** route could not:
+`_fused_big` re-derived its same-shape/dtype/device buckets on every step, so the lists
+were new objects and `BigPointerCache` had to re-sweep. `Adakaon._big_shape_buckets`
+memoizes the split per group, so the big route validates by identity too — and when the
+memo does hand out a fresh list (something moved), a rebuilt pointer cache is the correct
+and conservative outcome, so Adakaon needs no `stale` fallback at all.
+`AdaPNM._big_shape_buckets` is the same memo keyed per `(group, lag)`, but AdaPNM keeps
+its `stale` fallback: a genuinely mixed-lag group gets fresh sub-lists from
+`_local_step_buckets` every step, and there only the full compare can tell a `p.data`
+rebind from a harmless re-bucketing. Measured witness sweeps per step:
+
+| bag (fused) | partition | per-bucket | total |
+|---|---|---|---|
+| 80 big tensors over four shapes | 1 | 4 → **0** | 5 → **1** |
+| 200×(256,256) + 100×(512,) + 128×0-D | 1 | 1 → **0** | 2 → **1** |
+| 24×(320,320,3,3) | 1 | 1 → **0** | 2 → **1** |
+| 128×(512,512) + 64×(1024,) | 1 | 1 → **0** | 2 → **1** |
+
+The memo is dropped by `_invalidate_fused_caches` with the pointer caches, and holds a
+reference to the route list it split — so that list's `id` cannot be recycled underneath
+it while the entry lives. What it does **not** watch is the one thing nothing here
+watches: a shape-changing `p.data = p.data.view(...)` rebind (see the note above).
+
+What a sweep costs, measured directly (CPU-only, medians of 200 calls on this machine):
+4.1 µs over 20 params, 15.8 µs over 80, 35.6 µs over 200, 71.8 µs over 428. So the
+80-tensor / four-shape bag above sheds ~16 µs of host work per step, and the LoRA bag's
+200-tensor big bucket ~36 µs.
+
+The GPU wall clock does not resolve any of this on a shared laptop card, and nothing is
+claimed from it. Best attempt, on the 80-tensor / four-shape bag with 200 timed steps per
+measurement and six interleaved base / arm / base repeats: the arm sits at −14.7 %
+(bf16 momentum) and −8.7 % (int8) of the base's host time — but the base-vs-base
+*control* sits at +6.4 % and −0.5 %, and its per-repeat deviation from the paired base
+repeat spans −42 … +83 %. The sweep counts and the microbenchmark above are the
+measurement; the clock only rules out a large regression.
 
 ### Measured
 
