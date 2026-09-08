@@ -865,13 +865,16 @@ class AdaPNM(AutoLRMixin, Optimizer):
             )
         key = (id(group), lag)
         cache = self._fused_ob_caches.get(key)
-        # ``built_from`` (list identity) first: ``_fused_partition`` compared ids, data_ptrs AND
+        # ``revalidate``: list identity first (``_fused_partition`` compared ids, data_ptrs AND
         # contiguity across the whole group this step and, in the single-lag case,
         # ``_local_step_buckets`` hands back that very list, so identity is exactly as strong as
-        # recomparing the tuples and skips a second witness sweep. A mixed-lag group gets a fresh
-        # sub-list, and then only the full ``stale`` compare can tell a ``p.data`` rebind (which
-        # keeps every id) from a harmless re-bucketing.
-        if cache is None or (not cache.built_from(plist) and cache.stale(plist)):
+        # recomparing the tuples and skips a second witness sweep), falling back to the full
+        # witness compare — which is the only thing that can tell a ``p.data`` rebind (it keeps
+        # every id) from a harmless re-bucketing — and ADOPTING the fresh list when nothing
+        # moved. That adoption is the whole point: ``not built_from(...) and stale(...)`` left
+        # ``src`` one generation behind and brought the per-bucket sweep back permanently (see
+        # ``_WitnessedCache.revalidate``).
+        if cache is None or not cache.revalidate(plist):
             cache = ft.AdaPnmCache(plist, lambda p: self.state[p])
             self._fused_ob_caches[key] = cache
         cache.refresh_grads()
@@ -921,8 +924,8 @@ class AdaPNM(AutoLRMixin, Optimizer):
             )
         key = (id(group), lag)
         cache = self._fused_od_caches.get(key)
-        if cache is None or (not cache.built_from(plist) and cache.stale(plist)):
-            cache = ft.OneDimPnmCache(plist, lambda p: self.state[p])   # see _fused_one_block
+        if cache is None or not cache.revalidate(plist):                # see _fused_one_block
+            cache = ft.OneDimPnmCache(plist, lambda p: self.state[p])
             self._fused_od_caches[key] = cache
         cache.refresh_grads()
         odd = group["step"] % 2 == 1
@@ -1072,11 +1075,12 @@ class AdaPNM(AutoLRMixin, Optimizer):
         states = [self.state[p] for p in plist]
         cache_key = (id(group), lag, tuple(plist[0].shape), plist[0].dtype, dev)
         cache = self._fused_big_caches.get(cache_key)
-        # ``built_from`` (identity) now actually HITS: ``plist`` comes from
+        # ``revalidate``'s identity path now actually HITS: ``plist`` comes from
         # :meth:`_big_shape_buckets`, which hands back the same list object while the
-        # partition's witness holds. ``stale`` stays as the fallback for the first step
-        # after the memo hands out a fresh list (a re-bucketing that moved nothing).
-        if cache is None or (not cache.built_from(plist) and cache.stale(plist)):
+        # partition's witness holds. Its witness fallback covers the step after the memo
+        # hands out a fresh list (a re-bucketing that moved nothing) and rebinds the cache
+        # onto it, so the identity path keeps working from the next step on.
+        if cache is None or not cache.revalidate(plist):
             cache = ft.BigPnmCache(plist, lambda p: self.state[p], R, C)  # see _fused_one_block
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()

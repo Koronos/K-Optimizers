@@ -257,12 +257,17 @@ move):
 | **Adakaon**, 428-tensor LoRA | int8 | 897 → **41** | — | 448 → **20** |
 | **Adakaon**, 128×(512,512)+64×(1024,) | int8 | 449 → **65** | — | 222 → **30** |
 | **Adakaon**, 24×(320,320,3,3) | int8 | 85 → **37** | — | 39 → **15** |
+| **Adakaon**, 448 × 0-D | 4-bit | 6 → 6 | — | 454 → **6** |
+| **Adakaon**, 428-tensor LoRA | 4-bit | 24 → 24 | — | 452 → **24** |
+| **Adakaon**, 128×(512,512)+64×(1024,) | 4-bit | 36 → 36 | — | 228 → **36** |
+| **Adakaon**, 24×(320,320,3,3) | 4-bit | 18 → 18 | — | 42 → **18** |
 
-The Adakaon rows are the follow-up (medians of 3 interleaved repeats against the
-pre-change tree). Its float and 4-bit codecs are **count-for-count unchanged**: the
-float lists were already served by the `momentum_cache` dict that this change deletes,
-and the cached views replace it at the same cost, so the win is the quantized-with-a-
-layout case — int8 — where the scale views and the write-back were the expensive half.
+The Adakaon rows are the follow-up (against the pre-change tree; the counts are
+deterministic and identical across repeats). Only its **float codecs (`float32` and
+`bfloat16`) are count-for-count unchanged** — those lists were already served by the
+`momentum_cache` dict that this change deletes, and the cached views replace them at the
+same cost. int8 wins on both columns (the scale views *and* the write-back); 4-bit wins
+on `copy_` alone, for the reason spelled out just below.
 
 The `copy_` column is the second half of the change: the quantized codecs wrote each
 parameter's new `m_scale` with its own `copy_` (the scale shapes differ per parameter

@@ -1115,3 +1115,111 @@ def test_pnm_big_bucket_memo_survives_a_mixed_lag_group():
     lags = {lag for _gid, lag in ov._fused_big_buckets}
     assert lags == {0, 1}, f"the memo lost or grew a lag entry: {lags}"
     assert all(torch.isfinite(p).all() for p in pv)
+
+
+# ------------------------------------------------- 8. a rebucketing must not desync the cache
+# ``if cache is None or (not cache.built_from(plist) and cache.stale(plist))`` had a hole that
+# only opens once and then never closes. One step with a non-contiguous grad anywhere in the
+# group makes ``_fused_demote`` rebuild all four route lists; the memos then hand out fresh
+# bucket lists over the SAME parameters. ``built_from`` fails (new object) and ``stale`` says
+# nothing moved, so the branch is not taken and the cache is left holding ``src`` from the
+# PREVIOUS generation — after which ``built_from`` fails on every subsequent step and the
+# ``param_witness`` sweep per bucket comes back permanently. Adakaon never had it (it uses a
+# bare ``not built_from``, so a fresh list simply rebuilds); AdaPNM's three routes did.
+
+
+def _witness_sweeps(opt, steps, gen, grads_for=_plain_grads):
+    """param_witness calls per step over ``steps`` steps (partition's included)."""
+    plist = [p for g in opt.param_groups for p in g["params"]]
+    with _PnmWitnessSpy() as spy:
+        _drive([(plist, opt)], steps, gen, grads_for=grads_for)
+    return spy.counts["pointer_cache"] / steps
+
+
+_REBUCKET_BAG = ([(512, 512)] * 3 + [(384, 384)] * 2      # two big shape buckets
+                 + [(8, 16)] * 4 + [(32,)] * 3)           # plus one_block and one_dim
+
+
+@pytest.mark.parametrize("route", ["big", "one_block", "one_dim"])
+def test_pnm_rebucketing_after_a_grad_toggle_resyncs_the_cache(route):
+    """A single strided-grad step must not cost a witness sweep per bucket forever after.
+
+    The toggle is applied to a param of ``route`` so that route's own lists are the ones
+    rebuilt; the demotion rebuilds all four route lists either way, so every route's cache
+    sees a fresh list and every route has to resynchronise.
+    """
+    pv = _bag(_REBUCKET_BAG, torch.float32, seed=223)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    idx = {"big": 0, "one_block": 5, "one_dim": 9}[route]
+    shape = tuple(pv[idx].shape)
+    gen = torch.Generator(device=DEV).manual_seed(227)
+
+    def strided(g, plist):
+        gs = _plain_grads(g, plist)
+        if len(shape) == 2:
+            gs[idx] = torch.randn(shape[::-1], generator=g, device=DEV,
+                                  dtype=torch.float32).t()
+        else:
+            gs[idx] = torch.randn((shape[0] * 2,), generator=g, device=DEV,
+                                  dtype=torch.float32)[::2]
+        return gs
+
+    _drive([(pv, ov)], 3, gen)                                  # warm, everything contiguous
+    before = _witness_sweeps(ov, 3, gen)
+    assert before == pytest.approx(1.0), (
+        f"steady state should be one sweep per step (the partition's), got {before}"
+    )
+
+    _drive([(pv, ov)], 1, gen, grads_for=strided)               # the toggle
+    _drive([(pv, ov)], 1, gen)                                  # contiguous again
+    after = _witness_sweeps(ov, 4, gen)
+    assert after == pytest.approx(1.0), (
+        f"{route}: after one strided-grad step the sweeps stayed at {after}/step — the "
+        "pointer cache never resynchronised with the rebuilt route lists"
+    )
+
+
+def test_pnm_rebucketing_resync_still_matches_native():
+    """The resync must adopt the new list, never keep stale pointer tables: a strided-grad
+    toggle followed by ordinary steps has to track the native path."""
+    pv = _bag(_REBUCKET_BAG, torch.float32, seed=229)
+    pn = _clone(pv)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    on = AdaPNM(pn, fused=False, **_SAFE_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(233)
+
+    def strided(g, plist):
+        gs = _plain_grads(g, plist)
+        gs[0] = torch.randn((512, 512), generator=g, device=DEV, dtype=torch.float32).t()
+        return gs
+
+    _drive([(pv, ov), (pn, on)], 2, gen)
+    _drive([(pv, ov), (pn, on)], 1, gen, grads_for=strided)
+    _drive([(pv, ov), (pn, on)], 3, gen)
+    scale = max(p.detach().abs().max().item() for p in pn)
+    d = _maxdiff(pv, pn)
+    assert d / scale < 1e-4, f"rel={d / scale:.2e} vs native after a rebucketing resync"
+
+
+def test_pnm_rebind_still_rebuilds_when_something_actually_moved():
+    """The resync must not swallow a real change: a fresh list whose params were REBOUND
+    has to rebuild the pointer tables, not adopt the list."""
+    pv = _bag(_REBUCKET_BAG, torch.float32, seed=239)
+    ov = AdaPNM(pv, fused=True, **_SAFE_CFG)
+    gen = torch.Generator(device=DEV).manual_seed(241)
+    _drive([(pv, ov)], 3, gen)
+    before = dict(ov._fused_big_caches)
+    retired = [(pv[0].data, pv[0].data.clone())]
+
+    def mutate(step, _pairs):
+        if step == 0:
+            pv[0].data = pv[0].data.clone()
+
+    _drive([(pv, ov)], 3, gen, mutate=mutate)
+    after = dict(ov._fused_big_caches)
+    assert not (after.keys() == before.keys()
+                and all(after[k] is before[k] for k in before)), (
+        "the rebind was swallowed: the big pointer cache was never rebuilt"
+    )
+    for old, snapshot in retired:
+        assert torch.equal(old, snapshot), "the step wrote the RETIRED storage"

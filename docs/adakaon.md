@@ -84,10 +84,13 @@ Two caches are Adakaon-specific:
 
 - **The codec's per-parameter view lists** (`ema_stacked(..., views=…)`). Built once
   per stacked chunk, not per step. With int8 momentum this removes 896 `aten::view` +
-  448 `aten::copy_` per step on a 448 × 0-D bag and 856 + 428 on a 428-tensor LoRA bag;
-  the float and 4-bit codecs are unchanged (they had no per-parameter layout views to
-  cache). Peak allocated memory does not move — the lists are *views* of
-  `state["m"]` / `state["m_scale"]`.
+  448 `aten::copy_` per step on a 448 × 0-D bag and 856 + 428 on a 428-tensor LoRA bag.
+  4-bit keeps its `view` count (its `m` is nibble-packed, with no effective layout to
+  view) but loses the same per-parameter scale write-back: `aten::copy_` 454 → 6 and
+  452 → 24 on those two bags. The **float codecs (`float32`/`bfloat16`) are unchanged** —
+  their lists were already served by the plan's old identity-keyed `mat` lookup. Peak
+  allocated memory does not move — the lists are *views* of `state["m"]` /
+  `state["m_scale"]`.
 - **The fused big-tensor bucket lists** (`_big_shape_buckets`). The
   same-shape/dtype/device partition of the "big" route is memoized per group and
   revalidated by list identity, so the per-step staleness witness (`param_witness`, a

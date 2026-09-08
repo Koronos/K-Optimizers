@@ -93,19 +93,25 @@ All notable changes to this project will be documented in this file.
   per step (RTX 3000 Ada Laptop, bf16 params + SR, `torch.profiler`, medians of 3
   interleaved repeats):
 
-  | bag (foreach) | `aten::view` | `aten::copy_` |
-  |---|---|---|
-  | 448 × 0-D, int8 | 905 → **9** | 453 → **5** |
-  | 428-tensor LoRA, int8 | 897 → **41** | 448 → **20** |
-  | 128×(512,512)+64×(1024,), int8 | 449 → **65** | 222 → **30** |
-  | 24×(320,320,3,3), int8 | 85 → **37** | 39 → **15** |
+  | bag (foreach) | codec | `aten::view` | `aten::copy_` |
+  |---|---|---|---|
+  | 448 × 0-D | int8 | 905 → **9** | 453 → **5** |
+  | 428-tensor LoRA | int8 | 897 → **41** | 448 → **20** |
+  | 128×(512,512)+64×(1024,) | int8 | 449 → **65** | 222 → **30** |
+  | 24×(320,320,3,3) | int8 | 85 → **37** | 39 → **15** |
+  | 448 × 0-D | 4-bit | 6 → 6 | 454 → **6** |
+  | 428-tensor LoRA | 4-bit | 24 → 24 | 452 → **24** |
+  | 128×(512,512)+64×(1024,) | 4-bit | 36 → 36 | 228 → **36** |
+  | 24×(320,320,3,3) | 4-bit | 18 → 18 | 42 → **18** |
 
-  The removed per-parameter `m_scale` write-back becomes 1–6 more `_foreach_copy_` calls.
-  The float codecs (`float32`/`bfloat16`) and 4-bit are **count-for-count unchanged**:
-  their lists were already served by the plan's identity-keyed `mat` lookup (see below),
-  and the cached views replace it at the same cost. Peak allocated memory unchanged
-  (0.00 MiB on every bag and both kernel modes) — the lists are views of `state["m"]` /
-  `state["m_scale"]`.
+  The removed per-parameter `m_scale` write-back becomes 1–6 more `_foreach_copy_` calls,
+  and for 4-bit that collapse is the *whole* gain: its `m` is a nibble-packed byte string
+  with no effective layout, so it never had per-parameter `view`s to cache (that column
+  does not move) but it did write every parameter's scale with its own `copy_`. Only the
+  **float codecs (`float32` and `bfloat16`) are count-for-count unchanged** — their lists
+  were already served by the plan's identity-keyed `mat` lookup (see below) and the cached
+  views replace it at the same cost. Peak allocated memory unchanged (0.00 MiB on every
+  bag and both kernel modes) — the lists are views of `state["m"]` / `state["m_scale"]`.
 - `ForeachSpec.momentum_cache` and `ForeachChunk.mat` are **gone**. The flag prebuilt an
   identity-keyed `{state["m"]: view(state["m"])}` lookup for the codec's `mat` callback;
   now that every optimizer on the shared plan passes `views=`, the codec's stacked path
@@ -147,6 +153,20 @@ All notable changes to this project will be documented in this file.
   because it rebuilt the lists too, and then paid the `stale` compare); it gets the same
   memo, keyed per `(group, lag)` and pruned by `_prune_lag_caches` with the pointer caches.
   Witness sweeps on 80 big tensors over 4 shapes: **5 → 1** per step.
+- **`_WitnessedCache.revalidate`** (new, additive) replaces AdaPNM's
+  `not cache.built_from(plist) and cache.stale(plist)` on all three of its fused routes.
+  That combination had a hole that opened once and never closed: one step with a
+  non-contiguous gradient anywhere in the group makes `_fused_demote` rebuild all four
+  route lists, so the caches are handed a *fresh list over unchanged parameters* —
+  `built_from` misses, `stale` correctly says nothing moved, the branch is skipped, and
+  the cache is left holding `src` from the previous generation. From then on `built_from`
+  misses on **every** step and the per-bucket `param_witness` sweep is back for good:
+  measured **1.0 → 3.17** sweeps per step after a single strided-grad step, permanently.
+  `revalidate` is the same two checks plus the rebind they were missing — it adopts the
+  fresh list when the witness agrees, so the next step is back on the O(1) identity path,
+  and still rebuilds the tables when the witness actually moved. At most one sweep, only
+  when identity misses. Adakaon was never affected (its routes use a bare
+  `not built_from`, so a fresh list simply rebuilds).
 - Bit-identity: 272 configurations (fp32/bf16 params × `float32`/`bfloat16`/`int8`/`4bit`
   momentum × foreach/fused × 5 bags — 428-tensor LoRA, 448 × 0-D, convs+1-D+0-D mixed,
   24×(320,320,3,3), 128×(512,512)+64×(1024,) — × 7 interference scenarios ×

@@ -648,6 +648,17 @@ class Adakaon(AutoLRMixin, ForeachPlanMixin, Optimizer):
         (checkpoint load, state reset) go through :meth:`_invalidate_fused_caches`,
         which clears this memo with the rest — and the cached list is held here, so its
         ``id`` cannot be reused by a new list while the entry lives.
+
+        WHAT THE ARGUMENT DOES NOT COVER: it is made entirely over PARAMETER identity
+        and says nothing about the identity of the STATE. Deleting a parameter's state
+        behind the optimizer's back (``del opt.state[p]``, then stepping) leaves every
+        route's pointer tables addressing the retired ``row``/``col``/``m`` buffers and
+        the step writes them, because no witness anywhere observes ``self.state``. That
+        predates this memo and is byte-for-byte identical with and without it (the
+        native plan has the same blind spot, via ``ForeachChunk``'s state views); it is
+        tracked as its own item, not fixed here. The supported way to discard state is
+        :meth:`_invalidate_fused_caches` — which is what ``load_state_dict`` and the
+        AutoLR reset call.
         """
         cached = self._fused_big_buckets.get(gid)
         if cached is not None and cached[0] is big:
