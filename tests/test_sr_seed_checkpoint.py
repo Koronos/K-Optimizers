@@ -859,3 +859,63 @@ def test_the_kernels_process_wide_fallback_keeps_stream_zero_across_a_reseed():
     base = torch.cuda.default_generators[0].initial_seed()
     assert ft._PROCESS_SR_STREAM.next_seed(dev) == (base + 0x9E3779B1) & 0x7FFFFFFF
     assert ft._PROCESS_SR_STREAM.stream_id == 0
+
+
+# ============================================ a mid-run manual_seed vs taking a checkpoint
+# `torch.manual_seed(base + epoch)` at an epoch boundary, next to an epoch-boundary save, is
+# an ordinary training-loop shape. Both events restart a stream's positions, and the two
+# routes must agree on WHAT they restart: only a `reseed_stochastic_rounding()` releases the
+# stream's identity (its allocator is back at 0); a changed global seed keeps it, or merely
+# calling `state_dict()` next to the seed change would move the run's noise.
+def _mid_run_manual_seed(*, checkpoint: bool) -> tuple[list[torch.Tensor], Any, Any]:
+    _fresh_process()
+    params = _params(torch.bfloat16, "cuda")
+    opt = Adakaon(params, lr=1e-2, momentum_dtype="bfloat16")
+    grads = _grads(torch.bfloat16)
+    sd = None
+    for i, g in enumerate(grads):
+        if i == 4:                                   # the epoch boundary
+            torch.manual_seed(12345)
+            torch.cuda.manual_seed_all(12345)
+            if checkpoint:
+                sd = copy.deepcopy(opt.state_dict())
+        _step("Adakaon", opt, params, g)
+    return [p.detach().float().cpu().clone() for p in params], opt.sr_stream.stream_id, sd
+
+
+def test_taking_a_checkpoint_does_not_move_the_noise_after_a_mid_run_manual_seed():
+    """``state_dict()`` must be an observation, not an event that changes the trajectory."""
+    skip_if_no_cuda()
+    plain, id_plain, _ = _mid_run_manual_seed(checkpoint=False)
+    saved, id_saved, _ = _mid_run_manual_seed(checkpoint=True)
+    assert id_plain == id_saved, (
+        f"checkpointing changed the stream identity ({id_plain} -> {id_saved}): a changed "
+        "global seed restarts the positions but must keep the identity, exactly as the "
+        "draw path does"
+    )
+    _assert_same(plain, saved, "mid-run manual_seed with vs without a state_dict()")
+
+
+def test_a_checkpoint_taken_at_a_mid_run_manual_seed_still_resumes_exactly():
+    """And that checkpoint must still be resumable bit-exactly in a fresh process."""
+    skip_if_no_cuda()
+    ref, _, sd = _mid_run_manual_seed(checkpoint=True)
+    assert sd is not None
+
+    _fresh_process()
+    params = _params(torch.bfloat16, "cuda")
+    opt = Adakaon(params, lr=1e-2, momentum_dtype="bfloat16")
+    grads = _grads(torch.bfloat16)
+    for g in grads[:4]:
+        _step("Adakaon", opt, params, g)
+    torch.manual_seed(12345)
+    torch.cuda.manual_seed_all(12345)
+    _fresh_process()                                  # a brand-new process would do this
+    torch.manual_seed(12345)
+    torch.cuda.manual_seed_all(12345)
+    opt = Adakaon(params, lr=1e-2, momentum_dtype="bfloat16")
+    opt.load_state_dict(sd)
+    for g in grads[4:]:
+        _step("Adakaon", opt, params, g)
+    _assert_same(ref, [p.detach().float().cpu().clone() for p in params],
+                 "resume from a checkpoint taken at a mid-run manual_seed")

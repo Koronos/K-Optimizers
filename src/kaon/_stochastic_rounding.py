@@ -280,9 +280,7 @@ class SRStream:
         """
         global _next_stream
         if restart:
-            self.draws = 0
-            self._bound.clear()
-            self._generators.clear()
+            self._restart()
         if self.stream_id is None:            # first real draw: claim an identity
             self.stream_id = _next_stream
             _next_stream += 1
@@ -329,6 +327,25 @@ class SRStream:
         return gen
 
     # ------------------------------------------------------------------- state
+    def _restart(self) -> None:
+        """Send every position back to the start of a run, KEEPING the identity.
+
+        This is what a mid-process ``torch.manual_seed`` with a different value means: a new
+        run over the same owners, so each keeps its place in the noise space and only its
+        positions rewind. Both the routes that can observe such a seed change — the draw
+        path (:meth:`_bind` with ``restart``) and :meth:`snapshot` — go through here, so
+        that merely *reading* the state cannot move the run's noise.
+        """
+        self.draws = 0
+        self._bound.clear()
+        self._generators.clear()
+        # NOT ``_pending_gen``: a state staged by :meth:`restore` is popped by the first
+        # torch-path draw, which happens before any seed change this method can see, so
+        # clearing here would only ever be a no-op — except in one unreachable-by-test
+        # corner (a CUDA ``gen`` payload restored into a run that never leaves the Triton
+        # kernel, followed by a seed change and then a strided weight). Left alone
+        # deliberately, so this stays byte-for-byte what the draw path always did.
+
     def reset(self) -> None:
         """Restart at draw 0, re-sync to the global seed, and **release the identity**.
 
@@ -352,11 +369,9 @@ class SRStream:
         for no reason.
         """
         self.stream_id = self._pinned_id
-        self.draws = 0
         self._epoch = _reseed_epoch
-        self._bound.clear()
-        self._generators.clear()
-        self._pending_gen.clear()
+        self._restart()
+        self._pending_gen.clear()   # a reseed discards a restored position outright
 
     def _base_moved(self) -> bool:
         """Did the global seed change under this stream since its last draw?"""
@@ -374,9 +389,18 @@ class SRStream:
         next draw so they cost nothing per step) is forced to land FIRST. Otherwise the
         checkpoint would record a position the live run is about to abandon, and the resume
         would continue from a draw the saving run never reached.
+
+        The two causes are NOT the same restart, and conflating them made taking a
+        checkpoint change the run: a reseed releases the identity (its allocator is back at
+        0), while a changed global seed keeps it — which is what the draw path does. With
+        both routed through :meth:`reset`, a ``torch.manual_seed`` at an epoch boundary
+        moved the stream from 0 to 1 *only if* ``state_dict()`` was called next to it, and
+        the weights then diverged by 3.1e-2 from the same run without the save.
         """
-        if self._epoch != _reseed_epoch or self._base_moved():
+        if self._epoch != _reseed_epoch:      # a reseed: a new run AND new identities
             self.reset()
+        elif self._base_moved():              # a new global seed: a new run, same identities
+            self._restart()
         if self.stream_id is None:
             return None
         meta: dict[str, Any] = {"stream": self.stream_id, "draws": self.draws}
