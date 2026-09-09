@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Experimental `Rakaon`: momentum-free variance shrinkage, tensorwise or contiguous
+  block variance, RMS clipping, and checkpointable BF16 stochastic rounding.
+  Proxy studies have not established superiority over existing optimizers.
+- Reproducible diffusion studies measuring time to evaluated loss/gap and allocated
+  memory, plus an Anima/Pets pilot with seeded adapter fingerprints and previews.
+
 ## [0.7.13]
 
 ### Fixed

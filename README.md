@@ -183,6 +183,13 @@ uv run pytest
 uv run ruff check src tests
 ```
 
+## Experimental diffusion research
+
+`Rakaon` explores variance shrinkage without momentum, with an optional scalar-state
+mode (`shrinkage=1`). It is **experimental**, not a demonstrated improvement over
+Adakaon/Nekaon. See [design, measurements and reproduction](docs/research/rakaon.md)
+before using it for training.
+
 ## Status
 
 v0.2 alpha. API may change.
