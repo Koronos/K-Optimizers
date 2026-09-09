@@ -13,10 +13,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output", type=Path, default=Path("benchmarks/anima/comparison_results.json"))
+    parser.add_argument("--arms", nargs="+", help="Explicit subset of completed arms")
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
     runs = []
-    for arm in manifest["arms"]:
+    by_name = {arm["arm"]: arm for arm in manifest["arms"]}
+    for name in args.arms or by_name:
+        arm = by_name[name]
         log_path = args.manifest.parent / f"{arm['arm']}.log"
         log = log_path.read_text()
         if "Training complete." not in log:
@@ -47,11 +50,12 @@ def main():
         if not all(math.isclose(value, initial[0], abs_tol=1e-6) for value in initial):
             raise RuntimeError(f"Initial {metric} loss differs despite matching adapter weights")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({"protocol": manifest, "runs": runs}, indent=2) + "\n")
+    args.output.write_text(json.dumps({"protocol": manifest, "reported_arms": [run["arm"] for run in runs],
+                                      "runs": runs}, indent=2) + "\n")
     lines = ["# Anima / Pets pilot", "",
              f"Seed {manifest['protocol']['train_seed']}, constant LR {manifest['protocol']['lr']:g}, "
              f"rank-16 LoRA, {manifest['protocol']['steps']} steps at 256px.",
-             "Eight fixed images per evaluation split, nine noise quantiles.",
+             f"{manifest['dataset']['val']['max_images']} fixed images per evaluation split, nine noise quantiles.",
              "Initialization fingerprints match. This is a pilot, not a tuned ranking.", "",
              "| Optimizer | Train eval | Val | Raw gap | Change in gap | Active train s | Peak GiB |",
              "|---|---:|---:|---:|---:|---:|---:|"]
@@ -68,7 +72,7 @@ def main():
               "it is descriptive, not a generalization bound. Active time excludes evaluation",
               "and previews; allocator peaks include prior preview allocations. Run order and",
               "laptop thermals can affect timing. No FID, perceptual ranking, multi-seed",
-              "confirmation, or full fine-tuning claim follows from this pilot.", ""]
+              "confirmation within this single-seed report, or full fine-tuning claim follows from this pilot.", ""]
     args.output.with_suffix(".md").write_text("\n".join(lines), encoding="utf-8")
 
 

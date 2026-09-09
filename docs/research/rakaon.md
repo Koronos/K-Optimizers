@@ -165,3 +165,9 @@ El optimizador restaura su RNG de stochastic rounding; la reanudación del train
 requiere además RNG de ruido, posición de datos y estado de modelo. Rengu actualmente
 vuelve a aplicar `train_seed` al entrar al loop: LR constante por sí solo no garantiza
 la misma trayectoria después de una reanudación. No se modificó el trainer.
+
+El [informe Anima](anima-rakaon.md) contiene el piloto emparejado de cuatro
+optimizadores y el smoke posterior de fine-tuning completo. En este último,
+1,956,405,248 parámetros entraron a optimizadores individuales durante backward,
+con 24 bloques intercambiados y pico 1.56 GiB a 256px. Se verificaron cambios en
+ocho matrices BF16 guardadas; tres pasos no demuestran convergencia de fine-tuning.

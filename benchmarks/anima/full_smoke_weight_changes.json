@@ -1,0 +1,95 @@
+{
+  "original": "/home/koronos/Rengu-Flow/tmp/models/anima-base-v1.0.safetensors",
+  "trained": "tmp/anima-full-smoke/20260909_18-33-10/step3/model.safetensors",
+  "checked": [
+    {
+      "key": "net.blocks.0.adaln_modulation_cross_attn.1.weight",
+      "shape": [
+        256,
+        2048
+      ],
+      "changed_elements": 137784,
+      "elements": 524288,
+      "dtype": "torch.bfloat16",
+      "maximum_absolute_change": 0.00048828125
+    },
+    {
+      "key": "net.blocks.0.adaln_modulation_cross_attn.2.weight",
+      "shape": [
+        6144,
+        256
+      ],
+      "changed_elements": 394156,
+      "elements": 1572864,
+      "dtype": "torch.bfloat16",
+      "maximum_absolute_change": 0.00048828125
+    },
+    {
+      "key": "net.blocks.0.adaln_modulation_mlp.1.weight",
+      "shape": [
+        256,
+        2048
+      ],
+      "changed_elements": 103430,
+      "elements": 524288,
+      "dtype": "torch.bfloat16",
+      "maximum_absolute_change": 0.00048828125
+    },
+    {
+      "key": "net.blocks.0.adaln_modulation_mlp.2.weight",
+      "shape": [
+        6144,
+        256
+      ],
+      "changed_elements": 423455,
+      "elements": 1572864,
+      "dtype": "torch.bfloat16",
+      "maximum_absolute_change": 0.00048828125
+    },
+    {
+      "key": "net.blocks.0.adaln_modulation_self_attn.1.weight",
+      "shape": [
+        256,
+        2048
+      ],
+      "changed_elements": 121446,
+      "elements": 524288,
+      "dtype": "torch.bfloat16",
+      "maximum_absolute_change": 0.00048828125
+    },
+    {
+      "key": "net.blocks.0.adaln_modulation_self_attn.2.weight",
+      "shape": [
+        6144,
+        256
+      ],
+      "changed_elements": 404104,
+      "elements": 1572864,
+      "dtype": "torch.bfloat16",
+      "maximum_absolute_change": 0.00048828125
+    },
+    {
+      "key": "net.blocks.0.cross_attn.k_proj.weight",
+      "shape": [
+        2048,
+        1024
+      ],
+      "changed_elements": 589426,
+      "elements": 2097152,
+      "dtype": "torch.bfloat16",
+      "maximum_absolute_change": 0.00048828125
+    },
+    {
+      "key": "net.blocks.0.cross_attn.output_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "changed_elements": 1464427,
+      "elements": 4194304,
+      "dtype": "torch.bfloat16",
+      "maximum_absolute_change": 0.00048828125
+    }
+  ],
+  "scope": "Selected matrices only; this is not a quality evaluation"
+}
