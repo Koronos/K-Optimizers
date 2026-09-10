@@ -1,0 +1,803 @@
+{
+  "settings": {
+    "steps": 400,
+    "channels": 64,
+    "seeds": [
+      42
+    ],
+    "lrs": [
+      0.0006,
+      0.0012,
+      0.0024
+    ],
+    "arm_lr": [],
+    "eval_every": 100,
+    "arms": [
+      "Rakaon-1",
+      "Rakaon-m0.5",
+      "Rakaon-m0.9"
+    ],
+    "output": "benchmarks/rakaon_momentum_screen.json"
+  },
+  "torch": "2.13.0+cu130",
+  "python": "3.10.20",
+  "device": "NVIDIA RTX 3000 Ada Generation Laptop GPU",
+  "fingerprint": "690c5a53ecfd55de89155d7019fdd1d8047a0c0901cd011cfeccbe80a967b9a3",
+  "runs": [
+    {
+      "arm": "Rakaon-1",
+      "lr": 0.0006,
+      "seed": 42,
+      "tr": 0.09905418567359447,
+      "te": 0.10419953241944313,
+      "gap": 0.005145346745848656,
+      "ms": 17.505621202499952,
+      "bpp": 0.00025539628759287613,
+      "traj": [
+        {
+          "step": 100,
+          "training_seconds": 2.1922246320000056,
+          "wall_seconds": 2.85986457300001,
+          "tr": 0.1852103564888239,
+          "te": 0.188235804438591,
+          "gap": 0.0030254479497671127
+        },
+        {
+          "step": 200,
+          "training_seconds": 3.8976306309999984,
+          "wall_seconds": 5.167189877000027,
+          "tr": 0.15081922430545092,
+          "te": 0.15192143619060516,
+          "gap": 0.0011022118851542473
+        },
+        {
+          "step": 300,
+          "training_seconds": 5.412766195999978,
+          "wall_seconds": 7.280822812000025,
+          "tr": 0.11449442431330681,
+          "te": 0.1184308435767889,
+          "gap": 0.003936419263482094
+        },
+        {
+          "step": 400,
+          "training_seconds": 7.002248480999981,
+          "wall_seconds": 9.464895013000017,
+          "tr": 0.09905418567359447,
+          "te": 0.10419953241944313,
+          "gap": 0.005145346745848656
+        }
+      ],
+      "targets": {
+        "val<0.1": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.1_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        }
+      }
+    },
+    {
+      "arm": "Rakaon-1",
+      "lr": 0.0012,
+      "seed": 42,
+      "tr": 0.09916050918400288,
+      "te": 0.1038595037534833,
+      "gap": 0.004698994569480419,
+      "ms": 15.99341048999996,
+      "bpp": 0.00025539628759287613,
+      "traj": [
+        {
+          "step": 100,
+          "training_seconds": 1.38397882000001,
+          "wall_seconds": 1.9845311020000054,
+          "tr": 0.1748048420995474,
+          "te": 0.1764425951987505,
+          "gap": 0.0016377530992031097
+        },
+        {
+          "step": 200,
+          "training_seconds": 2.900180153000008,
+          "wall_seconds": 4.0969010770000125,
+          "tr": 0.16565212048590183,
+          "te": 0.16537443734705448,
+          "gap": -0.0002776831388473511
+        },
+        {
+          "step": 300,
+          "training_seconds": 4.7165795770000045,
+          "wall_seconds": 6.512166330000014,
+          "tr": 0.11750754341483116,
+          "te": 0.12131523620337248,
+          "gap": 0.003807692788541317
+        },
+        {
+          "step": 400,
+          "training_seconds": 6.397364195999984,
+          "wall_seconds": 8.801106403999995,
+          "tr": 0.09916050918400288,
+          "te": 0.1038595037534833,
+          "gap": 0.004698994569480419
+        }
+      ],
+      "targets": {
+        "val<0.1": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.1_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        }
+      }
+    },
+    {
+      "arm": "Rakaon-1",
+      "lr": 0.0024,
+      "seed": 42,
+      "tr": 0.09851021878421307,
+      "te": 0.10194482188671827,
+      "gap": 0.003434603102505207,
+      "ms": 16.807427104999917,
+      "bpp": 0.00025539628759287613,
+      "traj": [
+        {
+          "step": 100,
+          "training_seconds": 1.6132365249999907,
+          "wall_seconds": 2.294482775000006,
+          "tr": 0.1748625449836254,
+          "te": 0.17595186084508896,
+          "gap": 0.0010893158614635468
+        },
+        {
+          "step": 200,
+          "training_seconds": 3.4637916879999864,
+          "wall_seconds": 4.86887694699999,
+          "tr": 0.17887347470968962,
+          "te": 0.1787964664399624,
+          "gap": -7.700826972723007e-05
+        },
+        {
+          "step": 300,
+          "training_seconds": 5.0369843799999785,
+          "wall_seconds": 7.093651162000015,
+          "tr": 0.11660779640078545,
+          "te": 0.11991840694099665,
+          "gap": 0.0033106105402112007
+        },
+        {
+          "step": 400,
+          "training_seconds": 6.722970841999967,
+          "wall_seconds": 9.42167358399999,
+          "tr": 0.09851021878421307,
+          "te": 0.10194482188671827,
+          "gap": 0.003434603102505207
+        }
+      ],
+      "targets": {
+        "val<0.1": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.1_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        }
+      }
+    },
+    {
+      "arm": "Rakaon-m0.5",
+      "lr": 0.0006,
+      "seed": 42,
+      "tr": 0.09994291514158249,
+      "te": 0.10501674190163612,
+      "gap": 0.005073826760053635,
+      "ms": 19.603420437500034,
+      "bpp": 4.000255396287593,
+      "traj": [
+        {
+          "step": 100,
+          "training_seconds": 1.723699793999998,
+          "wall_seconds": 2.38631943499999,
+          "tr": 0.16426895838230848,
+          "te": 0.16707083582878113,
+          "gap": 0.002801877446472645
+        },
+        {
+          "step": 200,
+          "training_seconds": 3.7277002140000093,
+          "wall_seconds": 4.9939145449999955,
+          "tr": 0.12966736871749163,
+          "te": 0.13203341141343117,
+          "gap": 0.002366042695939541
+        },
+        {
+          "step": 300,
+          "training_seconds": 5.828883356999995,
+          "wall_seconds": 7.689252140999997,
+          "tr": 0.11771710589528084,
+          "te": 0.1213929858058691,
+          "gap": 0.0036758799105882645
+        },
+        {
+          "step": 400,
+          "training_seconds": 7.841368175000014,
+          "wall_seconds": 10.29935944799999,
+          "tr": 0.09994291514158249,
+          "te": 0.10501674190163612,
+          "gap": 0.005073826760053635
+        }
+      ],
+      "targets": {
+        "val<0.1": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.1_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        }
+      }
+    },
+    {
+      "arm": "Rakaon-m0.5",
+      "lr": 0.0012,
+      "seed": 42,
+      "tr": 0.09696135390549898,
+      "te": 0.10155758447945118,
+      "gap": 0.004596230573952198,
+      "ms": 19.813572885,
+      "bpp": 4.000255396287593,
+      "traj": [
+        {
+          "step": 100,
+          "training_seconds": 1.9959662349999974,
+          "wall_seconds": 2.6190230089999886,
+          "tr": 0.1666096057742834,
+          "te": 0.16758977994322777,
+          "gap": 0.0009801741689443588
+        },
+        {
+          "step": 200,
+          "training_seconds": 3.9770964070000048,
+          "wall_seconds": 5.196674836999989,
+          "tr": 0.12631830479949713,
+          "te": 0.128438719548285,
+          "gap": 0.00212041474878788
+        },
+        {
+          "step": 300,
+          "training_seconds": 5.896040477000014,
+          "wall_seconds": 7.723016884999993,
+          "tr": 0.11366069782525301,
+          "te": 0.11661108676344156,
+          "gap": 0.002950388938188553
+        },
+        {
+          "step": 400,
+          "training_seconds": 7.925429154,
+          "wall_seconds": 10.408622520999984,
+          "tr": 0.09696135390549898,
+          "te": 0.10155758447945118,
+          "gap": 0.004596230573952198
+        }
+      ],
+      "targets": {
+        "val<0.1": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.1_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        }
+      }
+    },
+    {
+      "arm": "Rakaon-m0.5",
+      "lr": 0.0024,
+      "seed": 42,
+      "tr": 0.09746592864394188,
+      "te": 0.10287597589194775,
+      "gap": 0.005410047248005867,
+      "ms": 21.09094511249992,
+      "bpp": 4.000255396287593,
+      "traj": [
+        {
+          "step": 100,
+          "training_seconds": 1.9752143370000113,
+          "wall_seconds": 2.6350546099999974,
+          "tr": 0.16966357082128525,
+          "te": 0.17307480424642563,
+          "gap": 0.003411233425140381
+        },
+        {
+          "step": 200,
+          "training_seconds": 4.133188030999975,
+          "wall_seconds": 5.470625583000015,
+          "tr": 0.13501567300409079,
+          "te": 0.13759665004909039,
+          "gap": 0.0025809770449995995
+        },
+        {
+          "step": 300,
+          "training_seconds": 6.255884203999983,
+          "wall_seconds": 8.239088509999988,
+          "tr": 0.11618288420140743,
+          "te": 0.11962350830435753,
+          "gap": 0.003440624102950096
+        },
+        {
+          "step": 400,
+          "training_seconds": 8.43637804499997,
+          "wall_seconds": 11.020563704999972,
+          "tr": 0.09746592864394188,
+          "te": 0.10287597589194775,
+          "gap": 0.005410047248005867
+        }
+      ],
+      "targets": {
+        "val<0.1": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.1_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        }
+      }
+    },
+    {
+      "arm": "Rakaon-m0.9",
+      "lr": 0.0006,
+      "seed": 42,
+      "tr": 0.1012812340632081,
+      "te": 0.10856461059302092,
+      "gap": 0.007283376529812813,
+      "ms": 19.635646787500036,
+      "bpp": 4.000255396287593,
+      "traj": [
+        {
+          "step": 100,
+          "training_seconds": 2.053054911000004,
+          "wall_seconds": 2.6688401330000033,
+          "tr": 0.16927597299218178,
+          "te": 0.1775109115988016,
+          "gap": 0.008234938606619835
+        },
+        {
+          "step": 200,
+          "training_seconds": 3.8562004460000026,
+          "wall_seconds": 5.074523672999987,
+          "tr": 0.13144037686288357,
+          "te": 0.13478543423116207,
+          "gap": 0.0033450573682785034
+        },
+        {
+          "step": 300,
+          "training_seconds": 5.758777909000003,
+          "wall_seconds": 7.637004993000005,
+          "tr": 0.11904946994036436,
+          "te": 0.12251607701182365,
+          "gap": 0.0034666070714592934
+        },
+        {
+          "step": 400,
+          "training_seconds": 7.8542587150000145,
+          "wall_seconds": 10.41457391199998,
+          "tr": 0.1012812340632081,
+          "te": 0.10856461059302092,
+          "gap": 0.007283376529812813
+        }
+      ],
+      "targets": {
+        "val<0.1": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.1_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        }
+      }
+    },
+    {
+      "arm": "Rakaon-m0.9",
+      "lr": 0.0012,
+      "seed": 42,
+      "tr": 0.09827442653477192,
+      "te": 0.1066604359075427,
+      "gap": 0.008386009372770786,
+      "ms": 17.45559470499998,
+      "bpp": 4.000255396287593,
+      "traj": [
+        {
+          "step": 100,
+          "training_seconds": 1.8361086080000177,
+          "wall_seconds": 2.4985322450000353,
+          "tr": 0.16891175881028175,
+          "te": 0.1764613278210163,
+          "gap": 0.007549569010734558
+        },
+        {
+          "step": 200,
+          "training_seconds": 3.650548441000012,
+          "wall_seconds": 4.945708070000023,
+          "tr": 0.13727404177188873,
+          "te": 0.14069476816803217,
+          "gap": 0.0034207263961434364
+        },
+        {
+          "step": 300,
+          "training_seconds": 5.253513011999985,
+          "wall_seconds": 7.191811381000036,
+          "tr": 0.11684449203312397,
+          "te": 0.12070001009851694,
+          "gap": 0.003855518065392971
+        },
+        {
+          "step": 400,
+          "training_seconds": 6.982237881999993,
+          "wall_seconds": 9.55626109800005,
+          "tr": 0.09827442653477192,
+          "te": 0.1066604359075427,
+          "gap": 0.008386009372770786
+        }
+      ],
+      "targets": {
+        "val<0.1": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.1_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        }
+      }
+    },
+    {
+      "arm": "Rakaon-m0.9",
+      "lr": 0.0024,
+      "seed": 42,
+      "tr": 0.10025405138731003,
+      "te": 0.1079214159399271,
+      "gap": 0.007667364552617073,
+      "ms": 25.005766422499818,
+      "bpp": 4.000255396287593,
+      "traj": [
+        {
+          "step": 100,
+          "training_seconds": 2.1287852329999737,
+          "wall_seconds": 2.7445924269999864,
+          "tr": 0.17209274228662252,
+          "te": 0.1779224295169115,
+          "gap": 0.005829687230288982
+        },
+        {
+          "step": 200,
+          "training_seconds": 4.0740148079999585,
+          "wall_seconds": 5.310779872000012,
+          "tr": 0.13486218731850386,
+          "te": 0.13722073193639517,
+          "gap": 0.0023585446178913116
+        },
+        {
+          "step": 300,
+          "training_seconds": 7.083670084999937,
+          "wall_seconds": 8.992539531999967,
+          "tr": 0.11943937372416258,
+          "te": 0.12261766009032726,
+          "gap": 0.0031782863661646843
+        },
+        {
+          "step": 400,
+          "training_seconds": 10.002306568999927,
+          "wall_seconds": 12.509109492999983,
+          "tr": 0.10025405138731003,
+          "te": 0.1079214159399271,
+          "gap": 0.007667364552617073
+        }
+      ],
+      "targets": {
+        "val<0.1": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.1_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.09_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.08_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.077_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07": {
+          "first": null,
+          "first_of_two_consecutive": null
+        },
+        "val<0.07_abs_gap<0.007": {
+          "first": null,
+          "first_of_two_consecutive": null
+        }
+      }
+    }
+  ],
+  "rakaon_sha256": "a71ee626db8ba8176965d247e37dd4e54d142b4dd631fc935ccaca620ccbfd03"
+}

@@ -26,7 +26,8 @@ ANIMA = "/home/koronos/Rengu-Flow/tmp/models/anima-base-v1.0.safetensors"
 VAE = "/home/koronos/Rengu-Flow/tmp/models/qwen_image_vae.safetensors"
 LLM = "/home/koronos/Rengu-Flow/tmp/models/qwen_3_06b_base.safetensors"
 RFL_ROOT = "/home/koronos/Rengu-Flow"
-ARMS = ("nekaon", "adakaon", "rakaon_isotropic", "rakaon_block64", "adamw_fused")
+ARMS = ("nekaon", "adakaon", "rakaon_isotropic", "rakaon_block64", "adamw_fused",
+        "rakaon_m05", "rakaon_m09")
 
 
 def _toml_string(value: str) -> str:
@@ -117,6 +118,9 @@ def _optimizer_config(arm: str, lr: float) -> list[str]:
         ]
     if arm == "rakaon_block64":
         return _optimizer_config("rakaon_isotropic", lr) + ["block_size = 64"]
+    if arm in ("rakaon_m05", "rakaon_m09"):
+        return _optimizer_config("rakaon_isotropic", lr) + [
+            "beta1 = " + ("0.5" if arm == "rakaon_m05" else "0.9")]
     raise ValueError(f"unknown optimizer arm: {arm}")
 
 

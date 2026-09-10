@@ -90,3 +90,11 @@ def test_default_protocol_keeps_all_arms_and_eval_defaults(tmp_path: Path) -> No
     assert [item["arm"] for item in manifest["arms"]] == list(generator.ARMS)
     assert manifest["protocol"]["eval_every_n_steps"] == 100
     assert manifest["dataset"]["val"]["max_images"] == 8
+
+
+@pytest.mark.parametrize(("arm", "beta1"), [("rakaon_m05", .5), ("rakaon_m09", .9)])
+def test_momentum_recipe_changes_only_beta1(arm, beta1):
+    base = tomllib.loads("\n".join(generator._optimizer_config("rakaon_isotropic", .0001)))
+    candidate = tomllib.loads("\n".join(generator._optimizer_config(arm, .0001)))
+    assert candidate.pop("beta1") == beta1
+    assert candidate == base

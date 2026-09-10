@@ -18,7 +18,7 @@ __all__ = ["Rakaon"]
 
 
 class Rakaon(SRSeedState, Optimizer):
-    """Momentum-free Adafactor with variance shrinkage and RMS update clipping.
+    """Factored variance shrinkage and RMS update clipping; no momentum by default.
 
     ``shrinkage=0`` uses factored variance; ``1`` uses a tensorwise RMS.
     For an R x C matrix, persistent state is 4*(R+C) bytes. At shrinkage=1
@@ -33,14 +33,19 @@ class Rakaon(SRSeedState, Optimizer):
     shapes, never a flattened copy of the whole model.
     LR is absolute and constant by default; no hidden schedule or weight swap.
     Save model, optimizer, RNG and data position together for exact resumption.
+    Experimental ``beta1>0`` is limited to isotropic mode without blocks. It
+    averages normalized, clipped updates with bias correction before decay,
+    adding one FP32 buffer per parameter. This is a diagnostic, not a low-memory
+    momentum implementation. Beta1 cannot change after state initialization.
     """
 
     def __init__(self, params, lr=1e-3, beta2=0.999, shrinkage=0.1,
                  clip_threshold=1.0, weight_decay=0.0, eps=1e-30,
-                 stochastic_rounding=True, block_size=None):
+                 stochastic_rounding=True, block_size=None, beta1=0.0):
         defaults = dict(lr=lr, beta2=beta2, shrinkage=shrinkage,
                         clip_threshold=clip_threshold, weight_decay=weight_decay,
-                        eps=eps, stochastic_rounding=stochastic_rounding, block_size=block_size)
+                        eps=eps, stochastic_rounding=stochastic_rounding, block_size=block_size,
+                        beta1=beta1)
         super().__init__(params, defaults)
 
     def add_param_group(self, param_group):
@@ -53,6 +58,10 @@ class Rakaon(SRSeedState, Optimizer):
                 raise ValueError(f"{key} must be finite and positive")
         if not 0 <= values["beta2"] < 1:
             raise ValueError("beta2 must be in [0, 1)")
+        if not 0 <= values["beta1"] < 1:
+            raise ValueError("beta1 must be in [0, 1)")
+        if values["beta1"] and (values["shrinkage"] != 1 or values["block_size"] is not None):
+            raise ValueError("experimental beta1 requires shrinkage=1 and block_size=None")
         if not 0 <= values["shrinkage"] <= 1:
             raise ValueError("shrinkage must be in [0, 1]")
         block_size = values["block_size"]
@@ -67,6 +76,7 @@ class Rakaon(SRSeedState, Optimizer):
         load_state_dict_preserving_dtypes(self, state_dict)
         for group in self.param_groups:
             group.setdefault("block_size", None)
+            group.setdefault("beta1", 0.0)
 
     def _step_blocks(self, group):
         """One variance per contiguous block, global per-tensor update clipping.
@@ -129,8 +139,10 @@ class Rakaon(SRSeedState, Optimizer):
                 continue
             state = self.state[p]
             if not state:
-                state.update(step=0, isotropic=True,
+                state.update(step=0, isotropic=True, momentum_beta1=group["beta1"],
                              variance=torch.zeros((), device=p.device, dtype=torch.float32))
+                if group["beta1"]:
+                    state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
             key = (p.device, p.dtype, p.shape)
             buckets.setdefault(key, []).append(p)
         for params in buckets.values():
@@ -152,6 +164,15 @@ class Rakaon(SRSeedState, Optimizer):
                 scale = (variance / correction).clamp_min_(group["eps"]).rsqrt_()
                 scale.div_((energy.sqrt() * scale / group["clip_threshold"]).clamp_min_(1))
                 update = g * scale.reshape(-1, *([1] * chunk[0].ndim))
+                if group["beta1"]:
+                    momentum = torch.stack([state["momentum"] for state in states])
+                    momentum.lerp_(update, 1 - group["beta1"])
+                    torch._foreach_copy_([state["momentum"] for state in states],
+                                         list(momentum.unbind()))
+                    correction1 = torch.tensor(
+                        [1 - group["beta1"] ** state["step"] for state in states],
+                        device=g.device, dtype=torch.float32)
+                    update = momentum / correction1.reshape(-1, *([1] * chunk[0].ndim))
                 if group["weight_decay"]:
                     update.add_(torch.stack([p.float() for p in chunk]), alpha=group["weight_decay"])
                 method = "stochastic_rounding" if group["stochastic_rounding"] else "none"
@@ -169,6 +190,8 @@ class Rakaon(SRSeedState, Optimizer):
                 if p.grad is not None and (p.grad.is_sparse or p.is_complex()):
                     raise RuntimeError("Rakaon requires dense real gradients")
                 state = self.state.get(p)
+                if state and state.get("momentum_beta1", 0.0) != group["beta1"]:
+                    raise ValueError("Cannot switch beta1 after initialization")
                 if state and state.get("isotropic", False) != (group["shrinkage"] == 1):
                     raise ValueError("Cannot switch isotropic state layout after initialization")
                 if state and state.get("block_size") != group["block_size"]:

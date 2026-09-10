@@ -96,6 +96,8 @@ def main():
     }
     for s in (0., .1, .5, 1.):
         factories[f"Rakaon-{s:g}"] = lambda p, lr, s=s: Rakaon(p, lr=lr, shrinkage=s)
+    for beta1 in (.5, .9):
+        factories[f"Rakaon-m{beta1:g}"] = lambda p, lr, b=beta1: Rakaon(p, lr=lr, shrinkage=1, beta1=b)
     for block_size in (64, 256, 1024):
         factories[f"Rakaon-block{block_size}"] = lambda p, lr, b=block_size: Rakaon(p, lr=lr, shrinkage=1, block_size=b)
     output = dict(settings=vars(args) | {"output": str(args.output)},
