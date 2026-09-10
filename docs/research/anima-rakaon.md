@@ -71,3 +71,18 @@ reconocibles; cambian poses, proporciones y detalles. Ambos beagles tienen estil
 de ilustración. No hay una ventaja visual consistente demostrada por esos ocho
 ejemplos, ni métricas perceptuales o evaluación humana ciega. Los 32 ejemplos
 de test reservados siguen sin utilizarse.
+
+## Exploración de la mitad de pasos
+
+Tras la confirmación se probó Rakaon isotropic con LR constante 0.0002 y 100
+pasos, seed 43, mismos pesos iniciales y splits de 32 imágenes. Antes de obtener
+el resultado se registró el [criterio](../../benchmarks/anima/fast43_protocol.json):
+igualar o mejorar tanto validation como gap absoluto de Nekaon a 200 pasos,
+con menor tiempo activo. Es un ensayo exploratorio elegido usando seed 43,
+no una confirmación independiente.
+
+El [resultado](../../benchmarks/anima/fast43_results.md) fue validation 0.135747,
+gap absoluto 0.009612 y 85.4 s activos, frente a 0.132597, 0.009018 y 196.0 s
+de Nekaon. Falla ambas condiciones de calidad; el menor tiempo no constituye
+una aceleración hasta un resultado equivalente. Duplicar LR y reducir a la
+mitad los pasos queda descartado como mejora demostrada en este ensayo.
