@@ -29,7 +29,8 @@ class Rakaon(SRSeedState, Optimizer):
     groups. Their updates use one global tensor RMS clip, then the usual
     weight write. Convolutions flatten to [out, rest]. Scalars/vectors use a
     dense second moment when ``shrinkage < 1``.
-    Dense fp32 temporaries are scoped to one parameter, never the whole model.
+    Dense fp32 temporaries cover one parameter or bounded batches of matching
+    shapes, never a flattened copy of the whole model.
     LR is absolute and constant by default; no hidden schedule or weight swap.
     Save model, optimizer, RNG and data position together for exact resumption.
     """

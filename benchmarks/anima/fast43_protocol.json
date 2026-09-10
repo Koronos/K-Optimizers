@@ -1,0 +1,9 @@
+{
+  "purpose": "Exploratory reduction in steps, selected after observing the seed-43 confirmation; not held-out confirmation.",
+  "seed": 43,
+  "candidate": {"arm": "rakaon_isotropic", "lr": 0.0002, "steps": 100},
+  "reference": {"report": "confirmation43_results.json", "arm": "nekaon", "lr": 0.0001, "steps": 200},
+  "fixed": {"scheduler": "constant", "train_images": 96, "train_eval_images": 32, "val_images": 32, "resolution": 256, "lora_rank": 16},
+  "decision": "Candidate final validation loss and absolute raw gap must each be no greater than the reference final values, with less observed active training time. No interpolation and no equivalence margin.",
+  "limitations": "Numerical endpoints only; image quality equivalence is not established. A successful result needs another seed and separately tuned baselines. The original loss<0.07 and abs(gap)<0.007 targets remain separately reported."
+}
