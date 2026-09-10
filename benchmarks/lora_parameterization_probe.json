@@ -1,0 +1,55 @@
+{
+  "seed": 20260910,
+  "shape": [
+    64,
+    48
+  ],
+  "rank": 4,
+  "lr": 0.001,
+  "scope": "One step on squared matrix error. No diffusion or convergence claim.",
+  "caveat": "Gram reference requires full-rank factors; standard zero-B LoRA initialization makes B.T@B singular. Damping changes invariance and needs separate study.",
+  "results": [
+    {
+      "method": "rakaon_isotropic",
+      "factor_scale": 1.0,
+      "initial_product_error": 0.0,
+      "update_norm": 0.021890585547770004,
+      "relative_update_difference": 0.0
+    },
+    {
+      "method": "rakaon_isotropic",
+      "factor_scale": 0.1,
+      "initial_product_error": 1.9693330750272551e-16,
+      "update_norm": 0.15097510959986926,
+      "relative_update_difference": 6.1922269220421216
+    },
+    {
+      "method": "rakaon_isotropic",
+      "factor_scale": 10.0,
+      "initial_product_error": 1.961418952990008e-16,
+      "update_norm": 0.14905126881121117,
+      "relative_update_difference": 6.114035593341118
+    },
+    {
+      "method": "undamped_gram_sgd_reference",
+      "factor_scale": 1.0,
+      "initial_product_error": 0.0,
+      "update_norm": 1.4678842079961132e-05,
+      "relative_update_difference": 0.0
+    },
+    {
+      "method": "undamped_gram_sgd_reference",
+      "factor_scale": 0.1,
+      "initial_product_error": 1.9693330750272551e-16,
+      "update_norm": 1.4678842079966296e-05,
+      "relative_update_difference": 1.8367952576702194e-11
+    },
+    {
+      "method": "undamped_gram_sgd_reference",
+      "factor_scale": 10.0,
+      "initial_product_error": 1.961418952990008e-16,
+      "update_norm": 1.4678842079979364e-05,
+      "relative_update_difference": 1.8026839214011495e-11
+    }
+  ]
+}
