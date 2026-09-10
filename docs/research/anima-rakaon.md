@@ -29,9 +29,45 @@ Este smoke confirma una ruta de actualización de pesos completos bajo ese
 ajuste de offload, pero tres pasos no permiten afirmar convergencia de full
 fine-tuning ni calidad de generación.
 
-## Confirmación en curso
+## Confirmación y control AdamW
 
-Se están ejecutando seeds 43 y 44, con 32 imágenes de evaluación por split,
+Se completaron seeds 43 y 44, con 32 imágenes de evaluación por split,
 200 pasos, sin previews y orden alternado: seed 43 (`Nekaon → isotropic`) y
-seed 44 (`isotropic → Nekaon`). Todavía no hay resultados; por tanto, no se
-deben mezclar con el piloto de seed 42 ni extraer una conclusión de ranking.
+seed 44 (`isotropic → Nekaon`). AdamW fused se ejecutó después con las mismas
+semillas y LR. El [reporte combinado](../../benchmarks/anima/paired_confirmation.md)
+verifica modelo, dataset, protocolo, huella inicial de los adapters y pérdidas
+iniciales dentro de cada semilla. No se deben mezclar estas pérdidas con el piloto
+de seed 42.
+
+| Seed | Optimizador | Validation | Gap absoluto | Tiempo activo (s) | Pico CUDA (GiB) |
+|---|---|---:|---:|---:|---:|
+| 43 | Nekaon | 0.132597 | 0.009018 | 196.0 | 4.652 |
+| 43 | Rakaon isotropic | 0.133067 | 0.009335 | 181.4 | 4.624 |
+| 43 | AdamW fused | 0.133572 | 0.009295 | 160.5 | 4.763 |
+| 44 | Nekaon | 0.132850 | 0.009482 | 211.3 | 4.652 |
+| 44 | Rakaon isotropic | 0.133323 | 0.009603 | 175.9 | 4.624 |
+| 44 | AdamW fused | 0.134044 | 0.009608 | 153.1 | 4.763 |
+
+Rakaon usa menos tiempo para completar 200 pasos que Nekaon (7.4% y 16.8%),
+pero su pérdida validation es mayor en ambas semillas. AdamW completa los pasos
+más rápido y tiene mayor pérdida. Esto describe un compromiso; no demuestra
+menor tiempo hasta una calidad equivalente. Solo se evaluaron los pasos 0 y 200,
+por lo que no se pueden interpolar curvas de convergencia ni tiempos a umbrales.
+La diferencia de pico entre Rakaon y Nekaon es apenas 0.028 GiB en esta LoRA.
+
+AdamW usa estados estándar BF16, betas 0.9/0.999 y weight decay 0.01; Nekaon
+usa su receta cuantizada y Rakaon no usa momentum. No es un estudio de ajuste
+exhaustivo ni una comparación que iguale todas las precisiones de estado.
+Ningún brazo alcanza loss < 0.07 y gap absoluto < 0.007. El gap ya era negativo
+antes de entrenar; restarle el valor inicial no equivale a cumplir ese objetivo.
+
+## Inspección visual
+
+Se cargaron los adapters del piloto seed 42, paso 200, y se generaron cuatro
+prompts de razas a 512 px con 20 pasos Euler, guidance 4 y semilla 20260909.
+Se inspeccionaron exclusivamente los previews del paso 0, anteriores a cualquier
+actualización del trabajo de revisión. Ambos producen gatos, beagle y shiba inu
+reconocibles; cambian poses, proporciones y detalles. Ambos beagles tienen estilo
+de ilustración. No hay una ventaja visual consistente demostrada por esos ocho
+ejemplos, ni métricas perceptuales o evaluación humana ciega. Los 32 ejemplos
+de test reservados siguen sin utilizarse.

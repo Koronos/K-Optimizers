@@ -26,7 +26,7 @@ ANIMA = "/home/koronos/Rengu-Flow/tmp/models/anima-base-v1.0.safetensors"
 VAE = "/home/koronos/Rengu-Flow/tmp/models/qwen_image_vae.safetensors"
 LLM = "/home/koronos/Rengu-Flow/tmp/models/qwen_3_06b_base.safetensors"
 RFL_ROOT = "/home/koronos/Rengu-Flow"
-ARMS = ("nekaon", "adakaon", "rakaon_isotropic", "rakaon_block64")
+ARMS = ("nekaon", "adakaon", "rakaon_isotropic", "rakaon_block64", "adamw_fused")
 
 
 def _toml_string(value: str) -> str:
@@ -69,6 +69,15 @@ def _dataset_toml(path: str, *, max_images: int) -> str:
 
 
 def _optimizer_config(arm: str, lr: float) -> list[str]:
+    if arm == "adamw_fused":
+        return [
+            'type = "torch.optim.AdamW"',
+            f"lr = {lr!r}",
+            "betas = [0.9, 0.999]",
+            "weight_decay = 0.01",
+            "eps = 1.0e-8",
+            "fused = true",
+        ]
     if arm == "nekaon":
         return [
             'type = "kaon.Nekaon"',

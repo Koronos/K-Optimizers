@@ -2,8 +2,22 @@ import copy
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from kaon import Rakaon
+
+
+class _MaxOutputNumel(TorchDispatchMode):
+    def __init__(self):
+        self.max_numel = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        outputs = func(*args, **(kwargs or {}))
+        flat = outputs if isinstance(outputs, (tuple, list)) else (outputs,)
+        for output in flat:
+            if torch.is_tensor(output):
+                self.max_numel = max(self.max_numel, output.numel())
+        return outputs
 
 
 @pytest.mark.parametrize("shape", [(), (7,), (3, 5), (2, 3, 3, 3)])
@@ -27,6 +41,17 @@ def test_block_variance_matches_unpadded_reference(shape, block_size):
         torch.testing.assert_close(p, q)
         torch.testing.assert_close(p.grad, original, rtol=0, atol=0)
     assert opt.state[p]["variance"].numel() == len(variance)
+
+
+def test_oversized_block_does_not_pad_tiny_tensor():
+    p = torch.nn.Parameter(torch.ones(3))
+    p.grad = torch.ones_like(p)
+    opt = Rakaon([p], shrinkage=1, block_size=1_000_000, stochastic_rounding=False)
+    trace = _MaxOutputNumel()
+    with trace:
+        opt.step()
+    assert trace.max_numel < 1_000
+    assert opt.state[p]["variance"].numel() == 1
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

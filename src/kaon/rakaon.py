@@ -86,8 +86,11 @@ class Rakaon(SRSeedState, Optimizer):
             buckets.setdefault((p.device, p.dtype, p.shape), []).append(p)
         for params in buckets.values():
             elements = params[0].numel()
-            blocks = (elements + block_size - 1) // block_size
-            padded = blocks * block_size
+            # A tensor smaller than one block needs no padding. Requested block
+            # size controls partitioning, not an unbounded scratch allocation.
+            width = min(block_size, elements)
+            blocks = (elements + width - 1) // width
+            padded = blocks * width
             chunk_size = max(1, 262144 // padded)
             for offset in range(0, len(params), chunk_size):
                 chunk = params[offset:offset + chunk_size]
@@ -97,9 +100,9 @@ class Rakaon(SRSeedState, Optimizer):
                 g = torch.stack([p.grad.float().reshape(-1) for p in chunk])
                 if padded != elements:
                     g = torch.nn.functional.pad(g, (0, padded - elements))
-                g = g.reshape(len(chunk), blocks, block_size)
-                counts = g.new_full((blocks,), block_size)
-                counts[-1] = elements - (blocks - 1) * block_size
+                g = g.reshape(len(chunk), blocks, width)
+                counts = g.new_full((blocks,), width)
+                counts[-1] = elements - (blocks - 1) * width
                 energy = g.square().sum(-1) / counts
                 variance = torch.stack([state["variance"] for state in states])
                 beta = group["beta2"]

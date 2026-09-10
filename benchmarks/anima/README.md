@@ -84,3 +84,13 @@ frozen. The seeded launcher logs the parameter count actually given to optimizer
 Use the same DeepSpeed launch command with this config; it writes a full model
 checkpoint under `tmp/anima-full-smoke`, approximately 4 GB. Three steps only test
 integration and memory; they cannot establish full fine-tuning convergence.
+
+## Saved-adapter visual review
+
+`generate_visual_review.py SOURCE_MANIFEST --output-dir tmp/anima-visual-review`
+requires completed source runs and their exact final-step adapter checkpoints.
+Run its generated manifest with `run_comparison.py`. It loads those adapters and
+renders four fixed breed prompts at 512 px before the first training step. Review
+only `preview/*_step0.png`: the subsequent single training step exists to finish
+the trainer normally and is not part of the source experiment. These previews
+are qualitative checks, not a perceptual score or evidence of general superiority.
