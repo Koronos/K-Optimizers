@@ -60,6 +60,8 @@ def test_custom_eval_protocol_and_arm_subset(tmp_path: Path) -> None:
         ({"eval_every": 0}, "eval_every"),
         ({"steps": 201}, "multiple"),
         ({"lr": float("nan")}, "finite"),
+        ({"resolution": 1000}, "resolution"),
+        ({"resolution": True}, "resolution"),
     ],
 )
 def test_generator_rejects_unsafe_protocol_values(tmp_path: Path, kwargs: dict[str, object], message: str) -> None:
@@ -98,3 +100,21 @@ def test_momentum_recipe_changes_only_beta1(arm, beta1):
     candidate = tomllib.loads("\n".join(generator._optimizer_config(arm, .0001)))
     assert candidate.pop("beta1") == beta1
     assert candidate == base
+
+
+def test_low_lr_controls_and_1024_datasets(tmp_path):
+    manifest = generator.generate(
+        output_dir=tmp_path / "comparison", pets_root="/tmp/pets/subset",
+        steps=100, lr=1e-5, seed=45, previews=False, gap_threshold=None,
+        resolution=1024, arms=("nekaon_k0", "nekaon", "nekaon_sr_host"),
+    )
+    assert manifest["dataset"]["resolution"] == 1024
+    configs = {}
+    for arm in manifest["arms"]:
+        config = tomllib.loads(Path(arm["config"]).read_text())
+        configs[arm["arm"]] = config["optimizer"]
+        for path in [config["dataset"], *(d["config"] for d in config["eval_datasets"])]:
+            assert tomllib.loads(Path(path).read_text())["resolutions"] == [1024]
+    base = configs["nekaon"]
+    assert configs["nekaon_k0"] == {**base, "k": 0.0}
+    assert configs["nekaon_sr_host"] == {**base, "type": "benchmarks.nekaon_sr_offload.NekaonSROffload"}

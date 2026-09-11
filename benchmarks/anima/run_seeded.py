@@ -8,6 +8,7 @@ import hashlib
 import os
 import random
 import runpy
+import time
 
 import numpy as np
 import torch
@@ -56,6 +57,38 @@ def main():
         return groups
 
     CosmosPredict2Pipeline.get_param_groups = counted_groups
+    # Rengu's DeepSpeed resume checkpoint path does not enter optimizer.eval().
+    # Patch only this experimental class, in-process, around the ENTIRE save:
+    # switching views inside optimizer.state_dict would be too late for model data.
+    from benchmarks.anima.checkpoint_view import checkpoint_true_view
+    from benchmarks.nekaon_sr_offload import NekaonSROffload
+    from rengu_flow.utils.saver import Saver
+
+    save_checkpoint = Saver.save_checkpoint
+
+    def save_true_checkpoint(self, *args, **kwargs):
+        optimizer = self.model_engine.optimizer
+        if not isinstance(optimizer, NekaonSROffload):
+            return save_checkpoint(self, *args, **kwargs)
+        self._wait_async_export()
+        return checkpoint_true_view(optimizer, lambda: save_checkpoint(self, *args, **kwargs))
+
+    Saver.save_checkpoint = save_true_checkpoint
+    if os.environ.get("ANIMA_OPT_TIMING") == "1":
+        from kaon import Nekaon
+        original_step = Nekaon._step_impl
+
+        def timed_step(self, *args, **kwargs):
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            result = original_step(self, *args, **kwargs)
+            torch.cuda.synchronize()
+            seconds = time.perf_counter() - start
+            host_bytes = getattr(self, "host_snapshot_bytes", 0)
+            print(f"[optimizer diagnostic] seconds={seconds:.6f} host_snapshot_bytes={host_bytes}", flush=True)
+            return result
+
+        Nekaon._step_impl = timed_step
     runpy.run_module("rengu_flow.main", run_name="__main__")
 
 

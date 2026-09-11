@@ -54,7 +54,7 @@ def main():
                                       "runs": runs}, indent=2) + "\n")
     lines = ["# Anima / Pets pilot", "",
              f"Seed {manifest['protocol']['train_seed']}, constant LR {manifest['protocol']['lr']:g}, "
-             f"rank-16 LoRA, {manifest['protocol']['steps']} steps at 256px.",
+             f"rank-16 LoRA, {manifest['protocol']['steps']} steps at {manifest['dataset']['resolution']}px.",
              f"{manifest['dataset']['val']['max_images']} fixed images per evaluation split, nine noise quantiles.",
              "Initialization fingerprints match. This is a pilot, not a tuned ranking.", "",
              "| Optimizer | Train eval | Val | Raw gap | Change in gap | Active train s | Peak GiB |",
