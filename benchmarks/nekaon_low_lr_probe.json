@@ -1,0 +1,153 @@
+{
+  "device": "cuda",
+  "torch": "2.13.0+cu130",
+  "steps": 20,
+  "k": 1.5,
+  "scope": "Synthetic constant gradients, not a convergence or Anima gradient-effect measurement.",
+  "rows": [
+    {
+      "dtype": "torch.float32",
+      "magnitude": 1.0,
+      "lr": 0.0001,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 0.00014074917999096215,
+      "base_changed_fraction": 1.0
+    },
+    {
+      "dtype": "torch.float32",
+      "magnitude": 1.0,
+      "lr": 1e-05,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 1.408451316819992e-05,
+      "base_changed_fraction": 1.0
+    },
+    {
+      "dtype": "torch.float32",
+      "magnitude": 1.0,
+      "lr": 1e-06,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 1.411307380294602e-06,
+      "base_changed_fraction": 0.994140625
+    },
+    {
+      "dtype": "torch.float32",
+      "magnitude": 0.01,
+      "lr": 0.0001,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 0.00014074737555347383,
+      "base_changed_fraction": 1.0
+    },
+    {
+      "dtype": "torch.float32",
+      "magnitude": 0.01,
+      "lr": 1e-05,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 1.4074665159569122e-05,
+      "base_changed_fraction": 1.0
+    },
+    {
+      "dtype": "torch.float32",
+      "magnitude": 0.01,
+      "lr": 1e-06,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 1.4077130572331953e-06,
+      "base_changed_fraction": 1.0
+    },
+    {
+      "dtype": "torch.float32",
+      "magnitude": 0.001,
+      "lr": 0.0001,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 0.00014074744831304997,
+      "base_changed_fraction": 1.0
+    },
+    {
+      "dtype": "torch.float32",
+      "magnitude": 0.001,
+      "lr": 1e-05,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 1.4074745195102878e-05,
+      "base_changed_fraction": 1.0
+    },
+    {
+      "dtype": "torch.float32",
+      "magnitude": 0.001,
+      "lr": 1e-06,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 1.4074886394155328e-06,
+      "base_changed_fraction": 1.0
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "magnitude": 1.0,
+      "lr": 0.0001,
+      "represented_lookahead_fraction": 0.0,
+      "lookahead_rms": 0.0,
+      "base_changed_fraction": 0.2890625
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "magnitude": 1.0,
+      "lr": 1e-05,
+      "represented_lookahead_fraction": 0.0,
+      "lookahead_rms": 0.0,
+      "base_changed_fraction": 0.029296875
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "magnitude": 1.0,
+      "lr": 1e-06,
+      "represented_lookahead_fraction": 0.0,
+      "lookahead_rms": 0.0,
+      "base_changed_fraction": 0.001953125
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "magnitude": 0.01,
+      "lr": 0.0001,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 0.0001243219739990309,
+      "base_changed_fraction": 0.998046875
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "magnitude": 0.01,
+      "lr": 1e-05,
+      "represented_lookahead_fraction": 0.0,
+      "lookahead_rms": 0.0,
+      "base_changed_fraction": 0.95703125
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "magnitude": 0.01,
+      "lr": 1e-06,
+      "represented_lookahead_fraction": 0.0,
+      "lookahead_rms": 0.0,
+      "base_changed_fraction": 0.24609375
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "magnitude": 0.001,
+      "lr": 0.0001,
+      "represented_lookahead_fraction": 0.9921875,
+      "lookahead_rms": 0.0001416631566826254,
+      "base_changed_fraction": 1.0
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "magnitude": 0.001,
+      "lr": 1e-05,
+      "represented_lookahead_fraction": 0.98046875,
+      "lookahead_rms": 1.4633153114118613e-05,
+      "base_changed_fraction": 0.998046875
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "magnitude": 0.001,
+      "lr": 1e-06,
+      "represented_lookahead_fraction": 0.0,
+      "lookahead_rms": 0.0,
+      "base_changed_fraction": 0.904296875
+    }
+  ]
+}
