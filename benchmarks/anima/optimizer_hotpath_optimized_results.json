@@ -1,0 +1,34 @@
+[
+  {
+    "variant": "adakaon",
+    "fused": true,
+    "tensors": 896,
+    "parameters": 34635776,
+    "mean_step_ms": 3.572021149994953,
+    "cpu_operator_counts": {}
+  },
+  {
+    "variant": "k0",
+    "fused": true,
+    "tensors": 896,
+    "parameters": 34635776,
+    "mean_step_ms": 2.996276749996696,
+    "cpu_operator_counts": {}
+  },
+  {
+    "variant": "nekaon",
+    "fused": true,
+    "tensors": 896,
+    "parameters": 34635776,
+    "mean_step_ms": 7.038191999998844,
+    "cpu_operator_counts": {}
+  },
+  {
+    "variant": "nekaon_warning_disabled",
+    "fused": true,
+    "tensors": 896,
+    "parameters": 34635776,
+    "mean_step_ms": 4.364858399998184,
+    "cpu_operator_counts": {}
+  }
+]

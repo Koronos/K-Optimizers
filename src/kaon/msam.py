@@ -117,6 +117,11 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             the LR (and any schedule), the per-coordinate ``1/sqrt(v)`` metric, and the
             model's weight scale by construction — the transfer-robust formulation.
         eps: numerical floor on the momentum norm before dividing.
+        inert_check_interval: sample the inactivity warning every this many steps
+            (default 10, formerly every step). The heuristic observes at most the
+            first 200 climbs. Set 1 for the old diagnostic cadence; updates and
+            perturbations are unaffected. Transient changes between samples may
+            not be observed.
         **kwargs: forwarded verbatim to ``base_optimizer`` (e.g. ``lr``, ``betas``,
             ``cautious``, ``momentum_dtype``, ``gradient_centralization``, ``foreach``).
     """
@@ -128,10 +133,14 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         rho: float = 0.3,
         norm: str = "global",
         eps: float = 1e-12,
+        inert_check_interval: int = 10,
         **kwargs: Any,
     ) -> None:
         if eps < 0.0:
             raise ValueError(f"eps must be >= 0, got {eps}")
+        if isinstance(inert_check_interval, bool) or not isinstance(inert_check_interval, int) or inert_check_interval < 1:
+            raise ValueError("inert_check_interval must be a positive integer")
+        self.inert_check_interval = inert_check_interval
         if norm not in ("global", "tensor", "none"):
             raise ValueError(f"norm must be 'global', 'tensor' or 'none', got {norm!r}")
         self.norm = norm
@@ -291,8 +300,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
     # |dw|/|w| = 2.3e-5 moved the gradient by 1.8e-4 (0.018%), while |dw|/|w| = 3.7e-3
     # moved it by 2.1%. A climb under ~1e-4 relative samples nothing and is pure cost.
     _INERT_REL = 1e-4
-    # Warn only after the condition has held this many consecutive climbs, so an LR
-    # warmup (which legitimately starts near zero) does not trip it.
+    # Warn after sampled conditions span this many climbs; this is a heuristic,
+    # not a claim that every intervening step was inspected.
     _INERT_PATIENCE = 50
     # ...and stop looking after this many climbs either way: the check reads weights, so
     # leaving it armed for the whole run would cost bandwidth every step forever.
@@ -303,16 +312,20 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
 
     @torch.no_grad()
     def _warn_if_inert(self) -> None:
-        """Warn once when the climb is too small to perturb anything.
+        """Warn once when sampled weight scales suggest an ineffective climb.
 
-        Two regimes, both silent before this: the displacement can be under half a
-        low-precision ulp (unrepresentable — round-to-nearest drops it, stochastic
-        rounding would turn it into noise), or representable but so small that the
-        gradient at the perturbed point is indistinguishable from the true one. Either
-        way the mechanism is inert and ``rho``/``k`` is only costing time."""
+        This periodically sampled heuristic compares a displacement bound with a
+        representative ulp or relative weight scale. It does not inspect every
+        coordinate or measure whether the perturbed gradient actually changes.
+        """
         if self._inert_warned or self.rho == 0.0 or self._inert_checks >= self._INERT_MAX_CHECKS:
             return
         self._inert_checks += 1
+        # This heuristic converts device reductions to Python scalars. Sample
+        # periodically rather than synchronizing every optimizer step. Interval
+        # 1 retains the old cadence; it never changes the actual perturbation.
+        if self._inert_checks % self.inert_check_interval:
+            return
         msg = None
         for group in self.param_groups:
             params = [p for p in group["params"] if p.numel()][: self._INERT_SAMPLE]
@@ -357,22 +370,23 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             if dtype != torch.float32 and e < half_ulp:
                 msg = (
                     f"{type(self).__name__}: the lookahead displacement (<= {e:.2e}) is below "
-                    f"half a {dtype} ulp ({half_ulp:.2e}), so it cannot move the weights at all. "
+                    f"half a {dtype} ulp at the sampled mean weight scale ({half_ulp:.2e}); "
+                    f"some perturbations may round to zero. "
                     f"Use fp32 weights for these parameters, or set rho/k=0 to drop the cost."
                 )
             elif rel < self._INERT_REL:
                 msg = (
                     f"{type(self).__name__}: the lookahead displaces the weights by only "
                     f"{rel:.1e} relative (norm={self.norm!r}, lr={group['lr']:.2e}); below "
-                    f"~{self._INERT_REL:.0e} the perturbed gradient is indistinguishable from "
-                    f"the true one, so the mechanism is inert. {tip}"
+                    f"~{self._INERT_REL:.0e} this heuristic flags potentially inert lookahead. "
+                    f"It does not measure the gradient difference. {tip}"
                 )
             if msg is not None:
                 break
         if msg is None:
             self._inert_streak = 0
             return
-        self._inert_streak += 1
+        self._inert_streak += self.inert_check_interval
         if self._inert_streak >= self._INERT_PATIENCE:
             self._inert_warned = True
             warnings.warn(msg, stacklevel=3)

@@ -12,6 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--fused", action="store_true", help="Enable fused inner Adakaon in every arm")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     output = args.output.resolve()
@@ -23,6 +24,8 @@ def main():
     for index, k in enumerate((0.0, 1.5, 1.5, 0.0)):
         name = f"run{index}_k{k:g}"
         config = source
+        if args.fused:
+            config = config.replace("[optimizer]", "[optimizer]\nfused = true")
         replacements = {"run_name": f'"{name}"', "output_dir": f'"{output / name}"',
                         "max_steps": "4", "eval_before_first_step": "false",
                         "eval_every_n_steps": "999999", "k": str(k)}
