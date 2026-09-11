@@ -47,6 +47,10 @@ def main():
 
     def counted_groups(self, parameters):
         groups = get_groups(self, parameters)
+        if self.config["optimizer"]["type"] == "benchmarks.gram_lora.PairedGram":
+            from benchmarks.anima.gram_groups import pair_lora_groups
+            groups = pair_lora_groups(self.transformer, groups)
+            print(f"[anima comparison] gram_pairs={len(groups)} lora_scale=1", flush=True)
         count = sum(param.numel() for group in groups for param in group["params"])
         print(f"[anima comparison] optimizer_parameter_count={count}", flush=True)
         return groups

@@ -30,8 +30,24 @@ B=0; gradientes sin alterar; pérdida decreciente en un problema matricial
 pequeño; reanudación BF16 exacta en CPU/CUDA; gradiente parcial y damping inválido.
 La prueba pequeña no es difusión ni demuestra conservación de detalles.
 
-Pendiente: integración con pares LoRA explícitos de Rengu, comprobación del
-factor alpha/r del adapter, barrido de LR/damping, comparación Anima con
-inicialización idéntica y evaluación perceptual con prompts y ruido fijos.
+La integración Rengu usa los objetos PEFT para encontrar pares, preserva sus LR
+y exige alpha/r=1 en este piloto. Se rechazan parámetros no cubiertos, factores
+reutilizados y parejas separadas entre grupos. Pasaron 21 pruebas de prototipo,
+agrupación y configuración, incluida CUDA.
+
+El smoke Anima de tres pasos completó 448 pares (34,635,776 parámetros),
+con escala LoRA 1, pérdidas 0.116969/0.089265/0.127306 y pico CUDA 4.62 GiB.
+Guardó step3 correctamente. Los tiempos activos de los pasos fueron
+3.501/1.435/1.261 s; el primero incluye calentamiento. No son evidencia de
+convergencia ni un benchmark comparable a los ensayos largos de Pets.
+
+Se inició un barrido secuencial de cuatro corridas Anima/Pets: LR 0.001/0.01
+y damping 0.001/0.01, seed43, 200 pasos, evaluación antes de entrenar y cada100,
+32 imágenes por split, sin previews. Lanzador `benchmarks/anima/run_gram_screen.py`;
+planes, configs, logs y reportes en `tmp/anima-gram43`. Se detiene en el primer
+error para preservar el fallo. Es exploración, no confirmación independiente.
+
+Pendiente: resultados del barrido, comparación con inicialización idéntica y
+evaluación perceptual con prompts y ruido fijos, incluida conservación de detalles.
 No admite gradient-release por parámetro sin una adaptación para esperar ambos
 gradientes de cada par.

@@ -27,7 +27,7 @@ VAE = "/home/koronos/Rengu-Flow/tmp/models/qwen_image_vae.safetensors"
 LLM = "/home/koronos/Rengu-Flow/tmp/models/qwen_3_06b_base.safetensors"
 RFL_ROOT = "/home/koronos/Rengu-Flow"
 ARMS = ("nekaon", "adakaon", "rakaon_isotropic", "rakaon_block64", "adamw_fused",
-        "rakaon_m05", "rakaon_m09")
+        "rakaon_m05", "rakaon_m09", "gram_d001", "gram_d01")
 
 
 def _toml_string(value: str) -> str:
@@ -70,6 +70,10 @@ def _dataset_toml(path: str, *, max_images: int) -> str:
 
 
 def _optimizer_config(arm: str, lr: float) -> list[str]:
+    if arm in ("gram_d001", "gram_d01"):
+        return ['type = "benchmarks.gram_lora.PairedGram"', f"lr = {lr!r}",
+                "damping = " + ("0.001" if arm == "gram_d001" else "0.01"),
+                "stochastic_rounding = true"]
     if arm == "adamw_fused":
         return [
             'type = "torch.optim.AdamW"',
