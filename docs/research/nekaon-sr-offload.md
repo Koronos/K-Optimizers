@@ -49,7 +49,9 @@ initialization. Fixed train/validation evaluations use eight images per split
 and nine noise quantiles at steps 0, 50, and 100. The test split is untouched.
 The optimizer timing synchronization hook is disabled for these quality runs.
 
-No quality result is available yet. Stochastic activity alone is not evidence of
+The quality experiment has now completed; see `nekaon-lookahead-timing.md` and
+`benchmarks/anima/sr1024_results.json`. No useful quality improvement was observed.
+Stochastic activity alone is not evidence of
 useful lookahead: rare BF16-sized jumps may add noise. Compare validation loss,
 absolute train/validation gap, and active training time before selecting this
 approach. This small, single-seed screen cannot establish perceptual detail
