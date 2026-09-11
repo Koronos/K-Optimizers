@@ -47,7 +47,33 @@ y damping 0.001/0.01, seed43, 200 pasos, evaluación antes de entrenar y cada100
 planes, configs, logs y reportes en `tmp/anima-gram43`. Se detiene en el primer
 error para preservar el fallo. Es exploración, no confirmación independiente.
 
-Pendiente: resultados del barrido, comparación con inicialización idéntica y
-evaluación perceptual con prompts y ruido fijos, incluida conservación de detalles.
+## Barrido terminado
+
+Las cuatro corridas finalizaron con checkpoint y evaluación del paso200.
+Se verificó coincidencia de modelo, dataset, huella de los adapters y pérdidas
+iniciales con las referencias de seed43. Reportes:
+[LR0.001](../../benchmarks/anima/gram43_lr0_results.md) y
+[LR0.01](../../benchmarks/anima/gram43_lr1_results.md), con JSON completos contiguos.
+
+| LR | Damping | Validation | Gap absoluto | Tiempo activo s | Pico GiB |
+|---|---|---:|---:|---:|---:|
+| 0.001 | 0.001 | 0.133673 | 0.010835 | 301.0 | 4.624 |
+| 0.001 | 0.01 | 0.134747 | 0.010814 | 407.5 | 4.624 |
+| 0.01 | 0.001 | 0.133006 | 0.010526 | 469.0 | 4.624 |
+| 0.01 | 0.01 | 0.132821 | 0.010490 | 346.1 | 4.624 |
+
+El mejor validation final de Gram queda ligeramente por encima de Nekaon
+(0.132597, gap0.009018, 196.0s, 4.652GiB). Frente a Rakaon isotropic
+(0.133067, gap0.009335, 181.4s, 4.624GiB), reduce algo validation pero empeora
+gap y tiempo observado. No se demuestra ventaja global ni se cumplen los
+umbrales originales. La variación temporal entre corridas exige cautela por
+temperatura/carga del portátil; no fueron ensayos intercalados de throughput.
+Los protocolos tienen distinta frecuencia de evaluación, excluida del tiempo
+activo. Un menor cambio del gap respecto al paso0 no sustituye al gap absoluto.
+
+La versión probada es SGD Gram con damping absoluto y solves por pareja,
+sin momentum ni optimización de kernels; no equivale al método Riemannion completo.
+Pendiente: evaluación perceptual con prompts y ruido fijos, incluida conservación
+de detalles. Estas pérdidas no permiten concluir si los detalles mejoraron.
 No admite gradient-release por parámetro sin una adaptación para esperar ambos
 gradientes de cada par.
