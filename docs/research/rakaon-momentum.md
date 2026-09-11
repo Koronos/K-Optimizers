@@ -37,16 +37,35 @@ Los tiempos de la tabla son acumulaciones medidas, no estimaciones de throughput
 Estado lógico no es pico de VRAM; el buffer FP32 agrega aproximadamente 4 bytes
 por parámetro.
 
-## Ensayo real iniciado
+## Ensayo real completado
 
 Anima/Pets seed43, LoRA rank16, 256px, 200 pasos, LR constante 0.0001,
 beta1=0.5, 32 imágenes por split de evaluación y previews desactivados.
 La receta cambia solo beta1 respecto a Rakaon isotropic. Se evalúa antes de
 entrenar y cada50 pasos; la frecuencia cambia frente a la referencia previa
 que evaluó al principio y al final. La evaluación aísla/restaura RNG.
-Se verificará la huella inicial y las pérdidas iniciales antes de comparar.
+La huella inicial y las pérdidas iniciales coinciden con la referencia sin momentum
+y Nekaon de seed43.
 El mayor coste de evaluación debe aparecer en el tiempo total, separado del
 tiempo activo. La búsqueda de LR del proxy no se transfiere como receta Anima.
+
+Resultados finales ([reporte completo](../../benchmarks/anima/momentum43_results.md)):
+
+| Variante | Validation | Gap absoluto | Tiempo activo s | Pico GiB |
+|---|---:|---:|---:|---:|
+| Rakaon sin momentum | 0.133067 | 0.009335 | 181.4 | 4.624 |
+| Rakaon beta1=0.5 | 0.132970 | 0.009158 | 204.1 | 4.763 |
+| Nekaon | 0.132597 | 0.009018 | 196.0 | 4.652 |
+
+Momentum mejora levemente validation y gap respecto a Rakaon sin momentum,
+pero consume más tiempo activo y memoria. No supera a Nekaon en los endpoints
+medidos. Una semilla no establece significancia ni justifica añadir momentum
+FP32 como configuración recomendada. La frecuencia de evaluación y condiciones
+térmicas pueden afectar tiempos; no son comparaciones intercaladas.
+La curva validation del candidato en pasos 50/100/150/200 fue
+0.133415/0.133264/0.133701/0.132970. No alcanzó antes la pérdida final de la
+referencia sin momentum en los checkpoints observados. Tampoco cumplió los
+umbrales originales de pérdida y gap. No se midió calidad perceptual aquí.
 
 La implementación Gram sigue pendiente: esta ablación permite evaluar el primer
 mecanismo antes de combinarlo con cambios de parametrización.
