@@ -1,6 +1,7 @@
 """K-Optimizers (``kaon``) — memory-efficient PyTorch optimizers for diffusion.
 
 Optimizers:
+    Rakaon: experimental momentum-free variance shrinkage, with a scalar-state mode.
     Adakaon: conv-aware factored optimizer (AdamW-quality at Adafactor memory).
     AdaMuon: orthogonalized momentum + factored quantized variance (Adafactor memory).
     KProdigy: memory-efficient parameter-free Prodigy (D-adaptation).
@@ -42,6 +43,7 @@ from kaon.lion import Lion
 from kaon.lookahead import Lookahead
 from kaon.msam import MSAM
 from kaon.nekaon import Nekaon
+from kaon.rakaon import Rakaon
 from kaon.sam import SAM
 from kaon.schedulefree import ScheduleFree
 
@@ -57,6 +59,7 @@ __all__ = [
     "Lookahead",
     "MSAM",
     "Nekaon",
+    "Rakaon",
     "SAM",
     "ScheduleFree",
     "__version__",

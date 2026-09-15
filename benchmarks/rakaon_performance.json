@@ -1,0 +1,186 @@
+{
+  "device": "NVIDIA RTX 3000 Ada Generation Laptop GPU",
+  "torch": "2.13.0+cu130",
+  "runs": [
+    {
+      "optimizer": "AdamW-fused",
+      "regime": "unet128",
+      "dtype": "torch.float32",
+      "median_step_ms": 0.5635985007756972,
+      "state_bpp": 8.000065317134212,
+      "persistent_allocated_bytes": 22823936,
+      "step_extra_peak_bytes": 0
+    },
+    {
+      "optimizer": "Adakaon",
+      "regime": "unet128",
+      "dtype": "torch.float32",
+      "median_step_ms": 7.313936500395357,
+      "state_bpp": 0.03209485183837559,
+      "persistent_allocated_bytes": 94208,
+      "step_extra_peak_bytes": 14218752
+    },
+    {
+      "optimizer": "Nekaon",
+      "regime": "unet128",
+      "dtype": "torch.float32",
+      "median_step_ms": 20.487681500526378,
+      "state_bpp": 0.5633478581127253,
+      "persistent_allocated_bytes": 1645056,
+      "step_extra_peak_bytes": 30470656
+    },
+    {
+      "optimizer": "Rakaon-0.1",
+      "regime": "unet128",
+      "dtype": "torch.float32",
+      "median_step_ms": 13.399476999438775,
+      "state_bpp": 0.03209485183837559,
+      "persistent_allocated_bytes": 94208,
+      "step_extra_peak_bytes": 9701376
+    },
+    {
+      "optimizer": "Rakaon-1",
+      "regime": "unet128",
+      "dtype": "torch.float32",
+      "median_step_ms": 12.243299499459681,
+      "state_bpp": 6.53171342107365e-05,
+      "persistent_allocated_bytes": 23552,
+      "step_extra_peak_bytes": 7343616
+    },
+    {
+      "optimizer": "AdamW-fused",
+      "regime": "adapter_bag",
+      "dtype": "torch.float32",
+      "median_step_ms": 1.0285480002494296,
+      "state_bpp": 8.03125,
+      "persistent_allocated_bytes": 786432,
+      "step_extra_peak_bytes": 0
+    },
+    {
+      "optimizer": "Adakaon",
+      "regime": "adapter_bag",
+      "dtype": "torch.float32",
+      "median_step_ms": 3.503348500089487,
+      "state_bpp": 0.75,
+      "persistent_allocated_bytes": 524288,
+      "step_extra_peak_bytes": 937984
+    },
+    {
+      "optimizer": "Nekaon",
+      "regime": "adapter_bag",
+      "dtype": "torch.float32",
+      "median_step_ms": 6.137518999821623,
+      "state_bpp": 1.28125,
+      "persistent_allocated_bytes": 1060864,
+      "step_extra_peak_bytes": 1787904
+    },
+    {
+      "optimizer": "Rakaon-0.1",
+      "regime": "adapter_bag",
+      "dtype": "torch.float32",
+      "median_step_ms": 204.65355400028784,
+      "state_bpp": 0.75,
+      "persistent_allocated_bytes": 524288,
+      "step_extra_peak_bytes": 3584
+    },
+    {
+      "optimizer": "Rakaon-1",
+      "regime": "adapter_bag",
+      "dtype": "torch.float32",
+      "median_step_ms": 2.693348999855516,
+      "state_bpp": 0.03125,
+      "persistent_allocated_bytes": 262144,
+      "step_extra_peak_bytes": 532480
+    },
+    {
+      "optimizer": "AdamW-fused",
+      "regime": "unet128",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 0.29941399952804204,
+      "state_bpp": 4.000065317134211,
+      "persistent_allocated_bytes": 11303936,
+      "step_extra_peak_bytes": 0
+    },
+    {
+      "optimizer": "Adakaon",
+      "regime": "unet128",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 9.670739000284811,
+      "state_bpp": 0.03209485183837559,
+      "persistent_allocated_bytes": 94208,
+      "step_extra_peak_bytes": 16577024
+    },
+    {
+      "optimizer": "Nekaon",
+      "regime": "unet128",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 22.56487249997008,
+      "state_bpp": 0.5633478581127253,
+      "persistent_allocated_bytes": 1645056,
+      "step_extra_peak_bytes": 30470656
+    },
+    {
+      "optimizer": "Rakaon-0.1",
+      "regime": "unet128",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 23.944684999150923,
+      "state_bpp": 0.03209485183837559,
+      "persistent_allocated_bytes": 94208,
+      "step_extra_peak_bytes": 11798528
+    },
+    {
+      "optimizer": "Rakaon-1",
+      "regime": "unet128",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 11.765650499910407,
+      "state_bpp": 6.53171342107365e-05,
+      "persistent_allocated_bytes": 23552,
+      "step_extra_peak_bytes": 9439232
+    },
+    {
+      "optimizer": "AdamW-fused",
+      "regime": "adapter_bag",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 1.8299254998055403,
+      "state_bpp": 4.03125,
+      "persistent_allocated_bytes": 786432,
+      "step_extra_peak_bytes": 0
+    },
+    {
+      "optimizer": "Adakaon",
+      "regime": "adapter_bag",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 4.983646999789926,
+      "state_bpp": 0.75,
+      "persistent_allocated_bytes": 524288,
+      "step_extra_peak_bytes": 1067008
+    },
+    {
+      "optimizer": "Nekaon",
+      "regime": "adapter_bag",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 8.999763500469271,
+      "state_bpp": 1.28125,
+      "persistent_allocated_bytes": 1060864,
+      "step_extra_peak_bytes": 1787904
+    },
+    {
+      "optimizer": "Rakaon-0.1",
+      "regime": "adapter_bag",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 261.3416280009915,
+      "state_bpp": 0.75,
+      "persistent_allocated_bytes": 524288,
+      "step_extra_peak_bytes": 4096
+    },
+    {
+      "optimizer": "Rakaon-1",
+      "regime": "adapter_bag",
+      "dtype": "torch.bfloat16",
+      "median_step_ms": 10.811809000188077,
+      "state_bpp": 0.03125,
+      "persistent_allocated_bytes": 262144,
+      "step_extra_peak_bytes": 663552
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "runs": [
+    {
+      "run_dir": "tmp/anima-full-smoke/20260909_18-33-10",
+      "event_files": [
+        "tmp/anima-full-smoke/20260909_18-33-10/events.out.tfevents.1788978790.SW-Machine.740.0"
+      ],
+      "tags": [
+        "train/loss"
+      ],
+      "train_eval": {
+        "tag": null,
+        "points": null
+      },
+      "val": {
+        "tag": null,
+        "points": null
+      },
+      "gap": {
+        "definition": "val - train_eval",
+        "points": null
+      },
+      "excess_gap": {
+        "definition": "(val_t - train_eval_t) - (val_0 - train_eval_0)",
+        "points": null,
+        "note": "Descriptive baseline adjustment, not an unbiased generalization bound."
+      },
+      "checkpoint_value_quantiles": {
+        "train_eval": null,
+        "val": null,
+        "gap": null
+      },
+      "evaltime": null,
+      "timings": null,
+      "memory": null,
+      "bench_csv": [
+        {
+          "file": "tmp/anima-full-smoke/20260909_18-33-10/bench_steps.csv",
+          "points": [
+            {
+              "step": 1,
+              "active_train_seconds": 9.7205,
+              "cuda_peak_gb": 1.545
+            },
+            {
+              "step": 2,
+              "active_train_seconds": 13.685599999999999,
+              "cuda_peak_gb": 1.558
+            },
+            {
+              "step": 3,
+              "active_train_seconds": 16.906599999999997,
+              "cuda_peak_gb": 1.558
+            }
+          ],
+          "note": "Training batch duration excludes evaluation and previews; peak includes prior allocations."
+        }
+      ],
+      "scalars": {
+        "train/loss": [
+          {
+            "step": 1,
+            "value": 0.11696895956993103,
+            "wall_time": 1788978800.159784
+          },
+          {
+            "step": 2,
+            "value": 0.10912168025970459,
+            "wall_time": 1788978804.1406615
+          },
+          {
+            "step": 3,
+            "value": 0.1542992889881134,
+            "wall_time": 1788978807.3779786
+          }
+        ]
+      }
+    }
+  ]
+}

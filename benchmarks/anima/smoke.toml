@@ -1,0 +1,51 @@
+# Real Anima/Cosmos Predict2 smoke: 3 steps, one 256px image per micro-batch.
+# Run from WSL with the command documented in benchmarks/anima/README.md.
+
+dataset = "/mnt/c/Users/Koronos/Documents/Repos/K-Optimizers/.worktrees/diffusion-optimizer/benchmarks/anima/smoke_dataset.toml"
+output_dir = "/mnt/c/Users/Koronos/Documents/Repos/K-Optimizers/.worktrees/diffusion-optimizer/tmp/anima-smoke"
+max_steps = 3
+epochs = 999
+micro_batch_size_per_gpu = 1
+gradient_accumulation_steps = 1
+pipeline_stages = 1
+activation_checkpointing = true
+reentrant_activation_checkpointing = true
+compile = false
+blocks_to_swap = 0
+logging_steps = 1
+caching_batch_size = 1
+save_every_n_steps = 999
+save_every_n_epochs = 999
+bench = true
+warmup_steps = 0
+lr_scheduler = "constant"
+
+[model]
+type = "cosmos_predict2"
+dtype = "bfloat16"
+cache_text_embeddings = true
+transformer_path = "/home/koronos/Rengu-Flow/tmp/models/anima-base-v1.0.safetensors"
+vae_path = "/home/koronos/Rengu-Flow/tmp/models/qwen_image_vae.safetensors"
+llm_path = "/home/koronos/Rengu-Flow/tmp/models/qwen_3_06b_base.safetensors"
+llm_adapter_lr = 0
+
+[adapter]
+type = "lora"
+rank = 16
+
+[optimizer]
+type = "kaon.Rakaon"
+lr = 1.0e-4
+beta2 = 0.999
+shrinkage = 1.0
+clip_threshold = 1.0
+weight_decay = 0.0
+eps = 1.0e-30
+stochastic_rounding = true
+
+[preview]
+enabled = false
+
+[monitoring]
+enable_wandb = false
+enable_status_file = false

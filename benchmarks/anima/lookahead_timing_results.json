@@ -1,0 +1,78 @@
+[
+  {
+    "name": "run0_k0",
+    "k": 0.0,
+    "step_seconds": [
+      27.548,
+      25.721,
+      26.469,
+      22.113
+    ],
+    "optimizer_seconds": [
+      1.473118,
+      1.680743,
+      1.633751,
+      0.472647
+    ],
+    "median_step_after_first": 25.721,
+    "median_optimizer_after_first": 1.633751,
+    "telemetry_before": "44, 13.76 W, 1530 MHz, 0 MiB"
+  },
+  {
+    "name": "run1_k1.5",
+    "k": 1.5,
+    "step_seconds": [
+      25.125,
+      26.177,
+      25.272,
+      23.842
+    ],
+    "optimizer_seconds": [
+      1.215616,
+      1.734288,
+      0.326865,
+      1.609101
+    ],
+    "median_step_after_first": 25.272,
+    "median_optimizer_after_first": 1.609101,
+    "telemetry_before": "56, 15.06 W, 1530 MHz, 0 MiB"
+  },
+  {
+    "name": "run2_k1.5",
+    "k": 1.5,
+    "step_seconds": [
+      28.042,
+      26.107,
+      25.498,
+      24.11
+    ],
+    "optimizer_seconds": [
+      1.296937,
+      1.71561,
+      0.316686,
+      1.779079
+    ],
+    "median_step_after_first": 25.498,
+    "median_optimizer_after_first": 1.71561,
+    "telemetry_before": "58, 15.14 W, 1530 MHz, 0 MiB"
+  },
+  {
+    "name": "run3_k0",
+    "k": 0.0,
+    "step_seconds": [
+      25.921,
+      26.579,
+      27.582,
+      22.728
+    ],
+    "optimizer_seconds": [
+      1.161742,
+      1.830953,
+      1.750143,
+      0.476215
+    ],
+    "median_step_after_first": 26.579,
+    "median_optimizer_after_first": 1.750143,
+    "telemetry_before": "56, 14.57 W, 1530 MHz, 0 MiB"
+  }
+]

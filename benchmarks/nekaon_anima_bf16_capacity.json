@@ -1,0 +1,38 @@
+{
+  "checkpoint": "tmp/anima-confirm43/runs/nekaon/anima_pets_nekaon_20260909_18-37-22/step200/adapter_model.safetensors",
+  "k": 1.5,
+  "clip_threshold": 1,
+  "caveat": "Upper bound using maximum allowed displacement, NOT actual momentum or gradient change. Frozen llm_adapter excluded.",
+  "results": {
+    "0.0001": {
+      "A": {
+        "parameters": 14106624,
+        "maximum_movable_fraction": 0.999807749891115
+      },
+      "B": {
+        "parameters": 20529152,
+        "maximum_movable_fraction": 1.0
+      }
+    },
+    "1e-05": {
+      "A": {
+        "parameters": 14106624,
+        "maximum_movable_fraction": 0.21902915963450928
+      },
+      "B": {
+        "parameters": 20529152,
+        "maximum_movable_fraction": 0.9879301882513218
+      }
+    },
+    "1e-06": {
+      "A": {
+        "parameters": 14106624,
+        "maximum_movable_fraction": 0.027323617613966317
+      },
+      "B": {
+        "parameters": 20529152,
+        "maximum_movable_fraction": 0.29619869344822425
+      }
+    }
+  }
+}

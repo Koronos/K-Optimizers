@@ -1,0 +1,8 @@
+# The repository's versioned 12-image CC0 fixture, at a fixed 256px bucket.
+resolutions = [256]
+enable_ar_bucket = false
+frame_buckets = [1]
+
+[[directory]]
+path = "/home/koronos/Rengu-Flow/tests/fixtures/smoke_cc0/images"
+num_repeats = 1

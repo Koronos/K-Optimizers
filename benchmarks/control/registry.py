@@ -16,9 +16,19 @@ from __future__ import annotations
 
 import torch
 
-from kaon import Adakaon, AdamP, AdaMuon, AdaPNM, Lion, Nekaon, ScheduleFree
+from kaon import Adakaon, AdamP, AdaMuon, AdaPNM, Lion, Nekaon, Rakaon, ScheduleFree
 
 OPTIMIZERS = {
+    "Rakaon (experimental)": dict(
+        make=lambda p, lr: Rakaon(p, lr=lr, shrinkage=.1),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="experimental variance shrinkage; no demonstrated quality advantage",
+    ),
+    "Rakaon-isotropic (experimental)": dict(
+        make=lambda p, lr: Rakaon(p, lr=lr, shrinkage=1.),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="experimental scalar RMS state per tensor; quality requires validation",
+    ),
     # --- reference baseline ---
     "torch.AdamW (fused)": dict(
         make=lambda p, lr: torch.optim.AdamW(p, lr=lr, betas=(0.9, 0.999), fused=True),
