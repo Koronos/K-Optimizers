@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from kaon import Adakaon, AdamP, AdaMuon, AdaPNM, Lion, Nekaon, Rakaon, ScheduleFree
+from kaon import Adakaon, AdamP, AdaMuon, AdaPNM, Antikaon, Lion, Nekaon, Rakaon, ScheduleFree
 
 OPTIMIZERS = {
     "Rakaon (experimental)": dict(
@@ -81,6 +81,24 @@ OPTIMIZERS = {
         make=lambda p, lr: Adakaon(p, lr=lr, betas=(0.0, 0.999), cautious=False, momentum_dtype="bfloat16"),
         lr=6e-4, lr_const=1.2e-3, family="in-house",
         blurb="factored Adam, no momentum (minimum VRAM, regularizing)",
+    ),
+    # Antikaon = Adakaon-nomom (above: same base, same LRs) + seeded Anti-PGD/RWP noise carried in
+    # the live weights. Scored at the clean iterate: evald() brackets every measurement with
+    # opt.eval()/opt.train() (the train-mode loss is at the perturbed point). The variants are the
+    # arms of docs/research/antikaon-design.md §6 (B1-B3 radius sweep, C1-C3 ablations); the
+    # default k_sigma=5 is the design prior, not a measured optimum.
+    "Antikaon": dict(
+        make=lambda p, lr: Antikaon(p, lr=lr, k_sigma=5.0),
+        lr=6e-4, lr_const=1.2e-3, family="in-house",
+        blurb="momentum-free Adakaon + seeded Anti-PGD/RWP noise in the weights (zero-state flat-minima; experimental)",
+        variants={
+            "B1 k_sigma=1.5": lambda p, lr: Antikaon(p, lr=lr, k_sigma=1.5),
+            "B2 k_sigma=5": lambda p, lr: Antikaon(p, lr=lr, k_sigma=5.0),
+            "B3 k_sigma=15": lambda p, lr: Antikaon(p, lr=lr, k_sigma=15.0),
+            "C1 k_sigma=5 shape=none": lambda p, lr: Antikaon(p, lr=lr, k_sigma=5.0, shape="none"),
+            "C2 k_sigma=5 antithetic": lambda p, lr: Antikaon(p, lr=lr, k_sigma=5.0, antithetic=True),
+            "C3 k_sigma=5 sigma_ref=weight": lambda p, lr: Antikaon(p, lr=lr, k_sigma=5.0, sigma_ref="weight"),
+        },
     ),
     "Adakaon-bf16": dict(
         make=lambda p, lr: Adakaon(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="bfloat16"),

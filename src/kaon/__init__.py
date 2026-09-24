@@ -17,6 +17,8 @@ Optimizers:
         zero extra passes / zero extra state (wrapper).
     Nekaon: Adakaon + k-step negative momentum-lookahead — the in-house flat-minima flagship
         (gradient evaluated k steps ahead at zero extra cost; beta1 = the loss<->gap regime knob).
+    Antikaon: momentum-free Adakaon + seeded Anti-PGD/RWP perturbation carried in the weights
+        (zero-state flat-minima regularizer; experimental).
 
 Quickstart::
 
@@ -38,6 +40,7 @@ from kaon.adamp import AdamP
 from kaon.adamuon import AdaMuon
 from kaon.adapnm import AdaPNM
 from kaon.adopt import ADOPT
+from kaon.antikaon import Antikaon
 from kaon.kprodigy import KProdigy
 from kaon.lion import Lion
 from kaon.lookahead import Lookahead
@@ -54,6 +57,7 @@ __all__ = [
     "AdaPNM",
     "Adakaon",
     "AdamP",
+    "Antikaon",
     "KProdigy",
     "Lion",
     "Lookahead",
