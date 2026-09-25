@@ -1,0 +1,70 @@
+kaon: C:\Users\Koronos\AppData\Local\Temp\claude\C--Users-Koronos-Documents-Repos-K-Optimizers\78593ade-87c4-49ac-91af-2d6bea9fb51a\scratchpad\bisect\3c1cfc6\src\kaon\__init__.py
+torch: 2.12.0+cu130 cuda: 13.0
+name, power.limit [W], power.draw [W], clocks.max.sm [MHz], clocks.current.sm [MHz], temperature.gpu, utilization.gpu [%]
+NVIDIA RTX 3000 Ada Generation Laptop GPU, [N/A], 5.74 W, 3105 MHz, 210 MHz, 56, 0 %
+=== writer isolated (2^22 elements) === @ 2026-09-24 20:28:11
+writer done @ 2026-09-24 20:28:11
+
+=== full step (SR / kahan / kahan8, native / foreach / fused) ===
+start: big 2x(1024,1200) / no_momentum (beta1=0)  @ 2026-09-24 20:28:11
+SMI 5.74 W, 210 MHz, 56, 0x0000000000000001
+done: big 2x(1024,1200) / no_momentum (beta1=0)  @ 2026-09-24 20:28:14
+  native   stochastic_rounding    median=1.3604 ms [1.2462, 1.5780]
+  native   kahan                  median=1.4223 ms [1.3404, 1.7357]
+  native   kahan8                 median=1.3972 ms [1.2728, 1.6148]
+  foreach  stochastic_rounding    median=0.8550 ms [0.8141, 1.0721]
+  foreach  kahan8                 median=0.8760 ms [0.8479, 1.0752]
+  fused    stochastic_rounding    median=0.4623 ms [0.3236, 0.5622]
+  fused    kahan8                 median=0.4572 ms [0.3205, 0.5519]
+start: big 2x(1024,1200) / momentum_4bit  @ 2026-09-24 20:28:14
+SMI 18.21 W, 1830 MHz, 60, 0x0000000000000001
+done: big 2x(1024,1200) / momentum_4bit  @ 2026-09-24 20:28:14
+  native   stochastic_rounding    median=2.7884 ms [2.3398, 3.7990]
+  native   kahan                  median=2.8964 ms [2.3511, 3.7816]
+  native   kahan8                 median=2.7397 ms [2.3951, 3.3126]
+  foreach  stochastic_rounding    median=1.6517 ms [1.4377, 2.2477]
+  foreach  kahan8                 median=1.6527 ms [1.4602, 2.3306]
+  fused    stochastic_rounding    median=0.3087 ms [0.2744, 0.5304]
+  fused    kahan8                 median=0.3241 ms [0.2867, 0.5683]
+start: LoRA bag 512x r=16 dims 320-1280 / no_momentum (beta1=0)  @ 2026-09-24 20:28:14
+SMI 26.83 W, 1830 MHz, 60, 0x0000000000000001
+done: LoRA bag 512x r=16 dims 320-1280 / no_momentum (beta1=0)  @ 2026-09-24 20:29:56
+  native   stochastic_rounding    median=412.0950 ms [342.1962, 485.1763]
+  native   kahan                  median=459.2753 ms [379.3357, 489.7126]
+  native   kahan8                 median=434.9686 ms [374.6028, 466.9798]
+  foreach  stochastic_rounding    median=538.7540 ms [491.3408, 593.1571]
+  foreach  kahan8                 median=559.5095 ms [520.0118, 642.9205]
+  fused    stochastic_rounding    median=88.8305 ms [77.6940, 96.9943]
+  fused    kahan8                 median=90.2477 ms [81.0363, 106.4632]
+start: LoRA bag 512x r=16 dims 320-1280 / momentum_4bit  @ 2026-09-24 20:29:56
+SMI 12.61 W, 1095 MHz, 56, 0x0000000000000001
+done: LoRA bag 512x r=16 dims 320-1280 / momentum_4bit  @ 2026-09-24 20:33:12
+  native   stochastic_rounding    median=852.3177 ms [783.0354, 911.1317]
+  native   kahan                  median=886.7896 ms [768.3502, 975.2965]
+  native   kahan8                 median=876.5532 ms [742.6601, 903.9268]
+  foreach  stochastic_rounding    median=1096.4936 ms [1010.1268, 1160.1531]
+  foreach  kahan8                 median=1160.6661 ms [1085.6407, 1259.4545]
+  fused    stochastic_rounding    median=155.8477 ms [130.1289, 181.6791]
+  fused    kahan8                 median=161.2605 ms [132.7636, 175.0006]
+start: UNet-ish 8x(1024,1024)+16x(4096,) / no_momentum (beta1=0)  @ 2026-09-24 20:33:12
+SMI 10.48 W, 735 MHz, 56, 0x0000000000000001
+done: UNet-ish 8x(1024,1024)+16x(4096,) / no_momentum (beta1=0)  @ 2026-09-24 20:33:14
+  native   stochastic_rounding    median=11.8328 ms [11.1821, 14.2397]
+  native   kahan                  median=13.7718 ms [12.6505, 16.7096]
+  native   kahan8                 median=12.0003 ms [10.9496, 13.5741]
+  foreach  stochastic_rounding    median=4.1713 ms [4.1093, 4.2578]
+  foreach  kahan8                 median=4.4785 ms [4.4042, 4.6162]
+  fused    stochastic_rounding    median=0.5868 ms [0.5396, 0.6298]
+  fused    kahan8                 median=0.6733 ms [0.6042, 0.6943]
+start: UNet-ish 8x(1024,1024)+16x(4096,) / momentum_4bit  @ 2026-09-24 20:33:14
+SMI 40.78 W, 1995 MHz, 61, 0x0000000000000000
+done: UNet-ish 8x(1024,1024)+16x(4096,) / momentum_4bit  @ 2026-09-24 20:33:19
+  native   stochastic_rounding    median=28.7555 ms [25.4730, 40.2289]
+  native   kahan                  median=31.9657 ms [26.3137, 39.7292]
+  native   kahan8                 median=30.7722 ms [25.2836, 43.3265]
+  foreach  stochastic_rounding    median=9.4254 ms [8.7859, 11.8682]
+  foreach  kahan8                 median=10.1299 ms [8.4818, 11.0868]
+  fused    stochastic_rounding    median=0.7148 ms [0.6656, 0.8212]
+  fused    kahan8                 median=0.7516 ms [0.7168, 0.8847]
+
+total wall time: 307.3 s
