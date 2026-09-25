@@ -134,6 +134,7 @@ class Nekaon(AutoLRMixin, MSAM):
         auto_lr_scale: float = 1.0,
         auto_lr_fuse_rel: float = DEFAULT_FUSE_REL,
         auto_lr_d0: float | None = None,
+        lr_servo: bool = False,
         **adakaon_kwargs: Any,
     ) -> None:
         if k < 0.0:
@@ -177,6 +178,7 @@ class Nekaon(AutoLRMixin, MSAM):
                 "low-VRAM lr ratio. Use one or the other."
             )
         # Composable continuous Mechanic LR via AutoLRMixin. off -> zero overhead.
+        self._init_lr_servo(lr_servo)
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     # step() is the AutoLRMixin router; _step_impl is the full Nekaon step (SAM declimb ->

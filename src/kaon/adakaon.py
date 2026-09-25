@@ -215,6 +215,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         auto_lr_scale: float = 1.0,
         auto_lr_fuse_rel: float = DEFAULT_FUSE_REL,
         auto_lr_d0: float | None = None,
+        lr_servo: bool = False,
     ) -> None:
         beta1, beta2 = float(betas[0]), float(betas[1])
         if not 0.0 <= beta1 < 1.0:
@@ -289,6 +290,7 @@ class Adakaon(AutoLRMixin, Optimizer):
         # Optional continuous Mechanic step-size controller. It owns group["lr"] while
         # adapting and drives the base update through _step_impl.
         # Off (default) -> zero overhead, step == _step_impl.
+        self._init_lr_servo(lr_servo)
         self._init_autolr(auto_lr, auto_lr_scale, auto_lr_fuse_rel, auto_lr_d0)
 
     def _invalidate_fused_caches(self) -> None:

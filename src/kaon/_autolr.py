@@ -16,6 +16,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from kaon._lr_servo import LRServoMixin
+
 __all__ = ["AutoLRMixin", "AutoLRTuner", "DEFAULT_FUSE_REL"]
 
 DEFAULT_FUSE_REL: float = 20.0
@@ -426,7 +428,7 @@ class AutoLRTuner:
         self._set_group_lr(self.S)
 
 
-class AutoLRMixin:
+class AutoLRMixin(LRServoMixin):
     """Attach continuous Mechanic AutoLR to a Kaon optimizer."""
 
     _autolr: AutoLRTuner | None
@@ -438,6 +440,12 @@ class AutoLRMixin:
         fuse_rel: float,
         d0: float | None = None,
     ) -> None:
+        # External AutoLRMixin subclasses from 0.7.5 only call this initializer.
+        # Keep them source-compatible with the separately opt-in servo.
+        if not hasattr(self, "_lr_servo"):
+            self._lr_servo = None
+        if auto_lr and self._lr_servo is not None:
+            raise ValueError("auto_lr and lr_servo are mutually exclusive")
         self._autolr = (
             AutoLRTuner(self, scale=scale, fuse_rel=fuse_rel, d0=d0)  # type: ignore[arg-type]
             if auto_lr
@@ -448,7 +456,7 @@ class AutoLRMixin:
     def step(self, closure: Any = None) -> Any:
         if self._autolr is not None:
             return self._autolr.step(closure)
-        return self._step_impl(closure)
+        return LRServoMixin.step(self, closure)
 
     def _step_impl(self, closure: Any = None) -> Any:
         raise NotImplementedError("optimizer using AutoLRMixin must provide _step_impl")
@@ -480,14 +488,18 @@ class AutoLRMixin:
     def _autolr_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         if self._autolr is not None:
             state_dict["_autolr"] = self._autolr.state_blob()
-        return state_dict
+        return self._lr_servo_state_dict(state_dict)
 
     def _autolr_load(self, state_dict: dict[str, Any], inner_load: Any) -> None:
         copied = dict(state_dict)
         blob = copied.pop("_autolr", None)
+        servo_blob = copied.pop("_lr_servo", None)
         inner_load(copied)
         if self._autolr is not None and blob is not None:
             self._autolr.load_blob(blob)
+        # Enabling the servo while resuming a pre-servo checkpoint uses the LR
+        # stored in that checkpoint as the new local prior.
+        self._lr_servo_restore(servo_blob)
         after_load = getattr(self, "_autolr_after_load", None)
         if after_load is not None:
             after_load()

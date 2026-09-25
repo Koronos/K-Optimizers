@@ -31,6 +31,7 @@ Quickstart::
 """
 
 from kaon._autolr import AutoLRMixin
+from kaon._lr_servo import LRServoMixin
 from kaon._version import __version__
 from kaon.adabelief import AdaBelief
 from kaon.adakaon import Adakaon
@@ -56,6 +57,7 @@ __all__ = [
     "AutoLRMixin",
     "KProdigy",
     "Lion",
+    "LRServoMixin",
     "Lookahead",
     "MSAM",
     "Nekaon",
