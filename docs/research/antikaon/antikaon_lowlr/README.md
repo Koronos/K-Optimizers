@@ -1,8 +1,12 @@
 # Antikaon low-LR bf16 quality experiment
 
-Status: **prepared, not run** (only `--smoke` has been executed, to check the plumbing).
+> **Status: descartado 2026-09-25.** Antikaon fue evaluado y no promovido (ver
+> `docs/EXPERIMENTS_GRAVEYARD.md`). `run_lowlr.py` se eliminó del árbol; el código vive en el
+> tag `graveyard/antikaon` (`git show graveyard/antikaon:benchmarks/antikaon_lowlr/run_lowlr.py`).
+> Este README y los resultados (`results.json`, `smoke.json`, `run.log`) se conservan como
+> evidencia histórica — solo se ejecutó `--smoke`, la corrida completa nunca se lanzó.
 
-The control battery and `benchmarks/antikaon_gate` train the proxy U-Net in **fp32 at
+The control battery and the (now archived) `antikaon_gate` runner train the proxy U-Net in **fp32 at
 lr 1.2e-3**, ~100× a real fine-tune LR: every update is several bf16 ulps and the
 `bf16_method` never matters. This experiment keeps the same U-Net, dataset, loss and eval
 (`benchmarks/control/battery.py` + `benchmarks/proxy`, loaded by file path as `run_gate.py`

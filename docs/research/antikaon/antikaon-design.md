@@ -1,5 +1,9 @@
 # Antikaon (provisional name) — zero-state flat-minima regularization for momentum-free Adakaon
 
+> **Status: descartado 2026-09-25.** El código vive en el tag `graveyard/antikaon` (evaluado y
+> no promovido; ver `docs/EXPERIMENTS_GRAVEYARD.md`). Este documento y su evidencia se
+> conservan como registro histórico.
+
 Design note, 2026-09-24. Author: numerics/math design agent. Nothing in the repo was modified.
 Companion files in this folder: `sim_drift.py` / `sim_drift.json` / `sim_drift.log` (bf16 drift
 simulation), `check_regularizer.py` (Monte-Carlo check of the implicit regularizer), `antipgd.txt`,

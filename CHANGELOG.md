@@ -95,23 +95,11 @@ All notable changes to this project will be documented in this file.
   `BF16_METHODS` / `validate_bf16_method` / `init_bf16_state` /
   `per_param_only_bf16_method` in `kaon._backend` replace the per-optimizer copies of the
   method check, the `shift` allocation and the foreach predicate.
-- Experimental `Antikaon`: momentum-free Adakaon plus a seeded Anti-PGD/RWP perturbation
-  carried in the live weights (`w = z + xi`, one combined weight write per step through the
-  existing writers, weight decay on `z`). The radius is in optimizer steps
-  (`k_sigma · lr · clip`), shaped by the factored second moment (`shape="v"`, or `"none"`),
-  Rademacher or Gaussian, optionally antithetic; `sigma_ref="weight"` as an ablation. No
-  per-element state (`xi` is regenerated from `noise_seed`, parameter index and step).
-  `eval()`/`train()` remove/re-install `xi`; `step()` in eval mode raises; train-mode
-  checkpoints are refused. Per-parameter and foreach paths only (`fused=True` warns and falls
-  back). `bf16_method="kahan8"` works on both paths (and the `fused=True` fallback): the
-  combined write carries the residual, and eval/train, weight decay and `sigma_ref="weight"`
-  act on the compensated value (`decode(p, kahan_lo)`; `p + shift` under legacy `"kahan"` —
-  the decay previously read the bare bf16 weight). At lr 1e-5 with sub-ulp noise the clean
-  iterate stays 0.02 ulp from an fp32 run of the same rule (SR: 2.6–3.9 ulp). The inert-noise
-  warning measures against the resolution the weight keeps (`ulp/256` under kahan/kahan8), so
-  a sub-ulp radius no longer warns when it is compensated. The noise law is read-only; the checkpoint records the noise backend per device type
-  (`"torch-cuda"`/`"torch-cpu"`). Registered in the control battery with the design's sweep
-  arms; quality is not measured yet. See `docs/antikaon.md` and `docs/research/antikaon-design.md`.
+- **Removed/Experimental**: `Antikaon` (momentum-free Adakaon + seeded Anti-PGD/RWP noise
+  carried in the live weights) was evaluated and discarded — only slid the loss/gap
+  trade-off at the control-battery gate, no frontier win over Nekaon/A0. Code preserved at
+  tag `graveyard/antikaon`; evidence and verdict in `docs/EXPERIMENTS_GRAVEYARD.md` and
+  `docs/research/antikaon/`.
 - Experimental `Rakaon`: momentum-free variance shrinkage, tensorwise or contiguous
   block variance, RMS clipping, and checkpointable BF16 stochastic rounding.
   Proxy studies have not established superiority over existing optimizers.

@@ -45,7 +45,7 @@ Only quality (held-out loss, train-val gap) is scored; ms/step is NOT measured o
 
 ## Gate verdict (stage 2, the long two-seed gate)
 
-Reference corner: test <= 0.07, gap <= 0.007. Frontier-mover check (docs/research/antikaon-design.md §6): a B/C arm must beat A0 on BOTH axes by more than the two-seed spread, AND be non-dominated by A1 (loss<=A1 OR gap<=A1).
+Reference corner: test <= 0.07, gap <= 0.007. Frontier-mover check (docs/research/antikaon/antikaon-design.md §6): a B/C arm must beat A0 on BOTH axes by more than the two-seed spread, AND be non-dominated by A1 (loss<=A1 OR gap<=A1).
 
 | arm | reaches test<=.0700 & gap<=.0070 | beats A0 both axes beyond spread | non-dominated by A1 | verdict |
 |---|---|---|---|---|
