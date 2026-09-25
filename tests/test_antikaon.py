@@ -17,6 +17,7 @@ import warnings
 import pytest
 import torch
 
+import kaon
 from kaon import Adakaon, Antikaon
 from kaon.antikaon import noise_seed_for
 
@@ -723,7 +724,12 @@ def test_kahan8_eval_train_cycles_keep_clean_value():
     """kahan8: eval/train go through decode(p, lo) and re-encode with the residual's SR.
     Regime: xi (1.5e-3) >> ulp (~2.4e-4) >> step (lr 1e-4). The eval view is the clean
     value minus xi to the residual grid, and 20 cycles (40 re-encodes) only add the
-    unbiased grid walk (<= unit/2 * sqrt(40) RMS), far below a step."""
+    unbiased grid walk (<= unit/2 * sqrt(40) RMS), far below a step.
+
+    The noise stream is reseeded first: the residual SR draws from the optimizer's stream,
+    whose id depends on how many streams the process created before (test order), and the
+    per-coordinate max over 40 draws is a tail statistic that order moved across the bound."""
+    kaon.reseed_stochastic_rounding()
     torch.manual_seed(0)
     ps = [torch.nn.Parameter((torch.randn(64, 32) * 0.05).bfloat16()),
           torch.nn.Parameter((torch.randn(32) * 0.05).bfloat16())]
@@ -748,8 +754,11 @@ def test_kahan8_eval_train_cycles_keep_clean_value():
                 torch.floor(torch.log2(c_now.abs().clamp_min(2.0 ** -126))))
             assert ((p.detach().float() - c_now).abs() <= half_ulp).all()
         opt.train()
-    for p, c in zip(ps, before, strict=True):
-        drift_units = ((_clean(opt, p) - c) / _ck_unit(c)).pow(2).mean().sqrt()
+    for p, c, xi in zip(ps, before, xis, strict=True):
+        # half the writes (eval) land on the grid of |c - xi|, half (train) on that of |c|:
+        # measure in the coarser one, as the in-loop bound does
+        unit = _ck_unit(torch.maximum(c.abs(), (c - xi).abs()))
+        drift_units = ((_clean(opt, p) - c) / unit).pow(2).mean().sqrt()
         assert float(drift_units) < 0.75 * math.sqrt(2 * cycles), float(drift_units)
         drift = (_clean(opt, p) - c).pow(2).mean().sqrt()
         assert drift < 5e-2 * lr, float(drift)

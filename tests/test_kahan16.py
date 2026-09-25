@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import warnings
 
 import pytest
 import torch
@@ -634,3 +635,139 @@ def test_msam_switch_kahan8_to_kahan16_mid_run_decodes_the_old_width_first(fused
     # kahan8's residual grid (ulp/256 per write, ~12 writes incl. the climbs) for 4 steps, then
     # exact: measured 0.051. A removal that decoded the uint8 residual as int16 lands >= 1 ulp off.
     assert err < 0.25, err
+
+
+# ------------------------------------------------------------------------------ review of a6c7fb0
+def _tail_bag(dtype=torch.bfloat16):
+    """Numels 15 and 7: every tensor ends in a SIMD tail, and a stacked [3, 15] / [3, 7]
+    bucket puts the tails in DIFFERENT places than three per-tensor ops do."""
+    torch.manual_seed(0)
+    shapes = [(5, 3)] * 3 + [(7,)] * 3
+    return [torch.nn.Parameter((torch.randn(s) * 0.05).to(torch.bfloat16).to(dtype)) for s in shapes]
+
+
+@pytest.mark.parametrize("betas", [(0.0, 0.999), (0.9, 0.999)])
+def test_misaligned_tail_bucket_is_still_the_fp32_writer(betas):
+    """The CPU ``add_(alpha=)`` kernel fuses to an FMA in its vector body but rounds the
+    product first in its scalar tail. The first cut did ONE add over the stacked bucket:
+    1 fp32 ulp off the fp32 foreach writer on 5 coordinates of this bag after 30 steps. The
+    stacked kahan16 add now runs row by row (``compensated_add_(rows=True)``): kahan16
+    foreach == fp32 foreach and kahan16 per-param == fp32 per-param, bit for bit. What is
+    left between foreach and per-param is the fp32 optimizer's OWN difference (its stacked
+    update math has tails too), reproduced exactly."""
+    runs = {}
+    for foreach in (True, False):
+        p32, p16 = _tail_bag(torch.float32), _tail_bag()
+        kw = dict(lr=1e-4, betas=betas, foreach=foreach, fused=False, gradient_centralization=False)
+        o32 = Adakaon(p32, **kw)
+        o16 = Adakaon(p16, bf16_method="kahan16", **kw)
+        _drive([o32, o16], [p32, p16], steps=30)
+        _assert_fp32_master(p16, o16, p32)
+        runs[foreach] = ([a.data.clone() for a in p32], [_z(b, o16.state[b]) for b in p16])
+    for f32, pp32, f16, pp16 in zip(runs[True][0], runs[False][0], runs[True][1], runs[False][1],
+                                    strict=True):
+        assert torch.equal(f16 != pp16, f32 != pp32)                     # same coordinates
+        assert _bits_equal(f16 - pp16, f32 - pp32)                       # same differences
+
+
+def test_stacked_add_rows_is_the_per_tensor_add_and_bounds_the_plain_one():
+    """``rows=True`` == the per-tensor adds bit for bit; the plain stacked add (the first
+    cut) is within 1 fp32 ulp of it — the bound the SIMD-tail difference can reach."""
+    torch.manual_seed(0)
+    z = torch.randn(3, 15) * 0.05
+    d = torch.randn(3, 15) * 1e-3
+    p = torch.empty(3, 15, dtype=torch.bfloat16)
+    lo = torch.empty(3, 15, dtype=torch.int16)
+    encode_(z.clone(), p, lo, 16, None)
+    want = torch.stack([zi.clone().add_(di, alpha=-0.37) for zi, di in zip(z, d, strict=True)])
+    pr, lr_ = p.clone(), lo.clone()
+    compensated_add_(pr, lr_, d, -0.37, 16, None, rows=True)
+    assert _bits_equal(decode(pr, lr_, 16), want)
+    pp, lp = p.clone(), lo.clone()
+    compensated_add_(pp, lp, d, -0.37, 16, None, rows=False)
+    ulp32 = torch.exp2(torch.floor(torch.log2(want.abs())) - 23)
+    assert float(((decode(pp, lp, 16) - want).abs() / ulp32).max()) <= 1.0
+
+
+def test_rows_flag_leaves_kahan8_bit_identical(monkeypatch):
+    """kahan8's numerics are not touched: with the same residual noise, rows=True and the
+    plain stacked add store the same bits (its ulp/256 grid absorbs the tail difference
+    in expectation; here we only require the flag to be a no-op for it)."""
+    torch.manual_seed(0)
+    z = torch.randn(3, 15) * 0.05
+    d = torch.randn(3, 15) * 1e-3
+    p = torch.empty(3, 15, dtype=torch.bfloat16)
+    lo = torch.empty(3, 15, dtype=torch.uint8)
+    encode_(z.clone(), p, lo, 8, None)
+    real_randint = torch.randint
+    out = []
+    for rows in (True, False):
+        pa, la = p.clone(), lo.clone()
+        g = torch.Generator().manual_seed(5)                    # the same residual noise
+        monkeypatch.setattr(
+            torch, "randint",
+            lambda *a, _r=real_randint, _g=g, **k: _r(*a, **{**k, "generator": _g}))
+        compensated_add_(pa, la, d, -0.37, 8, None, rows=rows)
+        monkeypatch.setattr(torch, "randint", real_randint)
+        out.append((pa.view(torch.int16).clone(), la.clone()))
+    assert torch.equal(out[0][0], out[1][0]) and torch.equal(out[0][1], out[1][1])
+
+
+def test_subtract_batched_refuses_a_mixed_width_bucket():
+    """torch.stack promotes a uint8 + int16 mix to int16, which the width check on the stack
+    would accept: every view is checked."""
+    w = [torch.zeros(4, dtype=torch.bfloat16), torch.zeros(4, dtype=torch.bfloat16)]
+    comp = [torch.zeros(4, dtype=torch.int16), torch.zeros(4, dtype=torch.uint8)]
+    with pytest.raises(ValueError, match="other width"):
+        bk.subtract_batched_(w, torch.zeros(2, 4), "kahan16", alpha=1.0, comp=comp)
+    with pytest.raises(ValueError, match="other width"):
+        bk.subtract_batched_(w, torch.zeros(2, 4), "kahan8", alpha=1.0, comp=comp)
+
+
+def test_msam_climb_converts_a_bucket_left_mixed_by_a_param_without_grad():
+    """kahan8 -> kahan16 with one param of the bucket no longer getting gradients: the inner
+    step converts only the stepped param, so the bucket is mixed (int16 + uint8). The climb
+    normalizes it (``_ck_ready``) instead of falling back to the bare-bf16 climb forever."""
+    import kaon._backend as backend
+    from kaon import MSAM
+    from kaon.msam import _ck_climb
+    backend._CONVERTED_RESIDUAL_WARNED = False
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter((torch.randn(16, 32) * 0.05).to(torch.bfloat16)) for _ in range(2)]
+    o = MSAM(ps, rho=0.05, lr=1e-4, betas=(0.9, 0.999), cautious=False, bf16_method="kahan8",
+             foreach=True, fused=False)
+    o.train()
+    _drive([o], [ps], steps=2)
+    o.param_groups[0]["bf16_method"] = "kahan16"
+    with pytest.warns(UserWarning, match="re-encoded"):
+        for _ in range(3):
+            ps[0].grad = (torch.randn(16, 32) * 0.02).to(torch.bfloat16)
+            ps[1].grad = None                                        # never stepped again
+            o.step()
+    states = [o.inner.state[p] for p in ps]
+    assert all(st[RESIDUAL_KEY].dtype == torch.int16 for st in states)
+    assert _ck_climb(o.param_groups[0], ps, states) == 16
+    o.eval()
+    assert all(torch.isfinite(_z(p, st)).all() for p, st in zip(ps, states, strict=True))
+
+
+@pytest.mark.parametrize("method,warns", [("stochastic_rounding", True), ("kahan8", False),
+                                          ("kahan16", False)])
+def test_inert_climb_warning_knows_the_residual_grid(method, warns):
+    """|e| ~ 1.9e-3 of the weights: below half a bf16 ulp (3.9e-3 relative), so an SR climb
+    may round to nothing and warns; a compact-Kahan climb keeps it in the residual (ulp/256,
+    ulp/65536) and must not warn."""
+    from kaon import Nekaon
+    torch.manual_seed(0)
+    p = torch.nn.Parameter((torch.randn(32, 32) * 0.1).to(torch.bfloat16))
+    o = Nekaon([p], lr=1e-4, k=1.5, momentum_dtype="bfloat16", weight_decay=0.0,
+               bf16_method=method, foreach=True, fused=False)
+    o.inert_check_interval = 1
+    o.train()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(60):
+            p.grad = (torch.randn(32, 32) * 0.02).to(torch.bfloat16)
+            o.step()
+    fired = [w for w in caught if "lookahead displacement" in str(w.message)]
+    assert bool(fired) == warns, [str(w.message) for w in caught]

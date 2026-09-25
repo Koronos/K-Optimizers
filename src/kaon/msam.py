@@ -64,8 +64,8 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from kaon._backend import _ck_write_
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits_of
+from kaon._backend import _ck_write_, ensure_residuals
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits, residual_bits_of
 from kaon._foreach_plan import state_generation
 from kaon._wrappers import CodecBuffer, WrapsInnerOptimizer
 
@@ -111,7 +111,8 @@ def _ck_climb(group: dict[str, Any], plist: list[Tensor], states: list[dict[str,
     between ``kahan8`` and ``kahan16`` the removal at the top of the step must decode the
     residual the climb encoded; the inner step converts it afterwards and the next climb
     uses the new width. A bucket whose residuals are of mixed widths (a conversion caught
-    half-way) climbs plainly this once rather than decoding some of them wrongly.
+    half-way) reads as 0 here rather than decoding some of them wrongly; the CLIMB then
+    normalizes it (:func:`_ck_ready`), so it is never left on the plain climb.
     """
     if plist[0].dtype != torch.bfloat16 or not is_compact_kahan(group.get("bf16_method", "")):
         return 0
@@ -124,6 +125,32 @@ def _ck_climb(group: dict[str, Any], plist: list[Tensor], states: list[dict[str,
         if lo is None or lo.dtype != dt:
             return 0
     return residual_bits_of(lo0)
+
+
+def _ck_ready(group: dict[str, Any], plist: list[Tensor], states: list[dict[str, Any]],
+              climb: bool) -> int:
+    """:func:`_ck_climb`, and on the CLIMB (``climb=True``) first bring a compact-Kahan bf16
+    bucket to the group's width: residuals missing (a param that had state before a switch
+    to kahan8/kahan16) are allocated and residuals of the other width converted
+    (:func:`kaon._backend.ensure_residuals`, one warning). Without it a bucket holding a param
+    the inner never steps (no grad: it keeps the uint8 residual it had when the group was
+    switched to kahan16) stays mixed forever and climbs on the bare bf16 every step — the
+    coherent sub-ulp loss §4b of ``docs/research/compact-kahan.md`` measures.
+
+    Only the climb converts: the REMOVAL at the top of a step must decode the residual the
+    previous climb encoded, and the climb after a normalization always leaves the bucket
+    uniform, so the next removal reads one width. O(1) extra per bucket in steady state (the
+    width check is :func:`_ck_climb`'s own scan).
+    """
+    ck = _ck_climb(group, plist, states)
+    if climb and plist[0].dtype == torch.bfloat16:
+        method = group.get("bf16_method", "")
+        if is_compact_kahan(method):
+            want = residual_bits(method)
+            if ck != want:
+                ensure_residuals(plist, states, want)
+                ck = want
+    return ck
 
 # Env-gated divergence probe (zero overhead when unset; same env var as AdaPNM's probe).
 # Set KAON_PROBE_LOG=/path/to/log to record, per step, the FIRST non-finite tensor and the
@@ -412,10 +439,19 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 w_mean = float(torch.stack([p.detach().abs().mean().float() for p in params]).mean())
                 half_ulp = 0.5 * torch.finfo(dtype).eps * max(w_mean, 1e-12)
                 tip = "Raise rho/k, or set rho/k=0 to drop the cost."
+            # A compact-Kahan climb goes through the DECODED value (_ck_ready): the sub-ulp
+            # part of e is kept in the residual, so the resolution is ulp / 2**bits (kahan8:
+            # ulp/256; kahan16: the fp32 master's), not the bare bf16 ulp.
+            method = group.get("bf16_method", "")
+            res_bits = (residual_bits(method)
+                        if dtype == torch.bfloat16 and is_compact_kahan(method) else 0)
+            half_ulp /= 1 << res_bits
             if dtype != torch.float32 and e < half_ulp:
+                what = (f"half the {method} residual grid (ulp/{1 << res_bits})" if res_bits
+                        else f"half a {dtype} ulp")
                 msg = (
                     f"{type(self).__name__}: the lookahead displacement (<= {e:.2e}) is below "
-                    f"half a {dtype} ulp at the sampled mean weight scale ({half_ulp:.2e}); "
+                    f"{what} at the sampled mean weight scale ({half_ulp:.2e}); "
                     f"some perturbations may round to zero. "
                     f"Use fp32 weights for these parameters, or set rho/k=0 to drop the cost."
                 )
@@ -486,7 +522,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 m.clamp_(-bound, bound)  # per-element stability cap (see _climb_bound)
             if plist[0].dtype == torch.float32:
                 torch._foreach_add_([p.data for p in plist], list(m.unbind(0)))
-            elif ck_bits := _ck_climb(group, plist, states):
+            elif ck_bits := _ck_ready(group, plist, states, sign > 0.0):
                 # Compact Kahan (kahan8/kahan16): perturb the DECODED value and re-encode, so
                 # the climb/removal pair leaves the clean value intact to ~1/256 ulp
                 # (kahan8, stochastic rounding of the residual: unbiased) or to fp32's own
@@ -537,7 +573,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 for p in plist
             )
             # compact Kahan: the kernel needs every state's residual (contiguous, same numel)
-            ck = _ck_climb(group, plist, states)
+            ck = _ck_ready(group, plist, states, sign > 0.0)
             if ck and not all(st[RESIDUAL_KEY].is_contiguous() for st in states):
                 ok = False
             if ok:
@@ -617,14 +653,14 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             if tuple(map(_data_ptr, bk["plist"])) != bk["p_addrs"]:
                 return False
             states = bk["states"]
-            # bf16_method switched since the plan was built (either way), or kahan8/kahan16
-            # residuals appeared after it: rebuild — unless compact Kahan is on but the
-            # residuals are still missing, where the ck=0 plan is the right one. O(1) per
-            # bucket unless the method and the plan disagree. A kahan8 <-> kahan16 switch
-            # replaces the residual tensors when they are converted: the c_addrs check below.
+            # bf16_method switched since the plan was built (either way), or a compact-Kahan
+            # bucket was planned plain (residuals missing / of mixed widths): rebuild. The
+            # climb's rebuild normalizes the bucket (_ck_ready), so this settles after at most
+            # one removal + one climb. O(1) per bucket unless the method and the plan
+            # disagree. A kahan8 <-> kahan16 conversion replaces the residual tensors: the
+            # c_addrs check below.
             if (bk.get("lowp")
-                    and bool(bk["ck"]) != is_compact_kahan(bk["group"].get("bf16_method", ""))
-                    and (bk["ck"] or all(RESIDUAL_KEY in st for st in states))):
+                    and bool(bk["ck"]) != is_compact_kahan(bk["group"].get("bf16_method", ""))):
                 return False
             c_addrs = bk.get("c_addrs")
             if c_addrs is not None and (

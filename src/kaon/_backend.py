@@ -291,9 +291,14 @@ def _ck_write_(
     bits: int,
     triton: bool | None = None,
     sr: SRStream | None = None,
+    rows: bool = False,
 ) -> None:
     """``(target, lo) += alpha * source`` with the compact-Kahan codec, through Triton when
     it applies (CUDA, contiguous, bf16/residual/fp32) and the torch reference otherwise.
+
+    ``rows`` marks a stacked foreach bucket: the torch path's ``kahan16`` add then runs per
+    row (see :func:`kaon._compact_kahan.compensated_add_`); the Triton kernel is elementwise
+    and layout-invariant already.
 
     ``lo`` must be stored in the ``bits``-wide codec's dtype (``uint8`` for 8, ``int16``
     for 16): a residual of the other width is REFUSED, never decoded with the wrong grid —
@@ -315,7 +320,7 @@ def _ck_write_(
         if ft.ck_add_supported(target, lo, source, bits):
             ft.ck_add_(target, lo, source, alpha, bits, sr)
             return
-    compensated_add_(target, lo, source, alpha, bits, sr)
+    compensated_add_(target, lo, source, alpha, bits, sr, rows=rows)
 
 
 # ----------------------------- per-optimizer SR noise stream -----------------------------
@@ -480,9 +485,19 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
                 "residual views (comp=...); the caller must route this method per-param "
                 "or hand over ForeachChunk.cviews"
             )
+        bits = residual_bits(bf16_method)
+        want = residual_dtype(bits)
+        # EVERY view, not the stack: torch.stack promotes a uint8 + int16 mix to int16, which
+        # _ck_write_ would then accept and decode the uint8 rows on the 16-bit grid.
+        if any(c.dtype != want for c in comp):
+            raise ValueError(
+                f"subtract_batched_ with bf16_method={bf16_method!r} got residuals of the "
+                f"other width ({sorted({str(c.dtype) for c in comp})}, want {want}); convert "
+                "them first with kaon._backend.ensure_residuals"
+            )
         weights = torch.stack(pviews)
         lows = torch.stack(comp)
-        _ck_write_(weights, lows, delta, -alpha, residual_bits(bf16_method), triton, sr)
+        _ck_write_(weights, lows, delta, -alpha, bits, triton, sr, rows=True)
         torch._foreach_copy_(pviews, list(weights.unbind(0)))
         torch._foreach_copy_(comp, list(lows.unbind(0)))
     elif p0.dtype == torch.bfloat16 and bf16_method == "stochastic_rounding":

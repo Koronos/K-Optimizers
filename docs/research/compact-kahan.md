@@ -399,7 +399,12 @@ itself is not decodable: after a tie `w` is always even, and `trunc16` could be 
   that changes precision mid-run impossible. Readers that only DECODE (the MSAM/Nekaon climb
   removal, Antikaon's clean read) use the stored width, not the group's: the removal at the
   top of the step right after a switch must decode the residual the climb encoded, before
-  the inner step converts it. `_ck_write_` refuses a residual of the wrong width outright.
+  the inner step converts it. `_ck_write_` refuses a residual of the wrong width outright,
+  and `subtract_batched_` checks EVERY residual view of the bucket (`torch.stack` would
+  promote a uint8 + int16 mix to int16 and pass the stack's check). The MSAM/Nekaon CLIMB
+  normalizes its bucket (`_ck_ready`: allocate / convert to the group's width) — the only
+  place a bucket can stay mixed is a param the inner never steps again (no grad) after a
+  switch, which would otherwise have kept the whole bucket on the bare-bf16 climb forever.
 
 ### 8.3 Paths
 
@@ -412,6 +417,18 @@ take `CK=16` (the `kahan8` specializations compile to the same code as before); 
 budget counts 0/1/2 B of residual stack. **Traffic: +2 B/elem read and +2 B/elem written
 under `CK=16`** (vs +1/+1 for `kahan8`), no extra launch, no temporaries.
 
+**The stacked torch add runs row by row** (`compensated_add_(rows=True)` from
+`subtract_batched_`, `kahan16` only). The CPU `add_(alpha=)` kernel is not layout-invariant:
+its vector body contracts `z + alpha·d` into an FMA, its scalar tail rounds the product
+first. One add over a stacked `[N, *shape]` bucket puts the tails where the STACK ends, the
+fp32 foreach writer (`_foreach_sub_` over the per-param views) and the per-param writer where
+EACH TENSOR ends — the first cut was 1 fp32 ulp off on those coordinates (numel-15 and
+numel-7 tensors: 5 coordinates after 30 steps), which the review caught and `_bag`'s shapes
+had hidden. Row by row reproduces the per-tensor tails exactly. `kahan8` ignores the flag —
+its ulp/256 grid absorbs a 1-fp32-ulp difference and its reviewed numerics are unchanged
+(checked bit for bit against the previous commit on MSAM + Adakaon, both routes). The Triton
+axpy is elementwise and layout-invariant already.
+
 ### 8.4 Verified **[code]**
 
 * Codec: all 2³² fp32 patterns on CUDA (torch encode/decode 21 s, the Triton helpers against
@@ -420,11 +437,17 @@ under `CK=16`** (vs +1/+1 for `kahan8`), no extra launch, no temporaries.
   master stays exact); `lo` == low half; `w` == `(bits + 0x8000) >> 16`; differs from the RNE
   cast only on ties; non-finite propagate with `lo = 0`; every `(w, lo)` state with a finite
   `w` decodes finite.
-* Trajectory, same bf16 gradients to a bf16-`kahan16` run and an fp32-weight run, Gradient
-  Centralization off: **bit-exact** for Adakaon (bf16/int8/4-bit momentum, nomom, cautious)
-  per-param and foreach on CPU, and per-param, foreach and fused (every route incl. the big
-  bucket with `deterministic_reductions=True`) on CUDA; Lion, AdaBelief, ADOPT, KProdigy,
-  AdaMuon, AdaPNM per-param and foreach. The stored bf16 is the half-away nearest of the
+* Trajectory, same bf16 gradients to a bf16-`kahan16` run and an fp32-weight run OF THE
+  SAME ROUTE, Gradient Centralization off: **bit-exact** for Adakaon (bf16/int8/4-bit
+  momentum, nomom, cautious) per-param and foreach on CPU — including buckets whose tensors
+  end in SIMD tails (`test_misaligned_tail_bucket_is_still_the_fp32_writer`) — and
+  per-param, foreach and fused (every route incl. the big bucket with
+  `deterministic_reductions=True`) on CUDA; Lion, AdaBelief, ADOPT, KProdigy, AdaMuon, AdaPNM
+  per-param and foreach. **foreach vs per-param** is NOT bit-exact in general, for fp32
+  weights either: the stacked update math (second moment, normalisation) has its own SIMD
+  tails, so an fp32 Adakaon differs between its two routes by an fp32 ulp on a few
+  coordinates of such a bucket; `kahan16` reproduces that difference exactly (same
+  coordinates, same bits) and adds none of its own. The stored bf16 is the half-away nearest of the
   master, asserted per coordinate. Fused vs native `kahan16` differ only as the fp32 paths
   do (< 0.01 ulp; 4-bit's code-flip amplification < 0.5).
 * MSAM / Nekaon climb (torch and fused `CK=16`): the run IS the fp32 run, bit for bit, in
@@ -446,9 +469,10 @@ under `CK=16`** (vs +1/+1 for `kahan8`), no extra launch, no temporaries.
   weights. Measured < 0.5 ulp from an all-fp32 Lookahead over 6 steps (k=2). Reading the
   decoded `theta` would make it exact for `kahan16` (and tighten `kahan8`), but changes
   `kahan8`'s reviewed numerics: left as a follow-up.
-* MSAM's inert-climb warning is not method-aware: it compares the displacement with half a
-  bf16 ulp even when the climb goes through the residual (both `kahan8` and `kahan16`), so it
-  can fire for a climb that is in fact realized. Pre-existing; a follow-up.
+* (Fixed in the review round) MSAM's inert-climb warning was not method-aware: it compared
+  the displacement with half a bf16 ulp even when the climb goes through the residual. It now
+  compares with half the residual grid (`ulp/2^bits`: ulp/256 under `kahan8`, ulp/65536
+  under `kahan16`) for bf16 weights of a compact-Kahan group.
 
 ### 8.6 When to use which **[inference]**
 

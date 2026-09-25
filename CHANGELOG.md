@@ -15,12 +15,19 @@ All notable changes to this project will be documented in this file.
   is `z − lr·δ` in plain fp32 (round to nearest) and an exact split — no residual noise is
   drawn. Exhaustively verified over all 2^32 fp32 patterns (torch and Triton helpers; `±0`,
   subnormals, binade crossings and the carry into inf included). Given the same bf16
-  gradients, a `kahan16` run IS the fp32-weight run of the same optimizer, bit for bit, on
-  the per-param, foreach and fused paths (Adakaon's eight apply kernels, `CK=16`; the
+  gradients, a `kahan16` run IS the fp32-weight run of the same optimizer ON THE SAME
+  ROUTE, bit for bit, on the per-param, foreach and fused paths (the stacked CPU write adds
+  row by row: one `add_(alpha=)` over the stack put the SIMD tails elsewhere than the
+  per-tensor fp32 writer and was 1 fp32 ulp off on a few coordinates; `kahan8` is unchanged;
+  foreach vs per-param differ exactly as they do for fp32 weights, whose stacked update math
+  has its own tails) (Adakaon's eight apply kernels, `CK=16`; the
   one-launch native CUDA writer; the MSAM/Nekaon climb, torch and fused) for Adakaon, Lion,
   AdaBelief, ADOPT, KProdigy, AdaMuon and AdaPNM — two documented exceptions read the bf16
   weight where an fp32 run reads its master: weight decay and AdamP's projection (and
-  Gradient Centralization runs on the bf16 grad in bf16). Lookahead's sync carries it (its
+  Gradient Centralization runs on the bf16 grad in bf16). `subtract_batched_` refuses a
+  bucket of mixed residual widths (checked per view); the MSAM/Nekaon climb converts a
+  bucket left mixed by a param the inner no longer steps; MSAM's inert-climb warning now
+  compares with the residual grid (ulp/2^bits) under kahan8/kahan16. Lookahead's sync carries it (its
   `theta` is still the bare bf16, within 0.5 ulp of an fp32 Lookahead). Checkpoints keep
   `int16`; resume is bit-identical; memory is exactly +2.000 B/param. Mid-run switches:
   SR/none/kahan → `kahan16` allocates a zero residual (one warning); `kahan8 ↔ kahan16`

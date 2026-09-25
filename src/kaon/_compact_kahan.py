@@ -233,8 +233,19 @@ def compensated_add_(
     bits: int = 8,
     sr: SRStream | None = None,
     stochastic: bool = True,
+    rows: bool = False,
 ) -> None:
     """``(p, lo) += alpha * delta`` — decode, exact fp32 add, re-encode; in place. Torch path.
+
+    ``rows=True`` (a stacked foreach bucket ``[N, *shape]``) makes the ``kahan16`` add run
+    ROW BY ROW (``_foreach_add_`` over the unbound rows) instead of as one op over the stack.
+    The CPU ``add_(alpha=)`` kernel is not layout-invariant: its vector body fuses
+    ``z + alpha*d`` into an FMA while its scalar tail rounds the product first, so one op over
+    the stack puts the tails in different places than N per-tensor ops do — 1 fp32 ulp on a
+    few coordinates, breaking ``kahan16``'s bit-identity with the fp32 foreach writer
+    (``_foreach_sub_`` over the per-param views) and with its own per-param path. Row by
+    row reproduces the per-tensor tails exactly. ``kahan8`` ignores the flag: its residual
+    grid (ulp/256) absorbs the difference and its numerics are left as reviewed.
 
     ``sr`` is the owner's noise stream (:class:`kaon._stochastic_rounding.SRStream`): the
     residual's stochastic rounding draws from the same checkpointed generator the bf16 SR
@@ -243,7 +254,11 @@ def compensated_add_(
     identity). ``None`` falls back to the process-wide generator.
     """
     z = decode(p, lo, bits)
-    z.add_(delta if delta.dtype == torch.float32 else delta.float(), alpha=alpha)
+    d = delta if delta.dtype == torch.float32 else delta.float()
+    if rows and bits == 16 and z.ndim > 1:
+        torch._foreach_add_(list(z.unbind(0)), list(d.unbind(0)), alpha=alpha)
+    else:
+        z.add_(d, alpha=alpha)
     noise = None
     if stochastic and bits < 16:
         gen = _device_generator(z.device) if sr is None else sr.generator(z.device)
