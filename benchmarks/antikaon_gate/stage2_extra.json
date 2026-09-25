@@ -1,0 +1,46 @@
+{
+ "manifest": {
+  "commit": "bc22a1e63a87d34de7ecb78e8497ec107887e9fa",
+  "branch": "feature/antikaon",
+  "stage": 2,
+  "C": 40,
+  "N": 2000,
+  "seeds": [
+   0,
+   1
+  ],
+  "bs": 8,
+  "schedule": "const",
+  "proxy_weight_dtype": "torch.float32",
+  "dataset_fingerprint": "b0bad0f5fb622dd7a30641c8e1780b21fed818fddf8a430faf9a78b480399aef",
+  "wall_s": 217.73126673698425,
+  "arms": {
+   "B0 k_sigma=0.5": {
+    "lr": 0.0012
+   }
+  }
+ },
+ "results": {
+  "B0 k_sigma=0.5": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "train": 0.07074975967407227,
+     "test": 0.0831263242289424,
+     "gap": 0.012376564554870129
+    },
+    {
+     "seed": 1,
+     "train": 0.06441819574683905,
+     "test": 0.07664243597537279,
+     "gap": 0.012224240228533745
+    }
+   ],
+   "test_mean": 0.07988438010215759,
+   "test_std": 0.004584801352554867,
+   "gap_mean": 0.012300402391701937,
+   "gap_std": 0.00010770956409212961,
+   "bpp": 0.10258242003565038
+  }
+ }
+}

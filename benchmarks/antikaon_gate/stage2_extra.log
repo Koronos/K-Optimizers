@@ -1,0 +1,5 @@
+  [B0 k_sigma=0.5] seed=0 train=0.07075 test=0.08313 gap=+0.01238 bpp=0.103
+  [B0 k_sigma=0.5] seed=1 train=0.06442 test=0.07664 gap=+0.01222 bpp=0.103
+B0 k_sigma=0.5           test=0.07988(+-0.00458) gap=+0.01230(+-0.00011)
+wrote stage2_extra.json
+DONE

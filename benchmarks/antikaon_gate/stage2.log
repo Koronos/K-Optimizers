@@ -1,0 +1,32 @@
+  [A0 Adakaon-nomom] seed=0 train=0.07242 test=0.08353 gap=+0.01111 bpp=0.103
+  [A0 Adakaon-nomom] seed=1 train=0.06505 test=0.07648 gap=+0.01143 bpp=0.103
+A0 Adakaon-nomom         test=0.08001(+-0.00499) gap=+0.01127(+-0.00023)
+  [A1 Nekaon (defaults)] seed=0 train=0.06322 test=0.07513 gap=+0.01191 bpp=0.634
+  [A1 Nekaon (defaults)] seed=1 train=0.06334 test=0.07478 gap=+0.01144 bpp=0.634
+A1 Nekaon (defaults)     test=0.07496(+-0.00024) gap=+0.01168(+-0.00033)
+  [B1 k_sigma=1.5] seed=0 train=0.06944 test=0.08000 gap=+0.01056 bpp=0.103
+  [B1 k_sigma=1.5] seed=1 train=0.06530 test=0.07685 gap=+0.01156 bpp=0.103
+B1 k_sigma=1.5           test=0.07843(+-0.00223) gap=+0.01106(+-0.00071)
+  [B2 k_sigma=5] seed=0 train=0.07281 test=0.08190 gap=+0.00909 bpp=0.103
+  [B2 k_sigma=5] seed=1 train=0.06636 test=0.07745 gap=+0.01109 bpp=0.103
+B2 k_sigma=5             test=0.07967(+-0.00315) gap=+0.01009(+-0.00141)
+  [B3 k_sigma=15] seed=0 train=0.08349 test=0.08859 gap=+0.00510 bpp=0.103
+  [B3 k_sigma=15] seed=1 train=0.08020 test=0.08816 gap=+0.00796 bpp=0.103
+B3 k_sigma=15            test=0.08838(+-0.00030) gap=+0.00653(+-0.00203)
+  [C1 shape=none] seed=0 train=0.07133 test=0.07908 gap=+0.00776 bpp=0.103
+  [C1 shape=none] seed=1 train=0.06654 test=0.07934 gap=+0.01280 bpp=0.103
+C1 shape=none            test=0.07921(+-0.00019) gap=+0.01028(+-0.00357)
+  [C2 antithetic] seed=0 train=0.07040 test=0.08013 gap=+0.00973 bpp=0.103
+  [C2 antithetic] seed=1 train=0.06827 test=0.07783 gap=+0.00956 bpp=0.103
+C2 antithetic            test=0.07898(+-0.00162) gap=+0.00965(+-0.00012)
+  [C3 sigma_ref=weight] seed=0 train=0.07293 test=0.08185 gap=+0.00892 bpp=0.115
+  [C3 sigma_ref=weight] seed=1 train=0.06686 test=0.07839 gap=+0.01153 bpp=0.115
+C3 sigma_ref=weight      test=0.08012(+-0.00245) gap=+0.01023(+-0.00184)
+  [B2 lr x0.5] seed=0 train=0.07091 test=0.08129 gap=+0.01038 bpp=0.103
+  [B2 lr x0.5] seed=1 train=0.06580 test=0.07837 gap=+0.01256 bpp=0.103
+B2 lr x0.5               test=0.07983(+-0.00206) gap=+0.01147(+-0.00154)
+  [B2 lr x2] seed=0 train=0.07501 test=0.08280 gap=+0.00779 bpp=0.103
+  [B2 lr x2] seed=1 train=0.07044 test=0.08137 gap=+0.01093 bpp=0.103
+B2 lr x2                 test=0.08209(+-0.00101) gap=+0.00936(+-0.00222)
+wrote C:\Users\Koronos\Documents\Repos\K-Optimizers\.claude\worktrees\antikaon\benchmarks\antikaon_gate/stage2.json
+DONE
