@@ -219,6 +219,13 @@ Write `x_n = w_n − ηδ_n + Δξ_n` (fp32), `w_{n+1} = R(x_n)`, `f = frac(x_n/
   combined write is what makes the design work at all.
 * **Kahan** (`bf16_method="kahan"`, +2 B/param, already supported by `subtract_one_` [code]) makes the
   combined write exact to ~fp32; it is the escape hatch for the sub-ulp regime, not the default.
+  *Update (compact Kahan merged):* `bf16_method="kahan8"` (+1 B/param, per-param **and** foreach,
+  `docs/research/compact-kahan.md`) replaces it for this role. Measured on Antikaon itself at lr 1e-5
+  on ~0.05 weights (step ≈ 0.04 ulp, ξ 0.06–0.2 ulp, 300 steps, wd 0.1): the clean iterate is
+  0.020 ulp RMS from an fp32 run of the same rule with the same ξ, against 2.6–3.9 ulp under SR.
+  Weight decay, the `sigma_ref="weight"` radius and eval/train read the compensated value
+  (`decode(p, lo)`, or `p + shift` for legacy Kahan), and the inert warning measures `σ` against
+  `ulp/256` for the compensated methods (`docs/antikaon.md` §bf16).
 * **Eval/train round trip**: `w_eval = RTN(w − ξ_n)` has error ≤ ½ ulp(z) — the best bf16 representation
   of `z_n`, which is never exactly representable, so this *is* "exact removal" in the only sense
   available. `w_train = RTN(w_eval + ξ_n)` returns to the original `w_n` except where the subtraction

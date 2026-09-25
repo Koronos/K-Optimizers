@@ -621,3 +621,294 @@ def test_weight_reference_reads_clean_iterate(foreach):
     for p, zi in zip(ps, z, strict=True):
         want = (zi.square().mean(-1, keepdim=True).sqrt() * kw_).clamp(min=1e-2)
         torch.testing.assert_close(opt.state[p]["noise_sigma_rows"], want, rtol=1e-6, atol=0)
+
+
+# ----------------------------------------------------------------------------- kahan8
+# bf16_method="kahan8" (compact Kahan, docs/research/compact-kahan.md): the bf16 weight plus
+# a uint8 residual in units of its own ulp. Antikaon's combined write goes through the same
+# writers; the clean value (wd, sigma_ref="weight", eval/train) is decode(p, kahan_lo).
+from kaon._compact_kahan import RESIDUAL_KEY  # noqa: E402
+
+
+def _ck_bag(seed=0):
+    """bf16 bag at the ~0.05 scale of a real network (ulp ~2.4e-4), incl. 0-D and conv."""
+    g = torch.Generator().manual_seed(seed)
+    shapes = [(8, 6), (8, 6), (4, 3, 2, 2), (6,), (6,), ()]
+    return [torch.nn.Parameter((torch.randn(s, generator=g) * 0.05).bfloat16()) for s in shapes]
+
+
+def _ck_unit(z: torch.Tensor) -> torch.Tensor:
+    """Per-coordinate kahan8 grid unit ``ulp_bf16(z) / 256``."""
+    e = torch.floor(torch.log2(z.abs().clamp_min(2.0 ** -126)))
+    return torch.exp2(e - 7 - 8)
+
+
+def _clean(opt, p):
+    """Full-precision live value (decoded under kahan8, ``p + shift`` under kahan)."""
+    return opt._read_clean(p, opt.state[p], opt.param_groups[0]["bf16_method"])
+
+
+def _pin_residual_noise(monkeypatch):
+    """Zero every torch.randint draw: the residual's rounding becomes deterministic (the
+    Antikaon noise itself uses bernoulli_/normal_ and is untouched)."""
+    real = torch.randint
+    monkeypatch.setattr(torch, "randint", lambda *a, **k: torch.zeros_like(real(*a, **k)))
+
+
+@pytest.mark.parametrize("cfg", [
+    {},
+    {"weight_decay": 0.1},
+    {"weight_decay": 0.1, "cautious": True, "cautious_wd": "full"},
+    {"sigma_ref": "weight", "k_weight": 0.02, "weight_decay": 0.05},
+])
+def test_kahan8_foreach_matches_per_param_bit_exact(cfg, monkeypatch):
+    """With the residual's rounding noise pinned (the codec is then deterministic), the
+    foreach bucket write (comp = the chunk's kahan_lo views) and the per-param write agree
+    bit for bit — weights AND residual bytes — incl. a late joiner and eval/train."""
+    _pin_residual_noise(monkeypatch)
+    pa = _ck_bag()
+    pb = _clone(pa)
+    kw = dict(lr=1e-4, k_sigma=5.0, bf16_method="kahan8", noise_seed=3, **cfg)
+    oa = Antikaon(pa, foreach=True, **kw)
+    ob = Antikaon(pb, foreach=False, **kw)
+    grads = _grads(pa, 8)
+    for t, gs in enumerate(grads):
+        for i, (a, b, g) in enumerate(zip(pa, pb, gs, strict=True)):
+            if i == 1 and t < 3:
+                a.grad = b.grad = None
+                continue
+            a.grad, b.grad = g.bfloat16(), g.bfloat16()
+        oa.step()
+        ob.step()
+        if t == 4:
+            oa.eval()
+            ob.eval()
+            oa.train()
+            ob.train()
+    for a, b in zip(pa, pb, strict=True):
+        assert torch.equal(a.detach(), b.detach())
+        assert oa.state[a][RESIDUAL_KEY].dtype == torch.uint8
+        assert torch.equal(oa.state[a][RESIDUAL_KEY], ob.state[b][RESIDUAL_KEY])
+    assert any(bool(oa.state[a][RESIDUAL_KEY].any()) for a in pa)   # the residual is in use
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_kahan8_resume_is_bit_exact(foreach):
+    """Eval-mode checkpoint, fresh params + optimizer: bit-identical continuation, residual
+    included (it is ordinary state; its noise comes from the checkpointed SR stream, and the
+    eval/train re-encodes draw from that stream too)."""
+    kw = dict(lr=1e-4, k_sigma=5.0, weight_decay=0.1, foreach=foreach, bf16_method="kahan8")
+    params = _ck_bag()
+    grads = _grads(params, 9)
+    opt = Antikaon(params, noise_seed=11, **kw)
+    _run(opt, params, grads[:4])
+    opt.eval()
+    sd = copy.deepcopy(opt.state_dict())
+    model_ckpt = [p.detach().clone() for p in params]
+    opt.train()
+    _run(opt, params, grads[4:])
+
+    params_b = [torch.nn.Parameter(w.clone()) for w in model_ckpt]
+    opt_b = Antikaon(params_b, noise_seed=999, **kw)
+    opt_b.load_state_dict(sd)
+    for p in params_b:
+        assert opt_b.state[p][RESIDUAL_KEY].dtype == torch.uint8
+    _run(opt_b, params_b, grads[4:])
+    for a, b in zip(params, params_b, strict=True):
+        assert torch.equal(a.detach(), b.detach())
+        assert torch.equal(opt.state[a][RESIDUAL_KEY], opt_b.state[b][RESIDUAL_KEY])
+
+
+def test_kahan8_eval_train_cycles_keep_clean_value():
+    """kahan8: eval/train go through decode(p, lo) and re-encode with the residual's SR.
+    Regime: xi (1.5e-3) >> ulp (~2.4e-4) >> step (lr 1e-4). The eval view is the clean
+    value minus xi to the residual grid, and 20 cycles (40 re-encodes) only add the
+    unbiased grid walk (<= unit/2 * sqrt(40) RMS), far below a step."""
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter((torch.randn(64, 32) * 0.05).bfloat16()),
+          torch.nn.Parameter((torch.randn(32) * 0.05).bfloat16())]
+    lr = 1e-4
+    opt = Antikaon(ps, lr=lr, k_sigma=15.0, bf16_method="kahan8", noise_seed=8)
+    _run(opt, ps, [[torch.randn(p.shape) * 0.02 for p in ps] for _ in range(5)])
+    before = [_clean(opt, p) for p in ps]
+    xis = [opt.live_noise(p) for p in ps]
+    cycles = 20
+    for _ in range(cycles):
+        opt.eval()
+        for p, c, xi in zip(ps, before, xis, strict=True):
+            want = c - xi
+            # train writes land on the grid of |c|, eval writes on the grid of |z|: measure
+            # in the coarser one
+            err = (_clean(opt, p) - want).abs() / _ck_unit(torch.maximum(c.abs(), want.abs()))
+            assert float(err.max()) <= 2.0 * math.sqrt(2 * cycles), float(err.max())
+            # the forward pass in eval sees the nearest bf16 to the clean value (half-away
+            # ties: within half an ulp, not necessarily the round-to-even cast)
+            c_now = _clean(opt, p)
+            half_ulp = 0.5 * torch.finfo(torch.bfloat16).eps * torch.exp2(
+                torch.floor(torch.log2(c_now.abs().clamp_min(2.0 ** -126))))
+            assert ((p.detach().float() - c_now).abs() <= half_ulp).all()
+        opt.train()
+    for p, c in zip(ps, before, strict=True):
+        drift_units = ((_clean(opt, p) - c) / _ck_unit(c)).pow(2).mean().sqrt()
+        assert float(drift_units) < 0.75 * math.sqrt(2 * cycles), float(drift_units)
+        drift = (_clean(opt, p) - c).pow(2).mean().sqrt()
+        assert drift < 5e-2 * lr, float(drift)
+
+
+@pytest.mark.parametrize("method,foreach", [("kahan", False), ("kahan8", False),
+                                            ("kahan8", True)])
+def test_compensated_weight_decay_reads_the_clean_value(method, foreach, monkeypatch):
+    """The decay term is ``wd * (w - xi_n)`` with ``w`` the COMPENSATED value
+    (``p + shift`` / ``decode(p, lo)``), not the bare bf16 weight. Checked at the source:
+    the ``w`` the decay receives, against a residual made non-zero by the previous steps."""
+    seen: list[torch.Tensor] = []
+    real = Antikaon._decay_term
+
+    def spy(w, xi_old, wd):
+        seen.append(w.detach().clone())
+        return real(w, xi_old, wd)
+
+    ps = _ck_bag()[:3] if method == "kahan8" else _ck_bag()[:1]
+    opt = Antikaon(ps, lr=1e-4, k_sigma=5.0, weight_decay=0.1, foreach=foreach,
+                   bf16_method=method)
+    _run(opt, ps, _grads(ps, 3))
+    want = [_clean(opt, p) for p in ps]
+    assert any(bool((w != p.detach().float()).any()) for w, p in zip(want, ps, strict=True))
+    monkeypatch.setattr(Antikaon, "_decay_term", staticmethod(spy))
+    _run(opt, ps, _grads(ps, 1, seed=9))
+    got = [w.reshape(-1) for w in seen]
+    if foreach:                                  # one stacked call per bucket
+        got = [row for w in seen for row in w.reshape(w.shape[0], -1)]
+    assert len(got) == len(ps)
+    for w in want:
+        assert any(g.numel() == w.numel() and torch.equal(g, w.reshape(-1)) for g in got)
+
+
+def test_kahan8_weight_decay_tracks_the_exact_decay():
+    """Zero gradients: pure decay, z_n = z_0 (1 - lr wd)^n, with a big lr*wd (0.05/step) so a
+    decay that ignores the residual misses ``lr*wd*residual`` visibly. RMS error of the
+    clean iterate in residual grid units of the LIVE value (xi is 10x the weights here, so
+    the live value sets the precision). Measured: 1.2-2.6 units with the clean read,
+    12-26 units reading the bare bf16 weight (per-param and foreach)."""
+    for foreach in (False, True):
+        torch.manual_seed(0)
+        z0 = [(torch.randn(8, 6) * 0.05).bfloat16(), (torch.randn(8, 6) * 0.05).bfloat16(),
+              (torch.randn(6) * 0.05).bfloat16()]
+        params = [torch.nn.Parameter(z.clone()) for z in z0]
+        lr, wd, steps = 0.1, 0.5, 20
+        opt = Antikaon(params, lr=lr, k_sigma=5.0, weight_decay=wd, foreach=foreach,
+                       bf16_method="kahan8", gradient_centralization=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _ in range(steps):
+                for p in params:
+                    p.grad = torch.zeros_like(p)
+                opt.step()
+        for p, w0 in zip(params, z0, strict=True):
+            live = _clean(opt, p)
+            z = live - opt.live_noise(p)
+            want = w0.float() * (1 - lr * wd) ** steps
+            err = ((z - want) / _ck_unit(live)).pow(2).mean().sqrt()
+            assert float(err) < 6.0, (foreach, float(err))
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_kahan8_weight_reference_reads_clean_value(foreach, monkeypatch):
+    """sigma_ref="weight" reads RMS_row(decode(p, lo) - xi)."""
+    _pin_residual_noise(monkeypatch)
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter((torch.randn(6, 5) * 0.05).bfloat16()) for _ in range(2)]
+    kw_ = 0.3
+    opt = Antikaon(ps, lr=1e-4, k_sigma=1.0, sigma_ref="weight", k_weight=kw_,
+                   foreach=foreach, bf16_method="kahan8")
+    _run(opt, ps, _grads(ps, 1))
+    z = [_clean(opt, p) - opt.live_noise(p) for p in ps]
+    _run(opt, ps, _grads(ps, 1, seed=8))
+    for p, zi in zip(ps, z, strict=True):
+        want = (zi.square().mean(-1, keepdim=True).sqrt() * kw_).clamp(min=1e-4)
+        torch.testing.assert_close(opt.state[p]["noise_sigma_rows"], want, rtol=1e-6, atol=0)
+
+
+def _lowlr_runs(foreach, steps=300, lr=1e-5, k_sigma=5.0):
+    """bf16 at lr 1e-5 on ~0.05 weights (ulp ~2.4e-4): step ~0.04 ulp, xi ~0.2 ulp. The
+    same bf16-representable start and the same (bf16-valued) gradients in every run, so the
+    fp32 run is the same rule with the SAME xi (the shaping reads identical v).
+
+    Returns the RMS distance of each bf16 run's clean iterate to the fp32 one, in bf16 ulps
+    at RMS(w), and how far the fp32 run moved (max, same units)."""
+    torch.manual_seed(0)
+    w0 = [(torch.randn(64, 32) * 0.05).bfloat16(), (torch.randn(32) * 0.05).bfloat16()]
+    gg = torch.Generator().manual_seed(3)
+    g0 = [torch.randn(w.shape, generator=gg) for w in w0]
+    grads = [[(g + 0.3 * torch.randn(g.shape, generator=gg)).bfloat16() for g in g0]
+             for _ in range(steps)]
+    kw = dict(lr=lr, k_sigma=k_sigma, weight_decay=0.1, noise_seed=4, foreach=foreach,
+              gradient_centralization=False)      # GC on a bf16 grad rounds differently
+    out = {}
+    for name, dtype, method in (("fp32", torch.float32, "stochastic_rounding"),
+                                ("kahan8", torch.bfloat16, "kahan8"),
+                                ("sr", torch.bfloat16, "stochastic_rounding")):
+        ps = [torch.nn.Parameter(w.clone().to(dtype)) for w in w0]
+        opt = Antikaon(ps, bf16_method=method, **kw)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _run(opt, ps, grads)
+        out[name] = (opt, ps, [_clean(opt, p) - opt.live_noise(p) for p in ps])
+    ref_xi = [out["fp32"][0].live_noise(p) for p in out["fp32"][1]]
+    for name in ("kahan8", "sr"):                   # same xi in every run
+        for p, xi in zip(out[name][1], ref_xi, strict=True):
+            assert torch.equal(out[name][0].live_noise(p), xi)
+    zf = torch.cat([z.flatten() for z in out["fp32"][2]])
+    u = float(torch.finfo(torch.bfloat16).eps * zf.pow(2).mean().sqrt())   # ulp at RMS(w)
+    w0f = torch.cat([w.float().flatten() for w in w0])
+    err = {n: float((torch.cat([z.flatten() for z in out[n][2]]) - zf).pow(2).mean().sqrt()) / u
+           for n in ("kahan8", "sr")}
+    moved = float((zf - w0f).abs().max()) / u
+    return err, moved
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_kahan8_low_lr_clean_iterate_tracks_fp32_far_better_than_sr(foreach):
+    """THE regime kahan8 exists for: the clean iterate z = decode(p, lo) - xi of bf16
+    Antikaon+kahan8 follows the fp32 run of the same rule (same xi, same grads) to the
+    residual grid, while SR walks by whole ulps. Measured (300 steps, weight decay 0.1, RMS
+    distance to the fp32 clean iterate in bf16 ulps at RMS(w); the fp32 run moved up to
+    21 ulp): k_sigma 5 -> kahan8 0.020, SR 3.8-3.9 (~200x); k_sigma 1.5 -> kahan8 0.021,
+    SR 2.6-2.8 (~130x); per-param and foreach alike."""
+    err, moved = _lowlr_runs(foreach)
+    assert moved > 5.0, moved
+    assert err["kahan8"] < 0.05, err
+    assert err["sr"] > 50 * err["kahan8"], err
+
+
+def test_inert_warning_uses_the_compensated_resolution():
+    """lr 1e-5, k_sigma 5 on ~0.05 bf16 weights (mean |w| 0.04): xi ~5e-5 is below half a
+    bf16 ulp (~1.6e-4), so SR warns — but 80x above half kahan8's ulp/256 grid (~6e-7),
+    where it is kept, so kahan8 must not warn. At lr 1e-7 (xi 5e-7) even the residual grid
+    cannot hold it: warn."""
+    def drive(method, lr):
+        torch.manual_seed(0)
+        p = torch.nn.Parameter((torch.randn(32, 16) * 0.05).bfloat16())
+        opt = Antikaon([p], lr=lr, k_sigma=5.0, bf16_method=method, inert_check_interval=1)
+        for _ in range(Antikaon._INERT_PATIENCE + 2):
+            p.grad = torch.randn(32, 16).bfloat16()
+            opt.step()
+
+    with pytest.warns(UserWarning, match="below half"):
+        drive("stochastic_rounding", 1e-5)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        drive("kahan8", 1e-5)
+    with pytest.warns(UserWarning, match="kahan8"):
+        drive("kahan8", 1e-7)
+
+
+def test_kahan8_fused_request_falls_back_to_foreach():
+    params = _ck_bag()
+    with pytest.warns(UserWarning, match="no Triton-fused path"):
+        opt = Antikaon(params, lr=1e-4, fused=True, bf16_method="kahan8")
+    assert opt._fused is False
+    _run(opt, params, _grads(params, 3))
+    for p in params:
+        assert opt.state[p][RESIDUAL_KEY].dtype == torch.uint8
+        assert torch.isfinite(_clean(opt, p)).all()

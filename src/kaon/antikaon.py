@@ -39,9 +39,13 @@ Noise law. ``xi = sigma * S * eps``:
 The combined write goes through the SAME writers Adakaon uses
 (:func:`~kaon._backend.subtract_one_` / :func:`~kaon._backend.subtract_batched_`) with
 ``delta' = delta - (xi_{n+1} - xi_n) / lr``; every ``bf16_method`` they implement
-(stochastic rounding, Kahan, plain) therefore works without Antikaon knowing about it —
-see :meth:`Antikaon._combined_write_one` / :meth:`Antikaon._combined_write_batched`, the
-only two places that touch the weight during a step.
+(stochastic rounding, Kahan, compact Kahan ``kahan8``, plain) therefore works without
+Antikaon knowing about it — see :meth:`Antikaon._combined_write_one` /
+:meth:`Antikaon._combined_write_batched`, the only two places that touch the weight during
+a step. Everything else that needs the weight's full value (weight decay, the
+``sigma_ref="weight"`` radius, eval/train) goes through :meth:`Antikaon._read_clean` /
+:meth:`Antikaon._write_clean` (and the stacked :meth:`Antikaon._clean_stack`), which know
+each method's residual.
 
 Like Nekaon / MSAM / Lookahead, the live weights between steps are NOT the clean iterate:
 call :meth:`eval` before validation / sampling / checkpointing and :meth:`train` to resume
@@ -73,14 +77,17 @@ from torch import Tensor
 from kaon._backend import (
     cautious_batched_,
     cautious_one_,
+    ensure_residuals,
     flat_view,
     rms,
     subtract_batched_,
     subtract_one_,
 )
+from kaon._compact_kahan import RESIDUAL_KEY, decode, encode_, is_compact_kahan, residual_bits
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk
 from kaon._momentum_codec import _MomentumCodec
+from kaon._stochastic_rounding import SRStream, _device_generator
 from kaon.adakaon import Adakaon
 from kaon.msam import MSAM
 
@@ -447,8 +454,8 @@ class Antikaon(Adakaon):
         """``p <- write(p - lr*delta + dxi)`` as ONE call into Adakaon's per-param writer.
 
         ``delta' = delta - dxi/lr`` makes the writer's own ``p -= lr*delta'`` the combined
-        write, so whatever ``bf16_method`` the writer implements (SR, Kahan, a future
-        compact Kahan) applies to it unchanged. ``lr == 0`` passes ``-dxi`` with alpha 1.
+        write, so whatever ``bf16_method`` the writer implements (SR, Kahan, compact Kahan
+        ``kahan8``) applies to it unchanged. ``lr == 0`` passes ``-dxi`` with alpha 1.
 
         Every elementwise op on the stacked/per-param tensors here and in the decay avoids
         ``add_/sub_(..., alpha=)``: on CPU its SIMD body fuses ``a + alpha*b`` while the
@@ -461,14 +468,20 @@ class Antikaon(Adakaon):
         else:
             subtract_one_(p, dxi.neg_(), state, bf16_method, sr=self.sr_stream)
 
-    def _combined_write_batched(self, pviews: list[Tensor], delta: Tensor, dxi: Tensor,
+    def _combined_write_batched(self, chunk: ForeachChunk, delta: Tensor, dxi: Tensor,
                                 bf16_method: str, lr: float) -> None:
-        """Foreach twin of :meth:`_combined_write_one` (same identity, same writer family)."""
+        """Foreach twin of :meth:`_combined_write_one` (same identity, same writer family).
+
+        ``chunk.cviews`` (the ``kahan_lo`` views; ``None`` outside ``kahan8``) goes to the
+        writer exactly as Adakaon's own bucket write passes it.
+        """
         if lr != 0.0:
             delta.sub_(dxi.div_(lr))
-            subtract_batched_(pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream)
+            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream,
+                              comp=chunk.cviews)
         else:
-            subtract_batched_(pviews, dxi.neg_(), bf16_method, sr=self.sr_stream)
+            subtract_batched_(chunk.pviews, dxi.neg_(), bf16_method, sr=self.sr_stream,
+                              comp=chunk.cviews)
 
     @staticmethod
     def _commit(states: list[dict[str, Any]], ks: list[int], sigma_step: float,
@@ -547,11 +560,13 @@ class Antikaon(Adakaon):
             update.div_((rms(update) / clip).clamp_(min=1.0))
         delta = self._codec(group).ema_one(state, update, beta1) if beta1 > 0 else update
 
-        # Weight decay on the CLEAN iterate z = w - xi_n (design §1.2 / §1.4c).
+        # Weight decay on the CLEAN iterate z = w - xi_n (design §1.2 / §1.4c), where w is the
+        # weight's full value — the compensated one under kahan / kahan8 (_read_clean).
         wd_full = wd != 0 and group["cautious_wd"] == "full"
         p_fp32 = None
         if wd != 0 or self.sigma_ref == "weight":
-            p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
+            p_fp32 = (p.data if p.dtype == torch.float32
+                      else self._read_clean(p, state, bf16_method))
         if wd != 0 and not wd_full:
             delta = delta.add_(self._decay_term(p_fp32, xi_old, wd))
         if cautious:
@@ -633,16 +648,18 @@ class Antikaon(Adakaon):
         else:
             delta = update
 
-        delta = self._decay_on_z(chunk, delta, grad, xi_old, wd, cautious, wd_full)
+        w_full = (self._clean_stack(chunk, bf16_method)
+                  if wd != 0 or self.sigma_ref == "weight" else None)
+        delta = self._decay_on_z(w_full, delta, grad, xi_old, wd, cautious, wd_full)
 
         sigma_step = self._sigma_step(lr, clip)
-        rows_new = (self._weight_rows(chunk.param_stack(), xi_old, sigma_step)
+        rows_new = (self._weight_rows(w_full, xi_old, sigma_step)
                     if self.sigma_ref == "weight" else None)
         dxi = self._noise(pids, [k + 1 for k in ks], [self._noise_scale(sigma_step)] * N, eff,
                           (row, col), rows_new, dev)
         if xi_old is not None:
             dxi = dxi.sub_(xi_old)
-        self._combined_write_batched(chunk.pviews, delta, dxi, bf16_method, lr)
+        self._combined_write_batched(chunk, delta, dxi, bf16_method, lr)
         self._commit(chunk.states, ks, sigma_step, rows_new)
 
     @torch.no_grad()
@@ -692,28 +709,43 @@ class Antikaon(Adakaon):
         else:
             delta = update
 
-        delta = self._decay_on_z(chunk, delta, grad, xi_old, wd, cautious, wd_full)
+        w_full = (self._clean_stack(chunk, bf16_method)
+                  if wd != 0 or self.sigma_ref == "weight" else None)
+        delta = self._decay_on_z(w_full, delta, grad, xi_old, wd, cautious, wd_full)
 
         sigma_step = self._sigma_step(lr, clip)
-        rows_new = (self._weight_rows(chunk.param_stack(), xi_old, sigma_step)
+        rows_new = (self._weight_rows(w_full, xi_old, sigma_step)
                     if self.sigma_ref == "weight" else None)
         dxi = self._noise(pids, [k + 1 for k in ks], [self._noise_scale(sigma_step)] * N, eff,
                           (v,), rows_new, dev)
         if xi_old is not None:
             dxi = dxi.sub_(xi_old)
-        self._combined_write_batched(chunk.pviews, delta, dxi, bf16_method, lr)
+        self._combined_write_batched(chunk, delta, dxi, bf16_method, lr)
         self._commit(chunk.states, ks, sigma_step, rows_new)
 
     @staticmethod
-    def _decay_on_z(chunk: ForeachChunk, delta: Tensor, grad: Tensor, xi_old: Tensor | None,
+    def _clean_stack(chunk: ForeachChunk, bf16_method: str) -> Tensor:
+        """The bucket's full-precision weights ``[N, *eff]`` fp32 — :meth:`_read_clean`,
+        stacked. ``kahan8`` decodes ``(weights, kahan_lo)`` (exact and integer-only, so the
+        stacked and the per-param decode agree bit for bit); legacy ``kahan`` never reaches
+        the foreach path; SR / none / fp32 are the stored values."""
+        if (chunk.cviews is not None and is_compact_kahan(bf16_method)
+                and chunk.pviews[0].dtype == torch.bfloat16):
+            return decode(torch.stack(chunk.pviews), torch.stack(chunk.cviews),
+                          residual_bits(bf16_method))
+        return chunk.param_stack()
+
+    @staticmethod
+    def _decay_on_z(w_full: Tensor | None, delta: Tensor, grad: Tensor, xi_old: Tensor | None,
                     wd: float, cautious: bool, wd_full: bool) -> Tensor:
-        """Stacked ``delta += wd * (w - xi_n)`` around the cautious mask (Adakaon's order)."""
+        """Stacked ``delta += wd * (w - xi_n)`` around the cautious mask (Adakaon's order).
+        ``w_full`` is :meth:`_clean_stack` (read only when ``wd != 0``)."""
         if wd != 0 and not wd_full:
-            delta = delta.add_(Antikaon._decay_term(chunk.param_stack(), xi_old, wd))
+            delta = delta.add_(Antikaon._decay_term(w_full, xi_old, wd))
         if cautious:
             delta = cautious_batched_(delta, grad)
         if wd_full:
-            delta = delta.add_(Antikaon._decay_term(chunk.param_stack(), xi_old, wd))
+            delta = delta.add_(Antikaon._decay_term(w_full, xi_old, wd))
         return delta
 
     @staticmethod
@@ -752,20 +784,42 @@ class Antikaon(Adakaon):
 
         Plain bf16/fp16 (SR, none): the stored value. ``kahan``: ``p + shift`` — the Kahan
         writer keeps the bits a narrowing write dropped in ``state["shift"]``, and they are
-        part of the weight. A future writer with a compressed residual (compact Kahan) adds
-        its decode here and in :meth:`_write_clean`, nothing else.
+        part of the weight. ``kahan8``: the compensated value decoded from
+        ``(p, state["kahan_lo"])`` (:func:`kaon._compact_kahan.decode`; bf16 weights, a
+        missing residual reads as zero).
         """
-        x = p.data.float() if p.dtype != torch.float32 else p.data.clone()
-        if bf16_method == "kahan" and "shift" in state and p.dtype != torch.float32:
+        if p.dtype == torch.float32:
+            return p.data.clone()
+        if p.dtype == torch.bfloat16 and is_compact_kahan(bf16_method) and RESIDUAL_KEY in state:
+            return decode(p.data, state[RESIDUAL_KEY], residual_bits(bf16_method))
+        x = p.data.float()
+        if bf16_method == "kahan" and "shift" in state:
             x.add_(state["shift"].float())
         return x
 
     @staticmethod
-    def _write_clean(p: Tensor, state: dict[str, Any], bf16_method: str, x: Tensor) -> None:
-        """Store the fp32 value ``x`` into the weight, round-to-nearest, keeping the residual
-        wherever the writer has somewhere to keep it (``kahan``: ``shift = x - RTN(x)``)."""
+    def _write_clean(p: Tensor, state: dict[str, Any], bf16_method: str, x: Tensor,
+                     sr: SRStream | None = None) -> None:
+        """Store the fp32 value ``x`` (consumed) into the weight, keeping the residual
+        wherever the writer has somewhere to keep it.
+
+        SR / none: round-to-nearest (there is nowhere to keep the rest). ``kahan``: RTN plus
+        ``shift = x - RTN(x)``. ``kahan8``: :func:`kaon._compact_kahan.encode_` with the
+        residual's stochastic rounding — the ``kahan8`` writer's codec and noise law, drawn
+        from ``sr`` (the owner's checkpointed stream, so a resume reproduces it); the stored
+        bf16 is the nearest one to the kept value.
+        """
         if p.dtype == torch.float32:
             p.data.copy_(x)
+            return
+        if p.dtype == torch.bfloat16 and is_compact_kahan(bf16_method):
+            if RESIDUAL_KEY not in state:
+                ensure_residuals([p], [state])   # method switched on mid-run
+            bits = residual_bits(bf16_method)
+            gen = _device_generator(x.device) if sr is None else sr.generator(x.device)
+            noise = torch.randint(0, 1 << (16 - bits), x.shape, dtype=torch.int32,
+                                  device=x.device, generator=gen)
+            encode_(x.contiguous(), p.data, state[RESIDUAL_KEY], bits, noise)
             return
         p.data.copy_(x)
         if bf16_method == "kahan" and "shift" in state:
@@ -779,8 +833,11 @@ class Antikaon(Adakaon):
         nothing, so SR would only add an independent random walk (design §3.1: error <= 1/2
         ulp(z), a <= 1 ulp return only where the subtraction crossed a binade). Under
         ``bf16_method="kahan"`` the pair goes through the compensated value ``p + shift``
-        and leaves the RTN residual in ``shift`` (:meth:`_read_clean` /
-        :meth:`_write_clean`), so repeated eval/train cycles do not move the clean weight.
+        and leaves the RTN residual in ``shift``; under ``"kahan8"`` it goes through the
+        decoded value and re-encodes it with the residual's stochastic rounding (unbiased,
+        one ``ulp/256`` grid unit per write at most — what the MSAM/Nekaon kahan8 climb does).
+        Either way (:meth:`_read_clean` / :meth:`_write_clean`) repeated eval/train cycles
+        do not move the clean weight beyond the compensated grid.
         """
         for group in self.param_groups:
             method = group["bf16_method"]
@@ -793,7 +850,7 @@ class Antikaon(Adakaon):
                     p.data.add_(xi, alpha=sign)
                     continue
                 x = self._read_clean(p, st, method).add_(xi, alpha=sign)
-                self._write_clean(p, st, method, x)
+                self._write_clean(p, st, method, x, self.sr_stream)
 
     @torch.no_grad()
     def eval(self) -> None:  # noqa: A003 — mirrors the optimizer.eval() API (MSAM/Lookahead/SF)
@@ -815,9 +872,19 @@ class Antikaon(Adakaon):
         """Warn once when the sampled perturbation radius is too small to do anything.
 
         MSAM's inert-lookahead heuristic (commit 265989f), same constants and cadence: a
-        radius below half a low-precision ulp at the sampled mean weight scale is not
-        representable as designed; a radius under ``_INERT_REL`` of the weights moves the
+        radius below half the stored weight's resolution at the sampled mean weight scale is
+        not representable as designed; a radius under ``_INERT_REL`` of the weights moves the
         gradient by a negligible amount. Periodically sampled, bounded, off the hot path.
+
+        The resolution depends on the writer. Plain bf16 (SR / none): half an ulp. With a
+        compensated method the sub-ulp part of ``xi`` is not lost — it lives in the residual
+        and the clean iterate stays exact to the residual grid — so the threshold is half of
+        ``ulp/256`` (``kahan8``: its 8-bit residual; ``kahan``: its bf16 buffer holds the
+        same order). The forward pass still sees the nearest bf16 to ``z + xi``: a sub-ulp
+        ``xi`` reaches the gradient only through which coordinates it tips across a rounding
+        boundary (on top of ``z``'s own rounding offset), not coordinate by coordinate as
+        designed; that is a property of evaluating a bf16 model, not a loss of the
+        clean iterate (``docs/antikaon.md``).
         """
         if self._inert_warned or self._inert_checks >= self._INERT_MAX_CHECKS:
             return
@@ -836,19 +903,28 @@ class Antikaon(Adakaon):
             if self.sigma_ref == "weight":
                 sigma = max(sigma, self.k_weight * w)
             dtype = params[0].dtype
-            half_ulp = 0.5 * torch.finfo(dtype).eps * w
-            if dtype != torch.float32 and sigma < half_ulp:
-                if group["bf16_method"] == "kahan":
-                    how = ("bf16_method='kahan' keeps the clean iterate exact, but the forward "
-                           "pass still sees the weight rounded to bf16")
+            method = group["bf16_method"]
+            # The resolution the weight's storage actually keeps: the dtype's ulp for plain
+            # (SR / none) writes; a compensated method keeps what the ulp drops, so a sub-ulp
+            # xi is NOT lost — it accumulates in the residual. kahan8 resolves ulp/2^bits;
+            # legacy kahan's bf16 compensation buffer holds a residual <= ulp/2 to 8 bits
+            # (<= ulp/2^9) — the same order, so the same ulp/2^8 floor is used for both.
+            res_bits = (residual_bits(method) if is_compact_kahan(method)
+                        else 8 if method == "kahan" else 0)
+            half_res = 0.5 * torch.finfo(dtype).eps * w / (1 << res_bits)
+            if dtype != torch.float32 and sigma < half_res:
+                if res_bits:
+                    how = (f"even bf16_method={method!r}, which keeps sub-ulp movement down to "
+                           f"~ulp/{1 << res_bits}, stores it only as rounding")
                 else:
                     how = ("with stochastic rounding it is realized only as {0, +-ulp} draws "
                            "(unbiased, but a larger covariance than designed, and a larger SR "
                            "walk of the clean iterate)")
                 msg = (
                     f"{type(self).__name__}: the perturbation radius (~{sigma:.2e}) is below "
-                    f"half a {dtype} ulp at the sampled mean weight scale ({half_ulp:.2e}); "
-                    f"{how}. Raise k_sigma, or keep these parameters in fp32."
+                    f"half the resolution of the stored weight at the sampled mean weight "
+                    f"scale ({half_res:.2e}, {dtype}); {how}. Raise k_sigma, use "
+                    f"bf16_method='kahan8', or keep these parameters in fp32."
                 )
             elif sigma / w < self._INERT_REL:
                 msg = (

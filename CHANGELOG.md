@@ -68,8 +68,13 @@ All notable changes to this project will be documented in this file.
   per-element state (`xi` is regenerated from `noise_seed`, parameter index and step).
   `eval()`/`train()` remove/re-install `xi`; `step()` in eval mode raises; train-mode
   checkpoints are refused. Per-parameter and foreach paths only (`fused=True` warns and falls
-  back). Under `bf16_method="kahan"`, eval/train act on `p + shift` and keep the residual.
-  The noise law is read-only; the checkpoint records the noise backend per device type
+  back). `bf16_method="kahan8"` works on both paths (and the `fused=True` fallback): the
+  combined write carries the residual, and eval/train, weight decay and `sigma_ref="weight"`
+  act on the compensated value (`decode(p, kahan_lo)`; `p + shift` under legacy `"kahan"` —
+  the decay previously read the bare bf16 weight). At lr 1e-5 with sub-ulp noise the clean
+  iterate stays 0.02 ulp from an fp32 run of the same rule (SR: 2.6–3.9 ulp). The inert-noise
+  warning measures against the resolution the weight keeps (`ulp/256` under kahan/kahan8), so
+  a sub-ulp radius no longer warns when it is compensated. The noise law is read-only; the checkpoint records the noise backend per device type
   (`"torch-cuda"`/`"torch-cpu"`). Registered in the control battery with the design's sweep
   arms; quality is not measured yet. See `docs/antikaon.md` and `docs/research/antikaon-design.md`.
 - Experimental `Rakaon`: momentum-free variance shrinkage, tensorwise or contiguous

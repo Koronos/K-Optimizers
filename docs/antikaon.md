@@ -72,25 +72,54 @@ The combined write goes through Adakaon's own writers, so every `bf16_method` wo
   radius (measured, design §3.2). Once `lr·rms(update) ≳ ulp/6` carrying `xi` costs no extra
   rounding noise; in the sub-ulp regime (full fine-tunes at very low LR) it raises the SR walk
   of `z` toward `ulp²/6` per step.
-* `"kahan"` (+2 B/param, per-parameter path): keeps the clean iterate exact to ~fp32 — the
-  choice for very low LR, where SR would otherwise realize a sub-ulp `xi` only stochastically.
-* A radius below half a bf16 ulp at the sampled weight scale triggers a one-time warning (the
-  MSAM inert-lookahead heuristic, same cadence).
+* `"kahan8"` (+1 B/param, every path; the recommended choice for low LR): the compact Kahan of
+  `docs/research/compact-kahan.md` — the bf16 weight plus one `uint8` residual in units of its
+  own ulp, stochastically rounded at `ulp/256`. The clean iterate `z = decode(p, lo) − xi`
+  follows an fp32 run of the same rule (same `xi`, same gradients) to the residual grid:
+  measured at lr 1e-5 on ~0.05 weights (step ≈ 0.04 ulp, `xi` ≈ 0.06–0.2 ulp), 300 steps,
+  weight decay 0.1 — RMS distance **0.020 ulp with `kahan8` against 2.6–3.9 ulp with SR**
+  (130–200×), per-parameter and foreach alike, while the fp32 run moved up to 21 ulp
+  (`tests/test_antikaon.py::test_kahan8_low_lr_clean_iterate_tracks_fp32_far_better_than_sr`).
+* `"kahan"` (legacy, +2 B/param, per-parameter path only): a bf16 compensation buffer; exact on
+  dithered updates but it rounds deterministically, so it loses part of pure sub-grid drift
+  (compact-kahan note). Kept for compatibility.
+* **Weight decay and `sigma_ref="weight"` read the compensated value.** The decay term is
+  `wd · (w − xi_n)` with `w = p + shift` (`kahan`) or `decode(p, lo)` (`kahan8`), not the bare
+  bf16 weight (reading the bare weight misses `lr·wd·residual` every step: 12–26 residual units
+  after 20 steps of strong decay, against 1–3 with the fix). Same for the row RMS of
+  `sigma_ref="weight"`.
+* **Inert-noise warning.** A radius below half the *resolution the stored weight keeps* at the
+  sampled weight scale triggers a one-time warning (the MSAM inert-lookahead heuristic, same
+  cadence). The resolution is the bf16 ulp for SR / `none`, and `ulp/256` for the compensated
+  methods: with `kahan8` (or `kahan`) a sub-ulp `xi` is **not** inert — it is kept in the
+  residual and the clean iterate moves exactly as designed. So `lr=1e-5, k_sigma=5` on ~0.05
+  weights warns under SR and not under `kahan8`; the compensated methods warn only once the
+  radius falls under `ulp/512`. What the compensation cannot change is that the forward pass
+  sees the nearest bf16 to `z + xi`: a sub-ulp `xi` reaches the *gradient* only through the
+  coordinates it tips across a rounding boundary. That is a property of evaluating a bf16 model;
+  whether the resulting perturbation still helps quality at real fine-tune LRs is what
+  `benchmarks/antikaon_lowlr/` measures.
 
 `eval()`/`train()` use round-to-nearest (like MSAM's climb): error ≤ ½ ulp of `z`, and a ≤ 1 ulp
 return only where the subtraction crossed a binade. Under `bf16_method="kahan"` they act on the
 compensated value `p + shift` and keep the rounding residual in `shift`, so the eval view is
 `z` to ~fp32 and repeated eval/train cycles do not move the clean weight (measured with
 `xi ≫ ulp ≫ step`: eval-view error 0.8 % of a step, 20-cycle drift 0.08 % of a step, against
-490 % / 11 % for a plain RTN round trip). The read/write of the clean value lives in
-`Antikaon._read_clean` / `_write_clean`, the one place a new writer (e.g. a compact Kahan) plugs in.
+490 % / 11 % for a plain RTN round trip). Under `"kahan8"` they decode, add/subtract `xi` in
+fp32 and re-encode with the residual's stochastic rounding (the same codec as the writer, noise
+from the optimizer's checkpointed stream, so resumes stay bit-exact): the eval view is `z` to the
+residual grid, the forward pass sees the nearest bf16, and 20 cycles leave only the unbiased
+`ulp/256` walk (same regime as above: eval-view error ≤ 24 % of a step at the worst coordinate,
+20-cycle drift RMS 3 % of a step — coarser than legacy `kahan`'s ~fp32 buffer on this dithered
+round trip, and far below the step; a plain RTN round trip gives 490 % / 11 %). The read/write of the clean value lives in
+`Antikaon._read_clean` / `_write_clean` (and the stacked `_clean_stack`).
 
 ## Paths and limits
 
 * Per-parameter and native foreach paths; bit-exact with each other on fp32 CPU params (on
   CUDA they agree to Adakaon's own ~1-ulp foreach/per-param reduction parity).
 * **No Triton fused path yet**: `fused=True` warns and runs the foreach path (same math and
-  state). The noise is defined in one place (`Antikaon._noise`) so a fused `NOISE` branch can
+  state; with `kahan8` the foreach bucket write carries the residual views). The noise is defined in one place (`Antikaon._noise`) so a fused `NOISE` branch can
   reproduce it; it will need its own noise-backend id (recorded in the checkpoint).
 * `sigma_ref="weight"` reads the row RMS of the clean iterate `z` when a noise is installed.
 * **Pending (performance):** the noise draw is a Python loop of `torch.Generator` calls, two
