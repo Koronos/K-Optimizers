@@ -43,7 +43,24 @@ python benchmarks/control/battery.py            # measure every registry optimiz
 python benchmarks/control/battery.py --new      # measure only optimizers missing from the cache
 python benchmarks/control/battery.py --render-only   # rebuild RANKINGS.md from the cache (no training)
 python benchmarks/control/battery.py --quick    # smaller/faster settings (smoke; separate cache)
+python benchmarks/control/battery.py --seeds 5 --out evidence   # 5-seed run in its OWN cache/rankings
 ```
+
+Measuring **aborts unless the laptop is on AC power**: the GPU runs a 60 W cap on AC and 35 W on
+battery, so the two regimes produce timings that must never share a table. Every entry is stamped
+with its timestamp, kaon version, commit, GPU and electrical state, and the rankings header shows
+the state the last entry was measured under.
+
+`--seeds N` overrides the seed count and *enters the settings signature*, so a 5-seed battery is
+ranked apart from the 2-seed history. `--out TAG` sends both the cache and the rankings to
+`results_TAG.json` / `RANKINGS_TAG.md`, leaving `results.json` / `RANKINGS.md` untouched — the way
+to build a fresh evidence battery next to the historical one.
+
+Each entry keeps the **individual per-seed runs** behind its averages, so the quality tables show
+`mean ± 95% CI` (Student-t, n-1 d.o.f.) and mark with **≈** any row whose interval overlaps the
+leader's: *tied within the CI*, not beaten. Legacy entries (measured before per-seed retention)
+still render as bare means. The speed table also reports `opt-only ms/step` — a bare
+`opt.step()` — because `ms/step` is fwd+bwd+step and on this small proxy the optimizer dominates it.
 
 ### Add a contender (the whole point)
 

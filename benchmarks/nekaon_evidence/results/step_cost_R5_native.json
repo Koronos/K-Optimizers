@@ -1,0 +1,135 @@
+{
+  "schema": "nekaon_evidence.step_cost/1",
+  "meta": {
+    "kaon_version": "0.7.14",
+    "kaon_file": "C:\\Users\\Koronos\\Documents\\Repos\\K-Optimizers\\.claude\\worktrees\\nekaon-evidence\\src\\kaon\\__init__.py",
+    "commit": "0814c7025d6a4a5707940d17ca14878f79235674",
+    "branch": "feature/nekaon-evidence",
+    "dirty": true,
+    "torch": "2.12.0+cu130",
+    "torch_cuda": "13.0",
+    "triton": "3.7.1",
+    "python": "3.10.18",
+    "timestamp": "2026-09-18T18:30:45-0600",
+    "gpu": "NVIDIA RTX 3000 Ada Generation Laptop GPU",
+    "gpu_total_bytes": 8585216000,
+    "gpu_capability": "8.9",
+    "nvidia_smi": "[N/A], 60.00 W, 35.00 W, 3105 MHz, 65",
+    "battery_status": "2",
+    "on_ac": true,
+    "power_note": "on AC (BatteryStatus=2)"
+  },
+  "config": {
+    "R": 5,
+    "reps": 100,
+    "arms": [
+      "adamw_bf16",
+      "adamw_fp32",
+      "adakaon_bf16",
+      "adakaon_4bit",
+      "nekaon_bf16",
+      "nekaon_4bit",
+      "nekaon_k0_4bit"
+    ],
+    "native": true,
+    "baseline": "adamw_bf16"
+  },
+  "bag": {
+    "R": 5,
+    "tensors": 780,
+    "params": 663104000
+  },
+  "arms": {
+    "adamw_bf16": {
+      "param_dtype": "bfloat16",
+      "params": 663104000,
+      "tensors": 780,
+      "state_bytes_per_param": 4.000004705144291,
+      "peak_allocated_bytes": 5321635840,
+      "peak_reserved_bytes": 5645533184,
+      "resident_before_step_bytes": 5321635840,
+      "step_transient_bytes": 0,
+      "peak_bytes_per_param": 8.025341183283468,
+      "ms_step_solo": 48.75950000132434,
+      "note": "torch.optim.AdamW(fused) on bf16 params: state is bf16 too, 4 B/p. No stochastic rounding \u2014 the cheap thing people actually do. Baseline of the paired ratios."
+    },
+    "adamw_fp32": {
+      "param_dtype": "float32",
+      "params": 663104000,
+      "tensors": 780,
+      "state_bytes_per_param": 8.000004705144292,
+      "peak_allocated_bytes": 10610063360,
+      "peak_reserved_bytes": 11418992640,
+      "resident_before_step_bytes": 10610063360,
+      "step_transient_bytes": 0,
+      "peak_bytes_per_param": 16.00060225846926,
+      "ms_step_solo": 828.7443000008352,
+      "note": "Plain fp32 training: fp32 weights (4 B/p) + fp32 grad (4 B/p) + fp32 AdamW state (8 B/p) = 16 B/p resident. There is no bf16 copy and hence no master weight \u2014 the 8 B/p is the STATE alone, which is what the 'AdamW costs 8 bytes per parameter' folklore means. Only fits at small R."
+    },
+    "adakaon_bf16": {
+      "param_dtype": "bfloat16",
+      "params": 663104000,
+      "tensors": 780,
+      "state_bytes_per_param": 2.009072483351028,
+      "peak_allocated_bytes": 4807600128,
+      "peak_reserved_bytes": 5375000576,
+      "resident_before_step_bytes": 3996592128,
+      "step_transient_bytes": 811008000,
+      "peak_bytes_per_param": 7.250144966702056,
+      "ms_step_solo": 394.2784000100801,
+      "note": "Adakaon: bf16 momentum + factored second moment, stochastic-rounded bf16 writes."
+    },
+    "adakaon_4bit": {
+      "param_dtype": "bfloat16",
+      "params": 663104000,
+      "tensors": 780,
+      "state_bytes_per_param": 0.5403224833510278,
+      "peak_allocated_bytes": 3836930048,
+      "peak_reserved_bytes": 4114612224,
+      "resident_before_step_bytes": 3025922048,
+      "step_transient_bytes": 811008000,
+      "peak_bytes_per_param": 5.786317150854165,
+      "ms_step_solo": 564.2786999960663,
+      "note": "Adakaon with 4-bit quantized momentum."
+    },
+    "nekaon_bf16": {
+      "param_dtype": "bfloat16",
+      "params": 663104000,
+      "tensors": 780,
+      "state_bytes_per_param": 2.009072483351028,
+      "peak_allocated_bytes": 4807616512,
+      "peak_reserved_bytes": 5375000576,
+      "resident_before_step_bytes": 3996608512,
+      "step_transient_bytes": 811008000,
+      "peak_bytes_per_param": 7.25016967474182,
+      "ms_step_solo": 459.6006000065245,
+      "note": "Nekaon k=1.5 over the bf16-momentum Adakaon: the negative-momentum lookahead on top of the same inner step."
+    },
+    "nekaon_4bit": {
+      "param_dtype": "bfloat16",
+      "params": 663104000,
+      "tensors": 780,
+      "state_bytes_per_param": 0.5403224833510278,
+      "peak_allocated_bytes": 3836954624,
+      "peak_reserved_bytes": 4114612224,
+      "resident_before_step_bytes": 3025946624,
+      "step_transient_bytes": 811008000,
+      "peak_bytes_per_param": 5.786354212913811,
+      "ms_step_solo": 585.3470000001835,
+      "note": "Nekaon k=1.5 with 4-bit momentum \u2014 the Anima configuration."
+    },
+    "nekaon_k0_4bit": {
+      "param_dtype": "bfloat16",
+      "params": 663104000,
+      "tensors": 780,
+      "state_bytes_per_param": 0.5403224833510278,
+      "peak_allocated_bytes": 3836930048,
+      "peak_reserved_bytes": 4114612224,
+      "resident_before_step_bytes": 3025922048,
+      "step_transient_bytes": 811008000,
+      "peak_bytes_per_param": 5.786317150854165,
+      "ms_step_solo": 553.7833999987924,
+      "note": "Nekaon with k=0: the lookahead is inert, so the gap to nekaon_4bit isolates what the lookahead itself costs and the gap to adakaon_4bit is the wrapper's own tax."
+    }
+  }
+}

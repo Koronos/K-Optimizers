@@ -1,0 +1,95 @@
+=== 2026-09-18T18:21:35-06:00 step_cost R=5 main (solo+paired vs adamw_bf16+fraction C=256+capacity)
+C:\Users\Koronos\Documents\Repos\Rengu-Flow\.venv\lib\site-packages\torch\profiler\profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-09-18 18:21:42 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-18 18:21:42 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-18 18:22:27 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-18 18:22:28 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-18 18:22:33 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-18 18:22:33 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-18 18:22:38 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-18 18:22:38 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-18 18:22:44 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-18 18:22:44 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-18 18:22:50 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-18 18:22:50 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-18 18:22:54 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-18 18:22:54 48512:31612 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+bag R=5: 780 tensors, 663.1 M params  |  kaon 0.7.14 @ 0814c7025d6a  |  NVIDIA RTX 3000 Ada Generation Laptop GPU
+solo (memory, state bytes, unpaired ms):
+  adamw_bf16           48.67 ms   4.00 B/p  peak  4.96 GiB      9 launches
+  adamw_fp32          842.47 ms   8.00 B/p  peak  9.88 GiB      9 launches
+  adakaon_bf16         85.37 ms   2.01 B/p  peak  3.73 GiB     38 launches
+  adakaon_4bit         77.97 ms   0.54 B/p  peak  2.82 GiB     38 launches
+  nekaon_bf16         115.84 ms   2.01 B/p  peak  3.73 GiB     54 launches
+  nekaon_4bit          99.75 ms   0.54 B/p  peak  2.82 GiB     54 launches
+  nekaon_k0_4bit       74.89 ms   0.54 B/p  peak  2.82 GiB     38 launches
+paired vs adamw_bf16 at R=3 (150 reps, ABAB):
+  adamw_fp32          165.48 ms vs  411.32 ms  0.402x [0.401,0.403] faster
+  adakaon_bf16         45.66 ms vs   29.35 ms  1.550x [1.545,1.554] slower
+  adakaon_4bit         40.34 ms vs   29.70 ms  1.380x [1.362,1.399] slower
+  nekaon_bf16          68.27 ms vs   29.33 ms  2.319x [2.312,2.326] slower
+  nekaon_4bit          57.14 ms vs   29.48 ms  1.925x [1.917,1.933] slower
+  nekaon_k0_4bit       39.94 ms vs   29.32 ms  1.359x [1.353,1.364] slower
+fraction of a full step (UNet C=256):
+  adamw_bf16         total   57.66 ms  opt   1.30 ms    2.3%
+  adamw_fp32         total   96.98 ms  opt   2.04 ms    2.1%
+  adakaon_bf16       total   64.93 ms  opt   4.17 ms    6.4%
+  adakaon_4bit       total   70.12 ms  opt   6.85 ms    9.8%
+  nekaon_bf16        total   66.65 ms  opt   4.66 ms    7.0%
+  nekaon_4bit        total   69.89 ms  opt   6.84 ms    9.8%
+  nekaon_k0_4bit     total   69.26 ms  opt   5.83 ms    8.4%
+capacity sweep R=1..12:
+  adamw_bf16         max R=12 (1591.4 M params)  OOM at R=None
+  adamw_fp32         max R=12 (1591.4 M params)  OOM at R=None
+  adakaon_bf16       max R=12 (1591.4 M params)  OOM at R=None
+  adakaon_4bit       max R=12 (1591.4 M params)  OOM at R=None
+  nekaon_bf16        max R=12 (1591.4 M params)  OOM at R=None
+  nekaon_4bit        max R=12 (1591.4 M params)  OOM at R=None
+  nekaon_k0_4bit     max R=12 (1591.4 M params)  OOM at R=None
+wrote benchmarks\nekaon_evidence\results\step_cost_R5.json
+wrote benchmarks\nekaon_evidence\RESULTS_step_cost.md
+exit 0
+=== 2026-09-18T18:29:12-06:00 step_cost R=3 paired vs adakaon_4bit (lookahead cost at scale)
+bag R=3: 468 tensors, 397.9 M params  |  kaon 0.7.14 @ 0814c7025d6a  |  NVIDIA RTX 3000 Ada Generation Laptop GPU
+solo (memory, state bytes, unpaired ms):
+  adakaon_4bit         54.13 ms   0.54 B/p  peak  1.70 GiB
+  nekaon_4bit          64.94 ms   0.54 B/p  peak  1.70 GiB
+  nekaon_k0_4bit       52.10 ms   0.54 B/p  peak  1.70 GiB
+  nekaon_bf16          75.90 ms   2.01 B/p  peak  2.24 GiB
+  adakaon_bf16         54.54 ms   2.01 B/p  peak  2.24 GiB
+paired vs adakaon_4bit at R=3 (150 reps, ABAB):
+  nekaon_4bit          57.95 ms vs   40.04 ms  1.450x [1.445,1.454] slower
+  nekaon_k0_4bit       40.67 ms vs   40.64 ms  1.001x [0.999,1.003] n.s.
+  nekaon_bf16          69.74 ms vs   39.58 ms  1.761x [1.759,1.764] slower
+  adakaon_bf16         47.37 ms vs   40.01 ms  1.185x [1.183,1.186] slower
+wrote benchmarks\nekaon_evidence\results\step_cost_R3_vs_adakaon.json
+wrote benchmarks\nekaon_evidence\RESULTS_step_cost_vs_adakaon.md
+exit 0
+=== 2026-09-18T18:30:43-06:00 step_cost R=5 native path (torch/foreach, no Triton) paired vs adamw_bf16
+bag R=5: 780 tensors, 663.1 M params  |  kaon 0.7.14 @ 0814c7025d6a  |  NVIDIA RTX 3000 Ada Generation Laptop GPU
+solo (memory, state bytes, unpaired ms):
+  adamw_bf16           48.76 ms   4.00 B/p  peak  4.96 GiB
+  adamw_fp32          828.74 ms   8.00 B/p  peak  9.88 GiB
+  adakaon_bf16        394.28 ms   2.01 B/p  peak  4.48 GiB
+  adakaon_4bit        564.28 ms   0.54 B/p  peak  3.57 GiB
+  nekaon_bf16         459.60 ms   2.01 B/p  peak  4.48 GiB
+  nekaon_4bit         585.35 ms   0.54 B/p  peak  3.57 GiB
+  nekaon_k0_4bit      553.78 ms   0.54 B/p  peak  3.57 GiB
+wrote benchmarks\nekaon_evidence\results\step_cost_R5_native.json
+wrote benchmarks\nekaon_evidence\RESULTS_step_cost_native.md
+exit 0
+=== 2026-09-18T18:32:52-06:00 control battery 5 seeds (8 arms)
+BATTERY sig=C128_N2000_s5_w10_b0bad0f5 | measuring: ['torch.AdamW (fused)', 'Adakaon-bf16', 'Adakaon-bf16-fused', 'Adakaon-4bit-fused', 'Nekaon', 'Nekaon-fused', 'Nekaon-bf16-fused', 'Nekaon-k0-4bit-fused']
+  torch.AdamW (fused) te=0.0803 gap=+0.0114 35.2ms 8.00B/p lora=1.10ms const_gap=+0.0101
+  Adakaon-bf16     te=0.0738 gap=+0.0195 48.3ms 2.03B/p lora=5.36ms const_gap=+0.0170
+  Adakaon-bf16-fused te=0.0738 gap=+0.0197 46.1ms 2.03B/p lora=1.00ms const_gap=+0.0164
+  Adakaon-4bit-fused te=0.0753 gap=+0.0202 46.4ms 0.56B/p lora=1.00ms const_gap=+0.0173
+  Nekaon           te=0.0790 gap=+0.0091 55.4ms 0.56B/p lora=7.77ms const_gap=+0.0072
+  Nekaon-fused     te=0.0788 gap=+0.0093 47.1ms 0.56B/p lora=1.00ms const_gap=+0.0078
+  Nekaon-bf16-fused te=0.0781 gap=+0.0088 47.4ms 2.03B/p lora=1.00ms const_gap=+0.0077
+  Nekaon-k0-4bit-fused te=0.0752 gap=+0.0129 45.5ms 0.56B/p lora=0.00ms const_gap=+0.0101
+render: wrote RANKINGS_evidence.md (8 optimizers, target<=0.0803)
+DONE
+exit 0
+=== 2026-09-18T20:26:58-06:00 DONE

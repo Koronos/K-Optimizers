@@ -60,6 +60,38 @@ OPTIMIZERS = {
         lr=1.2e-3, lr_const=1.2e-3, family="in-house",
         blurb="Nekaon, Triton-fused inner step (same math; speed twin of Nekaon)",
     ),
+    # --- fair-comparison arms (added 2026-09-18) ----------------------------------------------
+    # The historical head-to-head, "Nekaon" vs "Adakaon-bf16", varies FOUR things at once:
+    # beta1 (0.5 vs 0.9), weight_decay (0.1 vs 0), the momentum codec (4bit vs bf16) and the
+    # k-step lookahead (k=1.5 vs none). Attributing its ms/step delta to any one of them is
+    # guesswork. These three arms each move ONE knob off an existing arm:
+    #   Nekaon-bf16-fused    = Nekaon-fused, bf16 codec       -> the CODEC, on the Nekaon base.
+    #   Nekaon-k0-4bit-fused = Nekaon-fused, k=0              -> the LOOKAHEAD, everything else held.
+    #   Adakaon-4bit-fused   = Adakaon-bf16-fused, 4bit codec -> the CODEC, on the Adakaon base.
+    # Note that Nekaon-k0-4bit-fused is *also* "Adakaon at Nekaon's config" (betas 0.5/0.999,
+    # wd 0.1, 4bit) wrapped in an inert lookahead — which is why Adakaon-4bit-fused must keep
+    # Adakaon-bf16-fused's OWN betas (0.9/0.999) and wd: at Nekaon's betas/wd the two arms
+    # would be the same optimizer measured twice, and neither pairing would isolate anything.
+    # LRs are INHERITED from the base each arm derives from (Nekaon 1.2e-3 / Adakaon-bf16 1.2e-3 —
+    # the same value here), not re-tuned: an arm that changed its LR would stop being a controlled
+    # comparison against the config it is paired with.
+    "Nekaon-bf16-fused": dict(
+        make=lambda p, lr: Nekaon(p, lr=lr, k=1.5, betas=(0.5, 0.999), weight_decay=0.1, momentum_dtype="bfloat16", fused=True),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="Nekaon-fused with bf16 momentum instead of 4bit (isolates the codec cost; LR inherited from Nekaon)",
+    ),
+    "Nekaon-k0-4bit-fused": dict(
+        make=lambda p, lr: Nekaon(p, lr=lr, k=0.0, betas=(0.5, 0.999), weight_decay=0.1, momentum_dtype="4bit", fused=True),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="Nekaon-fused with k=0, i.e. lookahead OFF — Adakaon at Nekaon's b1=0.5/wd=0.1/4bit "
+              "(isolates the lookahead; LR inherited from Nekaon)",
+    ),
+    "Adakaon-4bit-fused": dict(
+        make=lambda p, lr: Adakaon(p, lr=lr, betas=(0.9, 0.999), cautious=True, momentum_dtype="4bit", fused=True),
+        lr=1.2e-3, lr_const=1.2e-3, family="in-house",
+        blurb="Adakaon-bf16-fused with the 4bit codec instead of bf16 — its ONLY difference "
+              "(isolates the codec on the Adakaon base; LR inherited from Adakaon-bf16)",
+    ),
     # wd-sweep finding (2026-06-15): default wd=0.1 is under-regularized; the long-run const-LR
     # sweet spot is the basin ~0.25-0.35. beta1 then dials fidelity<->gap at constant te.
     "Nekaon-wd0.3": dict(

@@ -1,0 +1,154 @@
+{
+  "schema": "nekaon_evidence.step_cost/1",
+  "meta": {
+    "kaon_version": "0.7.14",
+    "kaon_file": "C:\\Users\\Koronos\\Documents\\Repos\\K-Optimizers\\.claude\\worktrees\\nekaon-evidence\\src\\kaon\\__init__.py",
+    "commit": "0814c7025d6a4a5707940d17ca14878f79235674",
+    "branch": "feature/nekaon-evidence",
+    "dirty": true,
+    "torch": "2.12.0+cu130",
+    "torch_cuda": "13.0",
+    "triton": "3.7.1",
+    "python": "3.10.18",
+    "timestamp": "2026-09-18T18:29:14-0600",
+    "gpu": "NVIDIA RTX 3000 Ada Generation Laptop GPU",
+    "gpu_total_bytes": 8585216000,
+    "gpu_capability": "8.9",
+    "nvidia_smi": "[N/A], 60.00 W, 35.00 W, 3105 MHz, 58",
+    "battery_status": "2",
+    "on_ac": true,
+    "power_note": "on AC (BatteryStatus=2)"
+  },
+  "config": {
+    "R": 3,
+    "reps": 150,
+    "arms": [
+      "adakaon_4bit",
+      "nekaon_4bit",
+      "nekaon_k0_4bit",
+      "nekaon_bf16",
+      "adakaon_bf16"
+    ],
+    "native": false,
+    "baseline": "adakaon_4bit",
+    "paired_R": 3
+  },
+  "bag": {
+    "R": 3,
+    "tensors": 468,
+    "params": 397862400
+  },
+  "arms": {
+    "adakaon_4bit": {
+      "param_dtype": "bfloat16",
+      "params": 397862400,
+      "tensors": 468,
+      "state_bytes_per_param": 0.5403224833510278,
+      "peak_allocated_bytes": 1820881408,
+      "peak_reserved_bytes": 1881145344,
+      "resident_before_step_bytes": 1820881408,
+      "step_transient_bytes": 0,
+      "peak_bytes_per_param": 4.5766611974391145,
+      "ms_step_solo": 54.1320999909658,
+      "note": "Adakaon with 4-bit quantized momentum."
+    },
+    "nekaon_4bit": {
+      "param_dtype": "bfloat16",
+      "params": 397862400,
+      "tensors": 468,
+      "state_bytes_per_param": 0.5403224833510278,
+      "peak_allocated_bytes": 1820899840,
+      "peak_reserved_bytes": 1881145344,
+      "resident_before_step_bytes": 1820899840,
+      "step_transient_bytes": 0,
+      "peak_bytes_per_param": 4.576707525013673,
+      "ms_step_solo": 64.94150000798982,
+      "note": "Nekaon k=1.5 with 4-bit momentum \u2014 the Anima configuration."
+    },
+    "nekaon_k0_4bit": {
+      "param_dtype": "bfloat16",
+      "params": 397862400,
+      "tensors": 468,
+      "state_bytes_per_param": 0.5403224833510278,
+      "peak_allocated_bytes": 1820881408,
+      "peak_reserved_bytes": 1881145344,
+      "resident_before_step_bytes": 1820881408,
+      "step_transient_bytes": 0,
+      "peak_bytes_per_param": 4.5766611974391145,
+      "ms_step_solo": 52.09669999021571,
+      "note": "Nekaon with k=0: the lookahead is inert, so the gap to nekaon_4bit isolates what the lookahead itself costs and the gap to adakaon_4bit is the wrapper's own tax."
+    },
+    "nekaon_bf16": {
+      "param_dtype": "bfloat16",
+      "params": 397862400,
+      "tensors": 468,
+      "state_bytes_per_param": 2.009072483351028,
+      "peak_allocated_bytes": 2403092992,
+      "peak_reserved_bytes": 2545942528,
+      "resident_before_step_bytes": 2403092992,
+      "step_transient_bytes": 0,
+      "peak_bytes_per_param": 6.040010295016568,
+      "ms_step_solo": 75.9016999945743,
+      "note": "Nekaon k=1.5 over the bf16-momentum Adakaon: the negative-momentum lookahead on top of the same inner step."
+    },
+    "adakaon_bf16": {
+      "param_dtype": "bfloat16",
+      "params": 397862400,
+      "tensors": 468,
+      "state_bytes_per_param": 2.009072483351028,
+      "peak_allocated_bytes": 2403080704,
+      "peak_reserved_bytes": 2545942528,
+      "resident_before_step_bytes": 2403080704,
+      "step_transient_bytes": 0,
+      "peak_bytes_per_param": 6.039979409966863,
+      "ms_step_solo": 54.5397999958368,
+      "note": "Adakaon: bf16 momentum + factored second moment, stochastic-rounded bf16 writes."
+    }
+  },
+  "paired": {
+    "nekaon_4bit": {
+      "baseline": "adakaon_4bit",
+      "reps": 150,
+      "pairs_used": 145,
+      "ms_arm_median": 57.94879999302793,
+      "ms_baseline_median": 40.0357000035001,
+      "ratio": 1.4497800751950007,
+      "ci_lo": 1.445222148606499,
+      "ci_hi": 1.454352376524996,
+      "verdict": "slower"
+    },
+    "nekaon_k0_4bit": {
+      "baseline": "adakaon_4bit",
+      "reps": 150,
+      "pairs_used": 145,
+      "ms_arm_median": 40.66669999156147,
+      "ms_baseline_median": 40.6422000087332,
+      "ratio": 1.000597157558181,
+      "ci_lo": 0.9986069388502111,
+      "ci_hi": 1.0025913427622275,
+      "verdict": "n.s."
+    },
+    "nekaon_bf16": {
+      "baseline": "adakaon_4bit",
+      "reps": 150,
+      "pairs_used": 145,
+      "ms_arm_median": 69.74330000230111,
+      "ms_baseline_median": 39.58139999303967,
+      "ratio": 1.7611987524029045,
+      "ci_lo": 1.7586057407192905,
+      "ci_hi": 1.7637955874048643,
+      "verdict": "slower"
+    },
+    "adakaon_bf16": {
+      "baseline": "adakaon_4bit",
+      "reps": 150,
+      "pairs_used": 145,
+      "ms_arm_median": 47.36709999269806,
+      "ms_baseline_median": 40.00770000857301,
+      "ratio": 1.1845036361930321,
+      "ci_lo": 1.1825643093103952,
+      "ci_hi": 1.1864461434428828,
+      "verdict": "slower"
+    }
+  }
+}

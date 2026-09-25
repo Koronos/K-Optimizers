@@ -28,7 +28,7 @@ LLM = "/home/koronos/Rengu-Flow/tmp/models/qwen_3_06b_base.safetensors"
 RFL_ROOT = "/home/koronos/Rengu-Flow"
 ARMS = ("nekaon", "adakaon", "rakaon_isotropic", "rakaon_block64", "adamw_fused",
         "rakaon_m05", "rakaon_m09", "gram_d001", "gram_d01",
-        "nekaon_k0", "nekaon_sr_host")
+        "nekaon_k0", "nekaon_sr_host", "nekaon_fused", "adakaon_fused")
 
 
 def _toml_string(value: str) -> str:
@@ -77,6 +77,12 @@ def _optimizer_config(arm: str, lr: float) -> list[str]:
         return [line.replace('type = "kaon.Nekaon"',
                              'type = "benchmarks.nekaon_sr_offload.NekaonSROffload"')
                 for line in _optimizer_config("nekaon", lr)]
+    if arm == "nekaon_fused":
+        # Same configuration as `nekaon`, routed through Adakaon's existing fused
+        # kernels (see docs/research/nekaon-fused-validation.md).
+        return _optimizer_config("nekaon", lr) + ["fused = true"]
+    if arm == "adakaon_fused":
+        return _optimizer_config("adakaon", lr) + ["fused = true"]
     if arm in ("gram_d001", "gram_d01"):
         return ['type = "benchmarks.gram_lora.PairedGram"', f"lr = {lr!r}",
                 "damping = " + ("0.001" if arm == "gram_d001" else "0.01"),
