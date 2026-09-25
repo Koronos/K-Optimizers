@@ -39,7 +39,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import Tensor
 
-from kaon._backend import flat_view
+from kaon._backend import ensure_residuals, flat_view
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan
 
 if TYPE_CHECKING:  # annotations only — ``_momentum_codec`` does not import this module,
     # so a runtime import would not cycle either; it is deferred to keep the import
@@ -826,6 +827,15 @@ class ForeachPlanMixin:
         chunks = plan.rechunk(budget, spec, cached)
         if spec.extra_key is not None:
             plan.refresh(values)
+        if is_compact_kahan(group.get("bf16_method", "")):
+            # A group switched to kahan8 after its plan/state existed: give every bf16 chunk
+            # its residual views now (allocating zero residuals, with a one-time warning),
+            # instead of letting the batched writer refuse the bucket. Allocating a NEW key
+            # does not move the state generation, so the plan itself stays valid.
+            for chunk in chunks:
+                if chunk.cviews is None and chunk.plist[0].dtype == torch.bfloat16:
+                    ensure_residuals(chunk.plist, chunk.states)
+                    chunk.cviews = [chunk.view(s[RESIDUAL_KEY]) for s in chunk.states]
         return chunks
 
     def _build_foreach_plan(

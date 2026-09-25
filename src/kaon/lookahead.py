@@ -230,7 +230,7 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
         chunk_budget = foreach_budget(
             self._foreach_stack_budget,
             self._foreach_batch_cutoff,
-            _SYNC_STACK_BYTES_PER_ELEM,
+            _SYNC_STACK_BYTES_PER_ELEM + (1 if is_compact_kahan(bf16_method) else 0),  # + residual stack
             params[0].device,
         )
         buckets: dict[tuple[Any, ...], list[Tensor]] = {}
@@ -248,9 +248,11 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
                 delta = theta.sub_(phi)                                         # theta - phi_new
                 # kahan8: the residual belongs to the WEIGHT, so it is the inner's ``kahan_lo``
                 # (same reasoning as ``_sync_one`` handing over the inner's state for ``shift``).
+                # Buckets are keyed by dtype, so the chunk is uniformly bf16 or not: only a bf16
+                # chunk carries (and needs) the residual; an fp32 chunk under kahan8 has none.
                 comp = (
                     [self.inner.state[p][RESIDUAL_KEY] for p in chunk]
-                    if is_compact_kahan(bf16_method) else None
+                    if is_compact_kahan(bf16_method) and chunk[0].dtype == torch.bfloat16 else None
                 )
                 subtract_batched_([p.data for p in chunk], delta, bf16_method, sr=self.sr_stream,
                                   comp=comp)

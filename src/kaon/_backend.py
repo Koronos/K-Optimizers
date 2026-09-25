@@ -27,6 +27,7 @@ the run it continues.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any
 
 import torch
@@ -52,6 +53,7 @@ __all__ = [
     "cautious_batched_",
     "cautious_one_",
     "centralize_grads_",
+    "ensure_residuals",
     "flat_view",
     "foreach_budget",
     "gc_applies",
@@ -91,6 +93,37 @@ def per_param_only_bf16_method(bf16_method: str) -> bool:
     its residual rides the batched writer (``comp=``) and Adakaon's fused kernels.
     """
     return bf16_method == "kahan"
+
+
+_LAZY_RESIDUAL_WARNED = False
+
+
+def ensure_residuals(params: list[Tensor], states: list[dict]) -> bool:
+    """Allocate a zero ``kahan_lo`` for every bf16 param in ``params`` whose state lacks one.
+
+    Returns True if anything was allocated. Reached only when a group's ``bf16_method`` was
+    switched to ``kahan8`` AFTER the state existed (a scheduler/user reaching into the group
+    dict): the weights simply start compensating from here, from a zero residual — the same
+    thing a fresh run does — which is safe. It warns once, because silently accepting a
+    mid-run switch is how a typo would hide. Every writer (per-param, foreach, fused) goes
+    through this rather than substituting another buffer for the missing one.
+    """
+    global _LAZY_RESIDUAL_WARNED
+    made = False
+    for p, st in zip(params, states, strict=True):
+        if p.dtype == torch.bfloat16 and RESIDUAL_KEY not in st:
+            st[RESIDUAL_KEY] = init_residual(p)
+            made = True
+    if made and not _LAZY_RESIDUAL_WARNED:
+        _LAZY_RESIDUAL_WARNED = True
+        warnings.warn(
+            "bf16_method='kahan8' was enabled on a group whose parameters already had "
+            "optimizer state: their compensation residual ('kahan_lo') starts at zero from "
+            "this step (the weights are taken as exact). Set bf16_method at construction to "
+            "avoid this.",
+            stacklevel=3,
+        )
+    return made
 
 
 def init_bf16_state(p: Tensor, state: dict, bf16_method: str) -> None:
@@ -334,6 +367,8 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
     """
     low = is_low_precision(p)
     if low and is_compact_kahan(bf16_method):
+        if RESIDUAL_KEY not in state:
+            ensure_residuals([p], [state])       # method switched on mid-run: see ensure_residuals
         _ck_write_(p.data, state[RESIDUAL_KEY], delta_fp32, -alpha,
                    residual_bits(bf16_method), triton, sr)
     elif low and bf16_method == "kahan":

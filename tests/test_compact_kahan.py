@@ -398,3 +398,250 @@ def test_validation():
         Adakaon([h], bf16_method="kahan8")
     with pytest.raises(ValueError, match="comp="):
         bk.subtract_batched_([torch.zeros(4, dtype=torch.bfloat16)], torch.zeros(1, 4), "kahan8")
+
+
+# ------------------------------------------------------------------------------ rework (review of b427e0c)
+def _mixed_bag(device="cpu"):
+    torch.manual_seed(1)
+    out = []
+    for i, s in enumerate([(8, 16), (8, 16), (16,), (16,), (), (4, 3, 3, 3)]):
+        t = torch.randn(s, device=device) * 0.05
+        out.append(torch.nn.Parameter(t.to(torch.bfloat16) if i % 2 == 0 else t))
+    return out
+
+
+def test_lookahead_kahan8_mixed_precision_foreach_sync():
+    """B1: a group mixing fp32 and bf16 params under kahan8 syncs through the foreach path
+    (the default); only the bf16 chunks carry a residual, fp32 chunks must not look one up."""
+    pb = _mixed_bag()
+    la = kaon.Lookahead(pb, lr=1e-4, k=2, bf16_method="kahan8")
+    _drive([la], [pb], steps=4)
+    assert all(torch.isfinite(p).all() for p in pb)
+    for p in pb:
+        st = la.inner.state[p]
+        assert (RESIDUAL_KEY in st) == (p.dtype == torch.bfloat16)
+    pc = _mixed_bag()
+    la_pp = kaon.Lookahead(pc, lr=1e-4, k=2, bf16_method="kahan8", foreach=False)
+    _drive([la_pp], [pc], steps=4)
+    assert all(torch.isfinite(p).all() for p in pc)
+
+
+def _all_states(device):
+    """Every (bf16 pattern, residual byte) state: 2**16 x 256, as the codec's own inputs."""
+    w16 = torch.arange(65536, dtype=torch.int32, device=device).repeat_interleave(256)
+    lo = torch.arange(256, dtype=torch.int32, device=device).repeat(65536)
+    p = ((w16 << 16) >> 16).to(torch.int16).view(torch.bfloat16)      # sign-extended pattern
+    exp_field = (w16 >> 7) & 0xFF
+    return p, lo.to(torch.uint8), exp_field != 0xFF
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_decode_is_finite_for_every_state_with_a_finite_weight(device):
+    """B2: 2**24 states enumerated. A finite bf16 must never decode to a non-finite value —
+    the +-0 patterns with a set top residual bit (256 states) used to wrap to a NaN pattern."""
+    p, lo, finite_w = _all_states(device)
+    z = decode(p, lo, 8)
+    assert bool(torch.isfinite(z)[finite_w].all())
+    # a NaN pattern stays NaN; an inf pattern with a set top residual bit is how the codec
+    # stores a finite value ABOVE bf16 max (the carry wrapped it to inf), so it may come
+    # back finite — but never below bf16's largest finite
+    assert bool((~torch.isfinite(z) | (z.abs() >= 3.3895e38))[~finite_w].all())
+    # the value is the residual read against the zero pattern's ulp, with the weight's sign
+    zero = (p.view(torch.int16).to(torch.int32) & 0x7FFF) == 0
+    assert bool((z[zero & (lo.to(torch.int32) >= 128)].abs() < 2.0 ** -126).all())
+    neg = zero & (p.view(torch.int16) < 0) & (lo.to(torch.int32) > 0)
+    assert bool((z[neg] < 0).all())
+
+
+@pytest.mark.skipif(not FUSED, reason="Triton fused kernels need CUDA + Triton")
+def test_triton_decode_is_finite_for_every_state_with_a_finite_weight():
+    import triton
+    import triton.language as tl
+
+    from kaon._fused_triton import ck_decode
+
+    @triton.jit
+    def _probe(p_ptr, c_ptr, out_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        tl.store(out_ptr + offs, ck_decode(p_ptr, c_ptr, offs, mask, 8), mask=mask)
+
+    p, lo, finite_w = _all_states("cuda")
+    out = torch.empty(p.numel(), device="cuda")
+    _probe[((p.numel() + 1023) // 1024,)](p, lo, out, p.numel(), BLOCK=1024)
+    assert bool(torch.isfinite(out)[finite_w].all())
+    torch.testing.assert_close(out[finite_w], decode(p, lo, 8)[finite_w], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False] + ([True] if FUSED else []))
+def test_externally_zeroed_weights_keep_training_finite(fused):
+    """B2 end to end: 5 steps, ``p.data.zero_()`` (pruning / re-init), 1 more step: finite."""
+    device = "cuda" if fused else "cpu"
+    pa = _bag(device=device)
+    o = Adakaon(pa, lr=1e-3, bf16_method="kahan8", fused=fused)
+    _drive([o], [pa], steps=5)
+    for p in pa:
+        p.data.zero_()
+    _drive([o], [pa], steps=1, seed=3)
+    for p in pa:
+        assert torch.isfinite(p).all()
+        assert torch.isfinite(decode(p.data, o.state[p][RESIDUAL_KEY])).all()
+
+
+@pytest.mark.parametrize("route", ["per_param", "foreach"] + (["fused"] if FUSED else []))
+def test_switching_to_kahan8_mid_run_creates_residuals_and_warns(route):
+    """B3: SR for 2 steps, then the group is flipped to kahan8. Every route allocates a zero
+    residual (warning once), never substitutes the weights' buffer, and the weights stay
+    where they were (the residue write over the weights used to send them to ~1e36)."""
+    import kaon._backend as backend
+    backend._LAZY_RESIDUAL_WARNED = False
+    device = "cuda" if route == "fused" else "cpu"
+    if route == "fused":
+        torch.manual_seed(0)
+        shapes = [(32, 64), (32, 64), (64,), (64,), (), (1024, 1200)]
+        pa = [torch.nn.Parameter((torch.randn(s, device=device) * 0.05).to(torch.bfloat16)) for s in shapes]
+    else:
+        pa = _bag()
+    o = Adakaon(pa, lr=1e-4, bf16_method="stochastic_rounding",
+                foreach=route == "foreach", fused=route == "fused")
+    _drive([o], [pa], steps=2)
+    before = [p.detach().clone() for p in pa]
+    o.param_groups[0]["bf16_method"] = "kahan8"
+    with pytest.warns(UserWarning, match="kahan_lo"):
+        _drive([o], [pa], steps=1, seed=5)
+    _drive([o], [pa], steps=2, seed=6)                       # and it keeps going quietly
+    for p, b in zip(pa, before, strict=True):
+        st = o.state[p]
+        assert st[RESIDUAL_KEY].dtype == torch.uint8 and st[RESIDUAL_KEY].shape == p.shape
+        z = decode(p.data, st[RESIDUAL_KEY])
+        assert torch.isfinite(z).all()
+        assert float((z - b.float()).abs().max()) < 4 * float(b.float().abs().max()) * 2.0 ** -8 + 1e-6
+
+
+@pytest.mark.skipif(not FUSED, reason="Triton fused kernels need CUDA + Triton")
+def test_fused_launch_refuses_a_missing_residual_array():
+    p_addr = torch.zeros(2, dtype=torch.int64, device="cuda")
+    assert Adakaon._c_addr_arg(None, p_addr, 0) is p_addr           # CK off: any valid array
+    with pytest.raises(RuntimeError, match="kahan_lo"):
+        Adakaon._c_addr_arg(None, p_addr, 8)
+
+
+def _enumerated_noise_inputs(device):
+    """256 copies of each probe value, one per noise value 0..255."""
+    vals = torch.tensor([1.0 + 0.13 * 2.0 ** -15, 1.0 + 0.5 * 2.0 ** -15, 1.0 + 0.87 * 2.0 ** -15,
+                         -0.05 + 0.3 * 2.0 ** -19, 3.0e-3 + 0.9 * 2.0 ** -23, 2.0 - 0.6 * 2.0 ** -15],
+                        device=device)
+    z = vals.repeat_interleave(256)
+    noise = torch.arange(256, dtype=torch.int32, device=device).repeat(vals.numel())
+    return vals, z, noise
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_residual_rounding_bias_is_exactly_zero_over_the_enumerated_noise(device):
+    """M1: with the 256 noise values enumerated, the mean of the stored values must equal the
+    input EXACTLY (an off-by-one noise range, e.g. [1, 256], would bias by 1/256 unit)."""
+    vals, z, noise = _enumerated_noise_inputs(device)
+    p = torch.empty_like(z, dtype=torch.bfloat16)
+    lo = torch.empty(z.shape, dtype=torch.uint8, device=device)
+    encode_(z.clone(), p, lo, 8, noise.clone())
+    got = decode(p, lo, 8).double().view(-1, 256).mean(dim=1)
+    assert torch.equal(got, vals.double())
+
+
+@pytest.mark.skipif(not FUSED, reason="Triton fused kernels need CUDA + Triton")
+def test_triton_residual_rounding_bias_is_exactly_zero_over_the_enumerated_noise():
+    import triton
+    import triton.language as tl
+
+    from kaon._fused_triton import ck_store_noise
+
+    @triton.jit
+    def _probe(z_ptr, p_ptr, c_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        z = tl.load(z_ptr + offs, mask=mask, other=0.0)
+        ck_store_noise(p_ptr, c_ptr, offs, mask, z, offs % 256, 8)
+
+    vals, z, _ = _enumerated_noise_inputs("cuda")
+    p = torch.empty_like(z, dtype=torch.bfloat16)
+    lo = torch.empty(z.shape, dtype=torch.uint8, device="cuda")
+    _probe[((z.numel() + 1023) // 1024,)](z, p, lo, z.numel(), BLOCK=1024)
+    got = decode(p, lo, 8).double().view(-1, 256).mean(dim=1)
+    assert torch.equal(got, vals.double())
+    # and the torch path stores the very same bits for the very same noise
+    p2 = torch.empty_like(p)
+    lo2 = torch.empty_like(lo)
+    encode_(z.clone(), p2, lo2, 8, (torch.arange(z.numel(), device="cuda") % 256).to(torch.int32))
+    assert torch.equal(p.view(torch.int16), p2.view(torch.int16)) and torch.equal(lo, lo2)
+
+
+def test_schedulefree_rejects_kahan8():
+    p = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="bf16_method"):
+        kaon.ScheduleFree([p], bf16_method="kahan8")
+
+
+def _climb_e2e(kind, fused, steps=100, seed=0):
+    """The climb_e2e.py experiment: max |z - z_fp32| in ulp for kahan8 and SR, clean weights."""
+    from kaon import MSAM, Nekaon
+    device = "cuda" if fused else "cpu"
+    torch.manual_seed(seed)
+    w = (torch.randn(64, 64, device=device) * 0.05).to(torch.bfloat16)
+
+    def build(params, method):
+        kw = dict(lr=1e-5, betas=(0.9, 0.999), cautious=False, foreach=True, fused=fused)
+        if method is not None:
+            kw["bf16_method"] = method
+        if kind == "msam":
+            return MSAM(params, rho=0.05, **kw)
+        return Nekaon(params, k=1.5, momentum_dtype="bfloat16", weight_decay=0.0, **kw)
+
+    runs = {}
+    for method in (None, "kahan8", "stochastic_rounding"):
+        p = torch.nn.Parameter(w.float() if method is None else w.clone())
+        runs[method] = (p, build([p], method))
+        runs[method][1].train()
+    gg = torch.Generator(device=device).manual_seed(seed + 1)
+    g0 = torch.randn(64, 64, generator=gg, device=device)
+    for _ in range(steps):
+        g = (g0 + 0.3 * torch.randn(64, 64, generator=gg, device=device)).to(torch.bfloat16)
+        for p, opt in runs.values():
+            p.grad = g.to(p.dtype)
+            opt.step()
+    for _p, opt in runs.values():
+        opt.eval()
+    z_ref = runs[None][0].data
+    u = _ulp_ref(z_ref)
+    out = {}
+    for method in ("kahan8", "stochastic_rounding"):
+        p, opt = runs[method]
+        st = opt.inner.state[p]
+        z = decode(p.data, st[RESIDUAL_KEY]) if RESIDUAL_KEY in st else p.data.float()
+        out[method] = float(((z - z_ref).abs() / u).max())
+    return out
+
+
+@pytest.mark.parametrize("kind", ["msam", "nekaon"])
+@pytest.mark.parametrize("fused", [False] + ([True] if FUSED else []))
+def test_msam_nekaon_climb_keeps_the_kahan8_advantage(kind, fused):
+    """The climb perturbs/restores the DECODED value: 100 steps at lr 1e-5 stay within a
+    fraction of an ulp of the fp32 run (before the fix: 12 ulp for MSAM, 25 for Nekaon after
+    300 steps — worse than stochastic rounding, which sits at ~15-20 ulp)."""
+    out = _climb_e2e(kind, fused)
+    assert out["kahan8"] < 0.6, out
+    assert out["stochastic_rounding"] > 5 * out["kahan8"], out
+
+
+@pytest.mark.skipif(not FUSED, reason="Triton fused kernels need CUDA + Triton")
+def test_msam_fused_plan_witness_sees_a_rebound_residual():
+    from kaon import Nekaon
+    pa = _bag(device="cuda")
+    o = Nekaon(pa, lr=1e-4, k=1.5, momentum_dtype="bfloat16", bf16_method="kahan8", weight_decay=0.0)
+    o.train()
+    _drive([o], [pa], steps=2)
+    cache = o._axpy_cache
+    assert cache is not None and all(bk["c_addr"] is not None for bk in cache["buckets"])
+    assert o._plan_addrs_valid(cache)
+    st = o.inner.state[pa[0]]
+    st[RESIDUAL_KEY] = st[RESIDUAL_KEY].clone()
+    assert not o._plan_addrs_valid(cache)

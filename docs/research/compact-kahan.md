@@ -195,10 +195,28 @@ Findings:
   its own `y`-write and rejects `kahan8` with its ValueError. **Lookahead** routes the
   `theta ← phi` sync per-param for `kahan` and through the batched writer with the inner's
   residual for `kahan8` (the sync writes the inner's `p`, so the inner's `kahan_lo` is the
-  compensation, as the 0.7.13 fix established for `shift`). **SAM / MSAM / Nekaon** climbs
-  write `p` without touching `kahan_lo`: the residual then re-attaches as a fraction of the
-  new `ulp(w)` — a bounded ≤ 1-ulp inconsistency per climb, the same the legacy `shift`
-  buffer has, and their climb writes were SR/cast-rounded before anyway. **[inference]**
+  compensation, as the 0.7.13 fix established for `shift`; the residual is looked up only
+  for bf16 chunks — an fp32 param under `kahan8` has none). **MSAM / Nekaon** climbs are
+  **kahan8-aware** (§4b): the perturbation is applied to and removed from the DECODED value
+  and re-encoded with the residual's stochastic rounding, in the torch path (one stacked
+  `_ck_write_` per bucket, noise from the wrapper's own checkpointed stream) and in the
+  fused `_axpy_momentum_batched` kernel (`CK` constexpr, `c_addr` in the plan, the plan
+  witness sees a rebound `kahan_lo`). The first cut perturbed the bare bf16 weight and left
+  `kahan_lo` alone, on the assumption that this was a bounded ≤ 1-ulp inconsistency — it is
+  not: see §4b. **SAM** perturbs `w` through `add_stochastic_` and restores it by an exact
+  `copy_` of its snapshot, so `(w, lo)` is untouched by the pair. **[code]**
+* **Externally written weights.** A weight written from outside the codec (pruning, a
+  re-initialisation to zero, loading a model while keeping the optimizer state) keeps its
+  old residual byte, which re-attaches to the new pattern's ulp: finite and within one ulp
+  everywhere — including `±0`, where the decoder now skips the carry (256 of the 2²⁴ states
+  used to wrap to a NaN pattern; `test_decode_is_finite_for_every_state_with_a_finite_weight`
+  enumerates all 2²⁴ on the torch and the Triton decoder). **[code]**
+* **A group switched to `kahan8` mid-run** (a scheduler/user writing `group["bf16_method"]`)
+  gets zero residuals allocated on the spot, with one warning, on every route
+  (`kaon._backend.ensure_residuals`; per-param, `ForeachPlanMixin._foreach_chunks`, and the
+  fused host, which then rebuilds its pointer cache). A fused launch with `CK` set and no
+  residual array is refused (`Adakaon._c_addr_arg`); the first cut substituted `p_addr`, so
+  the kernel wrote residue bytes over the weights (values up to ~1e36, silently). **[code]**
 * **Checkpoint / resume.** `kahan_lo` is an ordinary per-param state tensor: saved by
   `state_dict`, restored `uint8`-exact by `load_state_dict_preserving_dtypes`, and the
   residual's SR noise draws from the optimizer's checkpointed `SRStream` (generator on the
@@ -212,6 +230,40 @@ Findings:
   cautious-mask flip between reduction orders is a whole step on one coordinate — the same
   class of difference the SR tests tolerate; ≤ 0.1 ulp with `cautious=False` except 4-bit
   momentum's known code-flip amplification).
+
+### 4b. The MSAM / Nekaon climb **[code, `climb_e2e.py`]**
+
+The review's end-to-end check (one 64×64 bf16 weight, lr 1e-5 ≈ 0.04 ulp/step, 300 steps,
+the same bf16 gradients to an fp32 reference of the same optimizer; error = max |z − z_fp32|
+in ulp at the RMS weight, on the clean weights after `eval()`) showed the first cut's climb
+**destroying the advantage**: the perturbation `e` was added to and removed from the bare
+bf16 `w` with RTN while `kahan_lo` stayed put. Wherever `|e| ≥ ulp_local/2` (with
+`N(0, 0.05)` weights and `e` = 1.5e-5 that is every coordinate below |w| ≈ 4e-3, ~8 % of
+them) the climb moves `w` by `round_ulp(e)`, the base step then
+re-encodes the residual against the *perturbed* pattern, and the removal takes only
+`round_ulp(e)` off again — the sub-ulp part of `e` is folded into the clean value **every
+step, with a constant sign**. That is a coherent drift, not a bounded inconsistency: the
+"≤ 1 ulp per climb" claim of the first write-up was wrong.
+
+Fix: perturb and restore the DECODED value and re-encode through the codec (stochastic
+rounding of the residual, so the pair is unbiased at the 1/256-ulp grain; MSAM's reason for
+RTN — SR pairs not cancelling at the bf16 grain, 19 % L2 drift — does not apply 65536× down
+in variance). Torch path: one stacked `_ck_write_` per bucket; fused path: `CK` on
+`_axpy_momentum_batched`. Measured (`climb_e2e_before.md` / `climb_e2e_after.md`):
+
+| optimizer | route | kahan8 before | **kahan8 after** | SR | fp32 reference moved |
+|---|---|---|---|---|---|
+| Adakaon (no climb) | foreach | 0.298 | 0.298 | 21.8 | 37.9 ulp |
+| Adakaon (no climb) | fused | 0.281 | 0.281 | 18.7 | |
+| MSAM ρ=0.05 | foreach | 12.07 | **0.322** | 23.5 | |
+| MSAM ρ=0.05 | fused | 12.07 | **0.416** | 18.7 | |
+| Nekaon k=1.5 | foreach | 25.17 (worse than SR) | **0.400** | 24.6 | |
+| Nekaon k=1.5 | fused | 25.17 | **0.463** | 18.7 | |
+
+After the fix the climbing optimizers sit within 0.1–0.2 ulp of the climb-free Adakaon run
+(the two extra residual roundings per step) and 40–60× below stochastic rounding.
+`test_msam_nekaon_climb_keeps_the_kahan8_advantage` pins it (100 steps, < 0.6 ulp and
+> 5× better than SR, both routes).
 
 ### Memory **[code, `measure_memory.py`, 8.47 M bf16 params, bf16 momentum, RTX 3000 Ada 8 GB]**
 
@@ -278,12 +330,16 @@ reached on CPU or on a non-contiguous view. All of this is to be re-measured ser
 
 * AdaPNM's fused kernels (5) do not take `CK`; the group falls back to native/foreach with the
   existing decline reason. Mechanical to extend.
-* MSAM / SAM / Nekaon climb writes bypass the residual (bounded, see §4); a climb-aware
-  writer would carry it exactly.
-* ScheduleFree rejects `kahan8` (its `y`/`z` write is its own).
-* `foreach_budget`'s `bytes_per_elem` estimate does not include the residual's 1 B; the
-  transient is 3 B/elem on the Triton axpy, so the 10 %-of-free-VRAM chunk rule still holds
-  with margin, but a `kahan8`-aware estimate would be tidier.
-* The `hybrid` SR of the residual consumes one Philox draw per element per step in the fused
+* ScheduleFree rejects `kahan8` (its `y`/`z` write is its own; `test_schedulefree_rejects_kahan8`).
+* The residual's stochastic rounding consumes one Philox draw per element per step in the fused
   kernels — the same draw the SR write already consumed, so no added cost; on the torch
-  reference it is one `randint` (int32) per element like SR's.
+  reference it is one `randint` (int32) per element like SR's. The MSAM/Nekaon climb adds two
+  such draws per step (climb + removal) on `kahan8`, where it used to draw none (RTN).
+* The `kahan8` climb round trip is unbiased but not exact (≤ 1 grid unit = ulp/256 per
+  climb/removal, random sign); an exact scheme would need the clean pattern stored
+  somewhere for the removal, i.e. memory. Not worth it at 0.4 vs 0.3 ulp (§4b).
+* Kernels touched by the review fixes, hence to be re-timed: `sr_round` (a `tl.minimum` on
+  the noise, every SR launch), `ck_decode` (one `tl.where` for the ±0 guard, every `CK`
+  launch), `ck_store` (split into `ck_store_noise` + a wrapper, same arithmetic plus the
+  clamp) and `_axpy_momentum_batched` (new `c_addr` argument and `CK` path — the
+  MSAM/Nekaon climb). The Adakaon apply kernels' host signatures are unchanged.

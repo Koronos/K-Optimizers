@@ -42,7 +42,20 @@ residual is ever performed (no flush-to-zero exposure).
 
 Non-finite values are stored bit-for-bit as the plain cast would store them (a NaN stays a
 NaN, an inf an inf) with a zero residual — the same PROPAGATE policy as
-``kaon._fused_triton.sr_round``: a diverged run must surface, not be buried.
+``kaon._fused_triton.sr_round``: a diverged run must surface, not be buried. Conversely a
+finite weight never decodes to a non-finite value, whatever the byte says: every one of
+the 2**16 x 2**BITS states with a finite ``w`` decodes finite (``tests/test_compact_kahan.py``
+enumerates them), the one corner being a ``+-0`` weight written from outside the optimizer
+with a residual whose top bit is set — see :func:`decode`.
+
+**Weights written from outside the codec** (a SAM/MSAM climb, an EMA swap, pruning) leave
+``lo`` where it was: the residual then re-attaches to the NEW pattern's ulp. The value is
+finite and within one ulp, but a climb-then-remove pair that rounds ``e`` on the bf16 grid
+while the base step re-encodes the residual against the perturbed pattern loses the
+sub-ulp part of ``e`` COHERENTLY every step — measured 25 ulp over 300 Nekaon steps at lr
+1e-5 (worse than plain stochastic rounding). The MSAM/Nekaon climb is therefore
+kahan8-aware: it perturbs and restores the DECODED value and re-encodes (with the residual's
+stochastic rounding), so the clean value survives to ~1/256 ulp per cycle, unbiased.
 
 The Triton kernels in :mod:`kaon._fused_triton` (``ck_decode`` / ``ck_store``, and the
 one-launch ``ck_add_`` the native writers prefer on CUDA) implement the identical bit
@@ -106,7 +119,13 @@ def decode(p: Tensor, lo: Tensor, bits: int = 8) -> Tensor:
     w.bitwise_and_(0xFFFF)
     q = lo.to(torch.int32)
     q.bitwise_and_((1 << bits) - 1)              # int16 storage (bits == 16) is sign-extended
-    w.sub_(q >> (bits - 1))                      # the carry: back to the truncated pattern
+    # The carry, back to the truncated pattern — EXCEPT on a +-0 weight. The encoder never
+    # produces (+-0, lo >= 2**(bits-1)) (a set top bit carries the pattern to 1, never to 0),
+    # but an external write can: pruning, re-initialising to zero, loading a model while the
+    # optimizer state is kept. Subtracting there wraps the magnitude to 0x7FFF (a NaN
+    # pattern); the residual is instead read as a sub-ulp value of the same sign, which is
+    # what it means everywhere else. 256 states out of 2**24 reach this branch.
+    w.sub_((q >> (bits - 1)) * ((w & 0x7FFF) != 0))
     w.bitwise_left_shift_(16)
     q.bitwise_left_shift_(16 - bits)
     w.bitwise_or_(q)

@@ -47,6 +47,7 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
+    ensure_residuals,
     foreach_budget,
     gc_applies,
     init_bf16_state,
@@ -555,7 +556,11 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if not params:
             return
         if self._foreach and self._group_foreach_eligible(group):
-            chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
+            chunk_budget = foreach_budget(
+                self._foreach_stack_budget, self._foreach_batch_cutoff,
+                _STACK_BYTES_PER_ELEM + (1 if is_compact_kahan(group["bf16_method"]) else 0),  # + residual stack
+                params[0].device,
+            )
             # Effective cutoff = the performance threshold, lowered only if the
             # memory budget can't fit two of a tensor in a chunk (so batching
             # would be a wasteful stack-of-1). Roomy card -> cutoff wins;
@@ -857,6 +862,31 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         m = group["bf16_method"]
         return residual_bits(m) if is_compact_kahan(m) else 0
 
+    def _ck_prepare(self, plist: list[Tensor], group: dict[str, Any]) -> tuple[int, bool]:
+        """``(ck, allocated)`` for a fused launch over ``plist``: the ``CK`` constexpr, and
+        whether residuals had to be created (a mid-run switch to kahan8 — see
+        :func:`kaon._backend.ensure_residuals`), in which case the caller rebuilds its pointer
+        cache so the new buffers get a ``c_addr``."""
+        ck = self._ck_bits(group)
+        if not ck:
+            return 0, False
+        return ck, ensure_residuals(plist, [self.state[p] for p in plist])
+
+    @staticmethod
+    def _c_addr_arg(c_addr: Any, p_addr: Tensor, ck: int) -> Tensor:
+        """The residual pointer array a launch passes. With ``CK`` off the kernel never
+        dereferences it, so any valid array (``p_addr``) will do; with ``CK`` on a missing
+        array is REFUSED — substituting ``p_addr`` would have the kernel write residue bytes
+        over the weights (silently: weights up to 1e36 were observed)."""
+        if c_addr is not None:
+            return c_addr
+        if ck:
+            raise RuntimeError(
+                "kaon fused step: bf16_method='kahan8' but the bucket's pointer cache carries "
+                "no residual ('kahan_lo') array — the cache predates the residuals; rebuild it"
+            )
+        return p_addr
+
     def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
         """Launch the one-block pointer-array kernel over the eligible small 2-D weights."""
         for p in plist:
@@ -864,7 +894,11 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             if not st:
                 self._init_state(p, st, group)
         gid = id(group)
+        ck, made = self._ck_prepare(plist, group)
         cache = self._fused_ob_caches.get(gid)
+        if cache is not None and (made or (ck and any(bk["c_addr"] is None for bk in cache.buckets
+                                                     if bk["lowp"]))):
+            cache = None                              # rebuild: residuals are new (B3)
         # ``built_from`` (identity), not ``stale`` (tuple rebuild): _fused_partition already
         # revalidated ids+data_ptrs for the whole group this step and only returns this exact
         # list object while nothing moved. See _WitnessedCache.built_from.
@@ -883,7 +917,6 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         clip, wd = group["clip_threshold"], group["weight_decay"]
         cautious, gc = group["cautious"], group["gradient_centralization"]
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
-        ck = self._ck_bits(group)
         # A bucket's index arrays live on ITS device (PointerArrayCache buckets by device), and a
         # Triton launch goes to the CURRENT device, not to the one the arguments came from. A group
         # spanning cuda:0 and cuda:1 would otherwise launch every bucket on whichever device
@@ -893,7 +926,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             lanes = bk["BR"] * bk["BC"]
             with torch.cuda.device(bk["dev"]):
                 ft._adakaon_tile_kernel[(len(bk["plist"]),)](
-                    bk["g_addr"], bk["p_addr"], bk["c_addr"], bk["m_addr"], bk["mscale_addr"], bk["row_addr"],
+                    bk["g_addr"], bk["p_addr"],
+                    self._c_addr_arg(bk["c_addr"], bk["p_addr"], ck if bk["lowp"] else 0),
+                    bk["m_addr"], bk["mscale_addr"], bk["row_addr"],
                     bk["col_addr"], bk["Rs"], bk["Cs"], bk["mscale_n"],
                     lr, b1, b2, eps1, clip, wd, self._t, bk["blk"],
                     # GC is PER BUCKET: a tile of fan-in-1 tensors (BC == 1) has no fan-in
@@ -917,7 +952,11 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             if not st:
                 self._init_state(p, st, group)
         gid = id(group)
+        ck, made = self._ck_prepare(plist, group)
         cache = self._fused_od_caches.get(gid)
+        if cache is not None and (made or (ck and any(bk["c_addr"] is None for bk in cache.buckets
+                                                     if bk["lowp"]))):
+            cache = None                              # rebuild: residuals are new (B3)
         gen = state_generation(self.state)
         if cache is None or not cache.built_from(plist, gen):   # see _fused_one_block
             cache = ft.OneDimPointerCache(plist, lambda p: self.state[p], gen=gen)
@@ -928,11 +967,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         clip, wd = group["clip_threshold"], group["weight_decay"]
         cautious = group["cautious"]
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
-        ck = self._ck_bits(group)
         for bk in cache.buckets:                       # see _fused_one_block on the device scope
             with torch.cuda.device(bk["dev"]):
                 ft._adam_1d_kernel[(len(bk["plist"]),)](
-                    bk["g_addr"], bk["p_addr"], bk["c_addr"], bk["m_addr"], bk["mscale_addr"],
+                    bk["g_addr"], bk["p_addr"],
+                    self._c_addr_arg(bk["c_addr"], bk["p_addr"], ck if bk["lowp"] else 0),
+                    bk["m_addr"], bk["mscale_addr"],
                     bk["v_addr"], bk["Ls"], lr, b1, b2, eps1, clip, wd, self._t,
                     LOWP=bk["lowp"], MOM=bk["mom"], MOMENTUM=bk["momentum"], CAUTIOUS=cautious,
                     WD=wd != 0, SR=bk["lowp"] and not ck, CK=ck if bk["lowp"] else 0,
@@ -974,7 +1014,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         sr = (p.dtype == torch.bfloat16) and (group["bf16_method"] == "stochastic_rounding")
-        ck = self._ck_bits(group) if p.dtype == torch.bfloat16 else 0
+        ck = self._ck_prepare([p], group)[0] if p.dtype == torch.bfloat16 else 0
         g, r, c, inv_rms = self._chunked_reductions(p, group, st)
         quant = md in ("int8", "4bit")
         if quant:
@@ -1069,10 +1109,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         gc_flag = group["gradient_centralization"]
         lowp = plist[0].dtype == torch.bfloat16
         sr = lowp and (group["bf16_method"] == "stochastic_rounding")
-        ck = self._ck_bits(group) if lowp else 0
+        ck, made = self._ck_prepare(plist, group) if lowp else (0, False)
         states = [self.state[p] for p in plist]
         cache_key = (id(group), tuple(plist[0].shape), plist[0].dtype, plist[0].device)
         cache = self._fused_big_caches.get(cache_key)
+        if cache is not None and (made or (ck and cache.c_addr is None)):
+            cache = None                              # rebuild: residuals are new (B3)
         # ``built_from`` (identity), not ``stale`` (a second witness tuple over the bucket):
         # ``plist`` comes from :meth:`_big_shape_buckets`, which hands back the same list
         # object only while :meth:`_fused_partition`'s witness — ids + ``data_ptr``s +
@@ -1119,7 +1161,8 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             g, r, c, inv_rms = self._chunked_reductions_batched(plist, group, gc)
             keep = cache.keep.zero_()
 
-        p_addr, c_addr = cache.p_addr, cache.c_addr
+        p_addr = cache.p_addr
+        c_addr = self._c_addr_arg(cache.c_addr, p_addr, ck)
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         direct_4bit = md == "4bit" and states[0]["m_block"] <= 1024 \
@@ -1248,8 +1291,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         g_addr, rowmean, r, c, rms = self._chunked_reductions_fused(
             plist, group, ft, R, C, n, lowp, cache, gc
         )
-        p_addr, c_addr = cache.p_addr, cache.c_addr
+        p_addr = cache.p_addr
         ck = self._ck_bits(group) if lowp else 0
+        c_addr = self._c_addr_arg(cache.c_addr, p_addr, ck)
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         keep = cache.keep          # already zeroed with colsum/rms (one launch)

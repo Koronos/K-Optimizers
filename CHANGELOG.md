@@ -35,7 +35,20 @@ All notable changes to this project will be documented in this file.
   launch (+1 B/elem in, +1 B/elem out, no extra launch). AdaBelief, AdamP, AdaMuon, ADOPT,
   KProdigy, Lion and AdaPNM accept it on their foreach and per-param paths (AdaPNM's fused
   route declines it with its existing reason string); Lookahead's slow-weight sync carries
-  the inner's residual; ScheduleFree rejects it. `kahan_lo` is ordinary per-param state
+  the inner's residual (bf16 chunks only — a mixed fp32/bf16 group is fine); ScheduleFree
+  rejects it. **MSAM / Nekaon climbs are kahan8-aware**: the perturbation is applied to and
+  removed from the decoded compensated value and re-encoded (torch path and the fused
+  `_axpy_momentum_batched` kernel, `CK` constexpr). Perturbing the bare bf16 weight while
+  the residual stays put loses the sub-ulp part of the climb coherently every step —
+  measured 12 ulp (MSAM) and 25 ulp (Nekaon, worse than stochastic rounding) after 300
+  steps at lr 1e-5 against 0.3 for climb-free Adakaon; with the fix 0.32–0.46 ulp
+  (`docs/research/compact-kahan.md` §4b). Robustness: a finite weight never decodes to a
+  non-finite value (all 2^24 `(bf16, byte)` states enumerated; a `±0` weight written from
+  outside with a set top residual bit used to wrap to NaN), a group switched to `kahan8`
+  mid-run gets zero residuals allocated with one warning on every route (a fused launch
+  never substitutes another buffer for a missing residual array — it refuses), the
+  residual's stochastic rounding is exactly unbiased over the enumerated 256 noise values
+  (torch and Triton), and the foreach chunk budget counts the residual stack. `kahan_lo` is ordinary per-param state
   (`uint8`, `p.shape`): saved by `state_dict`, restored bit-exactly by
   `load_state_dict_preserving_dtypes`, watched by the pointer-cache generation, and its
   noise draws from the optimizer's checkpointed stream, so a resume is bit-identical to the

@@ -432,7 +432,7 @@ if _HAS_TRITON:
         finite, which still carries into inf exactly as ``.to(torch.bfloat16)`` would.
         """
         ibits = res.to(tl.int32, bitcast=True)
-        noise = (tl.rand(seed, offs) * 65536.0).to(tl.int32)
+        noise = tl.minimum((tl.rand(seed, offs) * 65536.0).to(tl.int32), 65535)
         rounded = (ibits + noise) & -65536  # 0xFFFF0000 as a two's-complement int32
         # 3.4028...e38 is FLT_MAX: the comparison is False for NaN and for +-inf. Inlined
         # because a Triton kernel cannot read a module global.
@@ -451,23 +451,25 @@ if _HAS_TRITON:
         """
         w16 = tl.load(pp + idx, mask=mask, other=0.0).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
         q = tl.load(cp + idx, mask=mask, other=0).to(tl.int32)
-        b = ((w16 - (q >> (BITS - 1))) << 16) | (q << (16 - BITS))
+        # No carry off a +-0 pattern (an externally zeroed weight with a set top residual
+        # bit): it would wrap the magnitude to a NaN pattern — see kaon._compact_kahan.decode.
+        carry = tl.where((w16 & 0x7FFF) != 0, q >> (BITS - 1), 0)
+        b = ((w16 - carry) << 16) | (q << (16 - BITS))
         return b.to(tl.float32, bitcast=True)
 
     @triton.jit
-    def ck_store(pp, cp, idx, mask, res, seed, BITS: tl.constexpr):
-        """Compact Kahan: store fp32 ``res`` as ``(bf16 weight, residual byte)`` with stochastic
-        rounding at the residual grid (mirror of :func:`kaon._compact_kahan.encode_`).
+    def ck_store_noise(pp, cp, idx, mask, res, noise, BITS: tl.constexpr):
+        """Compact Kahan: store fp32 ``res`` as ``(bf16 weight, residual byte)``, rounding the
+        residual with the GIVEN int32 ``noise`` in ``[0, 2**(16-BITS))`` (mirror of
+        :func:`kaon._compact_kahan.encode_`). ``ck_store`` draws the noise; this entry point
+        exists so a test can enumerate every noise value and require an exactly zero bias.
 
-        Same ``tl.rand(seed, idx)`` draw ``sr_round`` uses, scaled to the ``2**(16-BITS)`` bits
-        being dropped instead of to the 16 a bf16 cast drops: unbiased at the finer grid. The
-        stored bf16 is round-half-away-from-zero of the kept value (the carry ``q >> (BITS-1)``
+        The stored bf16 is round-half-away-from-zero of the kept value (the carry ``q >> (BITS-1)``
         on the 16-bit pattern), so the forward pass sees the nearest bf16. Non-finite values
         are cast as-is with a zero residual — PROPAGATE, exactly like ``sr_round``.
         """
         UNIT: tl.constexpr = 1 << (16 - BITS)
         ibits = res.to(tl.int32, bitcast=True)
-        noise = (tl.rand(seed, idx) * UNIT).to(tl.int32)
         finite = tl.abs(res) <= 3.4028234663852886e+38
         br = (ibits + noise) & -UNIT
         q = tl.where(finite, (br >> (16 - BITS)) & ((1 << BITS) - 1), 0)
@@ -476,6 +478,16 @@ if _HAS_TRITON:
         w = tl.where(finite, w16.to(tl.int16).to(tl.bfloat16, bitcast=True), res.to(tl.bfloat16))
         tl.store(pp + idx, w, mask=mask)
         tl.store(cp + idx, q.to(tl.uint8), mask=mask)
+
+    @triton.jit
+    def ck_store(pp, cp, idx, mask, res, seed, BITS: tl.constexpr):
+        """:func:`ck_store_noise` with stochastic rounding: the same ``tl.rand(seed, idx)``
+        draw ``sr_round`` uses, scaled to the ``2**(16-BITS)`` dropped bits instead of the 16 a
+        bf16 cast drops — unbiased at the finer grid (clamped to ``UNIT-1``; ``tl.rand < 1``
+        so the clamp is a no-op that pins the range)."""
+        UNIT: tl.constexpr = 1 << (16 - BITS)
+        noise = tl.minimum((tl.rand(seed, idx) * UNIT).to(tl.int32), UNIT - 1)
+        ck_store_noise(pp, cp, idx, mask, res, noise, BITS)
 
     @triton.jit
     def _sr_axpy_kernel(p_ptr, d_ptr, alpha, n, seed, BLOCK: tl.constexpr):
@@ -2206,9 +2218,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _axpy_momentum_batched(
-        p_addr, m_addr, mscale_addr, alpha, clamp, n, K, row_width, seed,
+        p_addr, c_addr, m_addr, mscale_addr, alpha, clamp, n, K, row_width, seed,
         MOM: tl.constexpr, FBLOCK: tl.constexpr, LOWP: tl.constexpr,
-        SR: tl.constexpr, BLOCK: tl.constexpr,
+        SR: tl.constexpr, BLOCK: tl.constexpr, CK: tl.constexpr = 0,
     ):
         """Fused ``p += alpha*m`` for every Kaon momentum storage format.
 
@@ -2216,6 +2228,12 @@ if _HAS_TRITON:
         flat chunk of one tensor and dequantizes momentum directly from its
         persistent storage, avoiding a stacked fp32 temporary and one Python
         stochastic-rounding call per parameter.
+
+        ``CK`` (compact Kahan, ``bf16_method="kahan8"``): the climb is applied to the DECODED
+        compensated value and re-encoded through ``ck_store`` (stochastic rounding of the
+        residual, seeded from ``seed``), so a climb/removal pair leaves the clean value intact
+        to ~1/256 ulp, unbiased. Perturbing the bare bf16 weight instead loses the sub-ulp
+        part of the climb coherently on every step — see kaon._compact_kahan.
         """
         pid = tl.program_id(0)
         t = pid // K
@@ -2248,10 +2266,14 @@ if _HAS_TRITON:
         e = tl.minimum(tl.maximum(e, -clamp), clamp)
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-        res = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32) + e
-        if LOWP and SR:
-            res = sr_round(res, seed + t, offs)
-        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+        if CK:
+            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            ck_store(pp, cp, offs, mask, ck_decode(pp, cp, offs, mask, CK) + e, seed + t, CK)
+        else:
+            res = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32) + e
+            if LOWP and SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
 
 # ============================================================ pointer-array cache (reusable)
@@ -2560,10 +2582,11 @@ class PointerArrayCache(_WitnessedCache):
                 # the caller ANDs it with the group flag, so a steady-state step reads a bool.
                 gc_ok=bucket_gc_ok(bl),
                 p_addr=i64([p.data_ptr() for p in bl]),
-                # compact-Kahan residual bytes (``kahan_lo``); float/SR buckets never
-                # dereference this (``CK`` is constexpr-elided), so they reuse p_addr.
-                c_addr=(i64([s["kahan_lo"].data_ptr() for s in st]) if "kahan_lo" in st[0]
-                        else i64([p.data_ptr() for p in bl])),
+                # compact-Kahan residual bytes (``kahan_lo``), or None: a launch with ``CK``
+                # set must REFUSE a None (never substitute another array — the kernel would
+                # write residue bytes over whatever it pointed at), see Adakaon._c_addr_arg.
+                c_addr=(i64([s["kahan_lo"].data_ptr() for s in st])
+                        if all("kahan_lo" in s for s in st) else None),
                 m_addr=m_addr, mscale_addr=mscale_addr, mscale_n=mscale_n,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
                 col_addr=i64([s["col"].data_ptr() for s in st]),
@@ -2640,9 +2663,9 @@ class BigPointerCache(_WitnessedCache):
         dev = plist[0].device
         states = [state_of(p) for p in plist]
         self.p_addr = ptr_array(plist, dev)
-        # compact-Kahan residual bytes; aliases p_addr when absent (never dereferenced then)
+        # compact-Kahan residual bytes, or None (a CK launch refuses None — see Adakaon._c_addr_arg)
         self.c_addr = (ptr_array([s["kahan_lo"] for s in states], dev)
-                       if "kahan_lo" in states[0] else self.p_addr)
+                       if all("kahan_lo" in s for s in states) else None)
         self.row_addr = ptr_array([s["row"] for s in states], dev)
         self.col_addr = ptr_array([s["col"] for s in states], dev)
         self.m_addr = ptr_array([s["m"] for s in states], dev) if "m" in states[0] else None
@@ -2809,8 +2832,8 @@ class OneDimPointerCache(_WitnessedCache):
             self.buckets.append(dict(
                 plist=bl, BL=BL, mom=mom, momentum=momentum, block=block, dev=dev,
                 p_addr=i64([p.data_ptr() for p in bl]),
-                c_addr=(i64([s["kahan_lo"].data_ptr() for s in st]) if "kahan_lo" in st[0]
-                        else i64([p.data_ptr() for p in bl])),   # see PointerArrayCache
+                c_addr=(i64([s["kahan_lo"].data_ptr() for s in st])
+                        if all("kahan_lo" in s for s in st) else None),   # see PointerArrayCache
                 m_addr=m_addr, mscale_addr=mscale_addr, v_addr=v_addr,
                 Ls=i32([p.numel() for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,
