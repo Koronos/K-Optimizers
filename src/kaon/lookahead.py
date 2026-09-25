@@ -62,7 +62,13 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from kaon._backend import foreach_budget, subtract_batched_, subtract_one_
+from kaon._backend import (
+    foreach_budget,
+    per_param_only_bf16_method,
+    subtract_batched_,
+    subtract_one_,
+)
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan
 from kaon._momentum_codec import _FOURBIT_BLOCK
 from kaon._wrappers import CodecBuffer, TrainEvalWeights, WrapsInnerOptimizer
 from kaon.adakaon import Adakaon
@@ -191,7 +197,7 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
         synced = [p for p in group["params"] if "phi" in self.state[p]]
         if not synced:
             return
-        if self._foreach and bf16_method != "kahan":
+        if self._foreach and not per_param_only_bf16_method(bf16_method):
             self._sync_foreach(synced, group, alpha, md, bf16_method)
         else:
             for p in synced:
@@ -224,7 +230,7 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
         chunk_budget = foreach_budget(
             self._foreach_stack_budget,
             self._foreach_batch_cutoff,
-            _SYNC_STACK_BYTES_PER_ELEM,
+            _SYNC_STACK_BYTES_PER_ELEM + (1 if is_compact_kahan(bf16_method) else 0),  # + residual stack
             params[0].device,
         )
         buckets: dict[tuple[Any, ...], list[Tensor]] = {}
@@ -240,7 +246,16 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
                 phi.lerp_(theta, alpha)
                 CodecBuffer.write_stacked(states, "phi", md, phi)
                 delta = theta.sub_(phi)                                         # theta - phi_new
-                subtract_batched_([p.data for p in chunk], delta, bf16_method, sr=self.sr_stream)
+                # kahan8: the residual belongs to the WEIGHT, so it is the inner's ``kahan_lo``
+                # (same reasoning as ``_sync_one`` handing over the inner's state for ``shift``).
+                # Buckets are keyed by dtype, so the chunk is uniformly bf16 or not: only a bf16
+                # chunk carries (and needs) the residual; an fp32 chunk under kahan8 has none.
+                comp = (
+                    [self.inner.state[p][RESIDUAL_KEY] for p in chunk]
+                    if is_compact_kahan(bf16_method) and chunk[0].dtype == torch.bfloat16 else None
+                )
+                subtract_batched_([p.data for p in chunk], delta, bf16_method, sr=self.sr_stream,
+                                  comp=comp)
 
     # ================================================================= state_dict glue
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:

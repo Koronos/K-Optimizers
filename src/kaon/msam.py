@@ -64,6 +64,8 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from kaon._backend import _ck_write_
+from kaon._compact_kahan import RESIDUAL_KEY
 from kaon._foreach_plan import state_generation
 from kaon._wrappers import CodecBuffer, WrapsInnerOptimizer
 
@@ -79,6 +81,7 @@ __all__ = ["MSAM"]
 _data_ptr = Tensor.data_ptr
 _get_m = operator.itemgetter("m")
 _get_m_scale = operator.itemgetter("m_scale")
+_get_lo = operator.itemgetter(RESIDUAL_KEY)
 
 # Env-gated divergence probe (zero overhead when unset; same env var as AdaPNM's probe).
 # Set KAON_PROBE_LOG=/path/to/log to record, per step, the FIRST non-finite tensor and the
@@ -441,6 +444,18 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 m.clamp_(-bound, bound)  # per-element stability cap (see _climb_bound)
             if plist[0].dtype == torch.float32:
                 torch._foreach_add_([p.data for p in plist], list(m.unbind(0)))
+            elif plist[0].dtype == torch.bfloat16 and all(RESIDUAL_KEY in st for st in states):
+                # Compact Kahan (kahan8): perturb the DECODED value and re-encode, so the
+                # climb/removal pair leaves the clean value intact to ~1/256 ulp (stochastic
+                # rounding of the residual: unbiased). Perturbing the bare bf16 instead
+                # loses the sub-ulp part of ``e`` coherently every step (25 ulp / 300 steps
+                # measured). One stacked write per bucket; the residual noise draws from
+                # this wrapper's own stream, so it is checkpointed like the SR write's.
+                weights = torch.stack([p.data for p in plist])
+                lows = torch.stack([st[RESIDUAL_KEY] for st in states])
+                _ck_write_(weights, lows, m, 1.0, 8, sr=self.sr_stream)
+                torch._foreach_copy_([p.data for p in plist], list(weights.unbind(0)))
+                torch._foreach_copy_([st[RESIDUAL_KEY] for st in states], list(lows.unbind(0)))
             else:  # low-precision weights: round-to-nearest, deliberately NOT stochastic
                 for p, m_i in zip(plist, m.unbind(0), strict=True):
                     p.data.copy_((p.data.float() + m_i).to(p.dtype))
@@ -478,11 +493,15 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 p.is_cuda and p.data.is_contiguous() and p.dtype in (torch.float32, torch.bfloat16)
                 for p in plist
             )
+            # compact Kahan: the kernel needs every state's residual (contiguous, same numel)
+            ck = plist[0].dtype == torch.bfloat16 and all(RESIDUAL_KEY in st for st in states)
+            if ck and not all(st[RESIDUAL_KEY].is_contiguous() for st in states):
+                ok = False
             if ok:
                 block = states[0].get("m_block", 1)
                 row_width = plist[0].numel() // plist[0].shape[0] if plist[0].ndim >= 2 else plist[0].numel()
                 key = (
-                    plist[0].numel(), plist[0].dtype, md, block, row_width, id(group)
+                    plist[0].numel(), plist[0].dtype, md, block, row_width, id(group), ck
                 )
                 lp, ls, _g = eligible.setdefault(key, ([], [], group))
                 lp.extend(plist)
@@ -490,7 +509,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             else:
                 leftover[(shape, md, id(group))] = (plist, states, md, shape, group)
         buckets = []
-        for (n, dtype, md, block, row_width, _gid), (plist, states, group) in eligible.items():
+        for (n, dtype, md, block, row_width, _gid, ck), (plist, states, group) in eligible.items():
             dev = plist[0].device
             mom = {
                 "float32": ft.MOM_FP32,
@@ -505,9 +524,12 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             # already points at a new buffer — the plan would stay falsely valid.
             buckets.append(dict(
                 p_addr=ft.ptr_array(plist, dev),
+                c_addr=ft.ptr_array([st[RESIDUAL_KEY] for st in states], dev) if ck else None,
+                ck=8 if ck else 0,
                 plist=plist,
                 states=states,
                 p_addrs=tuple(map(_data_ptr, plist)),
+                c_addrs=tuple(map(_data_ptr, map(_get_lo, states))) if ck else None,
                 m_addrs=tuple(map(_data_ptr, map(_get_m, states))),
                 sc_addrs=(
                     tuple(map(_data_ptr, map(_get_m_scale, states)))
@@ -552,6 +574,12 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             if tuple(map(_data_ptr, bk["plist"])) != bk["p_addrs"]:
                 return False
             states = bk["states"]
+            c_addrs = bk.get("c_addrs")
+            if c_addrs is not None and (
+                any(RESIDUAL_KEY not in st for st in states)
+                or tuple(map(_data_ptr, map(_get_lo, states))) != c_addrs
+            ):
+                return False
             if tuple(map(_data_ptr, map(_get_m, states))) != bk["m_addrs"]:
                 return False
             sc_addrs = bk["sc_addrs"]
@@ -567,11 +595,13 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
         for bk in cache["buckets"]:
             alpha = sign * self.rho * scale * self._climb_step_scale(bk["group"], sign)
             ft._axpy_momentum_batched[(bk["N"] * bk["K"],)](
-                bk["p_addr"], bk["m_addr"], bk["sc_addr"], alpha,
+                bk["p_addr"], bk["c_addr"] if bk["c_addr"] is not None else bk["p_addr"],
+                bk["m_addr"], bk["sc_addr"], alpha,
                 self._climb_bound(bk["group"], sign), bk["n"], bk["K"], bk["row_width"],
                 self._axpy_seed, MOM=bk["mom"], FBLOCK=bk["block"],
                 # SR=False: round-to-nearest, matching the torch path. See the bf16 note.
-                LOWP=bk["lowp"], SR=False, BLOCK=1024,
+                # CK (kahan8): decoded-value climb with residual SR — see the kernel's doc.
+                LOWP=bk["lowp"], SR=False, BLOCK=1024, CK=bk["ck"],
             )
 
     # --------------------------------------------------------------- train/eval

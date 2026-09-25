@@ -72,9 +72,12 @@ from kaon._backend import (
     centralize_grads_,
     flat_view,
     foreach_budget,
+    init_bf16_state,
     is_low_precision,
+    per_param_only_bf16_method,
     subtract_batched_,
     subtract_one_,
+    validate_bf16_method,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
@@ -142,7 +145,9 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
             keep the step size. Default ``False``. A no-op when ``beta1=0`` (the
             numerator is the raw grad, so the mask is all-ones).
         bf16_method: weight-update strategy for low-precision params —
-            ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
+            ``"stochastic_rounding"`` (default), ``"kahan8"`` (+1 B/param,
+            compact fixed-point Kahan, see ``docs/research/compact-kahan.md``),
+            ``"kahan"`` (+2 B/param, legacy per-param only), or
             ``"none"``. No-op on fp32 params.
         factor_conv_as_matrix: reshape 4-D conv kernels to 2-D before factoring
             (the conv-aware fix). Default ``True``.
@@ -209,8 +214,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
             )
         if second_moment not in ("full", "factored"):
             raise ValueError(f"second_moment must be full/factored, got {second_moment!r}")
-        if bf16_method not in ("stochastic_rounding", "kahan", "none"):
-            raise ValueError(f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}")
+        validate_bf16_method(bf16_method)
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
         warn_if_4bit_high_beta1(beta1, momentum_dtype)
@@ -300,8 +304,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
             # Full second moment (also the fallback for 1-D params under factored).
             state["v"] = torch.zeros_like(p, dtype=torch.float32)
 
-        if is_low_precision(p) and group["bf16_method"] == "kahan":
-            state["shift"] = torch.zeros_like(p)
+        init_bf16_state(p, state, group["bf16_method"])
 
     # -- step --------------------------------------------------------------
 
@@ -772,7 +775,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
         # kahan needs a per-param shift buffer -> per-param path.
-        return group["bf16_method"] != "kahan"
+        return not per_param_only_bf16_method(group["bf16_method"])
 
     def _param_foreach_eligible(self, p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
         # 0-D scalars are NOT excluded: they ride the non-factored bucket as
@@ -991,7 +994,8 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream)
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream,
+                          comp=chunk.cviews)
 
     @torch.no_grad()
     def _full_bucket(
@@ -1027,7 +1031,8 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream)
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream,
+                          comp=chunk.cviews)
 
     # -- weight update -----------------------------------------------------
 

@@ -19,6 +19,7 @@ What is already optimizer-AGNOSTIC vs Adakaon-SPECIFIC here:
                                                    realloc). The hard, reusable plumbing.
 
   Device-side ``@triton.jit`` helpers (the device-side mirror of ``kaon._momentum_codec``):
+    * ``ck_decode`` / ``ck_store`` (compact-Kahan bf16 + residual-byte weight write, ``bf16_method="kahan8"``)
     * ``sr_round``  (bf16 stochastic-rounding)   — REUSABLE by every bf16 optimizer (Lion, AdaPNM,
                                                    AdaMuon, …); pure, no Adakaon assumptions.
     * ``dequant_int8`` / ``requant_int8``        — per-row int8 momentum codec, in-kernel. REUSABLE by
@@ -431,12 +432,62 @@ if _HAS_TRITON:
         finite, which still carries into inf exactly as ``.to(torch.bfloat16)`` would.
         """
         ibits = res.to(tl.int32, bitcast=True)
-        noise = (tl.rand(seed, offs) * 65536.0).to(tl.int32)
+        noise = tl.minimum((tl.rand(seed, offs) * 65536.0).to(tl.int32), 65535)
         rounded = (ibits + noise) & -65536  # 0xFFFF0000 as a two's-complement int32
         # 3.4028...e38 is FLT_MAX: the comparison is False for NaN and for +-inf. Inlined
         # because a Triton kernel cannot read a module global.
         finite = tl.abs(res) <= 3.4028234663852886e+38
         return tl.where(finite, rounded, ibits).to(tl.float32, bitcast=True)
+
+    @triton.jit
+    def ck_decode(pp, cp, idx, mask, BITS: tl.constexpr):
+        """Compact Kahan: the exact compensated fp32 value of ``(bf16 weight, residual byte)``.
+
+        Integer-only mirror of :func:`kaon._compact_kahan.decode`: the pair IS an fp32 whose
+        low ``16 - BITS`` mantissa bits are zero — ``(trunc16 << 16) | (q << (16 - BITS))``
+        with ``trunc16 = w16 - (q >> (BITS - 1))`` (the stored bf16 is round-half-away of the
+        value, so a set top residual bit means the pattern carried one unit up). No float
+        arithmetic touches the residual, so a subnormal residual cannot be flushed.
+        """
+        w16 = tl.load(pp + idx, mask=mask, other=0.0).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        q = tl.load(cp + idx, mask=mask, other=0).to(tl.int32)
+        # No carry off a +-0 pattern (an externally zeroed weight with a set top residual
+        # bit): it would wrap the magnitude to a NaN pattern — see kaon._compact_kahan.decode.
+        carry = tl.where((w16 & 0x7FFF) != 0, q >> (BITS - 1), 0)
+        b = ((w16 - carry) << 16) | (q << (16 - BITS))
+        return b.to(tl.float32, bitcast=True)
+
+    @triton.jit
+    def ck_store_noise(pp, cp, idx, mask, res, noise, BITS: tl.constexpr):
+        """Compact Kahan: store fp32 ``res`` as ``(bf16 weight, residual byte)``, rounding the
+        residual with the GIVEN int32 ``noise`` in ``[0, 2**(16-BITS))`` (mirror of
+        :func:`kaon._compact_kahan.encode_`). ``ck_store`` draws the noise; this entry point
+        exists so a test can enumerate every noise value and require an exactly zero bias.
+
+        The stored bf16 is round-half-away-from-zero of the kept value (the carry ``q >> (BITS-1)``
+        on the 16-bit pattern), so the forward pass sees the nearest bf16. Non-finite values
+        are cast as-is with a zero residual — PROPAGATE, exactly like ``sr_round``.
+        """
+        UNIT: tl.constexpr = 1 << (16 - BITS)
+        ibits = res.to(tl.int32, bitcast=True)
+        finite = tl.abs(res) <= 3.4028234663852886e+38
+        br = (ibits + noise) & -UNIT
+        q = tl.where(finite, (br >> (16 - BITS)) & ((1 << BITS) - 1), 0)
+        w16 = ((br >> 16) & 0xFFFF) + (q >> (BITS - 1))
+        w16 = (w16 << 16) >> 16                                   # sign-extend to int16 range
+        w = tl.where(finite, w16.to(tl.int16).to(tl.bfloat16, bitcast=True), res.to(tl.bfloat16))
+        tl.store(pp + idx, w, mask=mask)
+        tl.store(cp + idx, q.to(tl.uint8), mask=mask)
+
+    @triton.jit
+    def ck_store(pp, cp, idx, mask, res, seed, BITS: tl.constexpr):
+        """:func:`ck_store_noise` with stochastic rounding: the same ``tl.rand(seed, idx)``
+        draw ``sr_round`` uses, scaled to the ``2**(16-BITS)`` dropped bits instead of the 16 a
+        bf16 cast drops — unbiased at the finer grid (clamped to ``UNIT-1``; ``tl.rand < 1``
+        so the clamp is a no-op that pins the range)."""
+        UNIT: tl.constexpr = 1 << (16 - BITS)
+        noise = tl.minimum((tl.rand(seed, idx) * UNIT).to(tl.int32), UNIT - 1)
+        ck_store_noise(pp, cp, idx, mask, res, noise, BITS)
 
     @triton.jit
     def _sr_axpy_kernel(p_ptr, d_ptr, alpha, n, seed, BLOCK: tl.constexpr):
@@ -462,6 +513,20 @@ if _HAS_TRITON:
         p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         d = tl.load(d_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         tl.store(p_ptr + offs, sr_round(p + alpha * d, seed, offs).to(tl.bfloat16), mask=mask)
+
+    @triton.jit
+    def _ck_axpy_kernel(p_ptr, c_ptr, d_ptr, alpha, n, seed, BITS: tl.constexpr, BLOCK: tl.constexpr):
+        """``(p, lo) += alpha * d`` for a compact-Kahan bf16 ``p`` + residual byte ``lo`` and an
+        fp32 ``d``: ONE launch, ZERO temporaries — the ``kahan8`` twin of ``_sr_axpy_kernel``.
+        The torch reference (``kaon._compact_kahan.compensated_add_``) is a dozen integer
+        kernels with parameter-sized int32 scratch (measured ~23 B/elem transient on a
+        stacked bucket); this reads 3 B/elem and writes 3 B/elem."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        z = ck_decode(p_ptr, c_ptr, offs, mask, BITS)
+        d = tl.load(d_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        ck_store(p_ptr, c_ptr, offs, mask, z + alpha * d, seed, BITS)
 
     @triton.jit
     def dequant_int8(code_ptr, idx, mask, scale_ptr, rr, R):
@@ -608,13 +673,13 @@ if _HAS_TRITON:
 
     @triton.jit
     def _adakaon_tile_kernel(
-        g_addr, p_addr, m_addr, mscale_addr, row_addr, col_addr, Rs_ptr, Cs_ptr, Ns_ptr,
+        g_addr, p_addr, c_addr, m_addr, mscale_addr, row_addr, col_addr, Rs_ptr, Cs_ptr, Ns_ptr,
         lr, beta1, beta2, eps1, clip, wd, seed, m_blk,
         LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr,
         CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         GC: tl.constexpr, SR: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
         EXACT: tl.constexpr = False, FBLK: tl.constexpr = 0,
-        WDFULL: tl.constexpr = False,
+        WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """One program == one tensor. Whole factored Adakaon step, in place via pointer-array.
 
@@ -714,6 +779,9 @@ if _HAS_TRITON:
         # rejected coordinate decays by ~0 and a survivor by wd/keep. WDFULL=True ("full"): applied
         # AFTER the mask to every coordinate at the same lr*wd (the Cautious Optimizers placement).
         p_old = tl.load(pp + idx, mask=m2, other=0.0).to(tl.float32)
+        if CK:
+            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            zc = ck_decode(pp, cp, idx, m2, CK)
         delta = m_new
         if WD and not WDFULL:
             delta = delta + wd * p_old                 # momentum requant above used m_new (sans wd)
@@ -737,10 +805,13 @@ if _HAS_TRITON:
             delta = delta + wd * p_old
 
         # --- weight write (plain fp32 or bf16 stochastic rounding); lr on the FULL delta ---
-        res = p_old - lr * delta
-        if SR:
-            res = sr_round(res, seed + t, idx)
-        tl.store(pp + idx, res.to(pp.dtype.element_ty), mask=m2)
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(pp, cp, idx, m2, zc - lr * delta, seed + t, CK)
+        else:
+            res = p_old - lr * delta
+            if SR:
+                res = sr_round(res, seed + t, idx)
+            tl.store(pp + idx, res.to(pp.dtype.element_ty), mask=m2)
 
     # ---- chunked (multi-block) path for tensors too large for one block ----
     # The per-tensor reductions (row/col EMA, rms via matvec, cautious mean) are cheap and stay in
@@ -775,9 +846,9 @@ if _HAS_TRITON:
             tl.atomic_add(keep_ptr, tl.sum(keep.to(tl.int32)))
 
     @triton.jit
-    def _chunked_apply(g_ptr, m_ptr, p_ptr, n, inv_mean, lr, wd, seed,
+    def _chunked_apply(g_ptr, m_ptr, p_ptr, c_ptr, n, inv_mean, lr, wd, seed,
                        CAUTIOUS: tl.constexpr, WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
-                       WDFULL: tl.constexpr = False):
+                       WDFULL: tl.constexpr = False, CK: tl.constexpr = 0):
         """delta = cautious(m + wd*p, g) ["masked"] or cautious(m, g) + wd*p ["full"];
         p -= lr*delta, with bf16 stochastic rounding if SR."""
         pid = tl.program_id(0)
@@ -785,6 +856,9 @@ if _HAS_TRITON:
         mask = offs < n
         m = tl.load(m_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        if CK:
+            cp = c_ptr
+            zc = ck_decode(p_ptr, cp, offs, mask, CK)
         delta = m
         if WD and not WDFULL:
             delta = delta + wd * p
@@ -795,10 +869,13 @@ if _HAS_TRITON:
             delta = delta * tl.where(keep, inv_mean, 0.0)
         if WD and WDFULL:
             delta = delta + wd * p
-        res = p - lr * delta
-        if SR:
-            res = sr_round(res, seed, offs)
-        tl.store(p_ptr + offs, res.to(p_ptr.dtype.element_ty), mask=mask)
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(p_ptr, cp, offs, mask, zc - lr * delta, seed, CK)
+        else:
+            res = p - lr * delta
+            if SR:
+                res = sr_round(res, seed, offs)
+            tl.store(p_ptr + offs, res.to(p_ptr.dtype.element_ty), mask=mask)
 
     # ---- batched chunked (multi-block, pointer-array) path for the many-same-shape big regime ----
     # The dominant real workload (Cosmos LoKr: 236x 512x512 factors, all > TILE_CAP) used to route
@@ -867,9 +944,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_apply_batched(
-        g_ptr, m_addr, p_addr, inv_mean_ptr, lr, wd, seed, n, K,
+        g_ptr, m_addr, p_addr, c_addr, inv_mean_ptr, lr, wd, seed, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
-        SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
+        SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """Batched pass 2: delta = cautious(m + wd*p, g) ["masked"] or cautious(m, g) + wd*p
         ["full"]; p -= lr*delta (bf16 SR if LOWP+SR)."""
@@ -886,6 +963,9 @@ if _HAS_TRITON:
         pi = tl.load(p_addr + t)
         pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if CK:
+            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            zc = ck_decode(pp, cp, offs, mask, CK)
         delta = m
         if WD and not WDFULL:
             delta = delta + wd * p
@@ -897,10 +977,13 @@ if _HAS_TRITON:
             delta = delta * tl.where(keep, inv_mean, 0.0)
         if WD and WDFULL:
             delta = delta + wd * p
-        res = p - lr * delta
-        if SR:
-            res = sr_round(res, seed + t, offs)
-        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
+        else:
+            res = p - lr * delta
+            if SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
     # ---- candidate #4: FUSED REDUCTIONS for the batched big regime (no 248MB torch stack) ----
     # The torch reductions (stack -> GC -> gsq -> row/col EMA -> rms) were measured at 73-80% of the
@@ -1157,9 +1240,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_apply_batched_g(
-        g_addr, rowmean_ptr, m_addr, p_addr, inv_mean_ptr, lr, wd, seed, R, C, n, K,
+        g_addr, rowmean_ptr, m_addr, p_addr, c_addr, inv_mean_ptr, lr, wd, seed, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
-        WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
+        WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """As ``_chunked_apply_batched`` but grad (for cautious) comes from the pointer array + GC."""
         pid = tl.program_id(0)
@@ -1175,6 +1258,9 @@ if _HAS_TRITON:
         pi = tl.load(p_addr + t)
         pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if CK:
+            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            zc = ck_decode(pp, cp, offs, mask, CK)
         delta = m
         if WD and not WDFULL:
             delta = delta + wd * p
@@ -1192,10 +1278,13 @@ if _HAS_TRITON:
             delta = delta * tl.where(keep, inv_mean, 0.0)
         if WD and WDFULL:
             delta = delta + wd * p
-        res = p - lr * delta
-        if SR:
-            res = sr_round(res, seed + t, offs)
-        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
+        else:
+            res = p - lr * delta
+            if SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
     # ---- one-block non-factored 1-D path (biases / norm scales) ----
     # A bag of many tiny 1-D tensors is the same launch-bound regime the 2-D one-block kernel wins
@@ -1207,11 +1296,11 @@ if _HAS_TRITON:
 
     @triton.jit
     def _adam_1d_kernel(
-        g_addr, p_addr, m_addr, mscale_addr, v_addr, Ls_ptr,
+        g_addr, p_addr, c_addr, m_addr, mscale_addr, v_addr, Ls_ptr,
         lr, beta1, beta2, eps1, clip, wd, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr, FBLOCK: tl.constexpr,
-        WDFULL: tl.constexpr = False,
+        WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """One program == one 1-D tensor. Whole non-factored Adam step, in place via pointer-array."""
         t = tl.program_id(0)
@@ -1290,6 +1379,9 @@ if _HAS_TRITON:
             delta = update
 
         p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if CK:
+            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            zc = ck_decode(pp, cp, offs, mask, CK)
         if WD and not WDFULL:                          # ``cautious_wd`` — see _adakaon_tile_kernel
             delta = delta + wd * p_old
         if CAUTIOUS:
@@ -1301,10 +1393,13 @@ if _HAS_TRITON:
             delta = (delta * keepf) / mm
         if WD and WDFULL:
             delta = delta + wd * p_old
-        res = p_old - lr * delta
-        if SR:
-            res = sr_round(res, seed + t, offs)
-        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
+        else:
+            res = p_old - lr * delta
+            if SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
     # ============================================================ AdaPNM (positive-negative momentum)
     # Reuses the núcleo (gradient_centralize, factored_rc, dequant/requant_*, sr_round). New vs Adakaon:
@@ -1814,11 +1909,11 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_nomom_apply_batched_g(
-        g_addr, rowmean_ptr, p_addr, rfac_ptr, cfac_ptr, rms_ptr, clip,
+        g_addr, rowmean_ptr, p_addr, c_addr, rfac_ptr, cfac_ptr, rms_ptr, clip,
         inv_mean_ptr, lr, wd, seed, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
-        WDFULL: tl.constexpr = False,
+        WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """Apply a chunked factored update without materializing momentum."""
         pid = tl.program_id(0)
@@ -1839,6 +1934,9 @@ if _HAS_TRITON:
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if CK:
+            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            zc = ck_decode(pp, cp, offs, mask, CK)
         if WD and not WDFULL:
             delta += wd * p
         if CAUTIOUS:
@@ -1849,10 +1947,13 @@ if _HAS_TRITON:
             delta = delta * tl.where(keep, inv_mean, 0.0)
         if WD and WDFULL:
             delta += wd * p
-        res = p - lr * delta
-        if SR:
-            res = sr_round(res, seed + t, offs)
-        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
+        else:
+            res = p - lr * delta
+            if SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
     @triton.jit
     def _chunked_4bit_keep_batched_g(
@@ -1899,11 +2000,11 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_4bit_apply_batched_g(
-        g_addr, rowmean_ptr, packed_addr, scale_addr, p_addr, rfac_ptr, cfac_ptr,
+        g_addr, rowmean_ptr, packed_addr, scale_addr, p_addr, c_addr, rfac_ptr, cfac_ptr,
         keep_ptr, rms_ptr, clip, lr, wd, beta1, seed, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, FBLOCK: tl.constexpr, BLOCK: tl.constexpr,
-        WDFULL: tl.constexpr = False,
+        WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """Exact update plus in-kernel 4-bit requantization for a chunked tensor.
 
@@ -1936,6 +2037,9 @@ if _HAS_TRITON:
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if CK:
+            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            zc = ck_decode(pp, cp, offs, mask, CK)
         delta = momentum
         if WD and not WDFULL:
             delta += wd * p
@@ -1946,10 +2050,13 @@ if _HAS_TRITON:
             delta = delta * tl.where(keep, n.to(tl.float32) / tl.maximum(count, 1.0), 0.0)
         if WD and WDFULL:
             delta += wd * p
-        res = p - lr * delta
-        if SR:
-            res = sr_round(res, seed + t, offs)
-        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
+        else:
+            res = p - lr * delta
+            if SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
         # Segmented absmax/requant. Chunk and codec block boundaries are aligned,
         # including the final partial chunk; padded lanes quantize to the zero nibble.
@@ -2041,11 +2148,11 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_int8_apply_batched_g(
-        g_addr, rowmean_ptr, code_addr, scale_addr, p_addr, rfac_ptr, cfac_ptr,
+        g_addr, rowmean_ptr, code_addr, scale_addr, p_addr, c_addr, rfac_ptr, cfac_ptr,
         keep_ptr, rms_ptr, clip, lr, wd, beta1, seed, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         SR: tl.constexpr, CSEG: tl.constexpr, RPC: tl.constexpr, BLOCK: tl.constexpr,
-        WDFULL: tl.constexpr = False,
+        WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """Exact update plus in-kernel per-row int8 requantization for a chunked tensor.
 
@@ -2076,6 +2183,9 @@ if _HAS_TRITON:
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if CK:
+            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            zc = ck_decode(pp, cp, offs, mask, CK)
         delta = momentum
         if WD and not WDFULL:
             delta += wd * p
@@ -2086,10 +2196,13 @@ if _HAS_TRITON:
             delta = delta * tl.where(keep, n.to(tl.float32) / tl.maximum(count, 1.0), 0.0)
         if WD and WDFULL:
             delta += wd * p
-        res = p - lr * delta
-        if SR:
-            res = sr_round(res, seed + t, offs)
-        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
+        else:
+            res = p - lr * delta
+            if SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
         # Per-row absmax / 127, round half-to-even, clamp — element-for-element
         # ``_quant_int8``. One reduce over the row axis of a (RPC, CSEG) reshape; padded lanes
@@ -2105,9 +2218,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _axpy_momentum_batched(
-        p_addr, m_addr, mscale_addr, alpha, clamp, n, K, row_width, seed,
+        p_addr, c_addr, m_addr, mscale_addr, alpha, clamp, n, K, row_width, seed,
         MOM: tl.constexpr, FBLOCK: tl.constexpr, LOWP: tl.constexpr,
-        SR: tl.constexpr, BLOCK: tl.constexpr,
+        SR: tl.constexpr, BLOCK: tl.constexpr, CK: tl.constexpr = 0,
     ):
         """Fused ``p += alpha*m`` for every Kaon momentum storage format.
 
@@ -2115,6 +2228,12 @@ if _HAS_TRITON:
         flat chunk of one tensor and dequantizes momentum directly from its
         persistent storage, avoiding a stacked fp32 temporary and one Python
         stochastic-rounding call per parameter.
+
+        ``CK`` (compact Kahan, ``bf16_method="kahan8"``): the climb is applied to the DECODED
+        compensated value and re-encoded through ``ck_store`` (stochastic rounding of the
+        residual, seeded from ``seed``), so a climb/removal pair leaves the clean value intact
+        to ~1/256 ulp, unbiased. Perturbing the bare bf16 weight instead loses the sub-ulp
+        part of the climb coherently on every step — see kaon._compact_kahan.
         """
         pid = tl.program_id(0)
         t = pid // K
@@ -2147,10 +2266,14 @@ if _HAS_TRITON:
         e = tl.minimum(tl.maximum(e, -clamp), clamp)
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-        res = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32) + e
-        if LOWP and SR:
-            res = sr_round(res, seed + t, offs)
-        tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+        if CK:
+            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            ck_store(pp, cp, offs, mask, ck_decode(pp, cp, offs, mask, CK) + e, seed + t, CK)
+        else:
+            res = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32) + e
+            if LOWP and SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
 
 # ============================================================ pointer-array cache (reusable)
@@ -2330,6 +2453,40 @@ def sr_add_(target, source, alpha: float = 1.0, sr: SRStream | None = None) -> N
         )
 
 
+def ck_add_supported(target, lo, source) -> bool:
+    """Can :func:`ck_add_` take this triple? bf16 CUDA target, uint8 residual, fp32 source,
+    all contiguous and the same numel (the kernel indexes all three as ``base + offs``)."""
+    return (
+        _HAS_TRITON
+        and target.is_cuda
+        and target.dtype == torch.bfloat16
+        and lo.dtype == torch.uint8
+        and source.dtype == torch.float32
+        and target.is_contiguous()
+        and lo.is_contiguous()
+        and source.is_contiguous()
+        and target.numel() == source.numel() == lo.numel()
+        and lo.device == target.device
+    )
+
+
+@torch.no_grad()
+def ck_add_(target, lo, source, alpha: float = 1.0, bits: int = 8, sr: SRStream | None = None) -> None:
+    """``(target, lo) += alpha * source`` with the compact-Kahan codec, in ONE Triton launch.
+
+    The caller must have checked :func:`ck_add_supported`. ``sr`` is the caller's noise
+    stream, exactly as for :func:`sr_add_` (its next draw seeds the residual's stochastic
+    rounding; checkpointed, so a resume reproduces it).
+    """
+    n = target.numel()
+    stream = _PROCESS_SR_STREAM if sr is None else sr
+    seed = stream.next_seed(target.device)
+    with torch.cuda.device(target.device):
+        _ck_axpy_kernel[((n + 1023) // 1024,)](
+            target, lo, source, alpha, n, seed, BITS=bits, BLOCK=1024,
+        )
+
+
 def fourbit_kernel_blocks(numel: int, block: int = 0) -> int:
     """Number of 4-bit absmax blocks a one-block tile kernel writes for an ``numel``-element
     tensor under ``block``-element absmax blocks — i.e. the ``m_scale`` capacity that layout
@@ -2425,6 +2582,11 @@ class PointerArrayCache(_WitnessedCache):
                 # the caller ANDs it with the group flag, so a steady-state step reads a bool.
                 gc_ok=bucket_gc_ok(bl),
                 p_addr=i64([p.data_ptr() for p in bl]),
+                # compact-Kahan residual bytes (``kahan_lo``), or None: a launch with ``CK``
+                # set must REFUSE a None (never substitute another array — the kernel would
+                # write residue bytes over whatever it pointed at), see Adakaon._c_addr_arg.
+                c_addr=(i64([s["kahan_lo"].data_ptr() for s in st])
+                        if all("kahan_lo" in s for s in st) else None),
                 m_addr=m_addr, mscale_addr=mscale_addr, mscale_n=mscale_n,
                 row_addr=i64([s["row"].data_ptr() for s in st]),
                 col_addr=i64([s["col"].data_ptr() for s in st]),
@@ -2501,6 +2663,9 @@ class BigPointerCache(_WitnessedCache):
         dev = plist[0].device
         states = [state_of(p) for p in plist]
         self.p_addr = ptr_array(plist, dev)
+        # compact-Kahan residual bytes, or None (a CK launch refuses None — see Adakaon._c_addr_arg)
+        self.c_addr = (ptr_array([s["kahan_lo"] for s in states], dev)
+                       if all("kahan_lo" in s for s in states) else None)
         self.row_addr = ptr_array([s["row"] for s in states], dev)
         self.col_addr = ptr_array([s["col"] for s in states], dev)
         self.m_addr = ptr_array([s["m"] for s in states], dev) if "m" in states[0] else None
@@ -2667,6 +2832,8 @@ class OneDimPointerCache(_WitnessedCache):
             self.buckets.append(dict(
                 plist=bl, BL=BL, mom=mom, momentum=momentum, block=block, dev=dev,
                 p_addr=i64([p.data_ptr() for p in bl]),
+                c_addr=(i64([s["kahan_lo"].data_ptr() for s in st])
+                        if all("kahan_lo" in s for s in st) else None),   # see PointerArrayCache
                 m_addr=m_addr, mscale_addr=mscale_addr, v_addr=v_addr,
                 Ls=i32([p.numel() for p in bl]),
                 lowp=bl[0].dtype == torch.bfloat16,

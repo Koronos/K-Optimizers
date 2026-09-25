@@ -39,7 +39,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import Tensor
 
-from kaon._backend import flat_view
+from kaon._backend import ensure_residuals, flat_view
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan
 
 if TYPE_CHECKING:  # annotations only — ``_momentum_codec`` does not import this module,
     # so a runtime import would not cycle either; it is deferred to keep the import
@@ -129,7 +130,8 @@ WATCHED_STATE_KEYS = frozenset({
     "m_pos", "m_neg", "m_pos_scale", "m_neg_scale",  # AdaPNM's two momenta
     "row", "col",                                    # factored second moment
     "v", "max_v",                                    # non-factored second moment (+ AMSGrad)
-    "shift",                                         # Kahan compensation
+    "shift",                                         # Kahan compensation (bf16, legacy)
+    "kahan_lo",                                      # compact Kahan residual byte (kahan8)
 })
 
 
@@ -499,6 +501,9 @@ class ForeachChunk:
       admits 0-D params, identity otherwise.
     * :attr:`pviews` — ``[view(p.data) for p in plist]``, the list the weight decay,
       the projection stack and the final subtract all walk.
+    * :attr:`cviews` — the same views over ``state["kahan_lo"]`` (the compact-Kahan
+      residual bytes) when the bucket carries them, else ``None``; handed to
+      :func:`kaon._backend.subtract_batched_` as ``comp=``.
     * :attr:`state_views` — one list per key named in the spec, in spec order.
     * :meth:`momentum_views` — the codec's own stacked-path view lists, built on first
       use and kept for the chunk's lifetime. :attr:`view` is also what the codec's
@@ -514,8 +519,8 @@ class ForeachChunk:
     Staleness is the caller's job — see :meth:`ForeachPlanMixin._foreach_chunks`.
     """
 
-    __slots__ = ("eff", "grad_reshape", "grad_uniform", "key", "key_index", "length",
-                 "matrixize", "momentum_view_cache", "n", "plist", "pviews",
+    __slots__ = ("cviews", "eff", "grad_reshape", "grad_uniform", "key", "key_index",
+                 "length", "matrixize", "momentum_view_cache", "n", "plist", "pviews",
                  "single_alias", "state_views", "states", "view")
 
     def __init__(
@@ -565,6 +570,10 @@ class ForeachChunk:
             view = self.view
             self.state_views = tuple([view(s[k]) for s in states] for k in keys)
         self.pviews = [self.view(p.data) for p in plist]
+        view = self.view
+        self.cviews = (
+            [view(s["kahan_lo"]) for s in states] if states and "kahan_lo" in states[0] else None
+        )
         self.momentum_view_cache: tuple[_MomentumCodec, _StackedViews | None] | None = None
 
     def momentum_views(self, codec: _MomentumCodec) -> _StackedViews | None:
@@ -818,6 +827,15 @@ class ForeachPlanMixin:
         chunks = plan.rechunk(budget, spec, cached)
         if spec.extra_key is not None:
             plan.refresh(values)
+        if is_compact_kahan(group.get("bf16_method", "")):
+            # A group switched to kahan8 after its plan/state existed: give every bf16 chunk
+            # its residual views now (allocating zero residuals, with a one-time warning),
+            # instead of letting the batched writer refuse the bucket. Allocating a NEW key
+            # does not move the state generation, so the plan itself stays valid.
+            for chunk in chunks:
+                if chunk.cviews is None and chunk.plist[0].dtype == torch.bfloat16:
+                    ensure_residuals(chunk.plist, chunk.states)
+                    chunk.cviews = [chunk.view(s[RESIDUAL_KEY]) for s in chunk.states]
         return chunks
 
     def _build_foreach_plan(

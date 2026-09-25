@@ -128,10 +128,13 @@ from kaon._backend import (
     flat_view,
     foreach_budget,
     gc_applies,
+    init_bf16_state,
     is_low_precision,
+    per_param_only_bf16_method,
     rms,
     subtract_batched_,
     subtract_one_,
+    validate_bf16_method,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import WatchedStateMixin, state_generation
@@ -337,7 +340,9 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         momentum_4bit_block: block size for ``momentum_dtype="4bit"``. Default
             ``128``. ``0``/negative means whole-tensor.
         bf16_method: weight-update strategy for low-precision params —
-            ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
+            ``"stochastic_rounding"`` (default), ``"kahan8"`` (+1 B/param,
+            compact fixed-point Kahan, see ``docs/research/compact-kahan.md``),
+            ``"kahan"`` (+2 B/param, legacy per-param only), or
             ``"none"``. No-op on fp32 params.
         foreach: batch the step across parameters with stacked multi-tensor ops.
             Default ``True``. Numerically matches the per-parameter path
@@ -394,10 +399,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             raise ValueError(
                 f"momentum_dtype must be bfloat16/float32/int8/4bit, got {momentum_dtype!r}"
             )
-        if bf16_method not in ("stochastic_rounding", "kahan", "none"):
-            raise ValueError(
-                f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}"
-            )
+        validate_bf16_method(bf16_method)
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
         warn_if_4bit_high_beta1(beta1, momentum_dtype)  # beta1 = betas[0], the momentum EMA decay
@@ -519,8 +521,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         # Two momenta (pos / neg), each through the shared codec layout.
         self._alloc_momentum("m_pos", grad, state, group)
         self._alloc_momentum("m_neg", grad, state, group)
-        if is_low_precision(p) and group["bf16_method"] == "kahan":
-            state["shift"] = torch.zeros_like(p)
+        init_bf16_state(p, state, group["bf16_method"])
 
     # -------------------------------------------------- momentum read / write
     @staticmethod
@@ -1310,7 +1311,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
-        return group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
+        return not per_param_only_bf16_method(group["bf16_method"])  # kahan needs a per-param shift buffer
 
     @staticmethod
     def _param_foreach_eligible(p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
@@ -1430,7 +1431,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method, sr=self.sr_stream)
+        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method, sr=self.sr_stream,
+                          comp=[mat(s["kahan_lo"]) for s in states] if "kahan_lo" in states[0] else None)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -1488,7 +1490,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             delta = cautious_batched_(delta, grad)
 
         subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method,
-                          sr=self.sr_stream)
+                          sr=self.sr_stream,
+                          comp=[flat_view(s["kahan_lo"]) for s in states] if "kahan_lo" in states[0] else None)
 
     def _pn_stacked(
         self,

@@ -47,13 +47,18 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
+    ensure_residuals,
     foreach_budget,
     gc_applies,
+    init_bf16_state,
     is_low_precision,
+    per_param_only_bf16_method,
     rms,
     subtract_batched_,
     subtract_one_,
+    validate_bf16_method,
 )
+from kaon._compact_kahan import is_compact_kahan, residual_bits
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import (
     ForeachChunk,
@@ -225,7 +230,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             run-to-run nondeterministic unless ``deterministic_reductions=True``).
             No effect when ``weight_decay == 0``.
         bf16_method: weight-update strategy for low-precision params —
-            ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
+            ``"stochastic_rounding"`` (default), ``"kahan8"`` (+1 B/param,
+            compact fixed-point Kahan, see ``docs/research/compact-kahan.md``),
+            ``"kahan"`` (+2 B/param, legacy per-param only), or
             ``"none"``. No-op on fp32 params.
         foreach: batch the step across parameters with multi-tensor (stacked) ops
             instead of a per-parameter Python loop. Default ``True``. Huge win when
@@ -325,8 +332,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         warn_if_4bit_high_beta1(beta1, momentum_dtype)
         if cautious_wd not in ("masked", "full"):
             raise ValueError(f"cautious_wd must be 'masked' or 'full', got {cautious_wd!r}")
-        if bf16_method not in ("stochastic_rounding", "kahan", "none"):
-            raise ValueError(f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}")
+        validate_bf16_method(bf16_method)
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
         defaults = {
@@ -464,13 +470,13 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             params = list(params)
             param_group["params"] = params
         method = param_group.get("bf16_method", self.defaults.get("bf16_method"))
-        if method == "stochastic_rounding":
+        if method == "stochastic_rounding" or is_compact_kahan(method):
             for p in params:
                 if p.dtype == torch.float16:
                     raise NotImplementedError(
-                        "bf16_method='stochastic_rounding' does not support torch.float16 "
-                        "parameters (stochastic rounding is implemented for bfloat16 only); "
-                        "use bf16_method='kahan' for fp16 parameters, or keep them in fp32"
+                        f"bf16_method={method!r} does not support torch.float16 parameters "
+                        "(implemented for bfloat16 only); use bf16_method='kahan' for fp16 "
+                        "parameters, or keep them in fp32"
                     )
         super().add_param_group(param_group)
 
@@ -521,8 +527,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             state["v"] = torch.zeros_like(grad, dtype=torch.float32)
         if group["betas"][0] > 0:
             self._codec(group).init_state(state, grad, group)
-        if is_low_precision(p) and group["bf16_method"] == "kahan":
-            state["shift"] = torch.zeros_like(p)
+        init_bf16_state(p, state, group["bf16_method"])
 
     # step() is the AutoLRMixin router (drives Mechanic when auto_lr is on, else
     # calls _step_impl); it also re-imposes the frozen LR each step vs a harness clobber.
@@ -551,7 +556,11 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if not params:
             return
         if self._foreach and self._group_foreach_eligible(group):
-            chunk_budget = foreach_budget(self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM, params[0].device)
+            chunk_budget = foreach_budget(
+                self._foreach_stack_budget, self._foreach_batch_cutoff,
+                _STACK_BYTES_PER_ELEM + (1 if is_compact_kahan(group["bf16_method"]) else 0),  # + residual stack
+                params[0].device,
+            )
             # Effective cutoff = the performance threshold, lowered only if the
             # memory budget can't fit two of a tensor in a chunk (so batching
             # would be a wasteful stack-of-1). Roomy card -> cutoff wins;
@@ -766,8 +775,10 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         native: list[Tensor] = []
         momentum = group["betas"][0] > 0
         for p in params:
-            # bf16 params need stochastic rounding (the kernel's only bf16 write); kahan/none -> native
-            bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding")
+            # bf16 params need a kernel bf16 write: stochastic rounding or the compact-Kahan
+            # (bf16 + residual byte) codec; legacy kahan / none -> native
+            bf_ok = (p.dtype != torch.bfloat16) or (bf16m == "stochastic_rounding") \
+                or is_compact_kahan(bf16m)
             # ndim>2 (conv) is matrixized to (out, in*kh*kw); every momentum layout is row-major
             # compatible with that view (int8 scales dim-0, 4-bit blocks the same flat storage).
             # The matrixized write-back needs a contiguous GRAD — enforced per step by
@@ -844,6 +855,38 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         self._fused_demoted[gid] = (demoted, parts, out)
         return out
 
+    @staticmethod
+    def _ck_bits(group: dict[str, Any]) -> int:
+        """The compact-Kahan residual width the fused kernels' ``CK`` constexpr takes for this
+        group's bf16 buckets (0 = not compact Kahan; fp32 buckets always pass 0)."""
+        m = group["bf16_method"]
+        return residual_bits(m) if is_compact_kahan(m) else 0
+
+    def _ck_prepare(self, plist: list[Tensor], group: dict[str, Any]) -> tuple[int, bool]:
+        """``(ck, allocated)`` for a fused launch over ``plist``: the ``CK`` constexpr, and
+        whether residuals had to be created (a mid-run switch to kahan8 — see
+        :func:`kaon._backend.ensure_residuals`), in which case the caller rebuilds its pointer
+        cache so the new buffers get a ``c_addr``."""
+        ck = self._ck_bits(group)
+        if not ck:
+            return 0, False
+        return ck, ensure_residuals(plist, [self.state[p] for p in plist])
+
+    @staticmethod
+    def _c_addr_arg(c_addr: Any, p_addr: Tensor, ck: int) -> Tensor:
+        """The residual pointer array a launch passes. With ``CK`` off the kernel never
+        dereferences it, so any valid array (``p_addr``) will do; with ``CK`` on a missing
+        array is REFUSED — substituting ``p_addr`` would have the kernel write residue bytes
+        over the weights (silently: weights up to 1e36 were observed)."""
+        if c_addr is not None:
+            return c_addr
+        if ck:
+            raise RuntimeError(
+                "kaon fused step: bf16_method='kahan8' but the bucket's pointer cache carries "
+                "no residual ('kahan_lo') array — the cache predates the residuals; rebuild it"
+            )
+        return p_addr
+
     def _fused_one_block(self, plist: list[Tensor], group: dict[str, Any], ft: Any) -> None:
         """Launch the one-block pointer-array kernel over the eligible small 2-D weights."""
         for p in plist:
@@ -851,7 +894,11 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             if not st:
                 self._init_state(p, st, group)
         gid = id(group)
+        ck, made = self._ck_prepare(plist, group)
         cache = self._fused_ob_caches.get(gid)
+        if cache is not None and (made or (ck and any(bk["c_addr"] is None for bk in cache.buckets
+                                                     if bk["lowp"]))):
+            cache = None                              # rebuild: residuals are new (B3)
         # ``built_from`` (identity), not ``stale`` (tuple rebuild): _fused_partition already
         # revalidated ids+data_ptrs for the whole group this step and only returns this exact
         # list object while nothing moved. See _WitnessedCache.built_from.
@@ -879,7 +926,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             lanes = bk["BR"] * bk["BC"]
             with torch.cuda.device(bk["dev"]):
                 ft._adakaon_tile_kernel[(len(bk["plist"]),)](
-                    bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["row_addr"],
+                    bk["g_addr"], bk["p_addr"],
+                    self._c_addr_arg(bk["c_addr"], bk["p_addr"], ck if bk["lowp"] else 0),
+                    bk["m_addr"], bk["mscale_addr"], bk["row_addr"],
                     bk["col_addr"], bk["Rs"], bk["Cs"], bk["mscale_n"],
                     lr, b1, b2, eps1, clip, wd, self._t, bk["blk"],
                     # GC is PER BUCKET: a tile of fan-in-1 tensors (BC == 1) has no fan-in
@@ -888,7 +937,8 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     # bool AND, not a shape walk. See kaon._backend.gc_applies.
                     LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0,
                     GC=gc and bk["gc_ok"],
-                    SR=bk["lowp"], MOMENTUM=bk["momentum"], WDFULL=wd_full,
+                    SR=bk["lowp"] and not ck, CK=ck if bk["lowp"] else 0,
+                    MOMENTUM=bk["momentum"], WDFULL=wd_full,
                     BR=bk["BR"], BC=bk["BC"], EXACT=bk["exact4"], FBLK=bk["fblk"],
                     num_warps=ft.warps_for(lanes),
                 )
@@ -902,7 +952,11 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             if not st:
                 self._init_state(p, st, group)
         gid = id(group)
+        ck, made = self._ck_prepare(plist, group)
         cache = self._fused_od_caches.get(gid)
+        if cache is not None and (made or (ck and any(bk["c_addr"] is None for bk in cache.buckets
+                                                     if bk["lowp"]))):
+            cache = None                              # rebuild: residuals are new (B3)
         gen = state_generation(self.state)
         if cache is None or not cache.built_from(plist, gen):   # see _fused_one_block
             cache = ft.OneDimPointerCache(plist, lambda p: self.state[p], gen=gen)
@@ -916,10 +970,13 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         for bk in cache.buckets:                       # see _fused_one_block on the device scope
             with torch.cuda.device(bk["dev"]):
                 ft._adam_1d_kernel[(len(bk["plist"]),)](
-                    bk["g_addr"], bk["p_addr"], bk["m_addr"], bk["mscale_addr"], bk["v_addr"],
-                    bk["Ls"], lr, b1, b2, eps1, clip, wd, self._t,
+                    bk["g_addr"], bk["p_addr"],
+                    self._c_addr_arg(bk["c_addr"], bk["p_addr"], ck if bk["lowp"] else 0),
+                    bk["m_addr"], bk["mscale_addr"],
+                    bk["v_addr"], bk["Ls"], lr, b1, b2, eps1, clip, wd, self._t,
                     LOWP=bk["lowp"], MOM=bk["mom"], MOMENTUM=bk["momentum"], CAUTIOUS=cautious,
-                    WD=wd != 0, SR=bk["lowp"], BL=bk["BL"], FBLOCK=bk["block"], WDFULL=wd_full,
+                    WD=wd != 0, SR=bk["lowp"] and not ck, CK=ck if bk["lowp"] else 0,
+                    BL=bk["BL"], FBLOCK=bk["block"], WDFULL=wd_full,
                     num_warps=ft.warps_for(bk["BL"]),
                 )
 
@@ -957,6 +1014,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         sr = (p.dtype == torch.bfloat16) and (group["bf16_method"] == "stochastic_rounding")
+        ck = self._ck_prepare([p], group)[0] if p.dtype == torch.bfloat16 else 0
         g, r, c, inv_rms = self._chunked_reductions(p, group, st)
         quant = md in ("int8", "4bit")
         if quant:
@@ -982,8 +1040,10 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                 st["m"].copy_(packed)
                 st["m_scale"].copy_(sc)
         inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
-        ft._chunked_apply[grid](gf, mf, pf, n, inv_mean, lr, wd, self._t,
-                                CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full)
+        cf = st["kahan_lo"].reshape(-1) if ck else pf
+        ft._chunked_apply[grid](gf, mf, pf, cf, n, inv_mean, lr, wd, self._t,
+                                CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full,
+                                CK=ck)
 
     # ----------------------------------------------- batched chunked (many same-shape big tensors)
     @torch.no_grad()
@@ -1049,9 +1109,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         gc_flag = group["gradient_centralization"]
         lowp = plist[0].dtype == torch.bfloat16
         sr = lowp and (group["bf16_method"] == "stochastic_rounding")
+        ck, made = self._ck_prepare(plist, group) if lowp else (0, False)
         states = [self.state[p] for p in plist]
         cache_key = (id(group), tuple(plist[0].shape), plist[0].dtype, plist[0].device)
         cache = self._fused_big_caches.get(cache_key)
+        if cache is not None and (made or (ck and cache.c_addr is None)):
+            cache = None                              # rebuild: residuals are new (B3)
         # ``built_from`` (identity), not ``stale`` (a second witness tuple over the bucket):
         # ``plist`` comes from :meth:`_big_shape_buckets`, which hands back the same list
         # object only while :meth:`_fused_partition`'s witness — ids + ``data_ptr``s +
@@ -1099,6 +1162,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             keep = cache.keep.zero_()
 
         p_addr = cache.p_addr
+        c_addr = self._c_addr_arg(cache.c_addr, p_addr, ck)
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         direct_4bit = md == "4bit" and states[0]["m_block"] <= 1024 \
@@ -1116,9 +1180,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
                 )
             ft._chunked_int8_apply_batched_g[grid](
-                g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
+                g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
                 keep, rms, clip, lr, wd, b1, self._t, R, C, n, K,
-                LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr,
+                LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
                 CSEG=C, RPC=1024 // C, BLOCK=1024, WDFULL=wd_full,
             )
             return
@@ -1131,9 +1195,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     LOWP=lowp, GC=gc, WD=wd != 0, FBLOCK=block, BLOCK=1024, WDFULL=wd_full,
                 )
             ft._chunked_4bit_apply_batched_g[grid](
-                g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
+                g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
                 keep, rms, clip, lr, wd, b1, self._t, R, C, n, K,
-                LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr,
+                LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
                 FBLOCK=block, BLOCK=1024, WDFULL=wd_full,
             )
             return
@@ -1192,8 +1256,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     st["m_scale"].copy_(sc)
         if fused_red:
             ft._chunked_apply_batched_g[grid](
-                g_addr, rowmean, m_addr, p_addr, keep, lr, wd, self._t, R, C, n, K,
-                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full,
+                g_addr, rowmean, m_addr, p_addr, c_addr, keep, lr, wd, self._t, R, C, n, K,
+                LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
+                BLOCK=1024, WDFULL=wd_full,
             )
         else:
             inv_mean = (
@@ -1201,8 +1266,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                 if cautious else torch.ones(N, device=dev)
             )
             ft._chunked_apply_batched[grid](
-                g, m_addr, p_addr, inv_mean, lr, wd, self._t, n, K,
-                LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full,
+                g, m_addr, p_addr, c_addr, inv_mean, lr, wd, self._t, n, K,
+                LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
+                BLOCK=1024, WDFULL=wd_full,
             )
 
     def _chunked_step_batched_nomom(
@@ -1226,6 +1292,8 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             plist, group, ft, R, C, n, lowp, cache, gc
         )
         p_addr = cache.p_addr
+        ck = self._ck_bits(group) if lowp else 0
+        c_addr = self._c_addr_arg(cache.c_addr, p_addr, ck)
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         keep = cache.keep          # already zeroed with colsum/rms (one launch)
@@ -1235,9 +1303,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                 wd, R, C, n, K, LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
             )
         ft._chunked_nomom_apply_batched_g[grid](
-            g_addr, rowmean, p_addr, r, c, rms, clip, keep,
+            g_addr, rowmean, p_addr, c_addr, r, c, rms, clip, keep,
             lr, wd, self._t, R, C, n, K, LOWP=lowp, GC=gc,
-            CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full,
+            CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck, BLOCK=1024, WDFULL=wd_full,
         )
 
     @torch.no_grad()
@@ -1382,7 +1450,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         """Group-level options the batched fast path supports."""
         return (
             group["clip_threshold"] > 0          # clip always applied in the batched path
-            and group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
+            and not per_param_only_bf16_method(group["bf16_method"])  # kahan needs a per-param shift buffer
         )
 
     @staticmethod
@@ -1564,10 +1632,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         # lr rides the weight write (``alpha``) instead of a separate ``delta.mul_(lr)``
         # pass over the stacked bucket - see :func:`kaon._backend.subtract_batched_`.
         if self._write_fold_lr:
-            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream)
+            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream,
+                              comp=chunk.cviews)
         else:                                        # A/B baseline (pre-0.7.12 order)
             delta.mul_(lr)
-            subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream)
+            subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream,
+                          comp=chunk.cviews)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -1642,10 +1712,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             delta = delta.add_(p_fp32, alpha=wd)
 
         if self._write_fold_lr:                      # see _factored_bucket
-            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream)
+            subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream,
+                              comp=chunk.cviews)
         else:
             delta.mul_(lr)
-            subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream)
+            subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream,
+                          comp=chunk.cviews)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:

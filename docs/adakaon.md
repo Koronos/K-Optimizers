@@ -50,7 +50,7 @@ Adakaon(
     momentum_4bit_block=128,            # block size for 4bit momentum
     cautious=True,                      # cautious masking; helps w/ momentum, no-op without (set False if beta1=0)
     cautious_wd="masked",               # weight decay inside ("masked") or outside ("full") the mask
-    bf16_method="stochastic_rounding",  # "stochastic_rounding" | "kahan" | "none"
+    bf16_method="stochastic_rounding",  # "stochastic_rounding" | "kahan8" (+1 B/param, compact Kahan) | "kahan" (+2 B/param, legacy) | "none"
     foreach=True,                       # multi-tensor batching (foreach-batching.md)
     foreach_batch_cutoff=2_000_000,     # weights bigger than this loop instead of stacking
     foreach_stack_budget=None,          # chunk memory cap (None = adaptive to free VRAM)
