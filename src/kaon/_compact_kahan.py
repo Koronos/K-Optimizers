@@ -40,6 +40,14 @@ residual is ever performed (no flush-to-zero exposure).
   (``|alpha*delta| < ulp/512`` for ``kahan8``) exactly as plain RTN stalls below half an
   ulp — kept as a reference/diagnostic policy, not exposed as a ``bf16_method``.
 
+**``kahan16``** is the same codec at ``BITS = 16`` (+2 B/param, ``int16`` storage of the
+uint16 pattern): nothing is dropped, so the pair is bit for bit an fp32 — ``lo`` is the fp32's
+low half, ``w`` its high half carried half-away (the nearest bf16, as for ``kahan8``). A write
+is plain fp32 arithmetic (round to nearest) followed by an exact split: no noise is drawn, and
+given the same gradients the decoded weight is exactly what an fp32 master would hold. The
+residual's dtype says which width wrote it (:func:`residual_bits_of`); a switch between the
+two widths converts it (:func:`convert_residual`, exact when widening).
+
 Non-finite values are stored bit-for-bit as the plain cast would store them (a NaN stays a
 NaN, an inf an inf) with a zero residual — the same PROPAGATE policy as
 ``kaon._fused_triton.sr_round``: a diverged run must surface, not be buried. Conversely a
@@ -76,19 +84,30 @@ __all__ = [
     "COMPACT_KAHAN_METHODS",
     "RESIDUAL_KEY",
     "compensated_add_",
+    "convert_residual",
     "decode",
     "encode_",
     "init_residual",
     "is_compact_kahan",
     "residual_bits",
+    "residual_bits_of",
+    "residual_dtype",
 ]
 
-#: ``bf16_method`` value -> number of residual bits stored per parameter (in one uint8).
-COMPACT_KAHAN_BITS: dict[str, int] = {"kahan8": 8}
+#: ``bf16_method`` value -> number of residual bits stored per parameter. ``kahan8``: one
+#: ``uint8``; ``kahan16``: one ``int16`` holding the uint16 pattern (torch's ``uint16`` has no
+#: ``_foreach_copy_`` on CUDA, so the bits are stored in the signed type and every reader
+#: masks them back to ``[0, 2**16)``). With 16 bits the pair ``(w, lo)`` IS an fp32: the
+#: residual is the fp32's low half, bit for bit, and ``w`` its high half rounded half-away.
+COMPACT_KAHAN_BITS: dict[str, int] = {"kahan8": 8, "kahan16": 16}
 COMPACT_KAHAN_METHODS = tuple(COMPACT_KAHAN_BITS)
 
-#: The per-parameter state key holding the residual byte (``torch.uint8``, ``p.shape``).
+#: The per-parameter state key holding the residual (``p.shape``; ``torch.uint8`` under
+#: ``kahan8``, ``torch.int16`` under ``kahan16`` — the dtype says which codec wrote it).
 RESIDUAL_KEY = "kahan_lo"
+
+_RESIDUAL_DTYPES = {8: torch.uint8, 16: torch.int16}
+_BITS_OF_DTYPE = {torch.uint8: 8, torch.int16: 16}
 
 _FLT_MAX = 3.4028234663852886e38
 
@@ -101,9 +120,45 @@ def residual_bits(bf16_method: str) -> int:
     return COMPACT_KAHAN_BITS[bf16_method]
 
 
-def init_residual(p: Tensor) -> Tensor:
+def residual_dtype(bits: int) -> torch.dtype:
+    """The storage dtype of a ``bits``-wide residual (``uint8`` for 8, ``int16`` for 16)."""
+    return _RESIDUAL_DTYPES[bits]
+
+
+def residual_bits_of(lo: Tensor) -> int:
+    """The width of a STORED residual, read off its dtype — the codec that wrote it.
+
+    Readers that only decode (a climb removal, Antikaon's clean read) use this rather than
+    the group's ``bf16_method``: after a mid-run switch between ``kahan8`` and ``kahan16``
+    the residual keeps its old encoding until the next write converts it
+    (:func:`kaon._backend.ensure_residuals`), and decoding it with the new width would read
+    garbage.
+    """
+    try:
+        return _BITS_OF_DTYPE[lo.dtype]
+    except KeyError:
+        raise TypeError(f"not a compact-Kahan residual dtype: {lo.dtype}") from None
+
+
+def init_residual(p: Tensor, bits: int = 8) -> Tensor:
     """A fresh zero residual for ``p`` (``lo == 0`` means ``z == w`` exactly)."""
-    return torch.zeros(p.shape, dtype=torch.uint8, device=p.device)
+    return torch.zeros(p.shape, dtype=_RESIDUAL_DTYPES[bits], device=p.device)
+
+
+@torch.no_grad()
+def convert_residual(p: Tensor, lo: Tensor, bits: int) -> Tensor:
+    """Re-encode ``(p, lo)`` at a ``bits``-wide residual; returns the NEW residual tensor and
+    rewrites ``p`` in place.
+
+    ``kahan8 -> kahan16`` is exact (the 16-bit grid contains the 8-bit one; the stored bf16
+    and the value are unchanged). ``kahan16 -> kahan8`` drops 8 bits with round-half-away —
+    one deterministic rounding of at most half a grid unit (``ulp/512``), the stored bf16
+    being re-derived from the kept value (it can move by one ulp at a rounding boundary).
+    """
+    z = decode(p, lo, residual_bits_of(lo))
+    new = init_residual(p, bits)
+    encode_(z, p, new, bits, None)
+    return new
 
 
 @torch.no_grad()
@@ -161,6 +216,11 @@ def encode_(z: Tensor, p: Tensor, lo: Tensor, bits: int = 8, noise: Tensor | Non
     # ``0x8000..0xFFFF`` are negative patterns: sign-extend before narrowing to int16.
     w.bitwise_left_shift_(16).bitwise_right_shift_(16)
     p.view(torch.int16).copy_(torch.where(finite, w.to(torch.int16), pf))
+    if bits == 16:
+        # int16 storage of the uint16 pattern: sign-extend explicitly rather than rely on
+        # the int32 -> int16 narrowing wrapping (it does on CPU and CUDA, but it is
+        # implementation-defined in C++).
+        q.bitwise_left_shift_(16).bitwise_right_shift_(16)
     lo.copy_(q)                                  # uint8 (bits <= 8) or int16 (bits == 16)
 
 

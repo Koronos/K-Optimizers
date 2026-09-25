@@ -65,7 +65,7 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kaon._backend import _ck_write_
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits_of
 from kaon._foreach_plan import state_generation
 from kaon._wrappers import CodecBuffer, WrapsInnerOptimizer
 
@@ -99,17 +99,31 @@ def _climb_seed(counter: int) -> int:
     return (_CLIMB_SEED_SALT + counter * _CLIMB_SEED_STRIDE) & _CLIMB_SEED_MASK
 
 
-def _ck_climb(group: dict[str, Any], plist: list[Tensor], states: list[dict[str, Any]]) -> bool:
-    """Whether a bucket's climb goes through the compact-Kahan decoded value.
+def _ck_climb(group: dict[str, Any], plist: list[Tensor], states: list[dict[str, Any]]) -> int:
+    """The residual width a bucket's climb decodes with (8 / 16), or 0 for a plain climb.
 
     Keyed on the GROUP's ``bf16_method`` (and bf16 weights with every residual present), not
     on the mere presence of ``kahan_lo``: a group switched from ``kahan8`` back to SR keeps a
     stale residual in its state that the writer no longer maintains, and a climb that decoded
     it would inject that stale residual into the weights.
+
+    The WIDTH is the stored residual's (its dtype), not the method's: right after a switch
+    between ``kahan8`` and ``kahan16`` the removal at the top of the step must decode the
+    residual the climb encoded; the inner step converts it afterwards and the next climb
+    uses the new width. A bucket whose residuals are of mixed widths (a conversion caught
+    half-way) climbs plainly this once rather than decoding some of them wrongly.
     """
-    return (plist[0].dtype == torch.bfloat16
-            and is_compact_kahan(group.get("bf16_method", ""))
-            and all(RESIDUAL_KEY in st for st in states))
+    if plist[0].dtype != torch.bfloat16 or not is_compact_kahan(group.get("bf16_method", "")):
+        return 0
+    lo0 = states[0].get(RESIDUAL_KEY)
+    if lo0 is None:
+        return 0
+    dt = lo0.dtype
+    for st in states:
+        lo = st.get(RESIDUAL_KEY)
+        if lo is None or lo.dtype != dt:
+            return 0
+    return residual_bits_of(lo0)
 
 # Env-gated divergence probe (zero overhead when unset; same env var as AdaPNM's probe).
 # Set KAON_PROBE_LOG=/path/to/log to record, per step, the FIRST non-finite tensor and the
@@ -472,16 +486,17 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 m.clamp_(-bound, bound)  # per-element stability cap (see _climb_bound)
             if plist[0].dtype == torch.float32:
                 torch._foreach_add_([p.data for p in plist], list(m.unbind(0)))
-            elif _ck_climb(group, plist, states):
-                # Compact Kahan (kahan8): perturb the DECODED value and re-encode, so the
-                # climb/removal pair leaves the clean value intact to ~1/256 ulp (stochastic
-                # rounding of the residual: unbiased). Perturbing the bare bf16 instead
+            elif ck_bits := _ck_climb(group, plist, states):
+                # Compact Kahan (kahan8/kahan16): perturb the DECODED value and re-encode, so
+                # the climb/removal pair leaves the clean value intact to ~1/256 ulp
+                # (kahan8, stochastic rounding of the residual: unbiased) or to fp32's own
+                # rounding (kahan16, an exact split). Perturbing the bare bf16 instead
                 # loses the sub-ulp part of ``e`` coherently every step (25 ulp / 300 steps
                 # measured). One stacked write per bucket; the residual noise draws from
                 # this wrapper's own stream, so it is checkpointed like the SR write's.
                 weights = torch.stack([p.data for p in plist])
                 lows = torch.stack([st[RESIDUAL_KEY] for st in states])
-                _ck_write_(weights, lows, m, 1.0, 8, sr=self.sr_stream)
+                _ck_write_(weights, lows, m, 1.0, ck_bits, sr=self.sr_stream)
                 torch._foreach_copy_([p.data for p in plist], list(weights.unbind(0)))
                 torch._foreach_copy_([st[RESIDUAL_KEY] for st in states], list(lows.unbind(0)))
             else:  # low-precision weights: round-to-nearest, deliberately NOT stochastic
@@ -553,7 +568,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             buckets.append(dict(
                 p_addr=ft.ptr_array(plist, dev),
                 c_addr=ft.ptr_array([st[RESIDUAL_KEY] for st in states], dev) if ck else None,
-                ck=8 if ck else 0,
+                ck=ck,                                   # residual width (8/16), 0 = plain
                 plist=plist,
                 states=states,
                 p_addrs=tuple(map(_data_ptr, plist)),
@@ -602,10 +617,11 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             if tuple(map(_data_ptr, bk["plist"])) != bk["p_addrs"]:
                 return False
             states = bk["states"]
-            # bf16_method switched since the plan was built (either way), or kahan8 residuals
-            # appeared after it: rebuild — unless kahan8 is on but the residuals are still
-            # missing, where the ck=0 plan is the right one. O(1) per bucket unless the
-            # method and the plan disagree.
+            # bf16_method switched since the plan was built (either way), or kahan8/kahan16
+            # residuals appeared after it: rebuild — unless compact Kahan is on but the
+            # residuals are still missing, where the ck=0 plan is the right one. O(1) per
+            # bucket unless the method and the plan disagree. A kahan8 <-> kahan16 switch
+            # replaces the residual tensors when they are converted: the c_addrs check below.
             if (bk.get("lowp")
                     and bool(bk["ck"]) != is_compact_kahan(bk["group"].get("bf16_method", ""))
                     and (bk["ck"] or all(RESIDUAL_KEY in st for st in states))):
@@ -636,7 +652,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 self._climb_bound(bk["group"], sign), bk["n"], bk["K"], bk["row_width"],
                 _climb_seed(self._axpy_seed), MOM=bk["mom"], FBLOCK=bk["block"],
                 # SR=False: round-to-nearest, matching the torch path. See the bf16 note.
-                # CK (kahan8): decoded-value climb with residual SR — see the kernel's doc.
+                # CK (kahan8/kahan16): decoded-value climb — see the kernel's doc.
                 LOWP=bk["lowp"], SR=False, BLOCK=1024, CK=bk["ck"],
             )
 

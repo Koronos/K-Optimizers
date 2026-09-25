@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`bf16_method="kahan16"` — an fp32 master weight split in two, +2 B/param, on every
+  path.** The 16-bit twin of `kahan8`, on the same codec with `BITS=16`: the bf16 weight plus
+  one `int16` per parameter (the uint16 pattern in signed storage — torch's `uint16` has no
+  `_foreach_copy_` on CUDA) under the same state key `kahan_lo`, whose dtype says which
+  width wrote it. With 16 bits the pair IS an fp32, bit for bit: `lo` is the fp32's low
+  half and the stored bf16 its high half rounded half-away (the `kahan8` carry), so the
+  forward sees the nearest bf16 at no extra cost and the decode stays integer-only. A write
+  is `z − lr·δ` in plain fp32 (round to nearest) and an exact split — no residual noise is
+  drawn. Exhaustively verified over all 2^32 fp32 patterns (torch and Triton helpers; `±0`,
+  subnormals, binade crossings and the carry into inf included). Given the same bf16
+  gradients, a `kahan16` run IS the fp32-weight run of the same optimizer, bit for bit, on
+  the per-param, foreach and fused paths (Adakaon's eight apply kernels, `CK=16`; the
+  one-launch native CUDA writer; the MSAM/Nekaon climb, torch and fused) for Adakaon, Lion,
+  AdaBelief, ADOPT, KProdigy, AdaMuon and AdaPNM — two documented exceptions read the bf16
+  weight where an fp32 run reads its master: weight decay and AdamP's projection (and
+  Gradient Centralization runs on the bf16 grad in bf16). Lookahead's sync carries it (its
+  `theta` is still the bare bf16, within 0.5 ulp of an fp32 Lookahead). Checkpoints keep
+  `int16`; resume is bit-identical; memory is exactly +2.000 B/param. Mid-run switches:
+  SR/none/kahan → `kahan16` allocates a zero residual (one warning); `kahan8 ↔ kahan16`
+  **converts** the residual (widening exact, narrowing one round-half-away at ulp/512; one
+  warning; a watched rebinding, so plans and pointer tables rebuild) on every route, and a
+  write handed a residual of the other width is refused instead of decoded on the wrong
+  grid; the MSAM/Nekaon climb decodes with the STORED width, so the removal right after a
+  switch reads what the climb wrote. fp16 is refused (`"kahan"` stays the fp16 option);
+  ScheduleFree rejects it; AdaPNM's fused route declines it like `kahan8`.
+  `tests/test_kahan16.py`. `benchmarks/lowlr_bf16/run_lowlr.py` compares SR, `kahan`,
+  `kahan8`, `kahan16` and fp32 on Adakaon-nomom and Nekaon at a fine-tune LR (prepared, only
+  `--smoke` run).
 - **`bf16_method="kahan8"` — compact Kahan at +1 B/param, on every path.** The legacy
   `"kahan"` keeps a bf16 compensation buffer (+2 B/param, the model again) and only exists
   on the per-parameter writer. `kahan8` stores the residual as ONE `uint8` per parameter in

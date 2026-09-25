@@ -232,6 +232,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan8"`` (+1 B/param,
             compact fixed-point Kahan, see ``docs/research/compact-kahan.md``),
+            ``"kahan16"`` (+2 B/param, bit-exact fp32 master weight split in two),
             ``"kahan"`` (+2 B/param, legacy per-param only), or
             ``"none"``. No-op on fp32 params.
         foreach: batch the step across parameters with multi-tensor (stacked) ops
@@ -558,7 +559,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if self._foreach and self._group_foreach_eligible(group):
             chunk_budget = foreach_budget(
                 self._foreach_stack_budget, self._foreach_batch_cutoff,
-                _STACK_BYTES_PER_ELEM + (1 if is_compact_kahan(group["bf16_method"]) else 0),  # + residual stack
+                _STACK_BYTES_PER_ELEM + self._ck_bits(group) // 8,  # + residual stack (0/1/2 B)
                 params[0].device,
             )
             # Effective cutoff = the performance threshold, lowered only if the
@@ -864,13 +865,13 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
 
     def _ck_prepare(self, plist: list[Tensor], group: dict[str, Any]) -> tuple[int, bool]:
         """``(ck, allocated)`` for a fused launch over ``plist``: the ``CK`` constexpr, and
-        whether residuals had to be created (a mid-run switch to kahan8 — see
-        :func:`kaon._backend.ensure_residuals`), in which case the caller rebuilds its pointer
-        cache so the new buffers get a ``c_addr``."""
+        whether residuals had to be created or converted (a mid-run switch to kahan8/kahan16,
+        or between them — see :func:`kaon._backend.ensure_residuals`), in which case the
+        caller rebuilds its pointer cache so the new buffers get a ``c_addr``."""
         ck = self._ck_bits(group)
         if not ck:
             return 0, False
-        return ck, ensure_residuals(plist, [self.state[p] for p in plist])
+        return ck, ensure_residuals(plist, [self.state[p] for p in plist], ck)
 
     @staticmethod
     def _c_addr_arg(c_addr: Any, p_addr: Tensor, ck: int) -> Tensor:
@@ -882,7 +883,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             return c_addr
         if ck:
             raise RuntimeError(
-                "kaon fused step: bf16_method='kahan8' but the bucket's pointer cache carries "
+                f"kaon fused step: bf16_method='kahan{ck}' but the bucket's pointer cache carries "
                 "no residual ('kahan_lo') array — the cache predates the residuals; rebuild it"
             )
         return p_addr

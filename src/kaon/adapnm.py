@@ -137,7 +137,7 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import WatchedStateMixin, state_generation
 from kaon._momentum_codec import (
@@ -288,16 +288,17 @@ def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
 
 def _residual_views(plist: list[Tensor], states: list[dict[str, Any]], bf16_method: str,
                     view: Any) -> list[Tensor] | None:
-    """The bucket's ``kahan_lo`` views for a bf16 ``kahan8`` bucket, else ``None``.
+    """The bucket's ``kahan_lo`` views for a bf16 ``kahan8`` / ``kahan16`` bucket, else ``None``.
 
-    Missing residuals (a group switched to kahan8 after its state existed) are allocated
-    here with :func:`kaon._backend.ensure_residuals` — one warning, zero residuals — the
-    same lazy contract as the foreach plan and the per-param writer, instead of letting the
-    batched writer refuse the bucket.
+    Missing residuals (a group switched to kahan8/kahan16 after its state existed) are
+    allocated here with :func:`kaon._backend.ensure_residuals` — one warning, zero
+    residuals — and residuals of the other width are converted, the same lazy contract as
+    the foreach plan and the per-param writer, instead of letting the batched writer refuse
+    the bucket.
     """
     if not (plist and plist[0].dtype == torch.bfloat16 and is_compact_kahan(bf16_method)):
         return None
-    ensure_residuals(plist, states)
+    ensure_residuals(plist, states, residual_bits(bf16_method))
     return [view(s[RESIDUAL_KEY]) for s in states]
 
 class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
@@ -359,6 +360,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan8"`` (+1 B/param,
             compact fixed-point Kahan, see ``docs/research/compact-kahan.md``),
+            ``"kahan16"`` (+2 B/param, bit-exact fp32 master weight split in two),
             ``"kahan"`` (+2 B/param, legacy per-param only), or
             ``"none"``. No-op on fp32 params.
         foreach: batch the step across parameters with stacked multi-tensor ops.

@@ -162,9 +162,22 @@ from **318 ms → 15 ms** (1.45× of fused AdamW; was 28×). Full fine-tunes see
 > Note: `momentum_dtype="int8"` and `bf16_method="kahan"` are *not* foreach-covered and fall
 > back to the per-parameter loop. For the many-tiny-tensor adapter case, prefer no-momentum or
 > `bfloat16`/`4bit` momentum to keep the foreach speedup. The compact `bf16_method="kahan8"`
-> (+1 B/param) IS foreach- and fused-covered — for sub-ulp learning rates (full fine-tunes at
-> ~1e-5 and below) it tracks the fp32 iterate to ~0.2 ulp where stochastic rounding walks by
-> tens of ulps; see `docs/research/compact-kahan.md`.
+> (+1 B/param) and `"kahan16"` (+2 B/param) ARE foreach- and fused-covered; see below.
+
+### bf16 weights: which `bf16_method`
+
+| method | extra state | what the weight tracks | paths | use it when |
+|---|---|---|---|---|
+| `"stochastic_rounding"` (default) | 0 | unbiased bf16 rounding; walks √N ulps in the sub-ulp regime | all | the typical step is ≳ 1 bf16 ulp (LoRA / adapter LRs ~1e-4 and up, pre-training), or memory is the constraint |
+| `"kahan8"` | +1 B/param (`uint8`) | a 16-bit-significand value, residual stochastically rounded at ulp/256: ~0.2 ulp drift at 10k steps, no stall | all (per-param, foreach, Adakaon fused) | sub-ulp LRs (full fine-tunes at ~1e-5 and below) where SR walks by tens of ulps; the recommended Kahan |
+| `"kahan16"` | +2 B/param (`int16`) | an exact fp32 master (the pair IS an fp32): bit for bit the fp32-weight run, given the same bf16 grads | all (same as kahan8) | you want fp32-master numerics exactly — the reference arm, very long runs (kahan8's walk grows as √N), or when 2 B/param is affordable but fp32 weights (+2 B/param too, and a bf16 copy for the forward) are not an option |
+| `"kahan"` (legacy) | +2 B/param (bf16 `shift`) | bf16-rounded residual; stalls on pure sub-grain drift (~31 % lost in the sim) | per-param only | only for **fp16** parameters (the compact methods are bf16-only) or to load an old checkpoint that carries `shift` |
+
+`kahan16` costs what `kahan` costs and is strictly better (exact, every path); `kahan8` is
+half of either and within ~0.2 ulp of exact. Switching a group's method mid-run is supported
+(zero residual when switching on; `kahan8 ↔ kahan16` converts), with one warning. Details:
+`docs/research/compact-kahan.md` (§8 for `kahan16`); head-to-head at a fine-tune LR:
+`benchmarks/lowlr_bf16/`.
 
 ---
 

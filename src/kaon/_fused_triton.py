@@ -19,7 +19,8 @@ What is already optimizer-AGNOSTIC vs Adakaon-SPECIFIC here:
                                                    realloc). The hard, reusable plumbing.
 
   Device-side ``@triton.jit`` helpers (the device-side mirror of ``kaon._momentum_codec``):
-    * ``ck_decode`` / ``ck_store`` (compact-Kahan bf16 + residual-byte weight write, ``bf16_method="kahan8"``)
+    * ``ck_decode`` / ``ck_store`` (compact-Kahan bf16 + residual weight write, ``bf16_method="kahan8"`` /
+      ``"kahan16"``; ``ck_ptr`` types a residual pointer-array entry for the width)
     * ``sr_round``  (bf16 stochastic-rounding)   — REUSABLE by every bf16 optimizer (Lion, AdaPNM,
                                                    AdaMuon, …); pure, no Adakaon assumptions.
     * ``dequant_int8`` / ``requant_int8``        — per-row int8 momentum codec, in-kernel. REUSABLE by
@@ -440,17 +441,31 @@ if _HAS_TRITON:
         return tl.where(finite, rounded, ibits).to(tl.float32, bitcast=True)
 
     @triton.jit
+    def ck_ptr(c_addr, t, BITS: tl.constexpr):
+        """The residual pointer of tensor ``t`` in a compact-Kahan pointer array: ``uint8``
+        for ``kahan8``, ``int16`` (the uint16 pattern in signed storage) for ``kahan16``."""
+        base = tl.load(c_addr + t)
+        if BITS == 16:
+            return base.to(tl.pointer_type(tl.int16))
+        else:
+            return base.to(tl.pointer_type(tl.uint8))
+
+    @triton.jit
     def ck_decode(pp, cp, idx, mask, BITS: tl.constexpr):
-        """Compact Kahan: the exact compensated fp32 value of ``(bf16 weight, residual byte)``.
+        """Compact Kahan: the exact compensated fp32 value of ``(bf16 weight, residual)``.
 
         Integer-only mirror of :func:`kaon._compact_kahan.decode`: the pair IS an fp32 whose
         low ``16 - BITS`` mantissa bits are zero — ``(trunc16 << 16) | (q << (16 - BITS))``
         with ``trunc16 = w16 - (q >> (BITS - 1))`` (the stored bf16 is round-half-away of the
         value, so a set top residual bit means the pattern carried one unit up). No float
         arithmetic touches the residual, so a subnormal residual cannot be flushed.
+        ``BITS == 16`` (``kahan16``): ``q`` is the fp32's low half, loaded from int16 storage
+        (sign-extended, hence masked) — the pair is then bit for bit the fp32 master.
         """
         w16 = tl.load(pp + idx, mask=mask, other=0.0).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
         q = tl.load(cp + idx, mask=mask, other=0).to(tl.int32)
+        if BITS == 16:
+            q = q & 0xFFFF
         # No carry off a +-0 pattern (an externally zeroed weight with a set top residual
         # bit): it would wrap the magnitude to a NaN pattern — see kaon._compact_kahan.decode.
         carry = tl.where((w16 & 0x7FFF) != 0, q >> (BITS - 1), 0)
@@ -477,7 +492,10 @@ if _HAS_TRITON:
         w16 = (w16 << 16) >> 16                                   # sign-extend to int16 range
         w = tl.where(finite, w16.to(tl.int16).to(tl.bfloat16, bitcast=True), res.to(tl.bfloat16))
         tl.store(pp + idx, w, mask=mask)
-        tl.store(cp + idx, q.to(tl.uint8), mask=mask)
+        if BITS == 16:
+            tl.store(cp + idx, q.to(tl.int16), mask=mask)         # the uint16 pattern, wrapped
+        else:
+            tl.store(cp + idx, q.to(tl.uint8), mask=mask)
 
     @triton.jit
     def ck_store(pp, cp, idx, mask, res, seed, BITS: tl.constexpr):
@@ -490,10 +508,16 @@ if _HAS_TRITON:
         the product exactly below ``UNIT``). Should a draw ever reach 1.0, an unclamped
         noise of ``UNIT`` would round every such value up by one extra grid unit even when
         it sits exactly on the grid; the clamp keeps the noise in ``[0, UNIT)``, the range
-        the unbiasedness argument (and the torch path's ``randint``) assumes."""
-        UNIT: tl.constexpr = 1 << (16 - BITS)
-        noise = tl.minimum((tl.rand(seed, idx) * UNIT).to(tl.int32), UNIT - 1)
-        ck_store_noise(pp, cp, idx, mask, res, noise, BITS)
+        the unbiasedness argument (and the torch path's ``randint``) assumes.
+
+        ``BITS == 16`` (``kahan16``) drops no bit: the value is split exactly, no draw is made
+        (the rounding already happened in the fp32 arithmetic that produced ``res``)."""
+        if BITS == 16:
+            ck_store_noise(pp, cp, idx, mask, res, 0, BITS)
+        else:
+            UNIT: tl.constexpr = 1 << (16 - BITS)
+            noise = tl.minimum((tl.rand(seed, idx) * UNIT).to(tl.int32), UNIT - 1)
+            ck_store_noise(pp, cp, idx, mask, res, noise, BITS)
 
     @triton.jit
     def _sr_axpy_kernel(p_ptr, d_ptr, alpha, n, seed, BLOCK: tl.constexpr):
@@ -522,11 +546,11 @@ if _HAS_TRITON:
 
     @triton.jit
     def _ck_axpy_kernel(p_ptr, c_ptr, d_ptr, alpha, n, seed, BITS: tl.constexpr, BLOCK: tl.constexpr):
-        """``(p, lo) += alpha * d`` for a compact-Kahan bf16 ``p`` + residual byte ``lo`` and an
+        """``(p, lo) += alpha * d`` for a compact-Kahan bf16 ``p`` + residual ``lo`` and an
         fp32 ``d``: ONE launch, ZERO temporaries — the ``kahan8`` twin of ``_sr_axpy_kernel``.
         The torch reference (``kaon._compact_kahan.compensated_add_``) is a dozen integer
         kernels with parameter-sized int32 scratch (measured ~23 B/elem transient on a
-        stacked bucket); this reads 3 B/elem and writes 3 B/elem."""
+        stacked bucket); this reads 3 B/elem and writes 3 B/elem (4 and 4 for ``kahan16``)."""
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
@@ -786,7 +810,7 @@ if _HAS_TRITON:
         # AFTER the mask to every coordinate at the same lr*wd (the Cautious Optimizers placement).
         p_old = tl.load(pp + idx, mask=m2, other=0.0).to(tl.float32)
         if CK:
-            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, idx, m2, CK)
         delta = m_new
         if WD and not WDFULL:
@@ -970,7 +994,7 @@ if _HAS_TRITON:
         pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         if CK:
-            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
         delta = m
         if WD and not WDFULL:
@@ -1265,7 +1289,7 @@ if _HAS_TRITON:
         pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         if CK:
-            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
         delta = m
         if WD and not WDFULL:
@@ -1386,7 +1410,7 @@ if _HAS_TRITON:
 
         p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         if CK:
-            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
         if WD and not WDFULL:                          # ``cautious_wd`` — see _adakaon_tile_kernel
             delta = delta + wd * p_old
@@ -1941,7 +1965,7 @@ if _HAS_TRITON:
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         if CK:
-            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
         if WD and not WDFULL:
             delta += wd * p
@@ -2044,7 +2068,7 @@ if _HAS_TRITON:
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         if CK:
-            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
         delta = momentum
         if WD and not WDFULL:
@@ -2190,7 +2214,7 @@ if _HAS_TRITON:
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
         if CK:
-            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
         delta = momentum
         if WD and not WDFULL:
@@ -2235,11 +2259,12 @@ if _HAS_TRITON:
         persistent storage, avoiding a stacked fp32 temporary and one Python
         stochastic-rounding call per parameter.
 
-        ``CK`` (compact Kahan, ``bf16_method="kahan8"``): the climb is applied to the DECODED
-        compensated value and re-encoded through ``ck_store`` (stochastic rounding of the
-        residual, seeded from ``seed``), so a climb/removal pair leaves the clean value intact
-        to ~1/256 ulp, unbiased. Perturbing the bare bf16 weight instead loses the sub-ulp
-        part of the climb coherently on every step — see kaon._compact_kahan.
+        ``CK`` (compact Kahan, ``bf16_method="kahan8"`` = 8, ``"kahan16"`` = 16): the climb is
+        applied to the DECODED compensated value and re-encoded through ``ck_store``
+        (stochastic rounding of the residual, seeded from ``seed``; none at 16 bits), so a
+        climb/removal pair leaves the clean value intact to ~1/256 ulp, unbiased (to fp32's
+        own rounding for ``kahan16``). Perturbing the bare bf16 weight instead loses the
+        sub-ulp part of the climb coherently on every step — see kaon._compact_kahan.
         """
         pid = tl.program_id(0)
         t = pid // K
@@ -2273,7 +2298,7 @@ if _HAS_TRITON:
         pbase = tl.load(p_addr + t)
         pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
         if CK:
-            cp = tl.load(c_addr + t).to(tl.pointer_type(tl.uint8))
+            cp = ck_ptr(c_addr, t, CK)
             ck_store(pp, cp, offs, mask, ck_decode(pp, cp, offs, mask, CK) + e, seed + t, CK)
         else:
             res = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32) + e
@@ -2459,14 +2484,15 @@ def sr_add_(target, source, alpha: float = 1.0, sr: SRStream | None = None) -> N
         )
 
 
-def ck_add_supported(target, lo, source) -> bool:
-    """Can :func:`ck_add_` take this triple? bf16 CUDA target, uint8 residual, fp32 source,
-    all contiguous and the same numel (the kernel indexes all three as ``base + offs``)."""
+def ck_add_supported(target, lo, source, bits: int = 8) -> bool:
+    """Can :func:`ck_add_` take this triple? bf16 CUDA target, a residual in the ``bits``-wide
+    codec's dtype (``uint8`` / ``int16``), fp32 source, all contiguous and the same numel (the
+    kernel indexes all three as ``base + offs``)."""
     return (
         _HAS_TRITON
         and target.is_cuda
         and target.dtype == torch.bfloat16
-        and lo.dtype == torch.uint8
+        and lo.dtype == (torch.int16 if bits == 16 else torch.uint8)
         and source.dtype == torch.float32
         and target.is_contiguous()
         and lo.is_contiguous()

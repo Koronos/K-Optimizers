@@ -36,9 +36,11 @@ from torch import Tensor
 from kaon._compact_kahan import (
     RESIDUAL_KEY,
     compensated_add_,
+    convert_residual,
     init_residual,
     is_compact_kahan,
     residual_bits,
+    residual_dtype,
 )
 from kaon._stochastic_rounding import SRStream, add_stochastic_
 
@@ -60,6 +62,7 @@ __all__ = [
     "init_bf16_state",
     "is_low_precision",
     "per_param_only_bf16_method",
+    "residual_ok",
     "rms",
     "subtract_batched_",
     "subtract_one_",
@@ -70,8 +73,10 @@ LOW_PRECISION = (torch.bfloat16, torch.float16)
 
 #: Every ``bf16_method`` a kaon optimizer accepts. ``"kahan"`` is the legacy bf16
 #: compensation buffer (+2 B/param, per-param path only); ``"kahan8"`` the compact
-#: fixed-point residual (+1 B/param, every path) — see :mod:`kaon._compact_kahan`.
-BF16_METHODS = ("stochastic_rounding", "kahan", "kahan8", "none")
+#: fixed-point residual (+1 B/param, every path) and ``"kahan16"`` its 16-bit twin
+#: (+2 B/param, every path: ``(bf16, residual)`` is bit for bit an fp32 master weight) —
+#: see :mod:`kaon._compact_kahan`.
+BF16_METHODS = ("stochastic_rounding", "kahan", "kahan8", "kahan16", "none")
 
 
 def is_low_precision(t: Tensor) -> bool:
@@ -89,41 +94,78 @@ def per_param_only_bf16_method(bf16_method: str) -> bool:
     """Does this method exist only on the per-parameter writer?
 
     ``"kahan"`` keeps a bf16 ``state['shift']`` that only :func:`subtract_one_` knows how to
-    carry, so every foreach/fused route has to reject it. ``"kahan8"`` is NOT in this set:
-    its residual rides the batched writer (``comp=``) and Adakaon's fused kernels.
+    carry, so every foreach/fused route has to reject it. ``"kahan8"`` / ``"kahan16"`` are
+    NOT in this set: their residual rides the batched writer (``comp=``) and Adakaon's
+    fused kernels.
     """
     return bf16_method == "kahan"
 
 
 _LAZY_RESIDUAL_WARNED = False
+_CONVERTED_RESIDUAL_WARNED = False
 
 
-def ensure_residuals(params: list[Tensor], states: list[dict]) -> bool:
-    """Allocate a zero ``kahan_lo`` for every bf16 param in ``params`` whose state lacks one.
+def ensure_residuals(params: list[Tensor], states: list[dict], bits: int = 8) -> bool:
+    """Give every bf16 param in ``params`` a ``kahan_lo`` of the ``bits``-wide codec.
 
-    Returns True if anything was allocated. Reached only when a group's ``bf16_method`` was
-    switched to ``kahan8`` AFTER the state existed (a scheduler/user reaching into the group
-    dict): the weights simply start compensating from here, from a zero residual — the same
-    thing a fresh run does — which is safe. It warns once, because silently accepting a
-    mid-run switch is how a typo would hide. Every writer (per-param, foreach, fused) goes
-    through this rather than substituting another buffer for the missing one.
+    Returns True if any residual was allocated or replaced (the caller then rebuilds
+    whatever baked the old buffers). Two mid-run cases, both reached only when a group's
+    ``bf16_method`` was changed AFTER the state existed (a scheduler/user reaching into the
+    group dict):
+
+    * **no residual** (switched on from SR / none / kahan): a zero residual is allocated —
+      the weights start compensating from here, taken as exact, the same thing a fresh run
+      does. Safe.
+    * **a residual of the other width** (``kahan8 <-> kahan16``): it is CONVERTED, not
+      dropped — :func:`kaon._compact_kahan.convert_residual` decodes the value with the
+      codec that wrote it and re-encodes it at ``bits``. Widening is exact; narrowing is
+      one round-half-away at the 8-bit grid (``<= ulp/512``). The new tensor replaces the
+      old one in the state (a watched rebinding: every pointer table and plan rebuilds).
+
+    Each case warns once, because silently accepting a mid-run switch is how a typo would
+    hide. Every writer (per-param, foreach, fused) goes through this rather than
+    substituting another buffer for the missing one or decoding a residual with the wrong
+    width.
     """
-    global _LAZY_RESIDUAL_WARNED
-    made = False
+    global _LAZY_RESIDUAL_WARNED, _CONVERTED_RESIDUAL_WARNED
+    want = residual_dtype(bits)
+    made = converted = False
     for p, st in zip(params, states, strict=True):
-        if p.dtype == torch.bfloat16 and RESIDUAL_KEY not in st:
-            st[RESIDUAL_KEY] = init_residual(p)
+        if p.dtype != torch.bfloat16:
+            continue
+        lo = st.get(RESIDUAL_KEY)
+        if lo is None:
+            st[RESIDUAL_KEY] = init_residual(p, bits)
             made = True
+        elif lo.dtype != want:
+            st[RESIDUAL_KEY] = convert_residual(p.data, lo, bits)
+            converted = True
     if made and not _LAZY_RESIDUAL_WARNED:
         _LAZY_RESIDUAL_WARNED = True
         warnings.warn(
-            "bf16_method='kahan8' was enabled on a group whose parameters already had "
+            f"bf16_method='kahan{bits}' was enabled on a group whose parameters already had "
             "optimizer state: their compensation residual ('kahan_lo') starts at zero from "
             "this step (the weights are taken as exact). Set bf16_method at construction to "
             "avoid this.",
             stacklevel=3,
         )
-    return made
+    if converted and not _CONVERTED_RESIDUAL_WARNED:
+        _CONVERTED_RESIDUAL_WARNED = True
+        how = "exact" if bits == 16 else "one rounding at ulp/512"
+        warnings.warn(
+            f"bf16_method was switched to 'kahan{bits}' on a group whose compensation "
+            f"residuals ('kahan_lo') were written by the other compact-Kahan width: they are "
+            f"re-encoded at {bits} bits from this step ({how}).",
+            stacklevel=3,
+        )
+    return made or converted
+
+
+def residual_ok(state: dict, bits: int) -> bool:
+    """Does ``state`` already hold a residual of the ``bits``-wide codec? (The per-param
+    writers' fast check before :func:`ensure_residuals`.)"""
+    lo = state.get(RESIDUAL_KEY)
+    return lo is not None and lo.dtype == residual_dtype(bits)
 
 
 def init_bf16_state(p: Tensor, state: dict, bf16_method: str) -> None:
@@ -139,7 +181,7 @@ def init_bf16_state(p: Tensor, state: dict, bf16_method: str) -> None:
                 f"bf16_method={bf16_method!r} holds bf16 weights only (got {p.dtype}); "
                 "use bf16_method='kahan' for fp16 parameters, or keep them in fp32"
             )
-        state[RESIDUAL_KEY] = init_residual(p)
+        state[RESIDUAL_KEY] = init_residual(p, residual_bits(bf16_method))
 
 
 def rms(t: Tensor) -> Tensor:
@@ -251,17 +293,26 @@ def _ck_write_(
     sr: SRStream | None = None,
 ) -> None:
     """``(target, lo) += alpha * source`` with the compact-Kahan codec, through Triton when
-    it applies (CUDA, contiguous, bf16/uint8/fp32) and the torch reference otherwise.
+    it applies (CUDA, contiguous, bf16/residual/fp32) and the torch reference otherwise.
+
+    ``lo`` must be stored in the ``bits``-wide codec's dtype (``uint8`` for 8, ``int16``
+    for 16): a residual of the other width is REFUSED, never decoded with the wrong grid —
+    the callers convert it first (:func:`ensure_residuals`).
 
     Same stream contract as :func:`_sr_write_`: the kernel takes a launch seed from ``sr``,
     the torch path draws its residual noise from ``sr``'s generator. Same caveat too — the
     two paths' noise does not reproduce each other, both are unbiased. ``SR_TRITON`` pins
     the torch path for both writers (it is the same A/B switch).
     """
+    if lo.dtype != residual_dtype(bits):
+        raise ValueError(
+            f"compact-Kahan write with bits={bits} got a {lo.dtype} residual (written by the "
+            "other width); convert it first with kaon._backend.ensure_residuals"
+        )
     use = SR_TRITON if triton is None else triton
     if use:
         from kaon import _fused_triton as ft
-        if ft.ck_add_supported(target, lo, source):
+        if ft.ck_add_supported(target, lo, source, bits):
             ft.ck_add_(target, lo, source, alpha, bits, sr)
             return
     compensated_add_(target, lo, source, alpha, bits, sr)
@@ -364,13 +415,16 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
     and re-encodes with stochastic rounding at the residual grid
     (:func:`kaon._compact_kahan.compensated_add_`). Per-param and batched consume the
     same generator sequence, so the torch path keeps ``foreach == per-param`` for it.
+    ``kahan16`` is the same codec at 16 bits: ``z`` is the exact fp32 master, the add is
+    fp32's own round-to-nearest and the encode drops nothing (no noise is drawn), so the
+    decoded weight is bit for bit what an fp32 parameter would hold.
     """
     low = is_low_precision(p)
     if low and is_compact_kahan(bf16_method):
-        if RESIDUAL_KEY not in state:
-            ensure_residuals([p], [state])       # method switched on mid-run: see ensure_residuals
-        _ck_write_(p.data, state[RESIDUAL_KEY], delta_fp32, -alpha,
-                   residual_bits(bf16_method), triton, sr)
+        bits = residual_bits(bf16_method)
+        if not residual_ok(state, bits):
+            ensure_residuals([p], [state], bits)  # method switched mid-run: see ensure_residuals
+        _ck_write_(p.data, state[RESIDUAL_KEY], delta_fp32, -alpha, bits, triton, sr)
     elif low and bf16_method == "kahan":
         shift = state["shift"]
         shift.sub_((delta_fp32 * alpha if alpha != 1.0 else delta_fp32).to(p.dtype))
@@ -396,9 +450,10 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
 
     ``pviews`` is the list of N same-shape param views (each ``[*shape]``); ``delta`` is
     the stacked fp32 step ``[N, *shape]`` (row i applies to ``pviews[i]``). ``comp`` is the
-    matching list of ``state['kahan_lo']`` views for ``bf16_method="kahan8"``
+    matching list of ``state['kahan_lo']`` views for ``bf16_method="kahan8"`` / ``"kahan16"``
     (:attr:`kaon._foreach_plan.ForeachChunk.cviews`); a bf16 bucket under that method
-    without it is refused rather than silently written uncompensated.
+    without it is refused rather than silently written uncompensated, and so is one whose
+    residuals are of the other width (see :func:`_ck_write_`).
 
     Only the **bf16 + stochastic-rounding** case needs a materialized stacked-weights
     tensor (``add_stochastic_`` operates on the stack). Every other case — notably the

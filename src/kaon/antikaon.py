@@ -79,11 +79,19 @@ from kaon._backend import (
     cautious_one_,
     ensure_residuals,
     flat_view,
+    residual_ok,
     rms,
     subtract_batched_,
     subtract_one_,
 )
-from kaon._compact_kahan import RESIDUAL_KEY, decode, encode_, is_compact_kahan, residual_bits
+from kaon._compact_kahan import (
+    RESIDUAL_KEY,
+    decode,
+    encode_,
+    is_compact_kahan,
+    residual_bits,
+    residual_bits_of,
+)
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk
 from kaon._momentum_codec import _MomentumCodec
@@ -732,7 +740,7 @@ class Antikaon(Adakaon):
         if (chunk.cviews is not None and is_compact_kahan(bf16_method)
                 and chunk.pviews[0].dtype == torch.bfloat16):
             return decode(torch.stack(chunk.pviews), torch.stack(chunk.cviews),
-                          residual_bits(bf16_method))
+                          residual_bits_of(chunk.cviews[0]))
         return chunk.param_stack()
 
     @staticmethod
@@ -791,7 +799,10 @@ class Antikaon(Adakaon):
         if p.dtype == torch.float32:
             return p.data.clone()
         if p.dtype == torch.bfloat16 and is_compact_kahan(bf16_method) and RESIDUAL_KEY in state:
-            return decode(p.data, state[RESIDUAL_KEY], residual_bits(bf16_method))
+            # The STORED width (the residual's dtype), not the group's: after a switch
+            # between kahan8 and kahan16 the residual keeps its encoding until the next write.
+            lo = state[RESIDUAL_KEY]
+            return decode(p.data, lo, residual_bits_of(lo))
         x = p.data.float()
         if bf16_method == "kahan" and "shift" in state:
             x.add_(state["shift"].float())
@@ -813,12 +824,14 @@ class Antikaon(Adakaon):
             p.data.copy_(x)
             return
         if p.dtype == torch.bfloat16 and is_compact_kahan(bf16_method):
-            if RESIDUAL_KEY not in state:
-                ensure_residuals([p], [state])   # method switched on mid-run
             bits = residual_bits(bf16_method)
-            gen = _device_generator(x.device) if sr is None else sr.generator(x.device)
-            noise = torch.randint(0, 1 << (16 - bits), x.shape, dtype=torch.int32,
-                                  device=x.device, generator=gen)
+            if not residual_ok(state, bits):
+                ensure_residuals([p], [state], bits)   # method switched mid-run
+            noise = None                               # kahan16: an exact split, no rounding
+            if bits < 16:
+                gen = _device_generator(x.device) if sr is None else sr.generator(x.device)
+                noise = torch.randint(0, 1 << (16 - bits), x.shape, dtype=torch.int32,
+                                      device=x.device, generator=gen)
             encode_(x.contiguous(), p.data, state[RESIDUAL_KEY], bits, noise)
             return
         p.data.copy_(x)

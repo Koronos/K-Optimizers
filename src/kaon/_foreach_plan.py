@@ -40,7 +40,7 @@ import torch
 from torch import Tensor
 
 from kaon._backend import ensure_residuals, flat_view
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits, residual_dtype
 
 if TYPE_CHECKING:  # annotations only — ``_momentum_codec`` does not import this module,
     # so a runtime import would not cycle either; it is deferred to keep the import
@@ -131,7 +131,7 @@ WATCHED_STATE_KEYS = frozenset({
     "row", "col",                                    # factored second moment
     "v", "max_v",                                    # non-factored second moment (+ AMSGrad)
     "shift",                                         # Kahan compensation (bf16, legacy)
-    "kahan_lo",                                      # compact Kahan residual byte (kahan8)
+    "kahan_lo",                                      # compact Kahan residual (kahan8/kahan16)
 })
 
 
@@ -572,11 +572,14 @@ class ForeachChunk:
         self.pviews = [self.view(p.data) for p in plist]
         view = self.view
         # ALL states, not states[0]: after a mid-run switch to kahan8 a chunk can mix a param
-        # with a residual (fresh state) and one without (older state). None here lets the
-        # plan's ensure_residuals hook allocate the missing ones and rebuild the views.
+        # with a residual (fresh state) and one without (older state), and after a switch
+        # between kahan8 and kahan16 one residual width with the other. None here lets the
+        # plan's ensure_residuals hook allocate / convert them and rebuild the views; a
+        # non-None ``cviews`` is therefore always of ONE dtype, so the hook checks [0] only.
         self.cviews = (
             [view(s["kahan_lo"]) for s in states]
-            if states and all("kahan_lo" in s for s in states) else None
+            if states and all("kahan_lo" in s for s in states)
+            and len({s["kahan_lo"].dtype for s in states}) == 1 else None
         )
         self.momentum_view_cache: tuple[_MomentumCodec, _StackedViews | None] | None = None
 
@@ -831,14 +834,20 @@ class ForeachPlanMixin:
         chunks = plan.rechunk(budget, spec, cached)
         if spec.extra_key is not None:
             plan.refresh(values)
-        if is_compact_kahan(group.get("bf16_method", "")):
-            # A group switched to kahan8 after its plan/state existed: give every bf16 chunk
-            # its residual views now (allocating zero residuals, with a one-time warning),
-            # instead of letting the batched writer refuse the bucket. Allocating a NEW key
-            # does not move the state generation, so the plan itself stays valid.
+        method = group.get("bf16_method", "")
+        if is_compact_kahan(method):
+            # A group switched to kahan8/kahan16 after its plan/state existed: give every bf16
+            # chunk its residual views now (allocating zero residuals, with a one-time
+            # warning), instead of letting the batched writer refuse the bucket. Allocating a
+            # NEW key does not move the state generation, so the plan itself stays valid. A
+            # switch BETWEEN the two widths converts the residuals (new tensors: a watched
+            # rebinding, so the plan rebuilds next step; this step's views are rebuilt here).
+            bits = residual_bits(method)
+            want = residual_dtype(bits)
             for chunk in chunks:
-                if chunk.cviews is None and chunk.plist[0].dtype == torch.bfloat16:
-                    ensure_residuals(chunk.plist, chunk.states)
+                cv = chunk.cviews
+                if (cv is None or cv[0].dtype != want) and chunk.plist[0].dtype == torch.bfloat16:
+                    ensure_residuals(chunk.plist, chunk.states, bits)
                     chunk.cviews = [chunk.view(s[RESIDUAL_KEY]) for s in chunk.states]
         return chunks
 

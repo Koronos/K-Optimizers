@@ -63,12 +63,13 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kaon._backend import (
+    ensure_residuals,
     foreach_budget,
     per_param_only_bf16_method,
     subtract_batched_,
     subtract_one_,
 )
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits
 from kaon._momentum_codec import _FOURBIT_BLOCK
 from kaon._wrappers import CodecBuffer, TrainEvalWeights, WrapsInnerOptimizer
 from kaon.adakaon import Adakaon
@@ -227,10 +228,11 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
     def _sync_foreach(
         self, params: list[Tensor], group: dict[str, Any], alpha: float, md: str, bf16_method: str
     ) -> None:
+        ck_bits = residual_bits(bf16_method) if is_compact_kahan(bf16_method) else 0
         chunk_budget = foreach_budget(
             self._foreach_stack_budget,
             self._foreach_batch_cutoff,
-            _SYNC_STACK_BYTES_PER_ELEM + (1 if is_compact_kahan(bf16_method) else 0),  # + residual stack
+            _SYNC_STACK_BYTES_PER_ELEM + ck_bits // 8,  # + residual stack (0/1/2 B)
             params[0].device,
         )
         buckets: dict[tuple[Any, ...], list[Tensor]] = {}
@@ -246,14 +248,17 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
                 phi.lerp_(theta, alpha)
                 CodecBuffer.write_stacked(states, "phi", md, phi)
                 delta = theta.sub_(phi)                                         # theta - phi_new
-                # kahan8: the residual belongs to the WEIGHT, so it is the inner's ``kahan_lo``
-                # (same reasoning as ``_sync_one`` handing over the inner's state for ``shift``).
-                # Buckets are keyed by dtype, so the chunk is uniformly bf16 or not: only a bf16
-                # chunk carries (and needs) the residual; an fp32 chunk under kahan8 has none.
-                comp = (
-                    [self.inner.state[p][RESIDUAL_KEY] for p in chunk]
-                    if is_compact_kahan(bf16_method) and chunk[0].dtype == torch.bfloat16 else None
-                )
+                # kahan8/kahan16: the residual belongs to the WEIGHT, so it is the inner's
+                # ``kahan_lo`` (same reasoning as ``_sync_one`` handing over the inner's state
+                # for ``shift``). Buckets are keyed by dtype, so the chunk is uniformly bf16 or
+                # not: only a bf16 chunk carries (and needs) the residual; an fp32 chunk under
+                # kahan8/kahan16 has none. The inner step has normally allocated / converted
+                # it already; ensure_residuals is the same lazy contract as every writer.
+                comp = None
+                if ck_bits and chunk[0].dtype == torch.bfloat16:
+                    inner_states = [self.inner.state[p] for p in chunk]
+                    ensure_residuals(chunk, inner_states, ck_bits)
+                    comp = [st[RESIDUAL_KEY] for st in inner_states]
                 subtract_batched_([p.data for p in chunk], delta, bf16_method, sr=self.sr_stream,
                                   comp=comp)
 

@@ -195,7 +195,9 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         momentum_4bit_block: block size for ``momentum_dtype="4bit"`` (default 128;
             ``0``/negative means whole-tensor).
         bf16_method: low-precision weight-update strategy —
-            ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), ``"none"``.
+            ``"stochastic_rounding"`` (default), ``"kahan8"`` (+1 B/param) /
+            ``"kahan16"`` (+2 B/param, bit-exact fp32 master) compact Kahan,
+            ``"kahan"`` (+2 B/param, legacy per-param only), ``"none"``.
         foreach: batch the step across params with stacked multi-tensor ops. Default
             ``True``; numerically matches the per-parameter path (the v-lag read/write
             ordering is identical in both — see the module docstring).

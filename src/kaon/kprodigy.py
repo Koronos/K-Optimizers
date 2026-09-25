@@ -147,6 +147,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan8"`` (+1 B/param,
             compact fixed-point Kahan, see ``docs/research/compact-kahan.md``),
+            ``"kahan16"`` (+2 B/param, bit-exact fp32 master weight split in two),
             ``"kahan"`` (+2 B/param, legacy per-param only), or
             ``"none"``. No-op on fp32 params.
         factor_conv_as_matrix: reshape 4-D conv kernels to 2-D before factoring

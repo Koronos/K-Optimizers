@@ -1,4 +1,4 @@
-# Compact Kahan — `bf16_method="kahan8"` (1 B/param, every path)
+# Compact Kahan — `bf16_method="kahan8"` (1 B/param) and `"kahan16"` (2 B/param), every path
 
 Design, simulation and implementation notes for the compact fixed-point Kahan weight write.
 Scripts and raw results live in `docs/research/compact-kahan/` (`sim_compact_kahan.py`,
@@ -18,10 +18,12 @@ the simulation, **[code]** measured on the implementation, **[inference]** reaso
   bias 0 within 2 SE, **no stall** below the grid (`lost` ≈ 0). Plain stochastic rounding
   walks by 17–45 ulp in the same runs; the legacy bf16 `kahan` buffer is as accurate on
   dithered updates but **stalls (31 % of the movement lost)** on pure sub-grid drift.
-* `kahan4` (0.5 B/param) is 16× worse (1.5–3 ulp) and not implemented; `kahan16` (2 B/param)
-  is an exact fp32 master weight split in two and is only in the simulation as a reference.
-* The legacy `kahan` stays untouched (its checkpoints hold `shift`; per-param only). `kahan8`
-  is the recommended Kahan.
+* `kahan4` (0.5 B/param) is 16× worse (1.5–3 ulp) and not implemented.
+* **`kahan16`** (2 B/param, implemented — §8): the same codec at 16 bits, where the pair IS an
+  fp32 master weight split in two (bit for bit), with the same coverage as `kahan8`. Given
+  the same bf16 gradients a `kahan16` run is the fp32-weight run of the same optimizer.
+* The legacy `kahan` stays untouched (its checkpoints hold `shift`; per-param only; the only
+  Kahan that takes fp16). `kahan8` is the recommended Kahan; `kahan16` the exact one.
 
 ## 1. Representation
 
@@ -315,7 +317,7 @@ reached on CPU or on a non-contiguous view. All of this is to be re-measured ser
 ## 6. Decisions
 
 * **`kahan8`, SR residual, implicit exponent scale, round-half-away stored weight.** Rationale
-  in §§1–3. Name: `kahan8` (the residual width in bits; a future `kahan4` would fit the table).
+  in §§1–3. Name: `kahan8` (the residual width in bits; `kahan16` is the same table's 16).
 * **Legacy `kahan` kept as is**, not aliased: its checkpoints carry `shift` (bf16), its
   numerics differ (it stalls on sub-grain drift, `kahan8` does not), and it is the only Kahan
   that accepts fp16 parameters. It remains per-param only. Docs mark `kahan8` as the
@@ -343,3 +345,117 @@ reached on CPU or on a non-contiguous view. All of this is to be re-measured ser
   launch), `ck_store` (split into `ck_store_noise` + a wrapper, same arithmetic plus the
   clamp) and `_axpy_momentum_batched` (new `c_addr` argument and `CK` path — the
   MSAM/Nekaon climb). The Adakaon apply kernels' host signatures are unchanged.
+
+## 8. `kahan16` — the fp32 master split in two **[code, `tests/test_kahan16.py`]**
+
+### 8.1 Representation and the stored-bf16 decision **[derivation]**
+
+The §1 codec with `B = 16`: `bits32(z) = (trunc16 << 16) | lo`, `trunc16 = w16 − (lo >> 15)`.
+There are no dropped bits, so **every fp32 is representable and the pair is bit for bit the
+fp32**: `lo` is the fp32's low half, `w` its high half — carried by one when `lo`'s top bit
+is set. A write is `z' = z − lr·δ` in plain fp32 arithmetic (round to nearest) followed by an
+exact split; nothing else rounds, so **no residual SR is needed** (the only rounding is fp32's
+own, the same one an fp32 master weight takes).
+
+Decision: **the stored bf16 is the NEAREST one (ties away from zero), not the truncated high
+half.** Two alternatives were considered:
+
+* *truncated* (`w = high16(z)`, `lo = low16(z)`): the simplest split, but the forward then
+  sees `z` rounded toward zero — every weight shrunk by ~½ ulp on average (bias ~2⁻⁹
+  relative), which is exactly what `kahan8` was designed to avoid;
+* *nearest with a signed residual* (`lo = z − RN(z)` as a signed int16): also exact, but a
+  second convention next to `kahan8`'s, and a signed residual has no room for the half-ulp
+  tie in both directions without special-casing.
+
+The `kahan8` convention (the top residual bit IS the carry) gives the nearest bf16 at the cost
+of the same one add in encode and one subtract in decode that `kahan8` already pays, and the
+residual stays the fp32's literal low half. Ties (`lo == 0x8000`) round away from zero where
+`.to(torch.bfloat16)` rounds to even: the stored bf16 differs from the RNE cast of the master
+in exactly those 1-in-65536 patterns whose truncation is even (asserted exhaustively). RNE
+itself is not decodable: after a tie `w` is always even, and `trunc16` could be `w` or `w − 1`.
+
+### 8.2 Storage, state key, conversion
+
+* **Dtype `int16`**, holding the uint16 pattern. torch 2.12's `uint16` has no
+  `_foreach_copy_` on CUDA (the foreach writers' write-back); `int16` has every op and a
+  1:1 Triton pointer type. Every reader masks `& 0xFFFF` after the sign-extending load; the
+  torch encoder sign-extends explicitly before narrowing (the int32→int16 cast does wrap on
+  CPU and CUDA, but that is implementation-defined in C++).
+* **Same state key `kahan_lo`**: the residual's dtype identifies the width that wrote it
+  (`residual_bits_of`). `WATCHED_STATE_KEYS` already watches it, pointer arrays store
+  `data_ptr`s (width-agnostic), `ForeachChunk.cviews` and the MSAM plan key on it. A second
+  key would have doubled every one of those sites for no information the dtype does not carry.
+* **Mid-run switch** (`group["bf16_method"]` written after the state exists), handled by
+  `kaon._backend.ensure_residuals(params, states, bits)` on every route (per-param writer,
+  foreach plan hook, AdaPNM's bucket views, Adakaon's fused host, Lookahead's sync, Antikaon's
+  clean write): no residual → a zero one (one warning, as for `kahan8`); a residual of the
+  other width → **converted** (`convert_residual`: decode with the stored width, re-encode at
+  the new one; one warning). Widening `kahan8 → kahan16` is exact (the 8-bit grid is a subset;
+  the bf16 does not move); narrowing is one round-half-away at ulp/512. The new tensor is a
+  watched rebinding, so plans and pointer tables rebuild (the foreach hook rebuilds the
+  current step's views on the spot; `ForeachChunk.cviews` is `None` for a chunk of mixed
+  widths so the hook never trusts a half-converted chunk). Converting instead of raising was
+  chosen because the switch is value-preserving and cheap, and raising would make a scheduler
+  that changes precision mid-run impossible. Readers that only DECODE (the MSAM/Nekaon climb
+  removal, Antikaon's clean read) use the stored width, not the group's: the removal at the
+  top of the step right after a switch must decode the residual the climb encoded, before
+  the inner step converts it. `_ck_write_` refuses a residual of the wrong width outright.
+
+### 8.3 Paths
+
+Everything `kahan8` has, with `bits` threaded instead of the literal 8: `subtract_one_` /
+`subtract_batched_(comp=)`; the Triton `ck_decode` / `ck_store_noise` / `ck_store` (a
+`BITS == 16` constexpr branch: mask after the int16 load, int16 store, **no `tl.rand` draw**),
+a `ck_ptr` helper that types a pointer-array entry as `uint8` or `int16`, `ck_add_` /
+`ck_add_supported(…, bits)`; the eight Adakaon apply kernels and `_axpy_momentum_batched`
+take `CK=16` (the `kahan8` specializations compile to the same code as before); the foreach
+budget counts 0/1/2 B of residual stack. **Traffic: +2 B/elem read and +2 B/elem written
+under `CK=16`** (vs +1/+1 for `kahan8`), no extra launch, no temporaries.
+
+### 8.4 Verified **[code]**
+
+* Codec: all 2³² fp32 patterns on CUDA (torch encode/decode 21 s, the Triton helpers against
+  the torch codec 9 s), 2²⁰ on CPU: decode(encode(x)) == x bit for bit on the finite domain
+  (`±0`, subnormals, binade crossings, FLT_MAX carrying the stored bf16 into inf while the
+  master stays exact); `lo` == low half; `w` == `(bits + 0x8000) >> 16`; differs from the RNE
+  cast only on ties; non-finite propagate with `lo = 0`; every `(w, lo)` state with a finite
+  `w` decodes finite.
+* Trajectory, same bf16 gradients to a bf16-`kahan16` run and an fp32-weight run, Gradient
+  Centralization off: **bit-exact** for Adakaon (bf16/int8/4-bit momentum, nomom, cautious)
+  per-param and foreach on CPU, and per-param, foreach and fused (every route incl. the big
+  bucket with `deterministic_reductions=True`) on CUDA; Lion, AdaBelief, ADOPT, KProdigy,
+  AdaMuon, AdaPNM per-param and foreach. The stored bf16 is the half-away nearest of the
+  master, asserted per coordinate. Fused vs native `kahan16` differ only as the fp32 paths
+  do (< 0.01 ulp; 4-bit's code-flip amplification < 0.5).
+* MSAM / Nekaon climb (torch and fused `CK=16`): the run IS the fp32 run, bit for bit, in
+  the perturbed train state and after `eval()`.
+* Resume bit-identical with `int16` kept (per-param, foreach, fused); +2.000 B/param.
+
+### 8.5 Where `kahan16` is NOT the fp32 run (by design, documented)
+
+* **Weight decay** (every optimizer, every path) and **AdamP's projection** read the stored
+  bf16 `p`, where an fp32 run reads its master: the difference is `wd·lr·(z − w)` per step,
+  ≤ `wd·lr·½ulp` — far below the write's own resolution, but not zero. Making the decay read
+  the decoded value is a change to every optimizer's delta and to the fused kernels' `WD`
+  term (the delta would then use `zc` where it uses `p`); not done here.
+* **Gradient Centralization** runs on `p.grad` in the grad's dtype (bf16 for a bf16 param):
+  an input-preprocessing difference, not a storage one.
+* **Lookahead's sync** lerps `phi` toward the bare bf16 `theta` (`torch.stack(p).float()`),
+  not the decoded value, and writes `p ← p − (theta − phi)` through the residual: `z` then
+  lands at `phi + (z − w)`, i.e. the sync carries the ≤ ½-ulp forward rounding into the slow
+  weights. Measured < 0.5 ulp from an all-fp32 Lookahead over 6 steps (k=2). Reading the
+  decoded `theta` would make it exact for `kahan16` (and tighten `kahan8`), but changes
+  `kahan8`'s reviewed numerics: left as a follow-up.
+* MSAM's inert-climb warning is not method-aware: it compares the displacement with half a
+  bf16 ulp even when the climb goes through the residual (both `kahan8` and `kahan16`), so it
+  can fire for a climb that is in fact realized. Pre-existing; a follow-up.
+
+### 8.6 When to use which **[inference]**
+
+* **SR** (0 B): steps ≳ 1 ulp (LoRA/adapter LRs, pre-training) or memory-bound runs.
+* **`kahan8`** (+1 B): sub-ulp LRs; ~0.2 ulp at 10k steps, 0.5 at 100k, 1.6 at 1M (the
+  √N walk of §2) — the default Kahan.
+* **`kahan16`** (+2 B): fp32-master numerics exactly — very long sub-ulp runs where
+  `kahan8`'s √N walk matters, the reference arm of an experiment, or whenever +2 B/param is
+  affordable. Same memory as the legacy `kahan`, strictly better (exact, every path).
+* **legacy `kahan`** (+2 B): fp16 parameters only, or checkpoints that carry `shift`.
