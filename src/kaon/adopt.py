@@ -132,9 +132,12 @@ from kaon._backend import (
     cautious_one_,
     centralize_grads_,
     foreach_budget,
+    init_bf16_state,
     is_low_precision,
+    per_param_only_bf16_method,
     subtract_batched_,
     subtract_one_,
+    validate_bf16_method,
 )
 from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
@@ -239,10 +242,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             raise ValueError(
                 f"momentum_dtype must be bfloat16/float32/int8/4bit, got {momentum_dtype!r}"
             )
-        if bf16_method not in ("stochastic_rounding", "kahan", "none"):
-            raise ValueError(
-                f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}"
-            )
+        validate_bf16_method(bf16_method)
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
         warn_if_4bit_high_beta1(beta1, momentum_dtype)
@@ -302,8 +302,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             state["v"] = torch.zeros_like(grad, dtype=torch.float32)
         state.setdefault("step", 0)
         self._codec(group).init_state(state, grad, group)
-        if is_low_precision(p) and group["bf16_method"] == "kahan":
-            state["shift"] = torch.zeros_like(p)
+        init_bf16_state(p, state, group["bf16_method"])
 
     # -------------------------------------------------------------------- step
     @torch.no_grad()
@@ -421,7 +420,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
     @staticmethod
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
-        return group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
+        return not per_param_only_bf16_method(group["bf16_method"])  # kahan needs a per-param shift buffer
 
     @staticmethod
     def _param_foreach_eligible(p: Tensor, group: dict[str, Any], cutoff: int) -> bool:
@@ -509,7 +508,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
 
         # --- fold g_t into v AFTER it has been used (the v-lag) ---
         grad_sq = grad * grad
@@ -565,7 +564,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
 
         # fold g_t into v AFTER use.
         v.mul_(c["beta2"]).addcmul_(grad, grad, value=1.0 - c["beta2"])

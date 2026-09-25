@@ -71,10 +71,13 @@ from kaon._backend import (
     cautious_one_,
     centralize_grads_,
     foreach_budget,
+    init_bf16_state,
     is_low_precision,
+    per_param_only_bf16_method,
     rms,
     subtract_batched_,
     subtract_one_,
+    validate_bf16_method,
 )
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
@@ -433,7 +436,9 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             substantially — it flips AdaMuon from a loss to a win vs Adakaon (~2%
             on all seeds). Set ``False`` to recover the un-masked Muon-family update.
         bf16_method: low-precision weight-update strategy —
-            ``"stochastic_rounding"`` (default), ``"kahan"`` (+2 B/param), or
+            ``"stochastic_rounding"`` (default), ``"kahan8"`` (+1 B/param,
+            compact fixed-point Kahan, see ``docs/research/compact-kahan.md``),
+            ``"kahan"`` (+2 B/param, legacy per-param only), or
             ``"none"``. No-op on fp32 params.
         foreach: batch the step across parameters with stacked ops (default
             ``True``). Bucketed by shape: ``ndim>=2`` factored ``[N,R,C]`` (with a
@@ -521,8 +526,7 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             raise ValueError(
                 f"momentum_dtype must be bfloat16/float32/int8/4bit, got {momentum_dtype!r}"
             )
-        if bf16_method not in ("stochastic_rounding", "kahan", "none"):
-            raise ValueError(f"bf16_method must be stochastic_rounding/kahan/none, got {bf16_method!r}")
+        validate_bf16_method(bf16_method)
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
         warn_if_4bit_high_beta1(beta1, momentum_dtype)
@@ -637,8 +641,7 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         # shape (the codec matrixizes it per-step for Newton-Schulz).
         if group["betas"][0] > 0:
             self._codec(group).init_state(state, grad, group)
-        if is_low_precision(p) and group["bf16_method"] == "kahan":
-            state["shift"] = torch.zeros_like(p)
+        init_bf16_state(p, state, group["bf16_method"])
 
     @torch.no_grad()
     def _step_impl(self, closure: Any = None) -> Any:
@@ -744,7 +747,7 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     def _group_foreach_eligible(group: dict[str, Any]) -> bool:
         return (
             group["clip_threshold"] > 0
-            and group["bf16_method"] != "kahan"  # kahan needs a per-param shift buffer
+            and not per_param_only_bf16_method(group["bf16_method"])  # kahan needs a per-param shift buffer
         )
 
     @staticmethod
@@ -852,7 +855,7 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -912,7 +915,7 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
                 cautious,
             )
 
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:

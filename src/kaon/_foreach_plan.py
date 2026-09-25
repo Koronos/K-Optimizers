@@ -129,7 +129,8 @@ WATCHED_STATE_KEYS = frozenset({
     "m_pos", "m_neg", "m_pos_scale", "m_neg_scale",  # AdaPNM's two momenta
     "row", "col",                                    # factored second moment
     "v", "max_v",                                    # non-factored second moment (+ AMSGrad)
-    "shift",                                         # Kahan compensation
+    "shift",                                         # Kahan compensation (bf16, legacy)
+    "kahan_lo",                                      # compact Kahan residual byte (kahan8)
 })
 
 
@@ -499,6 +500,9 @@ class ForeachChunk:
       admits 0-D params, identity otherwise.
     * :attr:`pviews` — ``[view(p.data) for p in plist]``, the list the weight decay,
       the projection stack and the final subtract all walk.
+    * :attr:`cviews` — the same views over ``state["kahan_lo"]`` (the compact-Kahan
+      residual bytes) when the bucket carries them, else ``None``; handed to
+      :func:`kaon._backend.subtract_batched_` as ``comp=``.
     * :attr:`state_views` — one list per key named in the spec, in spec order.
     * :meth:`momentum_views` — the codec's own stacked-path view lists, built on first
       use and kept for the chunk's lifetime. :attr:`view` is also what the codec's
@@ -514,8 +518,8 @@ class ForeachChunk:
     Staleness is the caller's job — see :meth:`ForeachPlanMixin._foreach_chunks`.
     """
 
-    __slots__ = ("eff", "grad_reshape", "grad_uniform", "key", "key_index", "length",
-                 "matrixize", "momentum_view_cache", "n", "plist", "pviews",
+    __slots__ = ("cviews", "eff", "grad_reshape", "grad_uniform", "key", "key_index",
+                 "length", "matrixize", "momentum_view_cache", "n", "plist", "pviews",
                  "single_alias", "state_views", "states", "view")
 
     def __init__(
@@ -565,6 +569,10 @@ class ForeachChunk:
             view = self.view
             self.state_views = tuple([view(s[k]) for s in states] for k in keys)
         self.pviews = [self.view(p.data) for p in plist]
+        view = self.view
+        self.cviews = (
+            [view(s["kahan_lo"]) for s in states] if states and "kahan_lo" in states[0] else None
+        )
         self.momentum_view_cache: tuple[_MomentumCodec, _StackedViews | None] | None = None
 
     def momentum_views(self, codec: _MomentumCodec) -> _StackedViews | None:

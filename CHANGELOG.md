@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`bf16_method="kahan8"` — compact Kahan at +1 B/param, on every path.** The legacy
+  `"kahan"` keeps a bf16 compensation buffer (+2 B/param, the model again) and only exists
+  on the per-parameter writer. `kahan8` stores the residual as ONE `uint8` per parameter in
+  units of the weight's own bf16 ulp: the pair `(bf16, byte)` is an fp32 whose low 8
+  mantissa bits are zero — a 16-bit-significand float whose stored bf16 half is the nearest
+  bf16 (round half away), so the forward pass never sees a truncation. The exponent of the
+  weight is the scale (no per-block scale, no reduction), binade crossings are the `+1`
+  carry on the 16-bit pattern, zero/subnormals sit on the same monotone pattern, the decode
+  is integer-only, non-finites propagate as `sr_round` does.
+
+  The residual is **stochastically rounded** at its own grid (the SR bit trick on the 8
+  dropped bits): unbiased for every step size, so the tracked value is a martingale with a
+  `ulp/256 · sqrt(N/6)` walk — 0.16 ulp at 10k steps. Simulated (2^20 coords, 10k steps,
+  fp32 reference, `docs/research/compact-kahan.md`): 0.09–0.19 ulp drift in every regime
+  from 1 to 0.004 ulp/step, with or without an Antikaon-style perturbation carried in the
+  weights, bias 0 within 2 SE, **no stall**; plain stochastic rounding walks 17–45 ulp, and
+  the legacy bf16 `kahan` buffer — as accurate on dithered updates — **loses 31 % of the
+  movement on pure sub-grid drift** because it rounds deterministically. A 4-bit residual
+  was evaluated (16× the drift for 0.5 B/param) and not shipped.
+
+  Coverage: `subtract_one_` (per-param) and `subtract_batched_(…, comp=)` (foreach, the
+  bucket's residual views via `ForeachChunk.cviews`) in `kaon._backend`; a one-launch Triton
+  axpy (`kaon._fused_triton.ck_add_`) that the native CUDA writers take, as fast as the SR
+  write (0.074 vs 0.070 ms per 2^22 elements, orientative) and with no int32 scratch; and
+  **Adakaon's fused path** — all eight apply kernels (`_adakaon_tile_kernel`,
+  `_adam_1d_kernel`, the lone and batched chunked kernels incl. the in-Triton int8/4-bit
+  and no-momentum routes) take a `CK` constexpr and read/write the residual byte in the same
+  launch (+1 B/elem in, +1 B/elem out, no extra launch). AdaBelief, AdamP, AdaMuon, ADOPT,
+  KProdigy, Lion and AdaPNM accept it on their foreach and per-param paths (AdaPNM's fused
+  route declines it with its existing reason string); Lookahead's slow-weight sync carries
+  the inner's residual; ScheduleFree rejects it. `kahan_lo` is ordinary per-param state
+  (`uint8`, `p.shape`): saved by `state_dict`, restored bit-exactly by
+  `load_state_dict_preserving_dtypes`, watched by the pointer-cache generation, and its
+  noise draws from the optimizer's checkpointed stream, so a resume is bit-identical to the
+  uninterrupted run. fp16 parameters are refused (use `"kahan"`). Measured state: 3.04 B/param
+  vs 4.04 (`kahan`) and 2.04 (SR) with bf16 momentum — exactly +1.000 B/param, no first-step
+  transient on the fused path. `tests/test_compact_kahan.py`.
+
+  `"kahan"` is unchanged (checkpoints with `shift` load as before) and documented as legacy;
+  `BF16_METHODS` / `validate_bf16_method` / `init_bf16_state` /
+  `per_param_only_bf16_method` in `kaon._backend` replace the per-optimizer copies of the
+  method check, the `shift` allocation and the foreach predicate.
 - Experimental `Rakaon`: momentum-free variance shrinkage, tensorwise or contiguous
   block variance, RMS clipping, and checkpointable BF16 stochastic rounding.
   Proxy studies have not established superiority over existing optimizers.

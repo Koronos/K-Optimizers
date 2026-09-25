@@ -32,9 +32,17 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from kaon._compact_kahan import (
+    RESIDUAL_KEY,
+    compensated_add_,
+    init_residual,
+    is_compact_kahan,
+    residual_bits,
+)
 from kaon._stochastic_rounding import SRStream, add_stochastic_
 
 __all__ = [
+    "BF16_METHODS",
     "DEFAULT_STACK_ELEMS",
     "FOREACH_BATCH_CUTOFF",
     "LOW_PRECISION",
@@ -47,17 +55,58 @@ __all__ = [
     "flat_view",
     "foreach_budget",
     "gc_applies",
+    "init_bf16_state",
     "is_low_precision",
+    "per_param_only_bf16_method",
     "rms",
     "subtract_batched_",
     "subtract_one_",
+    "validate_bf16_method",
 ]
 
 LOW_PRECISION = (torch.bfloat16, torch.float16)
 
+#: Every ``bf16_method`` a kaon optimizer accepts. ``"kahan"`` is the legacy bf16
+#: compensation buffer (+2 B/param, per-param path only); ``"kahan8"`` the compact
+#: fixed-point residual (+1 B/param, every path) — see :mod:`kaon._compact_kahan`.
+BF16_METHODS = ("stochastic_rounding", "kahan", "kahan8", "none")
+
 
 def is_low_precision(t: Tensor) -> bool:
     return t.dtype in LOW_PRECISION
+
+
+def validate_bf16_method(bf16_method: str) -> None:
+    if bf16_method not in BF16_METHODS:
+        raise ValueError(
+            f"bf16_method must be one of {'/'.join(BF16_METHODS)}, got {bf16_method!r}"
+        )
+
+
+def per_param_only_bf16_method(bf16_method: str) -> bool:
+    """Does this method exist only on the per-parameter writer?
+
+    ``"kahan"`` keeps a bf16 ``state['shift']`` that only :func:`subtract_one_` knows how to
+    carry, so every foreach/fused route has to reject it. ``"kahan8"`` is NOT in this set:
+    its residual rides the batched writer (``comp=``) and Adakaon's fused kernels.
+    """
+    return bf16_method == "kahan"
+
+
+def init_bf16_state(p: Tensor, state: dict, bf16_method: str) -> None:
+    """Allocate the per-param compensation buffer ``bf16_method`` needs on a low-precision
+    ``p`` (nothing for SR / none / fp32 params). One call in every optimizer's ``_init_state``."""
+    if not is_low_precision(p):
+        return
+    if bf16_method == "kahan":
+        state["shift"] = torch.zeros_like(p)
+    elif is_compact_kahan(bf16_method):
+        if p.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"bf16_method={bf16_method!r} holds bf16 weights only (got {p.dtype}); "
+                "use bf16_method='kahan' for fp16 parameters, or keep them in fp32"
+            )
+        state[RESIDUAL_KEY] = init_residual(p)
 
 
 def rms(t: Tensor) -> Tensor:
@@ -159,6 +208,32 @@ def _sr_write_(
     add_stochastic_(target, source, alpha=alpha, sr=sr)
 
 
+def _ck_write_(
+    target: Tensor,
+    lo: Tensor,
+    source: Tensor,
+    alpha: float,
+    bits: int,
+    triton: bool | None = None,
+    sr: SRStream | None = None,
+) -> None:
+    """``(target, lo) += alpha * source`` with the compact-Kahan codec, through Triton when
+    it applies (CUDA, contiguous, bf16/uint8/fp32) and the torch reference otherwise.
+
+    Same stream contract as :func:`_sr_write_`: the kernel takes a launch seed from ``sr``,
+    the torch path draws its residual noise from ``sr``'s generator. Same caveat too — the
+    two paths' noise does not reproduce each other, both are unbiased. ``SR_TRITON`` pins
+    the torch path for both writers (it is the same A/B switch).
+    """
+    use = SR_TRITON if triton is None else triton
+    if use:
+        from kaon import _fused_triton as ft
+        if ft.ck_add_supported(target, lo, source):
+            ft.ck_add_(target, lo, source, alpha, bits, sr)
+            return
+    compensated_add_(target, lo, source, alpha, bits, sr)
+
+
 # ----------------------------- per-optimizer SR noise stream -----------------------------
 class SRSeedState:
     """Mixin: the optimizer's own stochastic-rounding noise stream, in its ``state_dict``.
@@ -250,9 +325,18 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
     is in the param's dtype, so scaling during the narrowing subtract would round the
     product to bf16 and defeat the compensation. Kahan never reaches the foreach path
     (``Adakaon._group_foreach_eligible`` rejects it), so no invariant depends on it.
+
+    ``kahan8`` decodes the compensated fp32 value ``z`` from ``(p, state['kahan_lo'])``,
+    does ``z.add_(delta, alpha=-alpha)`` — the same ``alpha`` fold as the batched writer —
+    and re-encodes with stochastic rounding at the residual grid
+    (:func:`kaon._compact_kahan.compensated_add_`). Per-param and batched consume the
+    same generator sequence, so the torch path keeps ``foreach == per-param`` for it.
     """
     low = is_low_precision(p)
-    if low and bf16_method == "kahan":
+    if low and is_compact_kahan(bf16_method):
+        _ck_write_(p.data, state[RESIDUAL_KEY], delta_fp32, -alpha,
+                   residual_bits(bf16_method), triton, sr)
+    elif low and bf16_method == "kahan":
         shift = state["shift"]
         shift.sub_((delta_fp32 * alpha if alpha != 1.0 else delta_fp32).to(p.dtype))
         p_before = p.detach().clone()
@@ -271,11 +355,15 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
 @torch.no_grad()
 def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
                       alpha: float = 1.0, triton: bool | None = None,
-                      sr: SRStream | None = None) -> None:
+                      sr: SRStream | None = None,
+                      comp: list[Tensor] | None = None) -> None:
     """In-place ``p -= alpha * delta`` over a foreach bucket of (matrixized) param views.
 
     ``pviews`` is the list of N same-shape param views (each ``[*shape]``); ``delta`` is
-    the stacked fp32 step ``[N, *shape]`` (row i applies to ``pviews[i]``).
+    the stacked fp32 step ``[N, *shape]`` (row i applies to ``pviews[i]``). ``comp`` is the
+    matching list of ``state['kahan_lo']`` views for ``bf16_method="kahan8"``
+    (:attr:`kaon._foreach_plan.ForeachChunk.cviews`); a bf16 bucket under that method
+    without it is refused rather than silently written uncompensated.
 
     Only the **bf16 + stochastic-rounding** case needs a materialized stacked-weights
     tensor (``add_stochastic_`` operates on the stack). Every other case — notably the
@@ -295,7 +383,19 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
     is what the ``foreach == per-param`` invariant rests on, is ``Tensor.sub_(d, alpha=lr)``
     against ``torch._foreach_sub_([p], [d], alpha=lr)``."""
     p0 = pviews[0]
-    if p0.dtype == torch.bfloat16 and bf16_method == "stochastic_rounding":
+    if p0.dtype == torch.bfloat16 and is_compact_kahan(bf16_method):
+        if comp is None:
+            raise ValueError(
+                f"subtract_batched_ with bf16_method={bf16_method!r} needs the bucket's "
+                "residual views (comp=...); the caller must route this method per-param "
+                "or hand over ForeachChunk.cviews"
+            )
+        weights = torch.stack(pviews)
+        lows = torch.stack(comp)
+        _ck_write_(weights, lows, delta, -alpha, residual_bits(bf16_method), triton, sr)
+        torch._foreach_copy_(pviews, list(weights.unbind(0)))
+        torch._foreach_copy_(comp, list(lows.unbind(0)))
+    elif p0.dtype == torch.bfloat16 and bf16_method == "stochastic_rounding":
         weights = torch.stack(pviews)
         _sr_write_(weights, delta, -alpha, triton, sr)
         torch._foreach_copy_(pviews, list(weights.unbind(0)))

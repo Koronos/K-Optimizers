@@ -161,7 +161,10 @@ from **318 ms → 15 ms** (1.45× of fused AdamW; was 28×). Full fine-tunes see
 
 > Note: `momentum_dtype="int8"` and `bf16_method="kahan"` are *not* foreach-covered and fall
 > back to the per-parameter loop. For the many-tiny-tensor adapter case, prefer no-momentum or
-> `bfloat16`/`4bit` momentum to keep the foreach speedup.
+> `bfloat16`/`4bit` momentum to keep the foreach speedup. The compact `bf16_method="kahan8"`
+> (+1 B/param) IS foreach- and fused-covered — for sub-ulp learning rates (full fine-tunes at
+> ~1e-5 and below) it tracks the fp32 iterate to ~0.2 ulp where stochastic rounding walks by
+> tens of ulps; see `docs/research/compact-kahan.md`.
 
 ---
 
