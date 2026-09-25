@@ -1,11 +1,38 @@
 # Experiments graveyard — not-merged optimizer attempts (kaon / K-Optimizers)
 
+## Recovering archived code
+
+All experiment branches below have been **purged** (deleted local and remote). Their code is
+preserved in annotated tags `graveyard/*`, published on `origin`, at the exact commit each
+branch pointed to when it was retired. To recover:
+
+```
+git checkout graveyard/<name>                       # inspect/build on the whole tree
+git show graveyard/<name>:<path/to/file.py>          # print one file without checking out
+git log graveyard/<name>                             # its history (unchanged from the branch)
+```
+
+| tag | sha (short) | experiment | verdict |
+|---|---|---|---|
+| `graveyard/antikaon` | `50c12d9` | Antikaon (momentum-free Adakaon + seeded Anti-PGD/RWP noise) | ⛔ REJECTED — slides loss/gap, no frontier win (gate C=40, seeds 0/1) |
+| `graveyard/lr-servo-momentum` | `c2c6b2f` | Momentum LR servo / "adjuster" | ⛔ REJECTED — no consistent quality gain across Adakaon/Nekaon/Lion |
+| `graveyard/ngnm-prototype` | `6d0ca0d` | NGN-MDv1 (exact loss-aware LR reference) | ⛔ REJECTED as autonomous discovery — stable high-side stabilizer, can't grow from a too-low `c`, 8 B/param |
+| `graveyard/new-optimizer-search` | `4147cb1` | Post-Nekaon optimizer search (TangentDual, LookKaon, coherence momentum, latch, coherent decay/lookahead) | ⛔ REJECTED — none crosses the `test<=.07, gap<=.007` corner; see entry below |
+| `graveyard/candidates-v2` | `e89135f` | candidates-v2 integration (6 winners promoted to main; contains `RESULTS_candidates_v2.md`) | ✅ winners promoted (`1879645`); see "Already on main" |
+| `graveyard/candidates-v2-discarded` | `2baf70b` | candidates-v2 rejected arms (MARS, AdEMAMix, Adan, Grams, Adai, SMMF, fp8 momentum, ...) | ⛔ REJECTED — mid-pack or dominated, none promoted |
+| `graveyard/gemini` | `5ee14c1` | early in-house AdEMAMix ("Gemini") | ↩ SUPERSEDED → reimplemented as AdEMAMix in candidates-v2, then rejected there |
+| `graveyard/janus` | `c4e406d` | Janus | ↩ SUPERSEDED → became AdaPNM (on main) |
+| `graveyard/orphan` | `c09f3de` | Orphan (early in-house ADOPT) | ↩ SUPERSEDED → reimplemented + promoted as ADOPT (on main) |
+| `graveyard/adafusionex` | `da620c6` | AdafusionEx (Adafusion + first-class weight EMA + optional MSAM, `koptim` era) | archived, no evaluation documented (never promoted) |
+| `graveyard/autolr-momo-pre-0.7.10` | `ab5ec44` | MoMo, AdamG and Mechanic add-on variants | ⛔ REJECTED — required trainer loss plumbing, extra state, or failed to improve the frontier reliably |
+| `graveyard/worktree-auto-lr-mixin` | `297942b` | auto_lr mixin worktree (freeze-ratio era, superseded by the stability-edge freeze) | ↩ SUPERSEDED — see the QUARANTINED entry below |
+
 > Why this file exists: so an agent (or human) does **not** re-implement an optimizer/technique that
 > was already built and **measured**, nor merge a branch by accident. Each entry says **what**, its
 > **measured verdict**, **where the branch/results are**, and its **status**. The authoritative numbers
 > live in [`benchmarks/control/RANKINGS.md`](../benchmarks/control/RANKINGS.md) and
 > [`benchmarks/control/RESULTS_candidates_v2.md`](../benchmarks/control/RESULTS_candidates_v2.md)
-> (on branch `integration/candidates-v2`).
+> (on branch `integration/candidates-v2`, purged — tag `graveyard/candidates-v2`, `e89135f`).
 >
 > **Read the verdicts as specialists, not a leaderboard:** the battery ranks objective
 > overfitting/convergence, not perceptual quality. The axes that matter for small-data LoRA are the
@@ -28,23 +55,26 @@ Legend: ⛔ REJECTED (measured, no win) · ↩ SUPERSEDED (renamed/absorbed) · 
   (~6 B/trainable bf16 parameter) and did not consistently match tuned Adakaon/Nekaon.
   **Production status:** `auto_lr=True` now raises during construction, before the first
   step. `auto_lr=False` is unchanged. Legacy checkpoints discard only `_autolr` state.
-  Recoverable history: releases 0.5.0–0.7.5, `origin/worktree-auto-lr-mixin`, and commits
-  `32fcd22`, `e6a496f`, `08456e1`.
+  Recoverable history: releases 0.5.0–0.7.5, tag `graveyard/worktree-auto-lr-mixin`
+  (`297942b`, ex-`origin/worktree-auto-lr-mixin`), and commits `32fcd22`, `e6a496f`,
+  `08456e1`.
 - **Momentum LR servo / “adjuster”** — bounded multiplicative corrections from alignment
   and momentum telemetry were safer than full discovery but did not produce consistent
   quality gains across Adakaon, Nekaon and Lion. A small LR still remained small; noisy
-  signals could move an already-good LR away from its optimum. Branch:
-  `codex/lr-servo-momentum`.
+  signals could move an already-good LR away from its optimum. Branch (purged):
+  `codex/lr-servo-momentum` → tag `graveyard/lr-servo-momentum` (`c2c6b2f`).
 - **MoMo, AdamG and Mechanic add-on variants** — loss-aware or scale-adaptive addons were
   implemented and exercised on the proxy, but either required trainer loss plumbing,
   carried extra state, or failed to improve the loss/generalization frontier reliably.
-  Branch: `codex/autolr-momo-prototype`; benchmark and test artifacts remain in that
-  worktree rather than the production package.
+  Branch (purged): `codex/autolr-momo-prototype` → tag `graveyard/autolr-momo-pre-0.7.10`
+  (`ab5ec44`); benchmark and test artifacts remain in that tag rather than the production
+  package.
 - **NGN-MDv1** — exact loss-aware reference was stable over a broad high-`c` range and
   protected against overshoot, but could not grow from a too-low `c`. On the 32×32 UNet
   proxy (128 steps, 3 seeds), best test loss was **0.21185** vs Nekaon **0.20843** and
   Adakaon **0.19825**, while its reference state cost **8 B/parameter**. It is a useful
-  high-side stabilizer, not autonomous LR discovery. Branch: `codex/ngnm-prototype`.
+  high-side stabilizer, not autonomous LR discovery. Branch (purged): `codex/ngnm-prototype`
+  → tag `graveyard/ngnm-prototype` (`6d0ca0d`).
 - **KProdigy as the answer to AutoLR** — Prodigy's one-way D-adaptation was robust when
   started in its intended regime but did not solve arbitrary-scale discovery: too-low
   seeds adapt slowly and the algorithm cannot safely infer a universal upper edge.
@@ -59,7 +89,10 @@ Legend: ⛔ REJECTED (measured, no win) · ↩ SUPERSEDED (renamed/absorbed) · 
 ---
 
 ## ⛔ REJECTED — built + measured, no win on the axes that matter (NOT on main)
-On `integration/candidates-v2` (per-optimizer working branches `worktree-agent-*`). All implemented
+On `integration/candidates-v2` (purged; per-optimizer working branches `worktree-agent-*`, also
+purged) → tag `graveyard/candidates-v2-discarded` (`2baf70b`, the rejected arms) alongside
+`graveyard/candidates-v2` (`e89135f`, the integration branch that carried the promoted winners
+and `RESULTS_candidates_v2.md`). All implemented
 with bit-exact foreach↔per-param parity + reference tests, tuned, and benchmarked — each lands
 mid-pack and heavier; **none beats the in-house Lion / Adakaon / AdaPNM** (or the 6 promoted
 candidates) on any axis that matters, so none was promoted. Confirmed absent from `src/kaon/` on main.
@@ -75,7 +108,7 @@ candidates) on any axis that matters, so none was promoted. Confirmed absent fro
 - **AdamP beta1 dial** (`betas[0]` 0.5/0.2/0.0 on AdamP+wd0.05, 2026-06-10) — does cutting momentum tighten AdamP's gap while keeping the projection? **No win at any point**: b1=0.5 diverged on the scheduled run (te 0.4119), b1=0.2/0.0 trade loss away (te 0.0781/0.0790 vs 0.0742 default) for ~no scheduled-gap gain; only b1=0.0 tightens const-gap (+0.0077) but from a *worse* const loss (0.4801 — broken). Default `beta1=0.9` stays.
 - **STORM variance-reduction enricher** on Adakaon (`variance_reduction`/`vr_coeff` flag POC, 2026-06-15) — momentum-based VR (Cutkosky-Orabona 2019) as a backend enricher, the hoped-for structural partner to the negative-momentum lookahead (attack the const-LR noise ball instead of sharpness). **REJECTED: variance reduction is a frontier-*slider*, not a *mover*, in this regime — it trades loss for gap (= regularization), at any implementation/strength.** Measured on the C=40 multi-res proxy (N=2000, eval@64) vs Adakaon b1=0.9 baseline (te 0.0776 / gap 0.0149): (a) cheap version (stored `g_{t-1}` on the preconditioned update): gap↓ to 0.0089 but te↑ to 0.082; (b) cheap on raw grad: BOTH worse (noise amplification, gap 0.0165); (c) **the CORRECT 2-gradient STORM** `d_t = g(x_t,z_t)+(1-a)(d_{t-1}-g(x_{t-1},z_t))` (same batch, two weight points — needs a 2nd backward, NOT free) done in the proxy loop: same slider pattern (a=0.9/0.5/0.3 → te 0.081/0.080/0.085, gap 0.0117/0.0110/**0.0040**), and **a=0.1 diverged** (te 0.93 — the tight gap there is the underfit mirage). **Why it can't move the frontier here:** on a small overfit-prone set the SGD noise *helps* fit (implicit augmentation); VR removes that useful noise → less overfit (gap↓) but worse fidelity (loss↑). No free-lunch like SAM→lookahead: STORM's correction is a finite-difference/Hessian term with no good cheap proxy (dropping it → plain momentum; stored-grad approx → fails, esp. under multi-res). The whole **cheap-VR lane was already rejected** here: see **MARS** and **Adan** above. The lookahead worked because it's **within-step** (no cross-step gradient-correlation dependence) — so the next try is the within-step **sharpness/GSAM** lineage, not more variance reduction. POC code reverted from `adakaon.py` (no residue); scripts in the session tmp.
 - **GSAM surrogate-gap term on Nekaon** (`gsam_alpha` flag on MSAM, 2026-06-15) — Surrogate Gap Minimization (Zhuang et al., ICLR 2022, `2203.08065`): after SAM's perturbed gradient `g_adv`, *ascend* the component of the clean gradient orthogonal to `g_adv` (`d = g_adv − α·(g − proj_{g_adv} g)`) to minimize the sharpness/surrogate gap. The motivation was a **zero-cost** version riding Nekaon's lookahead: `g_adv` is already the perturbed-point gradient and the stored momentum `m` is the clean-gradient proxy, so the term costs no extra gradient (vs SAM/GSAM's 2×). **REJECTED on Nekaon: it SLIDES the frontier (gap↓, loss↑), does not move it — the lookahead already sits at the achievable sharpness frontier here.** Proxy (C=40 multi-res, N=2000, fp32 momentum, gsam_alpha 0/0.05/0.1/0.2): te 0.0745→0.0767→0.0771→0.0794, gap 0.0105→0.0095→0.0089→0.0086. Plain Nekaon (α=0) is the best loss point. Confirmed NOT a momentum-proxy artifact: the **true 2-gradient GSAM** (real clean grad, on Adakaon b1=0.9) was also marginal — α=0.05/0.1/0.2/0.3 only tightened gap 0.0092→~0.0085 at a loss cost, no win over plain SAM (te 0.0768). **Caveat / why it's logged not closed:** GSAM is a real frontier-mover in its papers — it just adds nothing *on top of Nekaon's negative-momentum lookahead*, which already extracts the within-step sharpness win. **It may well help on an optimizer that lacks a SAM-like mechanism** (a plain Adam/Adakaon base without the lookahead) — worth re-trying there, not on Nekaon. Together with STORM above, the 2026-06-15 search concluded: neither variance-reduction (cross-step) nor surrogate-gap (within-step++) moves the loss/gap frontier past the lookahead on this setup; the corner `cte<0.0700 AND cgap<0.0070` stays unreached (closest single points: Nekaon-b0.9-wd0.3 loss-side, Nekaon-wd0.3 gap-side). POC code reverted from `msam.py`/`nekaon.py` (no residue, `gsam_alpha=0` was a verified no-op); scripts in session tmp.
-- **auto_lr freeze-ratio auto-scaling** (`_FREEZE_GROWTH` β1-law attempt, 2026-07-21) — the `auto_lr="auto"` growth-ratio freeze locks the discovered LR at `_FREEZE_GROWTH=10×seed`. **The undershoot is REAL** (confirmed): on Adakaon `cautious=True, b1=0.9` the fixed optimum is 2.4e-3 (te 0.0727) but auto froze at 9.4e-4 → te 0.0763 (**+0.0036**); nomom `cautious=False, b1=0` has its optimum right at 10×seed (te 0.0814, ~fixed-best). Attempted fix: **auto-scale ρ from an intrinsic quantity** (candidate `ρ = 10/√(1−β1)`, since momentum seemed to raise the optimum). **REJECTED — no clean law + a decisive asymmetry.** Isolating β1 (cautious=True fixed, ρ∈{10,15,20,25,30}): measured ρ\* = **20 / 20 / 10 / 30** for β1 = 0 / 0.5 / 0.7 / 0.9 — **non-monotone** (β1=0.7 wants ρ=10, breaking any β1-law; predicted 10/14/18/32 all miss), `cautious` is a **confound** (nomom ρ\* flips 10→20 when cautious turns on), and within-row te spreads (0.002–0.006) are ≈ single-seed proxy noise. **AND the penalty is sharply asymmetric:** overshoot is a **cliff** (ρ=50/never → te +0.012 over optimum on momentum, worse on nomom) while undershoot is **mild** (+0.0036) — so `ρ=10` is correctly on the SAFE side; bumping it to recover ~0.003 on momentum configs risks +0.012 on lower-optimum ones. **VERDICT: keep `_FREEZE_GROWTH=10` (the conservative default is vindicated, not condemned).** Textbook design-robust-not-proxy-tuned: validated by varying β1/cautious, the proxy-tuned law did not survive. Fix **never touched code** (probe-only monkeypatch; `_FREEZE_GROWTH=10.0` unchanged on main). Escape hatch (optional `auto_lr_freeze_growth` knob) deferred — reintroduces a param, against the parameter-free ethos. Scripts in session tmp (`probe_freeze.py`, `probe_freeze2.py`). **↩ SUPERSEDED (2026-07-23, branch `worktree-auto-lr-mixin`):** the growth-ratio freeze (and the whole `auto_lr_freeze` knob) was REMOVED after a real Anima LoRA failure — the `3e-3·RMS` seed landed 7.6× ABOVE the needed 3e-5 (weight RMS carries no info about an adapter's stability edge) and DoWG ratcheted UP with the divergence. Replaced by: decades-low seed (`1e-6·RMS`) + grad-norm-EMA stability-edge guard (spike → S×0.5 + re-anchor) + **automatic freeze on second edge contact** (`edge×0.5`, the safe side of this entry's overshoot cliff — its asymmetry finding is what made freezing *below* the edge the right call). Also fixed en route: x0 refs bf16→param-native dtype (bf16 quantization injected a `~4e-3·RMS` noise floor that clobbered any low seed).
+- **auto_lr freeze-ratio auto-scaling** (`_FREEZE_GROWTH` β1-law attempt, 2026-07-21) — the `auto_lr="auto"` growth-ratio freeze locks the discovered LR at `_FREEZE_GROWTH=10×seed`. **The undershoot is REAL** (confirmed): on Adakaon `cautious=True, b1=0.9` the fixed optimum is 2.4e-3 (te 0.0727) but auto froze at 9.4e-4 → te 0.0763 (**+0.0036**); nomom `cautious=False, b1=0` has its optimum right at 10×seed (te 0.0814, ~fixed-best). Attempted fix: **auto-scale ρ from an intrinsic quantity** (candidate `ρ = 10/√(1−β1)`, since momentum seemed to raise the optimum). **REJECTED — no clean law + a decisive asymmetry.** Isolating β1 (cautious=True fixed, ρ∈{10,15,20,25,30}): measured ρ\* = **20 / 20 / 10 / 30** for β1 = 0 / 0.5 / 0.7 / 0.9 — **non-monotone** (β1=0.7 wants ρ=10, breaking any β1-law; predicted 10/14/18/32 all miss), `cautious` is a **confound** (nomom ρ\* flips 10→20 when cautious turns on), and within-row te spreads (0.002–0.006) are ≈ single-seed proxy noise. **AND the penalty is sharply asymmetric:** overshoot is a **cliff** (ρ=50/never → te +0.012 over optimum on momentum, worse on nomom) while undershoot is **mild** (+0.0036) — so `ρ=10` is correctly on the SAFE side; bumping it to recover ~0.003 on momentum configs risks +0.012 on lower-optimum ones. **VERDICT: keep `_FREEZE_GROWTH=10` (the conservative default is vindicated, not condemned).** Textbook design-robust-not-proxy-tuned: validated by varying β1/cautious, the proxy-tuned law did not survive. Fix **never touched code** (probe-only monkeypatch; `_FREEZE_GROWTH=10.0` unchanged on main). Escape hatch (optional `auto_lr_freeze_growth` knob) deferred — reintroduces a param, against the parameter-free ethos. Scripts in session tmp (`probe_freeze.py`, `probe_freeze2.py`). **↩ SUPERSEDED (2026-07-23, branch `worktree-auto-lr-mixin`, purged — tag `graveyard/worktree-auto-lr-mixin`, `297942b`):** the growth-ratio freeze (and the whole `auto_lr_freeze` knob) was REMOVED after a real Anima LoRA failure — the `3e-3·RMS` seed landed 7.6× ABOVE the needed 3e-5 (weight RMS carries no info about an adapter's stability edge) and DoWG ratcheted UP with the divergence. Replaced by: decades-low seed (`1e-6·RMS`) + grad-norm-EMA stability-edge guard (spike → S×0.5 + re-anchor) + **automatic freeze on second edge contact** (`edge×0.5`, the safe side of this entry's overshoot cliff — its asymmetry finding is what made freezing *below* the edge the right call). Also fixed en route: x0 refs bf16→param-native dtype (bf16 quantization injected a `~4e-3·RMS` noise floor that clobbered any low seed).
 - **auto_lr soft-edge (mushy-regime) stop — 3 candidates measured, 2 REJECTED, fuse recalibrated (2026-07-23)** — with the seed-ratio freeze gone, DoWG-with-momentum's own fixed point OVERSHOOTS the loss optimum on the proxy (b1=0.9 ran to the 0.3·RMS fuse = 8.2e-3 vs fixed opt 2.4e-3, te 0.0877 vs 0.0727) and the degradation is *silent*: ⛔ **grad-norm level is FLAT in LR** (fixed ladder 6e-4→8.2e-3: late-median gnorm 0.40–0.49 at every LR) — no level-ratio soft-edge signal exists; the 5×-EMA spike guard only sees sharp edges. ⛔ **instantaneous-cosine coherence correction** (`ĉ=EMA cos(du_t,du_{t-1})`, divide estimate by `√((1+ĉ)/(1−ĉ))`): UNSTABLE — ĉ swings during the ramp (H 27→2.3) so the estimate jumps ×3 stepwise → runaway (S→0.73, te 1.07). ⛔ **cumulative-coherence correction** (`Ĥ=dist²/Σ‖du‖²`, quantities already computed): stable and contains momentum (te 0.0799) BUT drags nomom badly (te 0.0911 vs 0.0823) — net displacement in a fine-tune is always ballistic-ish, so Ĥ measures trajectory coherence, not momentum coherence. ✅ **fuse default `fuse_rel` 100→20** (ceiling 0.3→0.06·RMS): best measured point on BOTH configs (mom 0.0797 / nomom 0.0798 at 2000 steps; both pin at the ceiling). Honest framing: in mushy regimes the ceiling IS load-bearing (a LARS-flavored prior, deliberately, documented in `_autolr.py`) — sharp regimes are governed by the edge guard below it, genuinely-low scales by from-below discovery. Open caveat: a mushy problem with optimum ≪0.06·RMS would overshoot silently; none measured yet. Probes: `probe_gnorm.py`, `probe_coherence.py`, `probe_hcum.py`, `probe_fuse10.py`, `probe_edge.py` (job tmp).
 - **auto_lr gradient-only discovery DEMOTED TO FALLBACK — loss-driven range test is the primary mode (2026-07-23, kaon 0.7.0)** — the real Anima re-test with the geometric ramp + spike guard failed by **boiling frog**: the ×1.1/step ramp makes grad norms grow 10-30%/step ALONGSIDE the LR, the spike detector's EMA cooks along (norms 0.5→27 over 30 steps, ZERO 5×-triggers), the model was destroyed by step ~100, a destroyed model then shows COLLAPSED (calm-looking) grads, and the accidental late contact froze 38× hot. A boiled-frog **level guard** (EMA vs min-EMA floor, fires @step 82 = lr 1.7e-4 on the replayed log) was implemented but DISCARDED UNCOMMITTED — one more single-anecdote threshold. **/experts-meeting (4 independent Sonnet agents + web) verdict, unanimous where it matters:** (1) ALL travel-distance estimators (DoWG/Prodigy/D-adaptation/Mechanic) are one-directional ratchets — cannot come down from above; every one leans on a hand-set cap that ends up load-bearing (ours included); (2) gradient-MAGNITUDE signals are information-theoretically blind on mushy landscapes (level flat across a full LR decade — measured) and boilable on sharp ones — not fixable by better thresholds; (3) the missing ingredient is the LOSS — the only cheap model-independent "did this step help" signal (degradation at the edge is 10-100σ vs batch noise). **SHIPPED: loss-driven LR range test inside the optimizer** (fastai lr_finder pattern, non-destructive): exponential rungs, each restores exact x0 + wipes base state (clean trials), judged by median rung loss vs a first-two-rungs baseline (+25% or 4·MAD, 3× instant abort, non-finite instant fail), bidirectional (descends from a hot d0), chosen = last safe rung, then restore + freeze → training starts byte-clean. Enabled by `optimizer.report_loss(loss)` (one line in renga, tolerant of DeepSpeed's report-after-step 1-step lag via drop-first-loss-per-rung) or a step closure. ~90-100 steps, damage-free. Proxy: mom picks 8.6e-4 → te **0.0747** (best auto yet; fallback 0.0797, fixed-best 0.0727), and it detected REAL in-rung loss degradation at 2.7e-3 on the very proxy where grad-norm was flat. Gradient-only path (DoWG+guards+fuse) remains UNCHANGED as the no-loss fallback (kohya). Candidate future signal for the fallback's fuse, from the panel, untested: windowed secant curvature `κ=Δg·Δx/‖Δx‖²` with the EoS setpoint (bidirectional by construction; AdGD/BB lineage).
 - **per-group (per-param-group) DoWG auto_lr** (2026-07-21) — should auto_lr find a *different* LR per component (text-encoder vs UNet), as manual multi-LR setups do? Prototyped a per-`param_group` DoWG tuner (separate S/v/r̄/x0 per group) on a **composition split** of the proxy (10 Linear = TE-like vs 36 Conv/Norm = UNet-like). **Correct structure, null on loss.** It DOES discover a real per-component ratio — `S_A(TE)=2.97e-3 / S_B(UNet)=8.6e-4 = 3.45×`, each near its own fixed optimum, and the ratio emerges **for free from the data-relative seed** (Linear weights have ~3.4× larger RMS → larger seed → larger LR; note: TE-like wants the HIGHER LR here, opposite the folk "TE gentler" rule). A per-group fixed grid confirms real headroom (best per-group 0.0723 vs best global-fixed 0.0740). **BUT per-group auto ties global auto on final loss (0.0762 vs 0.0760)** — the freeze anchor binds both variants before either reaches the per-group optimum, and (per the entry above) the freeze can't be cleanly un-bound. Real capability, cheap (ratio is free from seeds), but **not worth building until/unless the freeze is solved** — which the β1-law failure says it can't be, cleanly. Probe-only (`probe_pergroup.py`); shipped auto_lr stays single-global-LR. *(2026-07-23: the seed-ratio freeze is gone — replaced by the stability-edge freeze, see the entry above — so the "freeze anchor binds both variants" blocker no longer applies as stated; per-group DoWG is worth a re-probe on the new mechanism if per-component LR ever matters.)*
@@ -109,10 +142,10 @@ also measured these. Numbers in `battery_round*.log` (job tmp) and the campaign 
   follows its momentum (the Adakaon family).
 
 ## ↩ SUPERSEDED — early names that became the shipped versions
-- **Janus** — `feat/janus` → became **AdaPNM** (on main; constant-LR generalization champion).
+- **Janus** — `feat/janus` (purged — tag `graveyard/janus`, `c4e406d`) → became **AdaPNM** (on main; constant-LR generalization champion).
 - **Liofusion** — `feat/liofusion` → became **Lion** (on main).
-- **Orphan** — `feat/orphan` (early in-house ADOPT on the factored/quantized backend) → reimplemented + promoted as **ADOPT** (on main).
-- **Gemini** — `feat/gemini` (early in-house AdEMAMix) → reimplemented as **AdEMAMix** in candidates-v2 — but AdEMAMix was then **rejected** (see above), so this line did not ship.
+- **Orphan** — `feat/orphan` (purged — tag `graveyard/orphan`, `c09f3de`; early in-house ADOPT on the factored/quantized backend) → reimplemented + promoted as **ADOPT** (on main).
+- **Gemini** — `feat/gemini` (purged — tag `graveyard/gemini`, `5ee14c1`; early in-house AdEMAMix) → reimplemented as **AdEMAMix** in candidates-v2 — but AdEMAMix was then **rejected** (see above), so this line did not ship.
 - **integration/candidates** (v1) → superseded by **integration/candidates-v2**.
 - **NekaonAlloc** (`src/kaon/nekaon_alloc.py`, 2026-07-01 ten-expert panel PoC) — a standalone routing optimizer that held two full inner-optimizer instances (Nekaon on small tensors, momentum-free Adakaon on big ones) to cut memory on full fine-tunes while keeping most of Nekaon's constant-LR quality edge. Measured genuinely useful for VRAM-constrained continued/constant-LR training (beats Adakaon-nomom outright on scheduled gap and const-LR loss at near-nomom memory cost), just implemented the wrong way: MSAM's lookahead already only climbs params that have a momentum buffer, and Adakaon already gates that buffer per param-GROUP (`betas[0] > 0`), so the routing needed no second optimizer instance at all. **Folded into `Nekaon` itself** as the `low_vram_above` / `low_vram_lr_ratio` kwargs (builds the same two groups internally, one optimizer, one `state_dict`) — see `src/kaon/nekaon.py`. File deleted, not exported separately; `NekaonAlloc`/`NekaonAlloc-fused` removed from `registry.py`/`RANKINGS.md` (superseded entries don't get a "not on main" measured-record slot, they get their `main` pointer, here `Nekaon(low_vram_above=...)`).
   **Correction (2026-07-03, same day):** the fold-in exposed a real bug in both `battery.py` and `profiler.py` — the schedule loop overwrote every param group's `lr` to the *same* value every step, silently discarding any per-group lr ratio a multi-group optimizer was constructed with. This means every number quoted above for `NekaonAlloc`'s `big_lr_ratio` (including the "0.25 vs 0.5 vs 1.0 (shared lr) wins" profiler finding) was measured with the ratio **always forced to ~1.0** regardless of what the registry said — the momentum on/off comparisons (Nekaon vs NekaonAlloc vs Adakaon-nomom) are unaffected (betas aren't touched by the bug), but any conclusion that depended on the lr-ratio specifically is not trustworthy. Fixed in both files (each group now keeps its own base lr through the schedule multiplier). Re-swept `low_vram_lr_ratio` post-fix on `Nekaon(low_vram_above=65536)`: it's a genuine U-shaped knob (te 0.0884/0.0806/**0.0789**/0.0801/0.0812 for ratio 0.1/0.25/**0.5**/0.75/1.0), and the shipped default (`0.5`) is validated as the best-loss point, not a guess. Bigger surprise: vs plain Nekaon (no split, te 0.0846/gap +0.0058), the corrected split at `ratio=0.5` **improves loss** (0.0789) at a gap cost (+0.0102) — a real loss<->gap trade, not the "cheaper but slightly worse" story told when the bug was still live.
@@ -140,6 +173,45 @@ renga-flow Anima LoKr real-config A/B. Verdicts (RTX 4080), **native-foreach →
   DiT LoKr. Full design: [`docs/FUSED_REDUCTIONS_DESIGN.md`](FUSED_REDUCTIONS_DESIGN.md).
 - Side fix: the control battery now times **steady-state** ms/step (excludes one-time Triton JIT) —
   that artifact had shown a *false* "fused UNet regression".
+
+---
+
+## ⛔ REJECTED / ARCHIVED — 2026-09 batch
+
+- **Antikaon (2026-09-24/25)** — Adakaon-nomom + seeded Anti-PGD/RWP noise (0 B/param, `σ =
+  k_sigma·lr·clip`, rank-1 shape of the factored `v`). Tag `graveyard/antikaon` (`50c12d9`).
+  On the control-battery gate (C=40, N=600→2000, seeds 0/1, fp32, constant LR) it only slides
+  the loss/gap trade-off. Best point `k_sigma=1.5`: test **0.0784** vs A0's **0.0800**, within
+  seed dispersion; Nekaon dominates on loss (**0.0750**). At low LR (lr=1e-5, bf16, the
+  `antikaon_lowlr` smoke) anti-fp32 matches ada-fp32: the noise anchored to `lr` is
+  negligible there because the implicit regularizer scales with `σ²`. **Lesson for a retry:**
+  anchor `σ` to the weight scale or an absolute scale, not to `lr`. Numbers from
+  `docs/research/antikaon/antikaon_gate/RESULTS.md` and
+  `docs/research/antikaon/antikaon_lowlr/results.json`.
+- **New optimizer search (2026-09, staged gate at C=40/N=600→2000, seeds 0/1)** — tag
+  `graveyard/new-optimizer-search` (`4147cb1`); full writeup at
+  `git show graveyard/new-optimizer-search:benchmarks/results/NEW_OPTIMIZER_SEARCH.md`.
+  **TangentDual** (fixed/orthogonal inverse-adaptive blends) is falsified — no config
+  dominated Adakaon/Nekaon, more tangent strength only opened the gap. **LookKaon**
+  (LookSAM-style periodic true-SAM probes) underfits at the published `alpha=0.5`
+  (test 0.0955) and gains nothing over Adakaon at lower alpha, while costing an extra
+  backward every `k` steps. **Coherence-conditioned momentum** moved the frontier on
+  seed 0 (test 0.074556 / gap 0.008972 vs Nekaon β=.7's 0.074744 / 0.011133) but did not
+  reproduce as strict dominance on seed 1 (0.07081/0.01019 vs Nekaon's 0.07023/0.00964);
+  on the two-seed mean nothing beats **test<=.0700 and gap<=.0070**, and nothing dominates
+  Nekaon β=.9 on loss while also dominating Nekaon β=.7 on gap. **Latch** (hard coherence
+  switch), **coherent decay** and **coherent lookahead** were also rejected — they helped at
+  600 steps but failed at 2000 (selective decay regularized by underfitting; the lookahead
+  duplicated the coherence controller and was dominated). Decision: no new optimizer shipped
+  from this campaign; the smooth coherence-momentum controller is kept only as a research
+  lead, not a shipped mechanism.
+- **AdafusionEx (2026-06, `koptim` era)** — tag `graveyard/adafusionex` (`da620c6`). Adafusion
+  subclassed with a first-class weight EMA (diffusers `EMAModel`-style store/copy_to/restore,
+  VRAM-aware bf16 shadow, decay warmup), optional post-hoc EMA reconstruction (EDM2), and an
+  optional zero-extra-memory MSAM flat-minima mode. `git show graveyard/adafusionex --stat`
+  shows a single-commit addition (`src/koptim/...`) with no follow-up measurement commits.
+  **Archived without a documented evaluation** — it was never promoted and no control-battery
+  verdict was ever recorded for it; treat any claim about its quality as unverified.
 
 ---
 
