@@ -51,7 +51,7 @@ def run(kind, fused, steps=300, seed=0):
         for params, opt in runs.values():
             params[0].grad = g.to(params[0].dtype)
             opt.step()
-    for params, opt in runs.values():
+    for _params, opt in runs.values():
         if hasattr(opt, "eval"):
             opt.eval()          # remove the climb: measure the CLEAN weights
     z_ref = runs["fp32"][0][0].data
