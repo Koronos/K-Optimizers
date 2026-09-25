@@ -1,0 +1,545 @@
+{
+ "manifest": {
+  "commit": "3d0741a81596c0c297dddd8615e60a59a19443df",
+  "branch": "feature/antikaon",
+  "config": {
+   "C": 40,
+   "bs": 8,
+   "pretrain": 300,
+   "steps": 8000,
+   "lr": 1e-05,
+   "seeds": [
+    0,
+    1
+   ]
+  },
+  "pretrain_lr": 0.0012,
+  "schedule": "const",
+  "device": "cuda",
+  "dataset_fingerprint": "b0bad0f5fb622dd7a30641c8e1780b21fed818fddf8a430faf9a78b480399aef",
+  "arms": [
+   "ada-sr",
+   "ada-k8",
+   "anti1.5-sr",
+   "anti1.5-k8",
+   "anti5-sr",
+   "anti5-k8",
+   "nek-sr",
+   "nek-k8",
+   "ada-fp32",
+   "anti1.5-fp32",
+   "anti5-fp32",
+   "nek-fp32"
+  ]
+ },
+ "results": {
+  "ada-sr": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.0888109803199768,
+     "train": 0.08046521944925189,
+     "gap": 0.008345760870724916,
+     "test_start": 0.10141753498464823,
+     "test_full": 0.08876956813037395,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 10.443099589144484,
+     "dist_rel": 0.6164323889149976,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.08807238843291998,
+     "train": 0.0801097396761179,
+     "gap": 0.007962648756802082,
+     "test_start": 0.10823476780205965,
+     "test_full": 0.08803715091198683,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 10.43403556860274,
+     "dist_rel": 0.5926732163129995,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08844168437644839,
+   "test_std": 0.0005222633318672514,
+   "gap_mean": 0.0081542048137635,
+   "gap_std": 0.00027090117370954934,
+   "train_mean": 0.0802874795626849,
+   "train_std": 0.00025136215815770203,
+   "test_start_mean": 0.10482615139335394,
+   "test_start_std": 0.00482051155411909,
+   "test_full_mean": 0.08840335952118039,
+   "test_full_std": 0.000517897181779326,
+   "dist_ulp_mean": 10.438567578873613,
+   "dist_rel_mean": 0.6045528026139986
+  },
+  "ada-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.0887294439598918,
+     "train": 0.0803303555585444,
+     "gap": 0.008399088401347399,
+     "test_start": 0.10141753498464823,
+     "test_full": 0.08867367822676897,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.13404402154691167,
+     "dist_rel": 0.010104452681974269,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.08800669852644205,
+     "train": 0.08000284759327769,
+     "gap": 0.008003850933164358,
+     "test_start": 0.10823476780205965,
+     "test_full": 0.0879765348508954,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.1323961952839266,
+     "dist_rel": 0.009808124137946243,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08836807124316692,
+   "test_std": 0.0005110581970639254,
+   "gap_mean": 0.008201469667255878,
+   "gap_std": 0.00027947509393123036,
+   "train_mean": 0.08016660157591105,
+   "train_std": 0.00023158310313269506,
+   "test_start_mean": 0.10482615139335394,
+   "test_start_std": 0.00482051155411909,
+   "test_full_mean": 0.08832510653883219,
+   "test_full_std": 0.0004929548085394805,
+   "dist_ulp_mean": 0.13322010841541915,
+   "dist_rel_mean": 0.009956288409960256
+  },
+  "anti1.5-sr": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08893766812980175,
+     "train": 0.08060169639065862,
+     "gap": 0.008335971739143133,
+     "test_start": 0.10141753498464823,
+     "test_full": 0.08891666773706675,
+     "dist_ref": "anti1.5-fp32",
+     "dist_ulp": 17.085187062268183,
+     "dist_rel": 1.031815913981999,
+     "inert_warnings": [
+      "Antikaon: the perturbation radius (~1.50e-05) is below half the resolution of the stored weight at the sampled mean weight scale (7.88e-04, torch.bfloat16); wit"
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08821224700659513,
+     "train": 0.08027359936386347,
+     "gap": 0.007938647642731667,
+     "test_start": 0.10823476780205965,
+     "test_full": 0.08818760886788368,
+     "dist_ref": "anti1.5-fp32",
+     "dist_ulp": 17.038492496671495,
+     "dist_rel": 0.9900624270587153,
+     "inert_warnings": [
+      "Antikaon: the perturbation radius (~1.50e-05) is below half the resolution of the stored weight at the sampled mean weight scale (7.68e-04, torch.bfloat16); wit"
+     ]
+    }
+   ],
+   "test_mean": 0.08857495756819844,
+   "test_std": 0.0005129501954353597,
+   "gap_mean": 0.0081373096909374,
+   "gap_std": 0.00028095056290136563,
+   "train_mean": 0.08043764787726104,
+   "train_std": 0.00023199963253399414,
+   "test_start_mean": 0.10482615139335394,
+   "test_start_std": 0.00482051155411909,
+   "test_full_mean": 0.08855213830247521,
+   "test_full_std": 0.0005155224702835402,
+   "dist_ulp_mean": 17.06183977946984,
+   "dist_rel_mean": 1.010939170520357
+  },
+  "anti1.5-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08873207122087479,
+     "train": 0.0803359355777502,
+     "gap": 0.00839613564312458,
+     "test_start": 0.10141753498464823,
+     "test_full": 0.08870049566030502,
+     "dist_ref": "anti1.5-fp32",
+     "dist_ulp": 0.13502746973849364,
+     "dist_rel": 0.010235596328724375,
+     "inert_warnings": [
+      "Antikaon: the perturbation radius is only 7.4e-05 of the sampled weight scale (lr=1.00e-05); below ~1e-04 this heuristic flags a potentially inert perturbation."
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08798637706786394,
+     "train": 0.08000680804252625,
+     "gap": 0.007979569025337696,
+     "test_start": 0.10823476780205965,
+     "test_full": 0.08797242026776075,
+     "dist_ref": "anti1.5-fp32",
+     "dist_ulp": 0.1330954672145374,
+     "dist_rel": 0.009939605994900732,
+     "inert_warnings": [
+      "Antikaon: the perturbation radius is only 7.6e-05 of the sampled weight scale (lr=1.00e-05); below ~1e-04 this heuristic flags a potentially inert perturbation."
+     ]
+    }
+   ],
+   "test_mean": 0.08835922414436936,
+   "test_std": 0.0005272853922851276,
+   "gap_mean": 0.008187852334231138,
+   "gap_std": 0.0002945570802530506,
+   "train_mean": 0.08017137181013823,
+   "train_std": 0.00023272831203207701,
+   "test_start_mean": 0.10482615139335394,
+   "test_start_std": 0.00482051155411909,
+   "test_full_mean": 0.08833645796403289,
+   "test_full_std": 0.0005148270472831105,
+   "dist_ulp_mean": 0.1340614684765155,
+   "dist_rel_mean": 0.010087601161812555
+  },
+  "anti5-sr": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08902506809681654,
+     "train": 0.08078851224854589,
+     "gap": 0.008236555848270655,
+     "test_start": 0.10141753498464823,
+     "test_full": 0.08900699950754642,
+     "dist_ref": "anti5-fp32",
+     "dist_ulp": 21.07802053745951,
+     "dist_rel": 1.3633287599893709,
+     "inert_warnings": [
+      "Antikaon: the perturbation radius (~5.00e-05) is below half the resolution of the stored weight at the sampled mean weight scale (7.88e-04, torch.bfloat16); wit"
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08837122935801744,
+     "train": 0.08066348545253277,
+     "gap": 0.007707743905484676,
+     "test_start": 0.10823476780205965,
+     "test_full": 0.08833621628582478,
+     "dist_ref": "anti5-fp32",
+     "dist_ulp": 21.08766661609342,
+     "dist_rel": 1.3185589147160803,
+     "inert_warnings": [
+      "Antikaon: the perturbation radius (~5.00e-05) is below half the resolution of the stored weight at the sampled mean weight scale (7.67e-04, torch.bfloat16); wit"
+     ]
+    }
+   ],
+   "test_mean": 0.08869814872741699,
+   "test_std": 0.00046233380600729996,
+   "gap_mean": 0.007972149876877666,
+   "gap_std": 0.00037392651071639784,
+   "train_mean": 0.08072599885053933,
+   "train_std": 8.840729529090212e-05,
+   "test_start_mean": 0.10482615139335394,
+   "test_start_std": 0.00482051155411909,
+   "test_full_mean": 0.0886716078966856,
+   "test_full_std": 0.00047431536478553755,
+   "dist_ulp_mean": 21.08284357677646,
+   "dist_rel_mean": 1.3409438373527256
+  },
+  "anti5-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08872132562100887,
+     "train": 0.08033528085798025,
+     "gap": 0.008386044763028622,
+     "test_start": 0.10141753498464823,
+     "test_full": 0.0886851018294692,
+     "dist_ref": "anti5-fp32",
+     "dist_ulp": 0.13377116663994343,
+     "dist_rel": 0.010294081113576962,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.0879982141777873,
+     "train": 0.08001311495900154,
+     "gap": 0.007985099218785763,
+     "test_start": 0.10823476780205965,
+     "test_full": 0.08796637691557407,
+     "dist_ref": "anti5-fp32",
+     "dist_ulp": 0.13195258607888954,
+     "dist_rel": 0.01016280880030756,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08835976989939809,
+   "test_std": 0.0005113170050555626,
+   "gap_mean": 0.008185571990907192,
+   "gap_std": 0.0002835113132206564,
+   "train_mean": 0.0801741979084909,
+   "train_std": 0.00022780569183490618,
+   "test_start_mean": 0.10482615139335394,
+   "test_start_std": 0.00482051155411909,
+   "test_full_mean": 0.08832573937252164,
+   "test_full_std": 0.000508215260422964,
+   "dist_ulp_mean": 0.1328618763594165,
+   "dist_rel_mean": 0.010228444956942261
+  },
+  "nek-sr": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.0883680609986186,
+     "train": 0.0796334994956851,
+     "gap": 0.008734561502933502,
+     "test_start": 0.10141753498464823,
+     "test_full": 0.08834436815232038,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 8.656420790660562,
+     "dist_rel": 0.47493772819093055,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.88e-04); some perturbations may round to"
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.0874761501327157,
+     "train": 0.07923972560092807,
+     "gap": 0.008236424531787634,
+     "test_start": 0.10823476780205965,
+     "test_full": 0.08743842504918575,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 8.657760775238273,
+     "dist_rel": 0.4547623720991325,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.67e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.08792210556566715,
+   "test_std": 0.0006306762214939065,
+   "gap_mean": 0.008485493017360568,
+   "gap_std": 0.00035223603025697105,
+   "train_mean": 0.07943661254830658,
+   "train_std": 0.0002784401912369355,
+   "test_start_mean": 0.10482615139335394,
+   "test_start_std": 0.00482051155411909,
+   "test_full_mean": 0.08789139660075307,
+   "test_full_std": 0.0006405985115956822,
+   "dist_ulp_mean": 8.657090782949417,
+   "dist_rel_mean": 0.46485005014503156
+  },
+  "nek-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08832009509205818,
+     "train": 0.07956309337168932,
+     "gap": 0.008757001720368862,
+     "test_start": 0.10141753498464823,
+     "test_full": 0.08829609397798777,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.25678570089943986,
+     "dist_rel": 0.0168237648579343,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.89e-04); some perturbations may round to"
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08744836878031492,
+     "train": 0.0791376861743629,
+     "gap": 0.008310682605952024,
+     "test_start": 0.10823476780205965,
+     "test_full": 0.08741172216832638,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.2552207698374952,
+     "dist_rel": 0.016103651374202554,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.68e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.08788423193618655,
+   "test_std": 0.0006164035863723971,
+   "gap_mean": 0.008533842163160443,
+   "gap_std": 0.0003155952723773205,
+   "train_mean": 0.07935038977302611,
+   "train_std": 0.00030080831399507653,
+   "test_start_mean": 0.10482615139335394,
+   "test_start_std": 0.00482051155411909,
+   "test_full_mean": 0.08785390807315707,
+   "test_full_std": 0.0006253453037017864,
+   "dist_ulp_mean": 0.25600323536846753,
+   "dist_rel_mean": 0.016463708116068426
+  },
+  "ada-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.0886794701218605,
+     "train": 0.08027913700789213,
+     "gap": 0.008400333113968372,
+     "test_start": 0.10140430554747581,
+     "test_full": 0.0886794701218605,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.08796238619834185,
+     "train": 0.07995869079604745,
+     "gap": 0.008003695402294397,
+     "test_start": 0.10825884528458118,
+     "test_full": 0.08796238619834185,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08832092816010118,
+   "test_std": 0.0005070549049998984,
+   "gap_mean": 0.008202014258131385,
+   "gap_std": 0.0002804652155989824,
+   "train_mean": 0.08011891390196979,
+   "train_std": 0.0002265896894009161,
+   "test_start_mean": 0.1048315754160285,
+   "test_start_std": 0.004846891530019861,
+   "test_full_mean": 0.08832092816010118,
+   "test_full_std": 0.0005070549049998984,
+   "dist_ulp_mean": null,
+   "dist_rel_mean": null
+  },
+  "anti1.5-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08867943845689297,
+     "train": 0.0802791491150856,
+     "gap": 0.008400289341807365,
+     "test_start": 0.10140430554747581,
+     "test_full": 0.08867943845689297,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.0030006236785157614,
+     "dist_rel": 0.00015980551740089606,
+     "inert_warnings": [
+      "Antikaon: the perturbation radius is only 7.4e-05 of the sampled weight scale (lr=1.00e-05); below ~1e-04 this heuristic flags a potentially inert perturbation."
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08796225301921368,
+     "train": 0.07995862606912851,
+     "gap": 0.008003626950085163,
+     "test_start": 0.10825884528458118,
+     "test_full": 0.08796225301921368,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.003011379646034957,
+     "dist_rel": 0.00015451180843261333,
+     "inert_warnings": [
+      "Antikaon: the perturbation radius is only 7.6e-05 of the sampled weight scale (lr=1.00e-05); below ~1e-04 this heuristic flags a potentially inert perturbation."
+     ]
+    }
+   ],
+   "test_mean": 0.08832084573805332,
+   "test_std": 0.0005071266863512686,
+   "gap_mean": 0.008201958145946264,
+   "gap_std": 0.0002804826670284439,
+   "train_mean": 0.08011888759210706,
+   "train_std": 0.00022664401932282467,
+   "test_start_mean": 0.1048315754160285,
+   "test_start_std": 0.004846891530019861,
+   "test_full_mean": 0.08832084573805332,
+   "test_full_std": 0.0005071266863512686,
+   "dist_ulp_mean": 0.003006001662275359,
+   "dist_rel_mean": 0.0001571586629167547
+  },
+  "anti5-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08867951575666666,
+     "train": 0.08027928462252021,
+     "gap": 0.008400231134146452,
+     "test_start": 0.10140430554747581,
+     "test_full": 0.08867951575666666,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.008745425483869716,
+     "dist_rel": 0.00046171245791225144,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.08796219807118177,
+     "train": 0.07995881699025631,
+     "gap": 0.008003381080925465,
+     "test_start": 0.10825884528458118,
+     "test_full": 0.08796219807118177,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.008879489664230817,
+     "dist_rel": 0.00045094135075341335,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08832085691392422,
+   "test_std": 0.0005072201996714021,
+   "gap_mean": 0.008201806107535958,
+   "gap_std": 0.00028061536374680244,
+   "train_mean": 0.08011905080638826,
+   "train_std": 0.0002266048359245997,
+   "test_start_mean": 0.1048315754160285,
+   "test_start_std": 0.004846891530019861,
+   "test_full_mean": 0.08832085691392422,
+   "test_full_std": 0.0005072201996714021,
+   "dist_ulp_mean": 0.008812457574050267,
+   "dist_rel_mean": 0.0004563269043328324
+  },
+  "nek-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08828523941338062,
+     "train": 0.07950604241341352,
+     "gap": 0.008779196999967098,
+     "test_start": 0.10140430554747581,
+     "test_full": 0.08828523941338062,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 2.1638313808332863,
+     "dist_rel": 0.13950593766979572,
+     "inert_warnings": [
+      "Nekaon: the lookahead displaces the weights by only 7.4e-05 relative (norm='none', lr=1.00e-05); below ~1e-04 this heuristic flags potentially inert lookahead. "
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08741420973092318,
+     "train": 0.07908648299053311,
+     "gap": 0.008327726740390062,
+     "test_start": 0.10825884528458118,
+     "test_full": 0.08741420973092318,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 2.2825431914874277,
+     "dist_rel": 0.1396312027974514,
+     "inert_warnings": [
+      "Nekaon: the lookahead displaces the weights by only 7.6e-05 relative (norm='none', lr=1.00e-05); below ~1e-04 this heuristic flags potentially inert lookahead. "
+     ]
+    }
+   ],
+   "test_mean": 0.0878497245721519,
+   "test_std": 0.0006159109950804259,
+   "gap_mean": 0.00855346187017858,
+   "gap_std": 0.00031923768205097293,
+   "train_mean": 0.07929626270197332,
+   "train_std": 0.00029667331302945306,
+   "test_start_mean": 0.1048315754160285,
+   "test_start_std": 0.004846891530019861,
+   "test_full_mean": 0.0878497245721519,
+   "test_full_std": 0.0006159109950804259,
+   "dist_ulp_mean": 2.223187286160357,
+   "dist_rel_mean": 0.13956857023362357
+  }
+ }
+}

@@ -1,0 +1,45 @@
+Thu Sep 24 20:45:39     2026
+exit 0
+Thu Sep 24 22:22:22     2026
+  [ada-sr] seed=0 test=0.08881 (start 0.10142, fp32 view 0.08877) train=0.08047 gap=+0.00835
+  [ada-k8] seed=0 test=0.08873 (start 0.10142, fp32 view 0.08867) train=0.08033 gap=+0.00840
+  [anti1.5-sr] seed=0 test=0.08894 (start 0.10142, fp32 view 0.08892) train=0.08060 gap=+0.00834  inert-warning x1
+  [anti1.5-k8] seed=0 test=0.08873 (start 0.10142, fp32 view 0.08870) train=0.08034 gap=+0.00840  inert-warning x1
+  [anti5-sr] seed=0 test=0.08903 (start 0.10142, fp32 view 0.08901) train=0.08079 gap=+0.00824  inert-warning x1
+  [anti5-k8] seed=0 test=0.08872 (start 0.10142, fp32 view 0.08869) train=0.08034 gap=+0.00839
+  [nek-sr] seed=0 test=0.08837 (start 0.10142, fp32 view 0.08834) train=0.07963 gap=+0.00873  inert-warning x1
+  [nek-k8] seed=0 test=0.08832 (start 0.10142, fp32 view 0.08830) train=0.07956 gap=+0.00876  inert-warning x1
+  [ada-fp32] seed=0 test=0.08868 (start 0.10140, fp32 view 0.08868) train=0.08028 gap=+0.00840
+  [anti1.5-fp32] seed=0 test=0.08868 (start 0.10140, fp32 view 0.08868) train=0.08028 gap=+0.00840  inert-warning x1
+  [anti5-fp32] seed=0 test=0.08868 (start 0.10140, fp32 view 0.08868) train=0.08028 gap=+0.00840
+  [nek-fp32] seed=0 test=0.08829 (start 0.10140, fp32 view 0.08829) train=0.07951 gap=+0.00878  inert-warning x1
+  [ada-sr] seed=1 test=0.08807 (start 0.10823, fp32 view 0.08804) train=0.08011 gap=+0.00796
+  [ada-k8] seed=1 test=0.08801 (start 0.10823, fp32 view 0.08798) train=0.08000 gap=+0.00800
+  [anti1.5-sr] seed=1 test=0.08821 (start 0.10823, fp32 view 0.08819) train=0.08027 gap=+0.00794  inert-warning x1
+  [anti1.5-k8] seed=1 test=0.08799 (start 0.10823, fp32 view 0.08797) train=0.08001 gap=+0.00798  inert-warning x1
+  [anti5-sr] seed=1 test=0.08837 (start 0.10823, fp32 view 0.08834) train=0.08066 gap=+0.00771  inert-warning x1
+  [anti5-k8] seed=1 test=0.08800 (start 0.10823, fp32 view 0.08797) train=0.08001 gap=+0.00799
+  [nek-sr] seed=1 test=0.08748 (start 0.10823, fp32 view 0.08744) train=0.07924 gap=+0.00824  inert-warning x1
+  [nek-k8] seed=1 test=0.08745 (start 0.10823, fp32 view 0.08741) train=0.07914 gap=+0.00831  inert-warning x1
+  [ada-fp32] seed=1 test=0.08796 (start 0.10826, fp32 view 0.08796) train=0.07996 gap=+0.00800
+  [anti1.5-fp32] seed=1 test=0.08796 (start 0.10826, fp32 view 0.08796) train=0.07996 gap=+0.00800  inert-warning x1
+  [anti5-fp32] seed=1 test=0.08796 (start 0.10826, fp32 view 0.08796) train=0.07996 gap=+0.00800
+  [nek-fp32] seed=1 test=0.08741 (start 0.10826, fp32 view 0.08741) train=0.07909 gap=+0.00833  inert-warning x1
+
+arm            test (+-sd)          gap (+-sd)         d_start   test_full  dist_ulp  dist_rel
+ada-sr        0.08844(+-0.00052) +0.00815(+-0.00027) -0.01638  0.08840    10.439     0.605
+ada-k8        0.08837(+-0.00051) +0.00820(+-0.00028) -0.01646  0.08833     0.133     0.010
+anti1.5-sr    0.08857(+-0.00051) +0.00814(+-0.00028) -0.01625  0.08855    17.062     1.011
+anti1.5-k8    0.08836(+-0.00053) +0.00819(+-0.00029) -0.01647  0.08834     0.134     0.010
+anti5-sr      0.08870(+-0.00046) +0.00797(+-0.00037) -0.01613  0.08867    21.083     1.341
+anti5-k8      0.08836(+-0.00051) +0.00819(+-0.00028) -0.01647  0.08833     0.133     0.010
+nek-sr        0.08792(+-0.00063) +0.00849(+-0.00035) -0.01690  0.08789     8.657     0.465
+nek-k8        0.08788(+-0.00062) +0.00853(+-0.00032) -0.01694  0.08785     0.256     0.016
+ada-fp32      0.08832(+-0.00051) +0.00820(+-0.00028) -0.01651  0.08832         -         -
+anti1.5-fp32  0.08832(+-0.00051) +0.00820(+-0.00028) -0.01651  0.08832     0.003     0.000
+anti5-fp32    0.08832(+-0.00051) +0.00820(+-0.00028) -0.01651  0.08832     0.009     0.000
+nek-fp32      0.08785(+-0.00062) +0.00855(+-0.00032) -0.01698  0.08785     2.223     0.140
+wrote C:\Users\Koronos\Documents\Repos\K-Optimizers\.claude\worktrees\antikaon\benchmarks\antikaon_lowlr\results.json
+DONE
+
+[exited with code 0]
