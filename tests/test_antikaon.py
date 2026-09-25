@@ -507,3 +507,117 @@ def test_registry_arms_construct_and_step():
         assert isinstance(opt, Antikaon)
         _run(opt, params, _grads(params, 2))
         assert all(math.isfinite(float(p.detach().abs().sum())) for p in params)
+
+
+# ----------------------------------------------------------------------------- review fixes
+def _z(opt, p):
+    xi = opt.live_noise(p)
+    return p.detach().float() if xi is None else p.detach().float() - xi
+
+
+@pytest.mark.parametrize("wd", [0.0, 0.1])
+@pytest.mark.parametrize("foreach", [False, True])
+def test_clean_iterate_is_adakaon_on_z_under_lr_changes(foreach, wd):
+    """With external gradients, ``z = p - xi`` must follow momentum-free Adakaon applied to z
+    exactly (up to fp32 rounding), through an lr that changes EVERY step, intermittent
+    ``grad=None``, a param group added mid-run with its own lr, and interleaved eval/train.
+    Guards the per-parameter frozen radius: recomputing ``noise_sigma`` from the current lr
+    at removal time subtracts a different xi than the one installed and z drifts."""
+    torch.manual_seed(0)
+    shapes = [(6, 5), (6, 5), (5,), (4, 3, 2, 2)]
+    pa = [torch.nn.Parameter(torch.randn(s) * 0.5) for s in shapes]
+    pb = _clone(pa)
+    kw = dict(weight_decay=wd, foreach=foreach, gradient_centralization=True)
+    oa = Antikaon(pa, lr=1e-2, k_sigma=5.0, noise_seed=21, **kw)
+    ob = Adakaon(pb, lr=1e-2, betas=(0.0, 0.999), cautious=False, **kw)
+    g = torch.Generator().manual_seed(3)
+    late_a: list[torch.nn.Parameter] = []
+    late_b: list[torch.nn.Parameter] = []
+    for t in range(14):
+        if t == 5:                                   # (c) new group, different lr
+            late_a = [torch.nn.Parameter(torch.randn(8, 4) * 0.3) for _ in range(2)]
+            late_b = _clone(late_a)
+            oa.add_param_group({"params": late_a, "lr": 3e-2})
+            ob.add_param_group({"params": late_b, "lr": 3e-2})
+        scale = 1.0 + 0.6 * math.sin(1.7 * t)        # (a) lr changes every step
+        for ga, gb in zip(oa.param_groups, ob.param_groups, strict=True):
+            base = 3e-2 if ga["params"] is late_a or ga["params"] == late_a else 1e-2
+            ga["lr"] = gb["lr"] = base * scale
+        for i, (a, b) in enumerate(zip(pa + late_a, pb + late_b, strict=True)):
+            if i == 2 and t % 3 == 1:                # (b) intermittent grad=None
+                a.grad = b.grad = None
+                continue
+            gr = torch.randn(a.shape, generator=g) * 0.02
+            a.grad, b.grad = gr.clone(), gr.clone()
+        oa.step()
+        ob.step()
+        if t in (4, 9):                              # (d) interleaved eval/train
+            oa.eval()
+            for a, b in zip(pa + late_a, pb + late_b, strict=True):
+                torch.testing.assert_close(a.detach(), b.detach(), rtol=1e-5, atol=5e-6)
+            oa.train()
+        for a, b in zip(pa + late_a, pb + late_b, strict=True):
+            torch.testing.assert_close(_z(oa, a), b.detach(), rtol=1e-5, atol=5e-6)
+
+
+def test_kahan_eval_train_cycles_keep_clean_value():
+    """bf16 + Kahan: eval/train go through the clean value ``p + shift`` and keep the RTN
+    residual in ``shift``. Regime: xi (1.5e-3) >> ulp (~2.4e-4) >> step (lr 1e-4). Measured:
+    eval-view error 0.8% of a step and 20-cycle drift RMS 0.08% of a step; a plain RTN round
+    trip that ignores ``shift`` gives 490% and 11%."""
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter((torch.randn(64, 32) * 0.05).bfloat16()),
+          torch.nn.Parameter((torch.randn(32) * 0.05).bfloat16())]
+    lr = 1e-4
+    opt = Antikaon(ps, lr=lr, k_sigma=15.0, bf16_method="kahan", noise_seed=8)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _run(opt, ps, [[torch.randn(p.shape) * 0.02 for p in ps] for _ in range(5)])
+
+    def clean(p):
+        return p.detach().float() + opt.state[p]["shift"].float()
+
+    before = [clean(p) for p in ps]
+    xis = [opt.live_noise(p) for p in ps]
+    for _ in range(20):
+        opt.eval()
+        for p, c, xi in zip(ps, before, xis, strict=True):   # eval view = clean - xi
+            torch.testing.assert_close(clean(p), c - xi, rtol=0, atol=5e-2 * lr)
+        opt.train()
+    for p, c in zip(ps, before, strict=True):
+        drift = (clean(p) - c).pow(2).mean().sqrt()
+        assert drift < 1e-2 * lr, float(drift)
+
+
+def test_noise_law_is_read_only():
+    opt = Antikaon([torch.nn.Parameter(torch.zeros(3))])
+    for name in ("k_sigma", "k_weight", "s_cap", "shape", "noise", "antithetic", "sigma_ref"):
+        with pytest.raises(AttributeError):
+            setattr(opt, name, getattr(opt, name))
+
+
+def test_noise_backend_names_the_device_and_warns_on_mismatch():
+    params = _bag()
+    opt = Antikaon(params, lr=1e-2)
+    _run(opt, params, _grads(params, 2))
+    opt.eval()
+    sd = copy.deepcopy(opt.state_dict())
+    assert sd["_antikaon_meta"]["noise_backend"] == "torch-cpu"
+    sd["_antikaon_meta"]["noise_backend"] = "torch-cuda"        # a checkpoint from a GPU run
+    fresh = Antikaon([torch.nn.Parameter(p.detach().clone()) for p in params], lr=1e-2)
+    with pytest.warns(UserWarning, match="noise backend 'torch-cuda'"):
+        fresh.load_state_dict(sd)
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+def test_weight_reference_reads_clean_iterate(foreach):
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter(torch.randn(6, 5) * 0.5) for _ in range(2)]
+    kw_ = 0.3
+    opt = Antikaon(ps, lr=1e-2, k_sigma=1.0, sigma_ref="weight", k_weight=kw_, foreach=foreach)
+    _run(opt, ps, _grads(ps, 1))
+    z = [_z(opt, p) for p in ps]                      # clean iterate entering step 2
+    _run(opt, ps, _grads(ps, 1, seed=8))
+    for p, zi in zip(ps, z, strict=True):
+        want = (zi.square().mean(-1, keepdim=True).sqrt() * kw_).clamp(min=1e-2)
+        torch.testing.assert_close(opt.state[p]["noise_sigma_rows"], want, rtol=1e-6, atol=0)

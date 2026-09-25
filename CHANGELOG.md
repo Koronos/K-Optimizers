@@ -13,8 +13,10 @@ All notable changes to this project will be documented in this file.
   per-element state (`xi` is regenerated from `noise_seed`, parameter index and step).
   `eval()`/`train()` remove/re-install `xi`; `step()` in eval mode raises; train-mode
   checkpoints are refused. Per-parameter and foreach paths only (`fused=True` warns and falls
-  back). Registered in the control battery with the design's sweep arms; quality is not
-  measured yet. See `docs/antikaon.md` and `docs/research/antikaon-design.md`.
+  back). Under `bf16_method="kahan"`, eval/train act on `p + shift` and keep the residual.
+  The noise law is read-only; the checkpoint records the noise backend per device type
+  (`"torch-cuda"`/`"torch-cpu"`). Registered in the control battery with the design's sweep
+  arms; quality is not measured yet. See `docs/antikaon.md` and `docs/research/antikaon-design.md`.
 - Experimental `Rakaon`: momentum-free variance shrinkage, tensorwise or contiguous
   block variance, RMS clipping, and checkpointable BF16 stochastic rounding.
   Proxy studies have not established superiority over existing optimizers.

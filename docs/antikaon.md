@@ -48,9 +48,18 @@ opt.train()                # re-install the same xi and keep training
 * **Always validate and checkpoint in eval mode.** The train-mode loss is at the perturbed
   point (higher by ≈ `½Tr(ΣH)`); a train-mode checkpoint is refused on load. `step()` in eval
   mode raises.
-* **Resume**: load the model weights first, then `opt.load_state_dict(...)` — it restores the
-  noise seed, re-installs `xi` and leaves the optimizer in train mode. Resuming is bit-exact
-  with a run that did `eval()`/`train()` at the same step.
+* **Resume — load the optimizer AFTER the model.** `opt.load_state_dict(...)` restores the
+  noise seed and ends by re-installing `xi` on top of whatever the weights are at that moment,
+  leaving the optimizer in train mode. Loading the model afterwards would overwrite the
+  re-installed noise (the next step would then remove an `xi` that is not there). Resuming is
+  bit-exact with a run that did `eval()`/`train()` at the same step.
+* The checkpoint records the noise backend including the device type (`"torch-cuda"`,
+  `"torch-cpu"`): a torch.Generator stream differs per device, so resuming on another device
+  warns (training stays correct — the checkpoint holds `z` — but the noise sequence differs).
+* The noise law (`k_sigma`, `shape`, `noise`, `antithetic`, `sigma_ref`, `k_weight`, `s_cap`)
+  is **read-only** after construction: `xi` is never stored, its removal regenerates it, so it
+  must be removed with the law that installed it. The radius of each installed `xi` is frozen
+  per parameter, so LR schedules, `grad=None` steps and new param groups are safe.
 * The noise of a parameter is keyed by its index in the flattened `param_groups`; re-ordering
   parameters between runs changes the noise (never the correctness of an eval-mode checkpoint).
 * `opt.live_noise(p)` returns the installed `xi` (diagnostics, e.g. `RMS(xi)/RMS(w)`).
@@ -69,7 +78,12 @@ The combined write goes through Adakaon's own writers, so every `bf16_method` wo
   MSAM inert-lookahead heuristic, same cadence).
 
 `eval()`/`train()` use round-to-nearest (like MSAM's climb): error ≤ ½ ulp of `z`, and a ≤ 1 ulp
-return only where the subtraction crossed a binade.
+return only where the subtraction crossed a binade. Under `bf16_method="kahan"` they act on the
+compensated value `p + shift` and keep the rounding residual in `shift`, so the eval view is
+`z` to ~fp32 and repeated eval/train cycles do not move the clean weight (measured with
+`xi ≫ ulp ≫ step`: eval-view error 0.8 % of a step, 20-cycle drift 0.08 % of a step, against
+490 % / 11 % for a plain RTN round trip). The read/write of the clean value lives in
+`Antikaon._read_clean` / `_write_clean`, the one place a new writer (e.g. a compact Kahan) plugs in.
 
 ## Paths and limits
 
@@ -78,9 +92,11 @@ return only where the subtraction crossed a binade.
 * **No Triton fused path yet**: `fused=True` warns and runs the foreach path (same math and
   state). The noise is defined in one place (`Antikaon._noise`) so a fused `NOISE` branch can
   reproduce it; it will need its own noise-backend id (recorded in the checkpoint).
-* The noise draw is one `torch.Generator` call per parameter per step (two: `xi_n` and
-  `xi_{n+1}`), plus up to three transient full-size fp32 tensors per parameter/chunk.
-  Performance has not been measured.
+* `sigma_ref="weight"` reads the row RMS of the clean iterate `z` when a noise is installed.
+* **Pending (performance):** the noise draw is a Python loop of `torch.Generator` calls, two
+  per parameter per step (`xi_n` and `xi_{n+1}`), even on the foreach path, plus up to three
+  transient full-size fp32 tensors per parameter/chunk. On bags of hundreds of small tensors
+  (LoRA) this loop may dominate the step. Not measured; the fused `NOISE` branch is the fix.
 
 Control-battery arms (registry entry `Antikaon`): `k_sigma ∈ {1.5, 5, 15}`, `shape="none"`,
 `antithetic=True`, `sigma_ref="weight"` — the design's B1–B3 / C1–C3.

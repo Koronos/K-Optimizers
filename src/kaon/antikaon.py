@@ -95,6 +95,13 @@ SigmaRef = Literal["step", "weight"]
 # (tl.rand Philox) and must record a different name; see Antikaon.load_state_dict.
 NOISE_BACKEND = "torch"
 
+
+def _noise_backend(device_types: Iterable[str]) -> str:
+    """``"torch-cuda"``, ``"torch-cpu"``, ... — a torch.Generator stream differs per device
+    type, so the device is part of the noise identity (``"torch-cpu+cuda"`` if mixed)."""
+    kinds = sorted(set(device_types))
+    return f"{NOISE_BACKEND}-{'+'.join(kinds) if kinds else 'none'}"
+
 _M64 = (1 << 64) - 1
 _M63 = (1 << 63) - 1
 
@@ -159,7 +166,11 @@ class Antikaon(Adakaon):
     ``param_groups`` order (the same key ``state_dict`` uses). Adding a param group appends
     new indices; re-ordering parameters between runs changes the noise (not the correctness
     of an eval-mode checkpoint). Each parameter keeps its own noise index (``noise_step`` in
-    its state), so a parameter that skips a step (``grad is None``) keeps its live ``xi``.
+    its state), so a parameter that skips a step (``grad is None``) keeps its live ``xi``,
+    and the radius of every installed ``xi`` is frozen with it (``noise_sigma``), so an LR
+    schedule cannot desynchronize install and removal. The noise law (``k_sigma``, ``shape``,
+    ``noise``, ``antithetic``, ``sigma_ref``, ``k_weight``, ``s_cap``) is read-only for the
+    same reason: the removal regenerates ``xi`` with it.
     """
 
     # Reuse MSAM's inert-lookahead heuristic constants — one definition of "inert" in kaon.
@@ -221,13 +232,16 @@ class Antikaon(Adakaon):
             fused=False,
             **adakaon_kwargs,
         )
-        self.k_sigma = float(k_sigma)
-        self.k_weight = float(k_weight)
-        self.s_cap = float(s_cap)
-        self.shape = shape
-        self.noise = noise
-        self.antithetic = bool(antithetic)
-        self.sigma_ref = sigma_ref
+        # The noise LAW is fixed at construction (read-only properties below): the removal of
+        # xi_n regenerates it with the law that installed it, so changing any of these
+        # between two steps would subtract a different xi than the one in the weights.
+        self._k_sigma = float(k_sigma)
+        self._k_weight = float(k_weight)
+        self._s_cap = float(s_cap)
+        self._shape = shape
+        self._noise_law = noise
+        self._antithetic = bool(antithetic)
+        self._sigma_ref = sigma_ref
         self.noise_seed = int(torch.initial_seed() if noise_seed is None else noise_seed) & _M63
         self.inert_check_interval = inert_check_interval
         # The mechanism is off only when no radius can be non-zero; then every override
@@ -239,6 +253,38 @@ class Antikaon(Adakaon):
         self._inert_streak = 0
         self._inert_checks = 0
         self._inert_warned = False
+
+    # ------------------------------------------------------------------ noise law (read-only)
+    # Read-only on purpose: ``xi_n`` is never stored, its removal REGENERATES it, so the law
+    # that removes it must be the law that installed it. Construct a new optimizer (and
+    # checkpoint in eval mode) to change any of these.
+    @property
+    def k_sigma(self) -> float:
+        return self._k_sigma
+
+    @property
+    def k_weight(self) -> float:
+        return self._k_weight
+
+    @property
+    def s_cap(self) -> float:
+        return self._s_cap
+
+    @property
+    def shape(self) -> str:
+        return self._shape
+
+    @property
+    def noise(self) -> str:
+        return self._noise_law
+
+    @property
+    def antithetic(self) -> bool:
+        return self._antithetic
+
+    @property
+    def sigma_ref(self) -> str:
+        return self._sigma_ref
 
     # ------------------------------------------------------------------ bookkeeping
     def add_param_group(self, param_group: dict[str, Any]) -> None:
@@ -362,14 +408,16 @@ class Antikaon(Adakaon):
         (v,) = src
         return v.div(v.mean(dim=-1, keepdim=True)).rsqrt_().sqrt_().clamp_(lo, hi)
 
-    def _weight_rows(self, p_eff: Tensor, sigma_step: float) -> Tensor:
-        """``sigma_ref="weight"`` radius: ``max(k_weight * RMS_row(w), sigma_step)``.
+    def _weight_rows(self, p_eff: Tensor, xi_old: Tensor | None, sigma_step: float) -> Tensor:
+        """``sigma_ref="weight"`` radius: ``max(k_weight * RMS_row(z), sigma_step)``.
 
         ``p_eff`` is ``[N, R, C]`` (factored -> ``[N, R, 1]``) or ``[N, L]`` (-> ``[N, 1]``).
-        Read from the live weight at install time and frozen in the state.
+        Read from the CLEAN iterate ``z = w - xi_n`` (the live weight minus the noise being
+        removed, already in hand) at install time, and frozen in the state.
         """
-        return p_eff.square().mean(dim=-1, keepdim=True).sqrt_().mul_(self.k_weight) \
-            .clamp_(min=sigma_step)
+        z = p_eff if xi_old is None else p_eff.sub(xi_old)
+        rows = z.square().mean(dim=-1, keepdim=True).sqrt_().mul_(self.k_weight)
+        return rows.clamp_(min=sigma_step)
 
     def _rows_of(self, states: list[dict[str, Any]], like: tuple[int, ...],
                  device: torch.device) -> Tensor | None:
@@ -513,8 +561,10 @@ class Antikaon(Adakaon):
 
         # xi_{n+1}, from the second moment just updated, frozen at the CURRENT lr.
         sigma_step = self._sigma_step(lr, clip)
-        rows_new = (self._weight_rows(p_fp32.reshape(1, *eff), sigma_step)
-                    if self.sigma_ref == "weight" else None)
+        rows_new = (self._weight_rows(
+            p_fp32.reshape(1, *eff),
+            None if xi_old is None else xi_old.reshape(1, *eff), sigma_step)
+            if self.sigma_ref == "weight" else None)
         dxi = self._noise([pid], [k + 1], [self._noise_scale(sigma_step)], eff, src,
                           rows_new, dev).view(p.shape)
         if xi_old is not None:
@@ -586,7 +636,7 @@ class Antikaon(Adakaon):
         delta = self._decay_on_z(chunk, delta, grad, xi_old, wd, cautious, wd_full)
 
         sigma_step = self._sigma_step(lr, clip)
-        rows_new = (self._weight_rows(chunk.param_stack(), sigma_step)
+        rows_new = (self._weight_rows(chunk.param_stack(), xi_old, sigma_step)
                     if self.sigma_ref == "weight" else None)
         dxi = self._noise(pids, [k + 1 for k in ks], [self._noise_scale(sigma_step)] * N, eff,
                           (row, col), rows_new, dev)
@@ -645,7 +695,7 @@ class Antikaon(Adakaon):
         delta = self._decay_on_z(chunk, delta, grad, xi_old, wd, cautious, wd_full)
 
         sigma_step = self._sigma_step(lr, clip)
-        rows_new = (self._weight_rows(chunk.param_stack(), sigma_step)
+        rows_new = (self._weight_rows(chunk.param_stack(), xi_old, sigma_step)
                     if self.sigma_ref == "weight" else None)
         dxi = self._noise(pids, [k + 1 for k in ks], [self._noise_scale(sigma_step)] * N, eff,
                           (v,), rows_new, dev)
@@ -695,24 +745,55 @@ class Antikaon(Adakaon):
                          [self._noise_scale(st["noise_sigma"])], eff, src, rows, p.device)
         return xi.view(p.shape)
 
+    # --- the clean-value accessors: the ONE place that knows how a writer stores a weight ---
+    @staticmethod
+    def _read_clean(p: Tensor, state: dict[str, Any], bf16_method: str) -> Tensor:
+        """The weight's full-precision value, fp32, as a fresh tensor.
+
+        Plain bf16/fp16 (SR, none): the stored value. ``kahan``: ``p + shift`` — the Kahan
+        writer keeps the bits a narrowing write dropped in ``state["shift"]``, and they are
+        part of the weight. A future writer with a compressed residual (compact Kahan) adds
+        its decode here and in :meth:`_write_clean`, nothing else.
+        """
+        x = p.data.float() if p.dtype != torch.float32 else p.data.clone()
+        if bf16_method == "kahan" and "shift" in state and p.dtype != torch.float32:
+            x.add_(state["shift"].float())
+        return x
+
+    @staticmethod
+    def _write_clean(p: Tensor, state: dict[str, Any], bf16_method: str, x: Tensor) -> None:
+        """Store the fp32 value ``x`` into the weight, round-to-nearest, keeping the residual
+        wherever the writer has somewhere to keep it (``kahan``: ``shift = x - RTN(x)``)."""
+        if p.dtype == torch.float32:
+            p.data.copy_(x)
+            return
+        p.data.copy_(x)
+        if bf16_method == "kahan" and "shift" in state:
+            state["shift"].copy_(x.sub_(p.data.float()))
+
     @torch.no_grad()
     def _shift_weights(self, sign: float) -> None:
-        """``w <- RTN(w + sign * xi)`` for every parameter carrying noise.
+        """``w <- w + sign * xi`` for every parameter carrying noise, on the CLEAN value.
 
         Round-to-nearest, like MSAM's climb round trip: the eval/train pair accumulates
         nothing, so SR would only add an independent random walk (design §3.1: error <= 1/2
-        ulp(z), a <= 1 ulp return only where the subtraction crossed a binade). A Kahan
-        compensation buffer is left untouched: it belongs to the clean iterate.
+        ulp(z), a <= 1 ulp return only where the subtraction crossed a binade). Under
+        ``bf16_method="kahan"`` the pair goes through the compensated value ``p + shift``
+        and leaves the RTN residual in ``shift`` (:meth:`_read_clean` /
+        :meth:`_write_clean`), so repeated eval/train cycles do not move the clean weight.
         """
         for group in self.param_groups:
+            method = group["bf16_method"]
             for p in group["params"]:
                 xi = self.live_noise(p)
                 if xi is None:
                     continue
+                st = self.state[p]
                 if p.dtype == torch.float32:
                     p.data.add_(xi, alpha=sign)
-                else:
-                    p.data.copy_(p.data.float().add_(xi, alpha=sign))
+                    continue
+                x = self._read_clean(p, st, method).add_(xi, alpha=sign)
+                self._write_clean(p, st, method, x)
 
     @torch.no_grad()
     def eval(self) -> None:  # noqa: A003 — mirrors the optimizer.eval() API (MSAM/Lookahead/SF)
@@ -787,11 +868,14 @@ class Antikaon(Adakaon):
             warnings.warn(msg, stacklevel=4)
 
     # ------------------------------------------------------------------ checkpoints
+    def _backend_name(self) -> str:
+        return _noise_backend(p.device.type for g in self.param_groups for p in g["params"])
+
     def state_dict(self) -> dict[str, Any]:
         state_dict = super().state_dict()
         state_dict["_antikaon_meta"] = {
             "noise_seed": self.noise_seed,
-            "noise_backend": NOISE_BACKEND,
+            "noise_backend": self._backend_name(),
             # A train-mode checkpoint holds z + xi; a fresh optimizer cannot know to remove
             # it, so load_state_dict refuses it (the MSAM contract).
             "train_mode": self._train_mode,
@@ -801,9 +885,10 @@ class Antikaon(Adakaon):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore state and re-install the live perturbation (the checkpoint holds ``z``).
 
-        The checkpoint must have been saved in eval mode. Load the MODEL weights first: this
-        ends by calling :meth:`train`, which adds ``xi_n`` (regenerated from the restored
-        seed, noise indices, frozen radii and second moment) on top of the current weights.
+        The checkpoint must have been saved in eval mode. Load the optimizer AFTER the model
+        weights (never before): this ends by calling :meth:`train`, which adds ``xi_n``
+        (regenerated from the restored seed, noise indices, frozen radii and second moment)
+        on top of the current weights; a model loaded afterwards would overwrite it.
         """
         copied = dict(state_dict)
         meta = copied.pop("_antikaon_meta", {})
@@ -814,14 +899,15 @@ class Antikaon(Adakaon):
                 "would bake one perturbation into the weights per resume. Call "
                 "optimizer.eval() before saving the checkpoint."
             )
-        backend = meta.get("noise_backend", NOISE_BACKEND)
-        if backend != NOISE_BACKEND:
+        backend = meta.get("noise_backend")
+        mine = self._backend_name()
+        if backend is not None and backend != mine:
             # An eval-mode checkpoint is self-consistent under any stream: train() installs
             # this backend's xi and the next step removes that same xi. Only the continuation
             # of the noise sequence (bit-exact resume) is lost.
             warnings.warn(
                 f"Antikaon checkpoint used noise backend {backend!r}, this run uses "
-                f"{NOISE_BACKEND!r}: training continues correctly, but the noise sequence "
+                f"{mine!r}: training continues correctly, but the noise sequence "
                 f"differs from the original run.",
                 stacklevel=2,
             )
