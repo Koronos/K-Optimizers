@@ -43,6 +43,7 @@ from kaon.lion import Lion
 from kaon.lookahead import Lookahead
 from kaon.msam import MSAM
 from kaon.nekaon import Nekaon
+from kaon.ngnmd import NGNMD
 from kaon.sam import SAM
 from kaon.schedulefree import ScheduleFree
 
@@ -59,6 +60,7 @@ __all__ = [
     "Lookahead",
     "MSAM",
     "Nekaon",
+    "NGNMD",
     "SAM",
     "ScheduleFree",
     "__version__",
