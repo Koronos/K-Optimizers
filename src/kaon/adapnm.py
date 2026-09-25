@@ -125,6 +125,7 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
+    ensure_residuals,
     flat_view,
     foreach_budget,
     gc_applies,
@@ -136,6 +137,7 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import WatchedStateMixin, state_generation
 from kaon._momentum_codec import (
@@ -282,6 +284,21 @@ def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
         out[id(p)] = "native"
     return out
 
+
+
+def _residual_views(plist: list[Tensor], states: list[dict[str, Any]], bf16_method: str,
+                    view: Any) -> list[Tensor] | None:
+    """The bucket's ``kahan_lo`` views for a bf16 ``kahan8`` bucket, else ``None``.
+
+    Missing residuals (a group switched to kahan8 after its state existed) are allocated
+    here with :func:`kaon._backend.ensure_residuals` — one warning, zero residuals — the
+    same lazy contract as the foreach plan and the per-param writer, instead of letting the
+    batched writer refuse the bucket.
+    """
+    if not (plist and plist[0].dtype == torch.bfloat16 and is_compact_kahan(bf16_method)):
+        return None
+    ensure_residuals(plist, states)
+    return [view(s[RESIDUAL_KEY]) for s in states]
 
 class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
     """AdaPNM (Adam + Positive-Negative Momentum) on Adakaon's memory backend.
@@ -1432,7 +1449,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             delta = cautious_batched_(delta, grad)
 
         subtract_batched_([mat(p.data) for p in plist], delta, bf16_method, sr=self.sr_stream,
-                          comp=[mat(s["kahan_lo"]) for s in states] if "kahan_lo" in states[0] else None)
+                          comp=_residual_views(plist, states, bf16_method, mat))
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -1491,7 +1508,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
 
         subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method,
                           sr=self.sr_stream,
-                          comp=[flat_view(s["kahan_lo"]) for s in states] if "kahan_lo" in states[0] else None)
+                          comp=_residual_views(plist, states, bf16_method, flat_view))
 
     def _pn_stacked(
         self,

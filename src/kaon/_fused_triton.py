@@ -483,8 +483,14 @@ if _HAS_TRITON:
     def ck_store(pp, cp, idx, mask, res, seed, BITS: tl.constexpr):
         """:func:`ck_store_noise` with stochastic rounding: the same ``tl.rand(seed, idx)``
         draw ``sr_round`` uses, scaled to the ``2**(16-BITS)`` dropped bits instead of the 16 a
-        bf16 cast drops — unbiased at the finer grid (clamped to ``UNIT-1``; ``tl.rand < 1``
-        so the clamp is a no-op that pins the range)."""
+        bf16 cast drops — unbiased at the finer grid. The clamp to ``UNIT-1`` is a guard, not
+        a no-op by contract: ``tl.rand`` is documented as ``[0, 1)`` but its value comes from
+        an int->float scaling whose top end sits one fp32 rounding away from 1.0 (the
+        current Triton scale keeps it at ``1 - 2**-24``, and a power-of-two ``UNIT`` keeps
+        the product exactly below ``UNIT``). Should a draw ever reach 1.0, an unclamped
+        noise of ``UNIT`` would round every such value up by one extra grid unit even when
+        it sits exactly on the grid; the clamp keeps the noise in ``[0, UNIT)``, the range
+        the unbiasedness argument (and the torch path's ``randint``) assumes."""
         UNIT: tl.constexpr = 1 << (16 - BITS)
         noise = tl.minimum((tl.rand(seed, idx) * UNIT).to(tl.int32), UNIT - 1)
         ck_store_noise(pp, cp, idx, mask, res, noise, BITS)

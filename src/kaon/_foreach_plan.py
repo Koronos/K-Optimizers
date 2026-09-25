@@ -571,8 +571,12 @@ class ForeachChunk:
             self.state_views = tuple([view(s[k]) for s in states] for k in keys)
         self.pviews = [self.view(p.data) for p in plist]
         view = self.view
+        # ALL states, not states[0]: after a mid-run switch to kahan8 a chunk can mix a param
+        # with a residual (fresh state) and one without (older state). None here lets the
+        # plan's ensure_residuals hook allocate the missing ones and rebuild the views.
         self.cviews = (
-            [view(s["kahan_lo"]) for s in states] if states and "kahan_lo" in states[0] else None
+            [view(s["kahan_lo"]) for s in states]
+            if states and all("kahan_lo" in s for s in states) else None
         )
         self.momentum_view_cache: tuple[_MomentumCodec, _StackedViews | None] | None = None
 

@@ -65,7 +65,7 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kaon._backend import _ck_write_
-from kaon._compact_kahan import RESIDUAL_KEY
+from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan
 from kaon._foreach_plan import state_generation
 from kaon._wrappers import CodecBuffer, WrapsInnerOptimizer
 
@@ -82,6 +82,34 @@ _data_ptr = Tensor.data_ptr
 _get_m = operator.itemgetter("m")
 _get_m_scale = operator.itemgetter("m_scale")
 _get_lo = operator.itemgetter(RESIDUAL_KEY)
+
+# The fused climb's Philox seed. The kernels draw ``tl.rand(seed + t, offs)`` (``t`` = the
+# parameter's slot in the launch), and the inner fused step seeds with its step counter
+# (``self._t + t``): a bare launch counter here would walk the SAME small integers and reuse
+# the inner write's uniform on the same element (correlated residual rounding between the
+# climb and the step). The counter is therefore hashed away from the small integers: a salt
+# plus a golden-ratio stride, masked to the kernels' non-negative int32 seed range.
+_CLIMB_SEED_SALT = 0x2545F491
+_CLIMB_SEED_STRIDE = 0x9E3779B1
+_CLIMB_SEED_MASK = 0x7FFFFFFF
+
+
+def _climb_seed(counter: int) -> int:
+    """Philox seed of the fused climb launch number ``counter`` (see the constants above)."""
+    return (_CLIMB_SEED_SALT + counter * _CLIMB_SEED_STRIDE) & _CLIMB_SEED_MASK
+
+
+def _ck_climb(group: dict[str, Any], plist: list[Tensor], states: list[dict[str, Any]]) -> bool:
+    """Whether a bucket's climb goes through the compact-Kahan decoded value.
+
+    Keyed on the GROUP's ``bf16_method`` (and bf16 weights with every residual present), not
+    on the mere presence of ``kahan_lo``: a group switched from ``kahan8`` back to SR keeps a
+    stale residual in its state that the writer no longer maintains, and a climb that decoded
+    it would inject that stale residual into the weights.
+    """
+    return (plist[0].dtype == torch.bfloat16
+            and is_compact_kahan(group.get("bf16_method", ""))
+            and all(RESIDUAL_KEY in st for st in states))
 
 # Env-gated divergence probe (zero overhead when unset; same env var as AdaPNM's probe).
 # Set KAON_PROBE_LOG=/path/to/log to record, per step, the FIRST non-finite tensor and the
@@ -444,7 +472,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 m.clamp_(-bound, bound)  # per-element stability cap (see _climb_bound)
             if plist[0].dtype == torch.float32:
                 torch._foreach_add_([p.data for p in plist], list(m.unbind(0)))
-            elif plist[0].dtype == torch.bfloat16 and all(RESIDUAL_KEY in st for st in states):
+            elif _ck_climb(group, plist, states):
                 # Compact Kahan (kahan8): perturb the DECODED value and re-encode, so the
                 # climb/removal pair leaves the clean value intact to ~1/256 ulp (stochastic
                 # rounding of the residual: unbiased). Perturbing the bare bf16 instead
@@ -494,7 +522,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 for p in plist
             )
             # compact Kahan: the kernel needs every state's residual (contiguous, same numel)
-            ck = plist[0].dtype == torch.bfloat16 and all(RESIDUAL_KEY in st for st in states)
+            ck = _ck_climb(group, plist, states)
             if ck and not all(st[RESIDUAL_KEY].is_contiguous() for st in states):
                 ok = False
             if ok:
@@ -574,6 +602,14 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             if tuple(map(_data_ptr, bk["plist"])) != bk["p_addrs"]:
                 return False
             states = bk["states"]
+            # bf16_method switched since the plan was built (either way), or kahan8 residuals
+            # appeared after it: rebuild — unless kahan8 is on but the residuals are still
+            # missing, where the ck=0 plan is the right one. O(1) per bucket unless the
+            # method and the plan disagree.
+            if (bk.get("lowp")
+                    and bool(bk["ck"]) != is_compact_kahan(bk["group"].get("bf16_method", ""))
+                    and (bk["ck"] or all(RESIDUAL_KEY in st for st in states))):
+                return False
             c_addrs = bk.get("c_addrs")
             if c_addrs is not None and (
                 any(RESIDUAL_KEY not in st for st in states)
@@ -598,7 +634,7 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 bk["p_addr"], bk["c_addr"] if bk["c_addr"] is not None else bk["p_addr"],
                 bk["m_addr"], bk["sc_addr"], alpha,
                 self._climb_bound(bk["group"], sign), bk["n"], bk["K"], bk["row_width"],
-                self._axpy_seed, MOM=bk["mom"], FBLOCK=bk["block"],
+                _climb_seed(self._axpy_seed), MOM=bk["mom"], FBLOCK=bk["block"],
                 # SR=False: round-to-nearest, matching the torch path. See the bf16 note.
                 # CK (kahan8): decoded-value climb with residual SR — see the kernel's doc.
                 LOWP=bk["lowp"], SR=False, BLOCK=1024, CK=bk["ck"],

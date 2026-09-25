@@ -518,6 +518,48 @@ def test_switching_to_kahan8_mid_run_creates_residuals_and_warns(route):
         assert float((z - b.float()).abs().max()) < 4 * float(b.float().abs().max()) * 2.0 ** -8 + 1e-6
 
 
+def test_switch_to_kahan8_with_a_mixed_chunk_fills_the_missing_residuals():
+    """A chunk that mixes a param WITH a residual (it joined after the switch: fresh kahan8
+    state) and one WITHOUT (it had SR state from before the switch). Its residual views must
+    not be read from states[0] alone (KeyError on the second); the lazy hook fills in."""
+    import kaon._backend as backend
+    backend._LAZY_RESIDUAL_WARNED = False
+    torch.manual_seed(0)
+    late, early = (torch.nn.Parameter((torch.randn(8, 16) * 0.05).to(torch.bfloat16))
+                   for _ in range(2))
+    o = Adakaon([late, early], lr=1e-4, bf16_method="stochastic_rounding", foreach=True)
+    early.grad = torch.randn(8, 16).to(torch.bfloat16)
+    o.step()                                     # only `early` gets (SR) state
+    o.param_groups[0]["bf16_method"] = "kahan8"
+    for p in (late, early):
+        p.grad = torch.randn(8, 16).to(torch.bfloat16)
+    with pytest.warns(UserWarning, match="kahan_lo"):
+        o.step()                                 # `late`: fresh kahan8 state; `early`: none yet
+    for p in (late, early):
+        assert o.state[p][RESIDUAL_KEY].dtype == torch.uint8
+        assert torch.isfinite(decode(p.data, o.state[p][RESIDUAL_KEY])).all()
+
+
+def test_adapnm_switch_to_kahan8_creates_residuals_lazily():
+    """AdaPNM's foreach buckets build their own residual views: a mid-run switch to kahan8
+    allocates the missing residuals (one warning) like every other route, instead of the
+    batched writer refusing the bucket."""
+    import kaon._backend as backend
+    from kaon import AdaPNM
+    backend._LAZY_RESIDUAL_WARNED = False
+    pa = _bag()
+    o = AdaPNM(pa, lr=1e-4, bf16_method="stochastic_rounding", foreach=True)
+    _drive([o], [pa], steps=2)
+    o.param_groups[0]["bf16_method"] = "kahan8"
+    with pytest.warns(UserWarning, match="kahan_lo"):
+        _drive([o], [pa], steps=1, seed=5)
+    _drive([o], [pa], steps=1, seed=6)
+    for p in pa:
+        if p.dtype == torch.bfloat16:
+            assert o.state[p][RESIDUAL_KEY].dtype == torch.uint8
+            assert torch.isfinite(decode(p.data, o.state[p][RESIDUAL_KEY])).all()
+
+
 @pytest.mark.skipif(not FUSED, reason="Triton fused kernels need CUDA + Triton")
 def test_fused_launch_refuses_a_missing_residual_array():
     p_addr = torch.zeros(2, dtype=torch.int64, device="cuda")
@@ -586,6 +628,10 @@ def _climb_e2e(kind, fused, steps=100, seed=0):
     from kaon import MSAM, Nekaon
     device = "cuda" if fused else "cpu"
     torch.manual_seed(seed)
+    # Restart the SR stream ids too: without it each optimizer built in this process gets
+    # the next stream, so the residual noise (and the result) depended on test order
+    # (0.54 vs 0.62 observed for the same call).
+    kaon.reseed_stochastic_rounding()
     w = (torch.randn(64, 64, device=device) * 0.05).to(torch.bfloat16)
 
     def build(params, method):
@@ -645,3 +691,44 @@ def test_msam_fused_plan_witness_sees_a_rebound_residual():
     st = o.inner.state[pa[0]]
     st[RESIDUAL_KEY] = st[RESIDUAL_KEY].clone()
     assert not o._plan_addrs_valid(cache)
+
+
+def test_fused_climb_seed_never_walks_the_inner_steps_small_seeds():
+    """The fused climb seeds Philox with a hashed launch counter, never with the small
+    integers the inner fused step uses (``self._t + slot``): the same (seed, offset) pair
+    would reuse one uniform for both writes of the same element."""
+    from kaon.msam import _climb_seed
+    seeds = [_climb_seed(n) for n in range(1, 20001)]
+    assert all(0 <= s < 2 ** 31 for s in seeds)
+    assert len(set(seeds)) == len(seeds)
+    inner = 20000 + 4096                           # inner seeds: step (<= 20000) + slot (< 4096)
+    assert min(seeds) > inner, min(seeds)
+
+
+@pytest.mark.parametrize("fused", [False] + ([True] if FUSED else []))
+def test_msam_climb_ignores_a_stale_residual_after_switching_away_from_kahan8(fused):
+    """kahan8 -> SR mid-run: the residual stays in the state but the writer no longer keeps
+    it. The climb must follow the group's bf16_method (bare-weight RTN), not the presence of
+    ``kahan_lo`` — otherwise it decodes the stale residual into the weights. Two runs that
+    differ ONLY in that stale residual must stay identical."""
+    from kaon import MSAM
+    device = "cuda" if fused else "cpu"
+    runs = []
+    for zero_stale in (False, True):
+        torch.manual_seed(0)
+        kaon.reseed_stochastic_rounding()
+        pa = [torch.nn.Parameter((torch.randn(16, 32, device=device) * 0.05).to(torch.bfloat16))
+              for _ in range(2)]
+        o = MSAM(pa, rho=0.05, lr=1e-4, betas=(0.9, 0.999), cautious=False,
+                 bf16_method="kahan8", foreach=True, fused=fused)
+        o.train()
+        _drive([o], [pa], steps=3)
+        o.param_groups[0]["bf16_method"] = "stochastic_rounding"
+        if zero_stale:
+            for p in pa:
+                o.inner.state[p][RESIDUAL_KEY].zero_()
+        _drive([o], [pa], steps=3, seed=11)
+        o.eval()
+        runs.append([p.detach().clone() for p in pa])
+    for a, b in zip(*runs, strict=True):
+        assert torch.equal(a, b)
