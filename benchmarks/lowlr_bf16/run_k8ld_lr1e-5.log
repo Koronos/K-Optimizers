@@ -1,0 +1,22 @@
+  [ada-k8] seed=0 test=0.08871 (start 0.10138, fp32 view 0.08868) train=0.08033 gap=+0.00838 ms/step=35.34 (opt 20.41, orientative)
+  [ada-k8ld] seed=0 test=0.08872 (start 0.10138, fp32 view 0.08871) train=0.08033 gap=+0.00839 ms/step=42.92 (opt 25.88, orientative)
+  [ada-fp32] seed=0 test=0.08868 (start 0.10136, fp32 view 0.08868) train=0.08028 gap=+0.00840 ms/step=28.71 (opt 14.77, orientative)
+  [nek-k8] seed=0 test=0.08832 (start 0.10138, fp32 view 0.08829) train=0.07956 gap=+0.00876 ms/step=69.57 (opt 51.14, orientative)  inert-warning x1
+  [nek-k8ld] seed=0 test=0.08833 (start 0.10138, fp32 view 0.08828) train=0.07956 gap=+0.00877 ms/step=54.92 (opt 41.08, orientative)  inert-warning x1
+  [nek-fp32] seed=0 test=0.08828 (start 0.10136, fp32 view 0.08828) train=0.07950 gap=+0.00878 ms/step=46.46 (opt 33.43, orientative)  inert-warning x1
+  [ada-k8] seed=1 test=0.08799 (start 0.10821, fp32 view 0.08796) train=0.08002 gap=+0.00798 ms/step=29.47 (opt 16.92, orientative)
+  [ada-k8ld] seed=1 test=0.08800 (start 0.10821, fp32 view 0.08797) train=0.08000 gap=+0.00799 ms/step=28.13 (opt 16.77, orientative)
+  [ada-fp32] seed=1 test=0.08796 (start 0.10824, fp32 view 0.08796) train=0.07996 gap=+0.00800 ms/step=22.72 (opt 11.73, orientative)
+  [nek-k8] seed=1 test=0.08744 (start 0.10821, fp32 view 0.08744) train=0.07914 gap=+0.00830 ms/step=47.34 (opt 35.11, orientative)  inert-warning x1
+  [nek-k8ld] seed=1 test=0.08745 (start 0.10821, fp32 view 0.08741) train=0.07914 gap=+0.00832 ms/step=48.35 (opt 36.29, orientative)  inert-warning x1
+  [nek-fp32] seed=1 test=0.08741 (start 0.10824, fp32 view 0.08741) train=0.07909 gap=+0.00833 ms/step=41.81 (opt 30.26, orientative)  inert-warning x1
+
+arm         test (+-sd)          gap (+-sd)         d_start   test_full  dist_ulp  dist_rel  ms/step  ms/opt   (ms: orientative)
+ada-k8      0.08835(+-0.00051) +0.00818(+-0.00029) -0.01644  0.08832     0.133     0.010    32.40   18.67
+ada-k8ld    0.08836(+-0.00051) +0.00819(+-0.00028) -0.01644  0.08834     0.111     0.008    35.53   21.32
+ada-fp32    0.08832(+-0.00050) +0.00820(+-0.00028) -0.01648  0.08832         -         -    25.72   13.25
+nek-k8      0.08788(+-0.00062) +0.00853(+-0.00032) -0.01691  0.08786     0.256     0.016    58.45   43.12
+nek-k8ld    0.08789(+-0.00062) +0.00854(+-0.00032) -0.01690  0.08785     0.230     0.014    51.63   38.69
+nek-fp32    0.08785(+-0.00061) +0.00855(+-0.00032) -0.01695  0.08785         -         -    44.14   31.85
+wrote benchmarks/lowlr_bf16/results_k8ld_lr1e-5.json
+DONE

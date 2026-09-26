@@ -1,0 +1,16 @@
+  [ada-k8] seed=0 test=0.09228 (start 0.10138, fp32 view 0.09225) train=0.08621 gap=+0.00607 ms/step=26.30 (opt 15.16, orientative)
+  [ada-k8ld] seed=0 test=0.09229 (start 0.10138, fp32 view 0.09226) train=0.08621 gap=+0.00608 ms/step=28.99 (opt 17.18, orientative)
+  [ada-fp32] seed=0 test=0.09226 (start 0.10136, fp32 view 0.09226) train=0.08616 gap=+0.00610 ms/step=24.15 (opt 12.49, orientative)
+  [nek-k8] seed=0 test=0.09214 (start 0.10138, fp32 view 0.09210) train=0.08582 gap=+0.00632 ms/step=47.11 (opt 34.97, orientative)  inert-warning x1
+  [nek-k8ld] seed=0 test=0.09214 (start 0.10138, fp32 view 0.09210) train=0.08583 gap=+0.00630 ms/step=51.54 (opt 38.75, orientative)  inert-warning x1
+  [nek-fp32] seed=0 test=0.09210 (start 0.10136, fp32 view 0.09210) train=0.08577 gap=+0.00633 ms/step=42.09 (opt 30.31, orientative)  inert-warning x1
+
+arm         test (+-sd)          gap (+-sd)         d_start   test_full  dist_ulp  dist_rel  ms/step  ms/opt   (ms: orientative)
+ada-k8      0.09228(+-0.00000) +0.00607(+-0.00000) -0.00910  0.09225     0.113     0.018    26.30   15.16
+ada-k8ld    0.09229(+-0.00000) +0.00608(+-0.00000) -0.00909  0.09226     0.086     0.014    28.99   17.18
+ada-fp32    0.09226(+-0.00000) +0.00610(+-0.00000) -0.00910  0.09226         -         -    24.15   12.49
+nek-k8      0.09214(+-0.00000) +0.00632(+-0.00000) -0.00924  0.09210     0.180     0.027    47.11   34.97
+nek-k8ld    0.09214(+-0.00000) +0.00630(+-0.00000) -0.00924  0.09210     0.139     0.020    51.54   38.75
+nek-fp32    0.09210(+-0.00000) +0.00633(+-0.00000) -0.00926  0.09210         -         -    42.09   30.31
+wrote benchmarks/lowlr_bf16/results_k8ld_lr3e-6.json
+DONE

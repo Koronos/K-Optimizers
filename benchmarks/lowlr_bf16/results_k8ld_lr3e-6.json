@@ -1,0 +1,230 @@
+{
+ "manifest": {
+  "commit": "aed4479c9471163d0becdea1b903d6007b219a2c",
+  "branch": "feature/kahan8-ld",
+  "config": {
+   "C": 40,
+   "bs": 8,
+   "pretrain": 300,
+   "steps": 8000,
+   "lr": 3e-06,
+   "seeds": [
+    0
+   ]
+  },
+  "pretrain_lr": 0.0012,
+  "schedule": "const",
+  "device": "cuda",
+  "dataset_fingerprint": "b0bad0f5fb622dd7a30641c8e1780b21fed818fddf8a430faf9a78b480399aef",
+  "arms": [
+   "ada-k8",
+   "ada-k8ld",
+   "ada-fp32",
+   "nek-k8",
+   "nek-k8ld",
+   "nek-fp32"
+  ],
+  "timing_warmup_steps": 20,
+  "timing_note": "ms/step and ms/opt are ORIENTATIVE (serial arms in one process, no power/clock control)"
+ },
+ "results": {
+  "ada-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09228039253503084,
+     "train": 0.08620683569461107,
+     "gap": 0.006073556840419769,
+     "test_start": 0.10137549508363008,
+     "test_full": 0.09225138183683157,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.11299906734392323,
+     "dist_rel": 0.018130593361968126,
+     "ms_step": 26.304538297175167,
+     "ms_opt": 15.16426251573969,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.09228039253503084,
+   "test_std": 0.0,
+   "gap_mean": 0.006073556840419769,
+   "gap_std": 0.0,
+   "train_mean": 0.08620683569461107,
+   "train_std": 0.0,
+   "test_start_mean": 0.10137549508363008,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09225138183683157,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.11299906734392323,
+   "dist_rel_mean": 0.018130593361968126,
+   "ms_step_mean": 26.304538297175167,
+   "ms_opt_mean": 15.16426251573969
+  },
+  "ada-k8ld": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09228514321148396,
+     "train": 0.08620627736672759,
+     "gap": 0.006078865844756365,
+     "test_start": 0.10137549508363008,
+     "test_full": 0.09225631412118673,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.08588011057570775,
+     "dist_rel": 0.013766222562418244,
+     "ms_step": 28.994662276007478,
+     "ms_opt": 17.17826711982115,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.09228514321148396,
+   "test_std": 0.0,
+   "gap_mean": 0.006078865844756365,
+   "gap_std": 0.0,
+   "train_mean": 0.08620627736672759,
+   "train_std": 0.0,
+   "test_start_mean": 0.10137549508363008,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09225631412118673,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.08588011057570775,
+   "dist_rel_mean": 0.013766222562418244,
+   "ms_step_mean": 28.994662276007478,
+   "ms_opt_mean": 17.17826711982115
+  },
+  "ada-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09225775022059679,
+     "train": 0.08616121532395482,
+     "gap": 0.00609653489664197,
+     "test_start": 0.10135907679796219,
+     "test_full": 0.09225775022059679,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "ms_step": 24.1542209252379,
+     "ms_opt": 12.485159906080193,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.09225775022059679,
+   "test_std": 0.0,
+   "gap_mean": 0.00609653489664197,
+   "gap_std": 0.0,
+   "train_mean": 0.08616121532395482,
+   "train_std": 0.0,
+   "test_start_mean": 0.10135907679796219,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09225775022059679,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": null,
+   "dist_rel_mean": null,
+   "ms_step_mean": 24.1542209252379,
+   "ms_opt_mean": 12.485159906080193
+  },
+  "nek-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09213969577103853,
+     "train": 0.08582304464653134,
+     "gap": 0.006316651124507189,
+     "test_start": 0.10137549508363008,
+     "test_full": 0.09210217837244272,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.17958097889080787,
+     "dist_rel": 0.027310465187960226,
+     "ms_step": 47.11411424149248,
+     "ms_opt": 34.96645678446107,
+     "inert_warnings": [
+      "Nekaon: the lookahead displaces the weights by only 2.2e-05 relative (norm='none', lr=3.00e-06); below ~1e-04 this heuristic flags potentially inert lookahead. "
+     ]
+    }
+   ],
+   "test_mean": 0.09213969577103853,
+   "test_std": 0.0,
+   "gap_mean": 0.006316651124507189,
+   "gap_std": 0.0,
+   "train_mean": 0.08582304464653134,
+   "train_std": 0.0,
+   "test_start_mean": 0.10137549508363008,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09210217837244272,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.17958097889080787,
+   "dist_rel_mean": 0.027310465187960226,
+   "ms_step_mean": 47.11411424149248,
+   "ms_opt_mean": 34.96645678446107
+  },
+  "nek-k8ld": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.0921360645443201,
+     "train": 0.08583168126642704,
+     "gap": 0.006304383277893066,
+     "test_start": 0.10137549508363008,
+     "test_full": 0.0920961294323206,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.13855314424582946,
+     "dist_rel": 0.02029870793579112,
+     "ms_step": 51.53556954042057,
+     "ms_opt": 38.7458664047987,
+     "inert_warnings": [
+      "Nekaon: the lookahead displaces the weights by only 2.2e-05 relative (norm='none', lr=3.00e-06); below ~1e-04 this heuristic flags potentially inert lookahead. "
+     ]
+    }
+   ],
+   "test_mean": 0.0921360645443201,
+   "test_std": 0.0,
+   "gap_mean": 0.006304383277893066,
+   "gap_std": 0.0,
+   "train_mean": 0.08583168126642704,
+   "train_std": 0.0,
+   "test_start_mean": 0.10137549508363008,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.0920961294323206,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.13855314424582946,
+   "dist_rel_mean": 0.02029870793579112,
+   "ms_step_mean": 51.53556954042057,
+   "ms_opt_mean": 38.7458664047987
+  },
+  "nek-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09210153669118881,
+     "train": 0.08577374089509249,
+     "gap": 0.006327795796096325,
+     "test_start": 0.10135907679796219,
+     "test_full": 0.09210153669118881,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "ms_step": 42.08758183099273,
+     "ms_opt": 30.31311783503769,
+     "inert_warnings": [
+      "Nekaon: the lookahead displaces the weights by only 2.2e-05 relative (norm='none', lr=3.00e-06); below ~1e-04 this heuristic flags potentially inert lookahead. "
+     ]
+    }
+   ],
+   "test_mean": 0.09210153669118881,
+   "test_std": 0.0,
+   "gap_mean": 0.006327795796096325,
+   "gap_std": 0.0,
+   "train_mean": 0.08577374089509249,
+   "train_std": 0.0,
+   "test_start_mean": 0.10135907679796219,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09210153669118881,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": null,
+   "dist_rel_mean": null,
+   "ms_step_mean": 42.08758183099273,
+   "ms_opt_mean": 30.31311783503769
+  }
+ }
+}
