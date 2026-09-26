@@ -1323,3 +1323,43 @@ def test_pnm_rebind_still_rebuilds_when_something_actually_moved():
     )
     for old, snapshot in retired:
         assert torch.equal(old, snapshot), "the step wrote the RETIRED storage"
+
+
+@pytest.mark.parametrize("dst", ["none", "kahan", "kahan8", "kahan16"])
+def test_fused_partition_follows_a_bf16_method_switch(dst):
+    """Regression (0.7.16): the fused partition cache was keyed on the param witness and the
+    state generation only. After a mid-run switch away from stochastic rounding the bf16
+    params stayed on the fused routes, whose kernels write bf16 only with SR — "none"/"kahan"
+    silently got SR, kahan8/kahan16 got no compensation at all. They must move native."""
+    import warnings
+    ps = [p.detach().to(torch.bfloat16).requires_grad_(True)
+          for p in _bag([(32, 64), (32, 64), (64,), (1024, 1200)])]
+    opt = AdaPNM(ps, lr=1e-3, fused=True)
+    gen = torch.Generator(device=DEV).manual_seed(0)
+    for _ in range(2):
+        for p in ps:
+            p.grad = torch.randn(p.shape, generator=gen, device=DEV).to(torch.bfloat16)
+        opt.step()
+    ob, big, od, _nat = _parts(opt)
+    assert ob or big or od                                           # fused before the switch
+    opt.param_groups[0]["bf16_method"] = dst
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                              # lazy residual warning
+        for p in ps:
+            p.grad = torch.randn(p.shape, generator=gen, device=DEV).to(torch.bfloat16)
+        opt.step()
+    ob, big, od, nat = _parts(opt)
+    assert not (ob or big or od) and len(nat) == len(ps)
+    assert all(torch.isfinite(p).all() for p in ps)
+    if dst.startswith("kahan") and dst != "kahan":
+        assert all("kahan_lo" in opt.state[p] for p in ps)
+
+
+def test_a_bf16_bucket_under_another_method_never_launches_fused():
+    """The launch-side guard: SR is derived from the group's method, and a bf16 bucket whose
+    method no AdaPNM kernel implements is refused rather than written with SR."""
+    from kaon.adapnm import _fused_sr
+    assert _fused_sr({"bf16_method": "stochastic_rounding"}, True) is True
+    assert _fused_sr({"bf16_method": "none"}, False) is False       # fp32 bucket: no SR
+    with pytest.raises(RuntimeError, match="stale routing"):
+        _fused_sr({"bf16_method": "none"}, True)

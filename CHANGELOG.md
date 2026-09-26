@@ -45,7 +45,12 @@ All notable changes to this project will be documented in this file.
   weights); a Triton-less install took the dtype-keyed torch buckets and was not affected.
 - Adakaon fused: the routing cache was not keyed on `bf16_method`, so after a mid-run switch
   to `"none"` or legacy `"kahan"` the bf16 params stayed on the fused routes and were written
-  with stochastic rounding instead of moving to the native path. A mid-run switch to legacy
+  with stochastic rounding instead of moving to the native path. AdaPNM's fused partition had
+  the same key (there a switch to `kahan8`/`kahan16` also silently lost the compensation);
+  both now key on the method, and the launches derive `SR` from it (`SR` only under
+  `"stochastic_rounding"`; a bf16 bucket under a method no fused kernel implements is refused
+  with an error instead of written with SR). SR/compact-Kahan launches compile the same
+  variants as before (bit-identical on 144 fused SR configs). A mid-run switch to legacy
   `"kahan"` also raised a bare `KeyError: 'shift'` (the buffer is now allocated lazily, zero).
 - `add_param_group` on a wrapper (Nekaon, MSAM, SAM, Lookahead) raised a bare
   `AttributeError: ... no attribute 'defaults'`; it now delegates to the inner optimizer (and

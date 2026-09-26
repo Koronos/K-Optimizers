@@ -898,6 +898,28 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         m = group["bf16_method"]
         return residual_bits(m) if is_compact_kahan(m) else 0
 
+    @staticmethod
+    def _fused_sr(group: dict[str, Any], lowp: bool) -> bool:
+        """The ``SR`` constexpr of a fused launch: bf16 stochastic rounding exactly when the
+        GROUP's method is ``"stochastic_rounding"`` (was ``lowp and not CK``, which read any
+        other method as SR). A bf16 bucket whose method no fused kernel writes (``"none"``,
+        legacy ``"kahan"``) must never get here — the partition routes it native, keyed on
+        the method — so reaching a launch with one is refused instead of written with the
+        wrong rounding. For SR and compact-Kahan groups the flags are the ones compiled
+        before (``SR=True``/``CK=0`` resp. ``SR=False``/``CK=bits``): same kernel variants."""
+        if not lowp:
+            return False
+        method = group["bf16_method"]
+        if method == "stochastic_rounding":
+            return True
+        if not is_compact_kahan(method):
+            raise RuntimeError(
+                f"kaon fused step: a bf16 bucket reached a fused kernel under "
+                f"bf16_method={method!r}, which no fused kernel implements (it belongs on the "
+                "native path — stale routing cache?)"
+            )
+        return False
+
     def _ck_prepare(self, plist: list[Tensor], group: dict[str, Any]) -> tuple[int, bool]:
         """``(ck, allocated)`` for a fused launch over ``plist``: the ``CK`` constexpr, and
         whether residuals had to be created or converted (a mid-run switch to kahan8/kahan16,
@@ -973,7 +995,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     # bool AND, not a shape walk. See kaon._backend.gc_applies.
                     LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0,
                     GC=gc and bk["gc_ok"],
-                    SR=bk["lowp"] and not ck, CK=ck if bk["lowp"] else 0,
+                    SR=self._fused_sr(group, bk["lowp"]), CK=ck if bk["lowp"] else 0,
                     MOMENTUM=bk["momentum"], WDFULL=wd_full,
                     BR=bk["BR"], BC=bk["BC"], EXACT=bk["exact4"], FBLK=bk["fblk"],
                     num_warps=ft.warps_for(lanes),
@@ -1011,7 +1033,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     bk["m_addr"], bk["mscale_addr"],
                     bk["v_addr"], bk["Ls"], lr, b1, b2, eps1, clip, wd, self._t,
                     LOWP=bk["lowp"], MOM=bk["mom"], MOMENTUM=bk["momentum"], CAUTIOUS=cautious,
-                    WD=wd != 0, SR=bk["lowp"] and not ck, CK=ck if bk["lowp"] else 0,
+                    WD=wd != 0, SR=self._fused_sr(group, bk["lowp"]), CK=ck if bk["lowp"] else 0,
                     BL=bk["BL"], FBLOCK=bk["block"], WDFULL=wd_full,
                     num_warps=ft.warps_for(bk["BL"]),
                 )
@@ -1049,7 +1071,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         md, b1 = group["momentum_dtype"], group["betas"][0]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
-        sr = (p.dtype == torch.bfloat16) and (group["bf16_method"] == "stochastic_rounding")
+        sr = self._fused_sr(group, p.dtype == torch.bfloat16)
         ck = self._ck_prepare([p], group)[0] if p.dtype == torch.bfloat16 else 0
         g, r, c, inv_rms = self._chunked_reductions(p, group, st)
         quant = md in ("int8", "4bit")
@@ -1144,7 +1166,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         gc_flag = group["gradient_centralization"]
         lowp = plist[0].dtype == torch.bfloat16
-        sr = lowp and (group["bf16_method"] == "stochastic_rounding")
+        sr = self._fused_sr(group, lowp)
         ck, made = self._ck_prepare(plist, group) if lowp else (0, False)
         states = [self.state[p] for p in plist]
         cache_key = (id(group), tuple(plist[0].shape), plist[0].dtype, plist[0].device)

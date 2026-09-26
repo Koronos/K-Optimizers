@@ -625,3 +625,16 @@ def test_fused_partition_follows_a_bf16_method_switch(dst):
     one_block, big, one_dim, native = next(iter(o._fused_part.values()))[-4:]
     assert not (one_block or big or one_dim)
     assert len(native) == len(ps)
+
+
+def test_adakaon_fused_sr_flag_follows_the_method():
+    """SR constexpr from the group's method: SR for SR, off for compact Kahan (CK writes),
+    refused for a bf16 bucket under a method no fused kernel implements."""
+    f = Adakaon._fused_sr
+    assert f({"bf16_method": "stochastic_rounding"}, True) is True
+    assert f({"bf16_method": "kahan8"}, True) is False
+    assert f({"bf16_method": "kahan16"}, True) is False
+    assert f({"bf16_method": "none"}, False) is False
+    for m in ("none", "kahan"):
+        with pytest.raises(RuntimeError, match="stale routing"):
+            f({"bf16_method": m}, True)

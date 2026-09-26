@@ -265,6 +265,22 @@ def _probe_census(one_block: list, big: list, native: list, md: str, bf16m: str,
     _probe_write(f"[census] big_shapes={dict(Counter(tuple(p.shape) for p in big))}")
 
 
+def _fused_sr(group: dict[str, Any], lowp: bool) -> bool:
+    """``SR`` constexpr of an AdaPNM fused launch. AdaPNM's kernels write bf16 only with
+    stochastic rounding, so a bf16 bucket under any other method must not reach them (the
+    partition, keyed on the method, routes it native); refused rather than silently written
+    with SR. For SR groups the flag is ``True`` exactly as before: same kernel variants."""
+    if not lowp:
+        return False
+    if group["bf16_method"] != "stochastic_rounding":
+        raise RuntimeError(
+            f"kaon AdaPNM fused step: a bf16 bucket reached a fused kernel under "
+            f"bf16_method={group['bf16_method']!r}; only stochastic rounding is implemented "
+            "there (it belongs on the native path — stale routing cache?)"
+        )
+    return True
+
+
 def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
     """Map id(param) -> 'one_block' | 'big' | 'native' from the cached fused partition."""
     out: dict[int, str] = {}
@@ -833,9 +849,13 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         witness = ft.param_witness(params)
         gen = state_generation(self.state)
         cached = self._fused_part.get(gid)
-        if cached is not None and cached[1] == gen and cached[0] == witness:
-            return cached[2], cached[3], cached[4], cached[5]
-        md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
+        bf16m = group["bf16_method"]
+        # bf16_method is a routing input (bf16 params are fused only under SR): a mid-run switch
+        # (to kahan8/kahan16, none, kahan) must re-route them native — see Adakaon's twin.
+        if (cached is not None and cached[1] == gen and cached[2] == bf16m
+                and cached[0] == witness):
+            return cached[-4:]
+        md, cap = group["momentum_dtype"], self._fused_tile_cap
         float_mom = md in ("bfloat16", "float32")  # the 1-D kernel handles only fp32/bf16 momentum
         no_ams = not group["ams_bound"]            # ams_bound 1-D (full max_v) -> native
         one_block: list[Tensor] = []
@@ -878,7 +898,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
                 one_dim.append(p)
             else:
                 native.append(p)
-        self._fused_part[gid] = (witness, gen, one_block, big, one_dim, native)
+        self._fused_part[gid] = (witness, gen, bf16m, one_block, big, one_dim, native)
         if _PROBE_LOG:
             _probe_census(one_block, big, native, md, bf16m, cap, ft)
         return one_block, big, one_dim, native
@@ -981,7 +1001,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
                     # build (``bucket_gc_ok``), so this is a bool AND — see
                     # kaon._backend.gc_applies.
                     WD=wd != 0, GC=gc and bk["gc_ok"],
-                    SR=bk["lowp"], CLIP=clip > 0.0, BR=bk["BR"], BC=bk["BC"],
+                    SR=_fused_sr(group, bk["lowp"]), CLIP=clip > 0.0, BR=bk["BR"], BC=bk["BC"],
                     num_warps=ft.warps_for(lanes),
                 )
 
@@ -1021,7 +1041,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
                     bk["g_addr"], bk["p_addr"], kpos, kneg, bk["v_addr"], bk["Ls"],
                     c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], c["step_size"], c["bc2_sq"],
                     eps, lr * wd, clip, group["step"], LOWP=bk["lowp"], MOM=bk["mom"],
-                    CAUTIOUS=cautious, WD=wd != 0, CLIP=clip > 0.0, SR=bk["lowp"], BL=bk["BL"],
+                    CAUTIOUS=cautious, WD=wd != 0, CLIP=clip > 0.0, SR=_fused_sr(group, bk["lowp"]),
+                    BL=bk["BL"],
                     num_warps=ft.warps_for(bk["BL"]),
                 )
 
@@ -1078,7 +1099,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         n = R * C
         md = group["momentum_dtype"]
         lr, wd, cautious = group["lr"], group["weight_decay"], group["cautious"]
-        sr = (p.dtype == torch.bfloat16) and (group["bf16_method"] == "stochastic_rounding")
+        sr = _fused_sr(group, p.dtype == torch.bfloat16)
         g, r, cfac = self._chunked_reductions(p, group, st)
         m_pos = self._dequant_one(st, pos_pref, md, g).reshape(R, C)   # fp32 temp (EMA'd in-kernel)
         m_neg = self._dequant_one(st, neg_pref, md, g).reshape(R, C)   # fp32 temp (read-only)
@@ -1161,7 +1182,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         clip = group["clip_threshold"]
         gc_flag = group["gradient_centralization"]
         lowp = plist[0].dtype == torch.bfloat16
-        sr = lowp and (group["bf16_method"] == "stochastic_rounding")
+        sr = _fused_sr(group, lowp)
         states = [self.state[p] for p in plist]
         cache_key = (id(group), lag, tuple(plist[0].shape), plist[0].dtype, dev)
         cache = self._fused_big_caches.get(cache_key)
