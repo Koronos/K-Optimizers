@@ -352,12 +352,14 @@ def test_only_adakaon_family_accepts_it_and_other_writers_refuse_it():
                              comp=[torch.zeros(4, 4, dtype=torch.uint8)])
 
 
-def test_lookahead_sync_refuses_kahan8ld_loudly():
+def test_lookahead_refuses_kahan8ld_at_construction():
+    """Lookahead's sync threads no LDNoise: refused up front, not at the k-th step after phi
+    has already been updated."""
     q = [torch.nn.Parameter(torch.randn(8, 8).to(torch.bfloat16))]
-    o = Lookahead(q, lr=1e-3, k=1, bf16_method="kahan8ld")
-    q[0].grad = torch.ones_like(q[0])
-    with pytest.raises(NotImplementedError, match="kahan8ld"):
-        o.step()
+    with pytest.raises(ValueError, match="kahan8ld"):
+        Lookahead(q, lr=1e-3, k=1, bf16_method="kahan8ld")
+    with pytest.raises(ValueError, match="kahan8ld"):
+        Lookahead([{"params": q, "bf16_method": "kahan8ld"}], lr=1e-3, k=1)
 
 
 # ------------------------------------------------------------------------------ MSAM / Nekaon
@@ -406,6 +408,118 @@ def test_msam_nekaon_climb_tracks_fp32_and_widens_the_counter(kind, route):
         u = _ulp_ref(a.data)
         err = float(((_z(b, old.inner.state[b]) - a.data).abs() / u).max())
         assert err < 0.3, (route, err)
+
+
+@pytest.mark.parametrize("kind", ["msam", "nekaon"])
+@pytest.mark.parametrize("route", ["per_param", "foreach"] + (["fused"] if FUSED else []))
+def test_msam_nekaon_write_counters_are_distinct_and_monotonic(kind, route, monkeypatch):
+    """Every kahan8ld write of a step gets its own counter: step 1 = base 4, climb 5; step t>1
+    = removal 3(t-1)+3 = 3t, base 3t+1, climb 3t+2 — one counter advancing by exactly one per
+    write, never re-using the previous climb's value. Recorded at the owner's counter (every
+    route, the fused kernels' seed included) AND at every LDNoise built (the torch routes'
+    actual noise), so an SR fallback would leave the second record empty."""
+    import kaon._compact_kahan as ckm
+    steps = 7
+    made = []
+    real_init = ckm.LDNoise.__init__
+
+    def spy_init(self, keys, n):
+        made.append(n)
+        real_init(self, keys, n)
+
+    monkeypatch.setattr(ckm.LDNoise, "__init__", spy_init)
+    seen = []
+
+    def collapse(xs):
+        out = []
+        for x in xs:
+            if not out or out[-1] != x:
+                out.append(x)
+        return out
+
+    # hook the owner's counter as soon as the optimizer exists: wrap Adakaon._ld_counter
+    real_counter = Adakaon._ld_counter
+
+    def spy_counter(self, offset):
+        n = real_counter(self, offset)
+        seen.append(n)
+        return n
+
+    monkeypatch.setattr(Adakaon, "_ld_counter", spy_counter)
+    _climb_runs(kind, route, ("kahan8ld",), steps=steps)
+    want = list(range(4, 3 * steps + 3))
+    assert collapse(seen) == want, collapse(seen)
+    if route != "fused":
+        assert collapse(made) == want, collapse(made)
+
+
+@pytest.mark.parametrize("kind", ["msam", "msam-tensor", "nekaon"])
+@pytest.mark.parametrize("foreach", [False, True])
+def test_switch_kahan16_to_kahan8ld_mid_run(kind, foreach):
+    """kahan16 -> kahan8ld under MSAM/Nekaon: the removal at the top of the next step decodes
+    the stored 16-bit residual (no LD noise at 16 bits — plain fp32 split), the inner step
+    converts it to 8 bits, and the climb then uses the LD dither. No error, finite weights, a
+    uint8 residual afterwards, and the value stays within the kahan8 grid of the fp32 run."""
+    torch.manual_seed(0)
+    w = (torch.randn(32, 32) * 0.05).to(torch.bfloat16)
+    ps = [torch.nn.Parameter(w.clone()), torch.nn.Parameter(w.float())]
+    kw = dict(lr=1e-5, betas=(0.9, 0.999), cautious=False, foreach=foreach)
+    opts = []
+    for i, p in enumerate(ps):
+        mk = {"bf16_method": "kahan16"} if i == 0 else {}
+        if kind == "nekaon":
+            o = Nekaon([p], k=1.5, momentum_dtype="bfloat16", weight_decay=0.0, **kw, **mk)
+        else:
+            o = MSAM([p], rho=0.05, norm="tensor" if kind == "msam-tensor" else "global", **kw, **mk)
+        o.train()
+        opts.append(o)
+    gg = torch.Generator().manual_seed(1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for s in range(12):
+            if s == 5:
+                opts[0].param_groups[0]["bf16_method"] = "kahan8ld"
+            g = torch.randn(32, 32, generator=gg).to(torch.bfloat16)
+            for p, o in zip(ps, opts, strict=True):
+                p.grad = g.to(p.dtype)
+                o.step()
+    for o in opts:
+        o.eval()
+    st = opts[0].inner.state[ps[0]]
+    assert st[RESIDUAL_KEY].dtype == torch.uint8
+    z = _z(ps[0], st)
+    assert torch.isfinite(z).all()
+    assert float(((z - ps[1].data).abs() / _ulp_ref(ps[1].data)).max()) < 0.1
+
+
+@pytest.mark.skipif(not FUSED, reason="Triton fused kernels need CUDA + Triton")
+def test_ld_tables_do_not_leak_across_pointer_cache_rebuilds():
+    """A param that alternates having a grad changes the fused routes' witness, so their
+    pointer caches are rebuilt every step. The keyed residual array lives ON the rebuilt cache
+    (bucket), never in an optimizer-level memo: after many rebuilds the live CUDA int64 tensors
+    are bounded."""
+    import gc
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter((torch.randn(s, device="cuda") * 0.05).to(torch.bfloat16))
+          for s in [(16, 32), (16, 32), (8, 8), (32,), (32,)]]
+    o = Adakaon(ps, lr=1e-4, bf16_method="kahan8ld", fused=True)
+    assert not hasattr(o, "_ld_tables")
+
+    def live_i64():
+        gc.collect()
+        return sum(1 for x in gc.get_objects()
+                   if isinstance(x, torch.Tensor) and x.is_cuda and x.dtype == torch.int64)
+
+    def run(n):
+        for s in range(n):
+            for i, p in enumerate(ps):
+                p.grad = None if (i in (1, 4) and s % 2) else torch.randn_like(p)
+            o.step()
+
+    run(20)
+    before = live_i64()
+    run(1000)
+    assert live_i64() <= before + 4, (before, live_i64())
 
 
 @pytest.mark.parametrize("kind", ["msam", "nekaon"])

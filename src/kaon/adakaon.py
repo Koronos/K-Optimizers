@@ -418,7 +418,6 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         self._ld_stride = 1
         self._ld_slot = 0
         self._ld_pids: dict[int, int] | None = None      # id(param) -> ordinal (the dither key)
-        self._ld_tables: dict[int, tuple[Tensor, Tensor]] = {}   # id(c_addr) -> (c_addr, LD table)
         # group id -> (param witness, state-identity generation, one_block, big, one_dim,
         # native). The two leading fields are the cache KEY; read the routes off the END
         # (``entry[-4:]``) so a future field cannot silently break a positional consumer.
@@ -527,24 +526,30 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             return self.sr_stream
         return LDNoise(self._ld_keys_for(plist), self._ld_counter(self._ld_slot))
 
-    def _ld_c_addr(self, c_addr: Tensor, plist: list[Tensor]) -> Tensor:
+    def _ld_c_addr(self, holder: Any, c_addr: Tensor, plist: list[Tensor]) -> Tensor:
         """The ``CK_LD8`` residual array of a fused bucket: the bucket's own ``c_addr``
         interleaved with its params' keys (``[ptr, key]`` per tensor, see
         ``kaon._fused_triton.ck_ptr``). Built on the device from the cached ``c_addr`` itself,
-        so it can never disagree with it; memoised per ``c_addr`` tensor (a rebuilt cache has a
-        new one)."""
-        ent = self._ld_tables.get(id(c_addr))
+        so it can never disagree with it, and stored ON ``holder`` — the pointer cache's bucket
+        dict or the cache object that owns ``c_addr`` — so it lives and dies with that cache: a
+        rebuilt cache (new witness, new residuals) starts without one, and nothing at the
+        optimizer level keeps retired tables alive."""
+        ent = holder.get("_ld_c_addr") if isinstance(holder, dict) else getattr(holder, "_ld_c_addr", None)
         if ent is None or ent[0] is not c_addr:
             keys = torch.tensor(self._ld_keys_for(plist), dtype=torch.int64).to(c_addr.device)
             ent = (c_addr, torch.stack([c_addr, keys], dim=1).reshape(-1).contiguous())
-            self._ld_tables[id(c_addr)] = ent
+            if isinstance(holder, dict):
+                holder["_ld_c_addr"] = ent
+            else:
+                holder._ld_c_addr = ent
         return ent[1]
 
-    def _ck_launch(self, c_addr: Tensor, plist: list[Tensor], ck: int) -> tuple[Tensor, int]:
+    def _ck_launch(self, holder: Any, c_addr: Tensor, plist: list[Tensor],
+                   ck: int) -> tuple[Tensor, int]:
         """``(c_addr, seed)`` a fused launch passes: unchanged (``_t``) for SR / kahan8 /
-        kahan16; for ``CK_LD8`` the interleaved table and the write counter."""
+        kahan16; for ``CK_LD8`` the interleaved table (kept on ``holder``) and the counter."""
         if ck == CK_LD8:
-            return self._ld_c_addr(c_addr, plist), self._ld_counter(self._ld_slot)
+            return self._ld_c_addr(holder, c_addr, plist), self._ld_counter(self._ld_slot)
         return c_addr, self._t
 
     def _invalidate_fused_caches(self) -> None:
@@ -563,7 +568,6 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         self._fused_od_caches.clear()
         self._fused_big_caches.clear()
         self._fused_big_buckets.clear()
-        self._ld_tables.clear()
         self._clear_foreach_plans()
 
     def _autolr_reset_base_state(self) -> None:
@@ -954,8 +958,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if c_addr is not None:
             return c_addr
         if ck:
+            name = "kahan8ld" if ck == CK_LD8 else f"kahan{ck}"
             raise RuntimeError(
-                f"kaon fused step: bf16_method='kahan{ck}' but the bucket's pointer cache carries "
+                f"kaon fused step: bf16_method='{name}' but the bucket's pointer cache carries "
                 "no residual ('kahan_lo') array — the cache predates the residuals; rebuild it"
             )
         return p_addr
@@ -999,7 +1004,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             lanes = bk["BR"] * bk["BC"]
             bck = ck if bk["lowp"] else 0
             c_addr, seed = self._ck_launch(
-                self._c_addr_arg(bk["c_addr"], bk["p_addr"], bck), bk["plist"], bck)
+                bk, self._c_addr_arg(bk["c_addr"], bk["p_addr"], bck), bk["plist"], bck)
             with torch.cuda.device(bk["dev"]):
                 ft._adakaon_tile_kernel[(len(bk["plist"]),)](
                     bk["g_addr"], bk["p_addr"], c_addr,
@@ -1045,7 +1050,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         for bk in cache.buckets:                       # see _fused_one_block on the device scope
             bck = ck if bk["lowp"] else 0
             c_addr, seed = self._ck_launch(
-                self._c_addr_arg(bk["c_addr"], bk["p_addr"], bck), bk["plist"], bck)
+                bk, self._c_addr_arg(bk["c_addr"], bk["p_addr"], bck), bk["plist"], bck)
             with torch.cuda.device(bk["dev"]):
                 ft._adam_1d_kernel[(len(bk["plist"]),)](
                     bk["g_addr"], bk["p_addr"], c_addr,
@@ -1246,7 +1251,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             keep = cache.keep.zero_()
 
         p_addr = cache.p_addr
-        c_addr, seed = self._ck_launch(self._c_addr_arg(cache.c_addr, p_addr, ck), plist, ck)
+        c_addr, seed = self._ck_launch(cache, self._c_addr_arg(cache.c_addr, p_addr, ck), plist, ck)
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         direct_4bit = md == "4bit" and states[0]["m_block"] <= 1024 \
@@ -1377,7 +1382,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         )
         p_addr = cache.p_addr
         ck = self._ck_bits(group) if lowp else 0
-        c_addr, seed = self._ck_launch(self._c_addr_arg(cache.c_addr, p_addr, ck), plist, ck)
+        c_addr, seed = self._ck_launch(cache, self._c_addr_arg(cache.c_addr, p_addr, ck), plist, ck)
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         keep = cache.keep          # already zeroed with colsum/rms (one launch)
@@ -1473,6 +1478,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         # momentum_units=2: the first moment is an LR-independent direction (lr is
         # applied to the final delta each step). Absent/1 marks the pre-0.7.11
         # layout where lr was folded into the EMA; load_state_dict migrates it.
+        # ``fused_step`` keeps its historical name but is now the step counter of EVERY path
+        # (``_t``: the fused kernels' Philox seed and the base of kahan8ld's write counter);
+        # before the kahan8ld experiment only the fused path advanced it.
         state_dict["_adakaon_meta"] = {"fused_step": self._t, "momentum_units": 2}
         return state_dict
 

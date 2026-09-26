@@ -187,8 +187,14 @@ D = 2**16, 100 000 steps, same streams and seeds as `results_long`. Cells: std o
 * Same state as `kahan8` (one `uint8` `kahan_lo`); `kahan8 ↔ kahan8ld` switches reuse it.
 * The counter `n` is Adakaon's checkpointed step `_t` (the native path advances it too since
   this change): `n = t` for a bare Adakaon; under MSAM/Nekaon each write of a step gets its
-  own value — removal `3t`, base step `3t+1`, climb `3t+2` (the sim's `multi-*` convention). An
-  `eval()`/`train()` pair re-uses the counters of the surrounding removal/climb.
+  own value — removal `3t`, base step `3t+1`, climb `3t+2`, i.e. one global counter that
+  advances by one per write, like the write counter `nw` of the simulator. (The sim's
+  `multi-*` three-writes-per-step regimes were not run at the long horizon, so this choice is
+  not validated by the tables above.) An `eval()`/`train()` pair re-uses the counters of the
+  surrounding removal/climb.
+* A first end-to-end check (review measurement, **one seed only**: 128×128 weights, lr 1e-5,
+  2000 steps, error of the decoded value against the fp32 run, ulp): Adakaon kahan8 0.088 vs
+  kahan8ld 0.051; Nekaon 0.144 vs 0.096; Nekaon with `low_vram_above` 0.084 vs 0.062.
 * The key is a hash of the parameter's ordinal in the optimizer, never of its slot in a stack,
   so per-param, foreach and fused writes dither each element identically whatever it is
   batched with. The noise is deterministic: per-param == foreach bit for bit; the Triton
@@ -200,3 +206,9 @@ D = 2**16, 100 000 steps, same streams and seeds as `results_long`. Cells: std o
 * Known limitation: with MSAM/Nekaon's stride 3, parameters that never climb (Nekaon's
   `low_vram_above` group without momentum) still advance 3 counters per step, i.e. their
   dither increment per write is `3·159 ≡ 221 (mod 256)`, not the simulated 159.
+* Known limitation: the dither pattern is FIXED across runs (the key salt is a constant), so
+  two seeds of an experiment share the same per-element pattern; only the data and the init
+  differ between them.
+* Cost note: each per-param / stacked native CUDA write copies the row keys host→device
+  (a tiny `torch.tensor(keys).to(device)` per write); the fused Adakaon buckets build their
+  keyed residual array once per pointer cache instead.

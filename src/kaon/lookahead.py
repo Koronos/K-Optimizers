@@ -69,7 +69,7 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
 )
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits
+from kaon._compact_kahan import LD_METHODS, RESIDUAL_KEY, is_compact_kahan, residual_bits
 from kaon._momentum_codec import _FOURBIT_BLOCK
 from kaon._wrappers import CodecBuffer, TrainEvalWeights, WrapsInnerOptimizer
 from kaon.adakaon import Adakaon
@@ -128,6 +128,14 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
         # Build the inner (fast) optimizer; WrapsInnerOptimizer shares its param_groups,
         # mirrors its foreach toggles, and owns the wrapper's separate per-param state.
         self._bind_inner(Adakaon(params, lr=lr, **adakaon_kwargs), state_key="lookahead")
+        # The phi sync writes the weights through the shared writer with no low-discrepancy
+        # noise: refuse the experimental kahan8ld up front rather than at the k-th step, after
+        # phi has already been updated (a mid-run switch is still refused by the writer).
+        if any(g.get("bf16_method") in LD_METHODS for g in self.param_groups):
+            raise ValueError(
+                "Lookahead does not support bf16_method='kahan8ld' (experimental: Adakaon and "
+                "MSAM/Nekaon only); use 'kahan8' or 'kahan16'"
+            )
         # Lookahead's OWN per-group keys (not part of the inner Adakaon's ``defaults``).
         # Kept as ``self.defaults`` — mirroring the attribute every plain
         # ``torch.optim.Optimizer`` carries — purely so ``load_state_dict`` can backfill

@@ -569,7 +569,10 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 # this wrapper's own stream, so it is checkpointed like the SR write's.
                 weights = torch.stack([p.data for p in plist])
                 lows = torch.stack([st[RESIDUAL_KEY] for st in states])
-                noise = (self._ld_noise(plist, sign) if group.get("bf16_method") in LD_METHODS
+                # LD only at the 8-bit width: right after a kahan16 -> kahan8ld switch the
+                # removal still decodes the stored 16-bit residual (an exact split, no noise).
+                noise = (self._ld_noise(plist, sign)
+                         if ck_bits == 8 and group.get("bf16_method") in LD_METHODS
                          else self.sr_stream)
                 _ck_write_(weights, lows, m, 1.0, ck_bits, sr=noise)
                 torch._foreach_copy_([p.data for p in plist], list(weights.unbind(0)))
