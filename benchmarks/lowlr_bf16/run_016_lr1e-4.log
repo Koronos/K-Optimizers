@@ -4,3 +4,25 @@
   [ada-fp32] seed=0 test=0.08214 (start 0.10131, fp32 view 0.08214) train=0.05904 gap=+0.02310 ms/step=33.90 (opt 16.90, orientative)
   [nek-sr] seed=0 test=0.08175 (start 0.10133, fp32 view 0.08172) train=0.05742 gap=+0.02432 ms/step=58.04 (opt 42.87, orientative)  inert-warning x1
   [nek-k8] seed=0 test=0.08087 (start 0.10133, fp32 view 0.08087) train=0.05721 gap=+0.02366 ms/step=55.97 (opt 41.69, orientative)
+  [nek-k16] seed=0 test=0.08091 (start 0.10133, fp32 view 0.08088) train=0.05720 gap=+0.02371 ms/step=54.16 (opt 40.41, orientative)
+  [nek-fp32] seed=0 test=0.08091 (start 0.10131, fp32 view 0.08091) train=0.05714 gap=+0.02377 ms/step=38.81 (opt 27.95, orientative)
+  [ada-sr] seed=1 test=0.08114 (start 0.10825, fp32 view 0.08110) train=0.06060 gap=+0.02054 ms/step=26.67 (opt 14.87, orientative)
+  [ada-k8] seed=1 test=0.08124 (start 0.10825, fp32 view 0.08108) train=0.06020 gap=+0.02104 ms/step=28.29 (opt 16.09, orientative)
+  [ada-k16] seed=1 test=0.08125 (start 0.10825, fp32 view 0.08110) train=0.06027 gap=+0.02098 ms/step=26.74 (opt 15.27, orientative)
+  [ada-fp32] seed=1 test=0.08114 (start 0.10827, fp32 view 0.08114) train=0.06012 gap=+0.02102 ms/step=21.97 (opt 11.43, orientative)
+  [nek-sr] seed=1 test=0.07978 (start 0.10825, fp32 view 0.07973) train=0.05823 gap=+0.02155 ms/step=45.14 (opt 33.00, orientative)  inert-warning x1
+  [nek-k8] seed=1 test=0.07981 (start 0.10825, fp32 view 0.07975) train=0.05820 gap=+0.02161 ms/step=44.17 (opt 32.83, orientative)
+  [nek-k16] seed=1 test=0.07986 (start 0.10825, fp32 view 0.07979) train=0.05820 gap=+0.02166 ms/step=45.82 (opt 34.07, orientative)
+  [nek-fp32] seed=1 test=0.07978 (start 0.10827, fp32 view 0.07978) train=0.05811 gap=+0.02167 ms/step=39.76 (opt 28.62, orientative)
+
+arm         test (+-sd)          gap (+-sd)         d_start   test_full  dist_ulp  dist_rel  ms/step  ms/opt   (ms: orientative)
+ada-sr      0.08160(+-0.00065) +0.02157(+-0.00146) -0.02319  0.08157    24.021     0.459    26.26   14.69
+ada-k8      0.08172(+-0.00067) +0.02205(+-0.00143) -0.02307  0.08168     0.434     0.008    31.60   17.82
+ada-k16     0.08178(+-0.00076) +0.02208(+-0.00156) -0.02301  0.08171     0.407     0.007    28.56   16.05
+ada-fp32    0.08164(+-0.00070) +0.02206(+-0.00147) -0.02314  0.08164         -         -    27.94   14.16
+nek-sr      0.08076(+-0.00139) +0.02294(+-0.00196) -0.02403  0.08072    22.054     0.366    51.59   37.94
+nek-k8      0.08034(+-0.00075) +0.02263(+-0.00145) -0.02445  0.08031     2.270     0.034    50.07   37.26
+nek-k16     0.08039(+-0.00074) +0.02269(+-0.00145) -0.02440  0.08034     2.266     0.034    49.99   37.24
+nek-fp32    0.08035(+-0.00080) +0.02272(+-0.00148) -0.02444  0.08035         -         -    39.29   28.28
+wrote benchmarks/lowlr_bf16/results_016_lr1e-4.json
+DONE
