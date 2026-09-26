@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.15] - 2026-09-25
+
+Includes the entries below that shipped without their own heading in 0.7.14.
+
 ### Added
 - **`bf16_method="kahan16"` — an fp32 master weight split in two, +2 B/param, on every
   path.** The 16-bit twin of `kahan8`, on the same codec with `BITS=16`: the bf16 weight plus
