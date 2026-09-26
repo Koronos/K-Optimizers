@@ -589,7 +589,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 # Keyed like _buckets (dtype included): a group mixing fp32 and bf16 params of
                 # one shape has TWO leftover buckets, and a key without the dtype let the
                 # second overwrite the first — that param was silently never climbed (any
-                # bf16_method; found by the 0.7.16 compact-Kahan audit).
+                # bf16_method, whenever Triton is importable and a bucket is ineligible — CPU
+                # params, non-contiguous weights; found by the 0.7.16 compact-Kahan audit).
                 leftover[(shape, plist[0].dtype, md, id(group))] = (plist, states, md, shape, group)
         buckets = []
         for (n, dtype, md, block, row_width, _gid, ck), (plist, states, group) in eligible.items():

@@ -10,6 +10,8 @@ into fp32 — for ``kahan16`` bit for bit the fp32 master, for ``kahan8`` the va
 """
 from __future__ import annotations
 
+import warnings
+from collections.abc import Iterator
 from typing import Any
 
 import torch
@@ -29,7 +31,7 @@ def _chain(optimizer: Any) -> list[Any]:
 
 
 def _check_view(chain: list[Any]) -> None:
-    """Refuse a live view the residual does not belong to (see :func:`decode_weights`)."""
+    """Refuse (or flag) a live view the export would get wrong (see :func:`decode_weights`)."""
     for opt in chain:
         # MSAM / Nekaon: in train mode the parameters carry the lookahead perturbation.
         if getattr(opt, "_train_mode", False) and getattr(opt, "_has_e", False):
@@ -38,46 +40,48 @@ def _check_view(chain: list[Any]) -> None:
                 "carry the lookahead perturbation; call optimizer.eval() first (and "
                 "optimizer.train() afterwards)."
             )
-        # Lookahead (TrainEvalWeights): the eval view shows the slow weights ``phi``; the
-        # residual belongs to the fast weights it replaced.
         groups = getattr(opt, "param_groups", None) or []
-        if groups and "train_mode" in groups[0] and not groups[0]["train_mode"]:
-            raise RuntimeError(
-                f"decode_weights: {type(opt).__name__} is in eval mode, which shows the slow "
-                "weights (stored at slow_dtype; there is no residual for them to decode) — "
-                "save model.state_dict() in eval mode as usual, or call decode_weights in "
-                "train mode for the fast weights."
+        if not groups or "train_mode" not in groups[0]:
+            continue
+        train = groups[0]["train_mode"]
+        if "slow_dtype" in groups[0]:
+            # Lookahead: its eval view shows the slow weights ``phi`` (stored at slow_dtype,
+            # no residual); the inner's residual belongs to the fast weights it replaced.
+            if not train:
+                raise RuntimeError(
+                    f"decode_weights: {type(opt).__name__} is in eval mode, which shows the "
+                    "slow weights phi (stored at slow_dtype — there is no residual to decode "
+                    "for them); save model.state_dict() in eval mode for phi, or call "
+                    "decode_weights in train mode for the fast weights' full value."
+                )
+        elif train:
+            # ScheduleFree (TrainEvalWeights, no compact Kahan): the train view is the
+            # gradient point y, not the iterate x a checkpoint wants. Nothing to decode;
+            # the export is the live view upcast — flag it rather than refuse.
+            warnings.warn(
+                f"decode_weights: {type(opt).__name__} is in train mode, so the parameters "
+                "hold its training view (ScheduleFree: y), not the evaluation weights; call "
+                "optimizer.eval() before exporting.",
+                stacklevel=3,
             )
 
 
-@torch.no_grad()
-def decode_weights(optimizer: Any) -> dict[Tensor, Tensor]:
-    """The full-precision value of every parameter ``optimizer`` steps, as fp32.
+def _decoded(p: Tensor, lo: Tensor | None, method: str) -> Tensor:
+    """fp32 full value of one param, on ``p``'s device (a fresh tensor)."""
+    # A residual is only maintained while the group's method is compact Kahan: after a
+    # switch back to SR / none it is stale and must not be added.
+    if lo is not None and is_compact_kahan(method):
+        return decode(p.detach(), lo, residual_bits_of(lo))
+    return p.detach().float().clone()
 
-    Returns ``{param: fp32 tensor}`` (fresh tensors, detached, same device). A bf16
-    parameter with a compact-Kahan residual (``bf16_method="kahan8"`` / ``"kahan16"``) is
-    decoded — ``kahan16``: exactly the fp32 value an fp32-weight run would hold;
-    ``kahan8``: to ``ulp/256`` — and every other parameter is its own value upcast to fp32
-    (so the dict is a complete fp32 export whatever the method). Works through wrappers
-    (Nekaon / MSAM / Lookahead / SAM): the residual is looked up at whichever level owns
-    it (the inner optimizer that writes the weight).
 
-    Call it on the TRUE weights: after ``optimizer.eval()`` for Nekaon / MSAM (in train
-    mode the parameters sit at the lookahead point — refused with an error), in train
-    mode for Lookahead (its eval view shows the slow weights, which have no residual —
-    also refused). Load the optimizer state AFTER the model weights when resuming: a
-    residual written for one bf16 pattern is meaningless on another.
-
-    Typical use, an fp32 checkpoint of a model trained in bf16::
-
-        opt.eval()
-        torch.save(kaon.full_precision_state_dict(model, opt), "model_fp32.pt")
-        opt.train()
-    """
+def _iter_decoded(optimizer: Any, device: Any) -> Iterator[tuple[Tensor, Tensor]]:
+    """``(param, fp32 value on device)`` one param at a time: the decode's temporaries and
+    the fp32 value exist on the param's device for ONE tensor at a time, then move."""
     chain = _chain(optimizer)
     _check_view(chain)
-    out: dict[Tensor, Tensor] = {}
     for group in optimizer.param_groups:
+        method = group.get("bf16_method", "")
         for p in group["params"]:
             lo = None
             if p.dtype == torch.bfloat16:
@@ -86,24 +90,77 @@ def decode_weights(optimizer: Any) -> dict[Tensor, Tensor]:
                     if st and RESIDUAL_KEY in st:
                         lo = st[RESIDUAL_KEY]
                         break
-            # A residual is only maintained while the group's method is compact Kahan:
-            # after a switch back to SR / none it is stale and must not be added.
-            if lo is not None and is_compact_kahan(group.get("bf16_method", "")):
-                out[p] = decode(p.detach(), lo, residual_bits_of(lo))
-            else:
-                out[p] = p.detach().float().clone()
-    return out
+            v = _decoded(p, lo, method)
+            if device is not None and v.device != torch.device(device):
+                v = v.to(device)
+            yield p, v
 
 
 @torch.no_grad()
-def full_precision_state_dict(module: torch.nn.Module, optimizer: Any) -> dict[str, Any]:
+def decode_weights(optimizer: Any, device: Any = None) -> dict[Tensor, Tensor]:
+    """The full-precision value of every parameter ``optimizer`` steps, as fp32.
+
+    Returns ``{param: fp32 tensor}`` (fresh, detached). A bf16 parameter with a
+    compact-Kahan residual (``bf16_method="kahan8"`` / ``"kahan16"``) is decoded —
+    ``kahan16``: exactly the fp32 value an fp32-weight run would hold; ``kahan8``: to
+    ``ulp/256`` — and every other parameter is its own value upcast to fp32 (so the dict is
+    a complete fp32 export whatever the method). Works for every kaon optimizer that
+    supports kahan8/kahan16 and through wrappers (Nekaon / MSAM / Lookahead / SAM): the
+    residual is looked up at whichever level owns it. (ScheduleFree does not support compact
+    Kahan; for it this is the live view upcast.)
+
+    ``device``: where the fp32 values go. ``None`` (default) keeps each on its param's device
+    — the WHOLE model in fp32 there, 4 B/param: a 2.6B-param model on an 8 GB GPU does not fit.
+    Pass ``device="cpu"`` to stream: each tensor is decoded on its device and moved before
+    the next one, so the device peak is one tensor (its fp32 value + the decode's scratch).
+    :func:`full_precision_state_dict` defaults to ``"cpu"``.
+
+    Call it on the TRUE weights: after ``optimizer.eval()`` for Nekaon / MSAM (in train mode
+    the parameters sit at the lookahead point — refused), in train mode for Lookahead (its
+    eval view shows the slow weights, which have no residual — refused), after ``eval()``
+    for ScheduleFree (its train view is ``y`` — warns). Load the optimizer state AFTER the
+    model weights when resuming: a residual written for one bf16 pattern is meaningless on
+    another.
+
+    Typical use, an fp32 checkpoint of a model trained in bf16::
+
+        opt.eval()
+        torch.save(kaon.full_precision_state_dict(model, opt), "model_fp32.pt")  # on CPU
+        opt.train()
+    """
+    return dict(_iter_decoded(optimizer, device))
+
+
+@torch.no_grad()
+def full_precision_state_dict(module: torch.nn.Module, optimizer: Any,
+                              device: Any = "cpu") -> dict[str, Any]:
     """``module.state_dict()`` with every parameter ``optimizer`` steps replaced by its
     fp32 full-precision value (:func:`decode_weights`); buffers and parameters the optimizer
-    does not own are kept as they are. Same view rules as :func:`decode_weights`."""
-    values = decode_weights(optimizer)
+    does not own are kept as they are (not moved). Same view rules as :func:`decode_weights`.
+
+    ``device`` (default ``"cpu"``): where the fp32 values go. Streamed one tensor at a time,
+    so the GPU peak is a single tensor's decode, never the model in fp32. ``None`` keeps
+    them on the params' devices (the whole fp32 model there at once).
+
+    Raises ``ValueError`` if none of the optimizer's parameters is a parameter of ``module``
+    (a different model instance, or a ``module`` whose tensors were re-created): the result
+    would otherwise silently be the bf16 state dict.
+    """
     sd = module.state_dict(keep_vars=True)
-    out: dict[str, Any] = {}
-    for name, t in sd.items():
-        v = values.get(t) if isinstance(t, Tensor) else None
-        out[name] = v if v is not None else (t.detach() if isinstance(t, Tensor) else t)
+    by_id = {id(t): name for name, t in sd.items() if isinstance(t, Tensor)}
+    out: dict[str, Any] = {name: (t.detach() if isinstance(t, Tensor) else t)
+                           for name, t in sd.items()}
+    found = n_opt = 0
+    for p, v in _iter_decoded(optimizer, device):
+        n_opt += 1
+        name = by_id.get(id(p))
+        if name is not None:
+            out[name] = v
+            found += 1
+    if n_opt and not found:
+        raise ValueError(
+            "full_precision_state_dict: none of the optimizer's parameters is a parameter of "
+            "this module (another model instance, or tensors re-created after the optimizer "
+            "was built) — the result would be the unchanged bf16 state dict."
+        )
     return out

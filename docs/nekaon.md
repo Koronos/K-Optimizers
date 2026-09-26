@@ -197,7 +197,10 @@ What Nekaon does with the residual:
   on the copy the update reads; `p.grad` itself is left uncentralized under these methods.
 * Every route and option works unchanged: fused / foreach / per-param, `low_vram_above` (the
   momentum-free group is compensated too), mixed fp32/bf16 groups (only bf16 params get a
-  residual), `add_param_group`, parameters without gradients, every `momentum_dtype`,
+  residual), `add_param_group` (note: a group added later is taken as given —
+  `low_vram_above` splits only the parameters passed to the constructor; route a big tensor
+  added later yourself with `{"params": [...], "betas": (0.0, 0.999), "lr": ...}`),
+  parameters without gradients, every `momentum_dtype`,
   `cautious`, GC, eval/train, and a mid-run method switch (SR → kahan: zero residual, one
   warning; kahan8 ↔ kahan16: converted, one warning; kahan → SR: the stale residual is ignored).
 
@@ -219,12 +222,18 @@ written for**:
 
   ```python
   opt.eval()
-  torch.save(kaon.full_precision_state_dict(model, opt), "model_fp32.pt")  # names + buffers
-  values = kaon.decode_weights(opt)          # or {param: fp32 tensor}
+  torch.save(kaon.full_precision_state_dict(model, opt), "model_fp32.pt")  # fp32, on CPU
+  values = kaon.decode_weights(opt, device="cpu")   # or {param: fp32 tensor}
   opt.train()
   ```
 
-  Both refuse to run while Nekaon's live weights carry the climb (call `eval()` first).
+  The fp32 model is 4 B/param — a 2.6B-param UNet is ~10 GB, more than an 8 GB GPU holds.
+  Both functions stream one tensor at a time to `device` (the GPU peak is then a single
+  tensor's decode); `full_precision_state_dict` defaults to `device="cpu"`, while
+  `decode_weights` defaults to `device=None` (each value stays on its param's device — the
+  whole fp32 model there), so pass `device="cpu"` to it for a big model. Both refuse to run
+  while Nekaon's live weights carry the climb (call `eval()` first), and
+  `full_precision_state_dict` raises if none of the optimizer's params belongs to `model`.
 
 ## Knobs
 

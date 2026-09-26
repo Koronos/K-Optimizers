@@ -29,15 +29,20 @@ All notable changes to this project will be documented in this file.
 - `kaon.decode_weights(opt)` / `kaon.full_precision_state_dict(model, opt)`: the fp32
   full-precision weights of any kaon optimizer using `kahan8`/`kahan16` (decoded residual;
   `kahan16` = the fp32 master bit for bit), through wrapper chains; refused while Nekaon/MSAM
-  carry the climb (call `eval()`) or Lookahead shows its slow weights.
+  carry the climb (call `eval()`) or Lookahead shows its slow weights (ScheduleFree in train
+  view warns). Streamed one tensor at a time to `device` — `full_precision_state_dict`
+  defaults to `"cpu"`, so the GPU peak is one tensor, not the model in fp32 — and it raises if
+  none of the optimizer's params belongs to the module.
 - docs/nekaon.md "Low LR / Kahan": when to use SR / `kahan8` / `kahan16` with Nekaon, memory
   (0.56 / 1.56 / 2.56 B/param), load the optimizer AFTER the model, save in eval mode, fp32
   export.
 
 ### Fixed
 - MSAM/Nekaon: in a group mixing fp32 and bf16 params of the SAME shape, the torch-path climb
-  keyed its leftover buckets without the dtype, so one of the two buckets overwrote the other
-  and its params were never climbed (any `bf16_method`, CPU and non-Triton paths).
+  keyed its fused-path LEFTOVER buckets without the dtype, so one of the two buckets overwrote
+  the other and its params were never climbed (any `bf16_method`). Reached whenever Triton is
+  importable and the params are ineligible for the fused climb (CPU params, non-contiguous
+  weights); a Triton-less install took the dtype-keyed torch buckets and was not affected.
 - `add_param_group` on a wrapper (Nekaon, MSAM, SAM, Lookahead) raised a bare
   `AttributeError: ... no attribute 'defaults'`; it now delegates to the inner optimizer (and
   back-fills the wrapper's own group keys).

@@ -346,23 +346,45 @@ def test_checkpoint_from_another_method_is_not_a_silent_downgrade():
 
 @pytest.mark.parametrize("route", ["per_param", "foreach"] + (["fused"] if FUSED else []))
 def test_switch_back_to_sr_ignores_the_stale_residual(route):
-    """kahan16 -> SR mid-run: the decay, the climb and decode_weights stop reading the
-    residual (the writer no longer maintains it), so the run is exactly an SR run from the
-    bf16 weights it had."""
+    """kahan16 -> a plain method mid-run: the decay, the climb and decode_weights stop
+    reading the residual (the writer no longer maintains it). Discriminating: the stale
+    residual is overwritten with random bits (read anywhere, they would move the decayed
+    value by up to an ulp, and the carry bit the stored bf16 pattern) and the run is compared
+    BIT FOR BIT with an identical twin whose residuals are deleted. The switch goes to
+    ``"none"`` (round-to-nearest) so the twins share no noise stream to keep aligned — the
+    residual-reading code is the same for every non-compact-Kahan method; an SR switch is
+    checked for finiteness on top."""
     dev = _device(route)
-    pa = _bag(device=dev)
-    o = Nekaon(pa, lr=1e-3, bf16_method="kahan16", **_route_kw(route))
-    _drive([o], [pa], steps=3)
-    o.param_groups[0]["bf16_method"] = "stochastic_rounding"
-    o.inner.param_groups[0]["bf16_method"] = "stochastic_rounding"
-    for p in pa:                                           # poison the stale residual
-        o.inner.state[p][RESIDUAL_KEY].fill_(0x7777)
-    _drive([o], [pa], steps=3, seed=9)
+    runs = []
+    for _ in range(2):                                      # kahan16 is noise-free: twins
+        ps = _bag(device=dev)
+        # wd*lr = 0.5: a stale residual read by the decay would move the decayed value by up
+        # to half an ulp — enough to flip the round-to-nearest write (checked by mutation)
+        o = Nekaon(ps, lr=1e-2, weight_decay=50.0, cautious_wd="full",
+                   bf16_method="kahan16", **_route_kw(route))
+        _drive([o], [ps], steps=3)
+        for g in o.param_groups:
+            g["bf16_method"] = "none"
+        runs.append((ps, o))
+    (pa, o), (pb, ob) = runs
+    gen = torch.Generator().manual_seed(123)
+    for p, q in zip(pa, pb, strict=True):
+        assert torch.equal(p.data, q.data)
+        lo = o.inner.state[p][RESIDUAL_KEY]                 # poison the stale residual
+        lo.copy_(torch.randint(-32768, 32767, lo.shape, generator=gen, dtype=torch.int16))
+        del ob.inner.state[q][RESIDUAL_KEY]                 # the twin has none at all
+    _drive([o, ob], [pa, pb], steps=3, seed=9)
     o.eval()
+    ob.eval()
     vals = kaon.decode_weights(o)
-    for p in pa:
-        assert torch.isfinite(p.data).all()
+    for p, q in zip(pa, pb, strict=True):
+        assert torch.equal(p.data, q.data), tuple(p.shape)
         assert torch.equal(vals[p], p.data.float())
+    for g in o.param_groups:                                # and on to SR: still sane
+        g["bf16_method"] = "stochastic_rounding"
+    o.train()
+    _drive([o], [pa], steps=2, seed=10)
+    assert all(torch.isfinite(p.data).all() for p in pa)
 
 
 @pytest.mark.parametrize("method,warns", [("stochastic_rounding", True), ("kahan8", False),
@@ -471,3 +493,103 @@ def test_every_param_of_a_mixed_dtype_same_shape_group_is_climbed(method):
     o.eval()
     for p, z in zip(ps, live, strict=True):
         assert float((z - _z(o, p)).abs().max()) > 1e-4, p.dtype        # a real climb
+
+
+# ------------------------------------------------------------------ export: memory / misuse
+def test_export_streams_to_the_requested_device():
+    """``full_precision_state_dict`` defaults to CPU values; ``decode_weights(device=)``
+    moves each value; ``None`` keeps the param's device."""
+    ps = _bag()
+    o = Nekaon(ps, lr=1e-3, bf16_method="kahan16")
+    _drive([o], [ps], steps=2)
+    o.eval()
+    for v in kaon.decode_weights(o, device="cpu").values():
+        assert v.device.type == "cpu" and v.dtype == torch.float32
+    model = torch.nn.Module()
+    for i, p in enumerate(ps):
+        model.register_parameter(f"p{i}", p)
+    sd = kaon.full_precision_state_dict(model, o)
+    assert all(t.device.type == "cpu" and t.dtype == torch.float32 for t in sd.values())
+
+
+def test_export_decodes_one_tensor_at_a_time(monkeypatch):
+    """At most ONE decoded fp32 value is alive on the source device at any time: each is
+    moved to the target before the next is decoded (checked by tracking the live
+    source-device values through weak references)."""
+    import weakref
+
+    import kaon._full_precision as fp
+    ps = _bag()
+    o = Nekaon(ps, lr=1e-3, bf16_method="kahan16")
+    _drive([o], [ps], steps=2)
+    o.eval()
+    live: list[weakref.ref] = []
+    peak = [0]
+    real = fp._decoded
+
+    def spy(p, lo, method):
+        v = real(p, lo, method)
+        live.append(weakref.ref(v))
+        peak[0] = max(peak[0], sum(r() is not None for r in live))
+        return v
+
+    monkeypatch.setattr(fp, "_decoded", spy)
+    real_to = torch.Tensor.to
+    # a "device" move that really copies, so the source value can die (CPU -> CPU would alias)
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: real_to(self, *a, **k).clone())
+    fp.full_precision_state_dict(torch.nn.ParameterList(ps), o, device="meta")
+    assert peak[0] == 1, peak[0]
+
+
+@pytest.mark.skipif(not CUDA, reason="GPU memory peak")
+def test_export_gpu_peak_is_one_tensor_not_the_model():
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter((torch.randn(1024, 1024, device="cuda") * 0.05).to(torch.bfloat16))
+          for _ in range(8)]
+    o = Nekaon(ps, lr=1e-3, bf16_method="kahan16", foreach=True)
+    for p in ps:
+        p.grad = (torch.randn_like(p, dtype=torch.float32) * 0.02).to(torch.bfloat16)
+    o.step()
+    o.eval()
+    torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    sd = kaon.full_precision_state_dict(torch.nn.ParameterList(ps), o)
+    torch.cuda.synchronize()
+    extra = torch.cuda.max_memory_allocated() - base
+    model_fp32 = sum(4 * p.numel() for p in ps)                      # 32 MiB
+    assert extra <= model_fp32 // 2, (extra, model_fp32)             # ~one tensor + scratch
+    assert all(t.device.type == "cpu" for t in sd.values())
+    vals = kaon.decode_weights(o)                                    # device=None: on GPU
+    assert all(v.is_cuda for v in vals.values())
+
+
+def test_full_precision_state_dict_refuses_a_foreign_module():
+    ps = _bag()
+    o = Nekaon(ps, lr=1e-3, bf16_method="kahan8")
+    _drive([o], [ps], steps=1)
+    o.eval()
+    other = torch.nn.ParameterList([torch.nn.Parameter(p.detach().clone()) for p in ps])
+    with pytest.raises(ValueError, match="none of the optimizer's parameters"):
+        kaon.full_precision_state_dict(other, o)
+
+
+def test_export_view_rules_for_schedulefree_and_lookahead():
+    """ScheduleFree (no compact Kahan): the train view is y — warns; eval exports x, no
+    warning. Lookahead in eval (slow weights phi) is refused with a phi-specific message."""
+    ps = _bag()
+    sf = kaon.ScheduleFree(ps, lr=1e-3)
+    _drive([sf], [ps], steps=2)
+    with pytest.warns(UserWarning, match="training view"):
+        kaon.decode_weights(sf)
+    sf.eval()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        vals = kaon.decode_weights(sf)
+    assert all(torch.equal(vals[p], p.data.float()) for p in ps)
+    ps2 = _bag()
+    la = kaon.Lookahead(ps2, lr=1e-4, bf16_method="kahan8")
+    _drive([la], [ps2], steps=2)
+    la.eval()
+    with pytest.raises(RuntimeError, match="slow weights phi"):
+        kaon.decode_weights(la)

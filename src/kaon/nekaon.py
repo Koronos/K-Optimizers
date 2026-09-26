@@ -111,7 +111,10 @@ class Nekaon(AutoLRMixin, MSAM):
             the lookahead (plain Adakaon at ``lr * low_vram_lr_ratio``) — see "Low-VRAM
             mode" above. Default ``None`` disables this (momentum + lookahead on every
             tensor, the original behavior). Not compatible with passing your own
-            param-group dicts in ``params`` (this splits a flat param list itself).
+            param-group dicts in ``params`` (this splits a flat param list itself), and
+            applied only at construction: a group added later with ``add_param_group`` is
+            taken as given (pass ``betas=(0.0, beta2)`` and the lr yourself to route it
+            momentum-free).
         low_vram_lr_ratio: the low-VRAM group's LR relative to ``lr``, when
             ``low_vram_above`` is set. Default ``0.5``, matching the registry's
             precedent that momentum-free Adakaon wants roughly half of Nekaon's LR.
