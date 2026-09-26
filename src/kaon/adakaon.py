@@ -154,31 +154,45 @@ def _same_shape_device_buckets(plist: list[Tensor]) -> dict[tuple, list[Tensor]]
     return by_shape
 
 
-def _demote_non_contiguous_grads(
+def _grad_unfusable(p: Tensor) -> bool:
+    """True when ``p``'s gradient cannot be read by a fused kernel THIS step: it is not
+    contiguous, or its dtype is not the param's. See :func:`_demote_unfusable_grads`."""
+    g = p.grad
+    return g.dtype != p.dtype or not g.is_contiguous()
+
+
+def _demote_unfusable_grads(
     one_block: list[Tensor], big: list[Tensor], one_dim: list[Tensor], native: list[Tensor],
 ) -> tuple[list[Tensor], list[Tensor], list[Tensor], list[Tensor]]:
-    """Move any param whose GRAD is not contiguous onto the native subset FOR THIS STEP.
+    """Move any param whose GRAD a fused kernel cannot read onto the native subset FOR THIS STEP.
 
     Every fused kernel addresses the gradient as ``base + ri*C + ci`` (or ``base + offs``) read
-    straight off ``grad.data_ptr()``. A transposed (``grad = x.t()``) or strided
-    (``grad = buf[::2]``) gradient has the right shape and the wrong layout, so the kernel
-    silently steps the wrong numbers — measured as a ~1e-3 relative divergence from native with
-    no error raised anywhere. ``fused_eligible`` / ``fused_1d_eligible`` check
-    ``p.is_contiguous()``, never the grad's.
+    straight off ``grad.data_ptr()``, TYPED BY THE PARAM's dtype (``LOWP`` casts the grad pointer
+    to bf16 exactly when the weight is bf16). Two properties of the gradient break that and
+    neither is visible to ``fused_eligible`` / ``fused_1d_eligible``, which only look at the param:
 
-    Contiguity belongs to THIS step's gradient (a fresh tensor every backward), so it cannot be
+    * layout — a transposed (``grad = x.t()``) or strided (``grad = buf[::2]``) gradient has the
+      right shape and the wrong layout, so the kernel silently steps the wrong numbers
+      (measured as a ~1e-3 relative divergence from native, no error raised anywhere);
+    * dtype — an fp32 gradient on a bf16 weight (``p.grad_dtype = None`` in torch 2.12, or a
+      trainer that keeps fp32 grads) is read as bf16 pairs of its fp32 words: NaN/garbage
+      weights from the first step, on every route and every ``bf16_method``. The native path
+      reads any grad dtype correctly (it upcasts to fp32), so the param simply goes there.
+
+    Both belong to THIS step's gradient (a fresh tensor every backward), so they cannot be
     frozen into the cached routing partition: this runs per step, returns new lists and leaves
-    the cache untouched. Only the offending tensors move — one strided grad on one adapter must
-    not cost the rest of its bucket the fused path.
+    the cache untouched (the callers' ``_fused_demote`` memo keys on the demoted SET, so a grad
+    whose dtype changes between steps moves the key). Only the offending tensors move — one
+    strided or fp32 grad on one adapter must not cost the rest of its bucket the fused path.
     """
     fused = (one_block, big, one_dim)
-    if all(p.grad.is_contiguous() for sub in fused for p in sub):
+    if not any(_grad_unfusable(p) for sub in fused for p in sub):
         return one_block, big, one_dim, native
     kept: tuple[list[Tensor], ...] = ([], [], [])
     demoted: list[Tensor] = []
     for keep, sub in zip(kept, fused, strict=True):
         for p in sub:
-            (keep if p.grad.is_contiguous() else demoted).append(p)
+            (demoted if _grad_unfusable(p) else keep).append(p)
     return kept[0], kept[1], kept[2], native + demoted
 
 
@@ -551,12 +565,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         return loss
 
     @staticmethod
-    def _gc_in_step(group: dict[str, Any], grad: Tensor) -> bool:
+    def _gc_in_step(group: dict[str, Any], p: Tensor) -> bool:
         """Does the native step centralize this gradient ITSELF, in fp32 (instead of
         :func:`kaon._backend.centralize_grads_` in place on ``p.grad``)?
 
-        Under ``kahan8`` / ``kahan16`` a low-precision gradient is centralized on the fp32
-        copy the update reads, not in its own dtype: ``centralize_grads_`` on a bf16
+        Under ``kahan8`` / ``kahan16`` the gradient of a low-precision weight is centralized on
+        the fp32 copy the update reads, not in its own dtype: ``centralize_grads_`` on a bf16
         ``p.grad`` rounds both the row mean and ``g - mean`` to bf16, an input error of up to
         half a bf16 ulp of the gradient per step that the compensated weight then faithfully
         integrates — the other half (with weight decay) of the gap between a ``kahan16``
@@ -566,8 +580,16 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         separate stack + copy-back ``centralize_grads_`` does. The group's other methods
         (SR, none, legacy kahan) keep the historical in-place bf16 GC, bit for bit — and so
         does ``p.grad`` of a compact-Kahan group: it is left UNcentralized (the step reads
-        its centralized copy)."""
-        return (group["gradient_centralization"] and grad.dtype != torch.float32
+        its centralized copy).
+
+        Keyed on the PARAM's dtype, not the grad's: the foreach path decides per bucket from
+        ``chunk.plist[0]``, and a bucket is grouped by param dtype, so only a param property is
+        uniform across it. Keyed on the grad, a bucket of bf16 weights whose grads mix bf16 and
+        fp32 (``p.grad_dtype = None``) took the decision of its FIRST grad — the bf16-grad rows
+        then got no GC at all (skipped here, not centralized in the step) or the fp32-grad rows
+        got it twice. An fp32 grad on a bf16 weight now takes the same in-step fp32 GC as a
+        bf16 one (same fp32 arithmetic the in-place GC did on it)."""
+        return (group["gradient_centralization"] and p.dtype != torch.float32
                 and is_compact_kahan(group["bf16_method"]))
 
     def _centralize_native(self, params: list[Tensor], group: dict[str, Any]) -> None:
@@ -576,7 +598,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if not group["gradient_centralization"]:
             return
         if is_compact_kahan(group["bf16_method"]):
-            params = [p for p in params if not self._gc_in_step(group, p.grad)]
+            params = [p for p in params if not self._gc_in_step(group, p)]
         centralize_grads_(params)
 
     @torch.no_grad()
@@ -787,7 +809,8 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         the flag, per bag.
 
         Grad properties deliberately stay OUT of this key: a gradient is a new tensor every
-        backward, so its contiguity is re-checked per step in :func:`_demote_non_contiguous_grads`
+        backward, so its contiguity and dtype are re-checked per step in
+        :func:`_demote_unfusable_grads`
         rather than frozen into the routing.
         """
         gid = id(group)
@@ -818,7 +841,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             # ndim>2 (conv) is matrixized to (out, in*kh*kw); every momentum layout is row-major
             # compatible with that view (int8 scales dim-0, 4-bit blocks the same flat storage).
             # The matrixized write-back needs a contiguous GRAD — enforced per step by
-            # _demote_non_contiguous_grads, not here, because the grad changes every backward.
+            # _demote_unfusable_grads, not here, because the grad changes every backward.
             two_d = bf_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous() \
                 and p.dtype in (torch.float32, torch.bfloat16)
             ok = bf_ok and ft.fused_eligible(p, cap)
@@ -870,16 +893,20 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         return one_block, big, one_dim, native
 
     def _fused_demote(self, gid: int, parts: tuple) -> tuple:
-        """This step's routing, with any non-contiguous-grad tensor moved to the native subset.
+        """This step's routing, with any tensor whose grad is non-contiguous or not of the
+        param's dtype (fp32 grad on a bf16 weight) moved to the native subset.
 
-        Thin memo over :func:`_demote_non_contiguous_grads`. The demotion has to build fresh
+        Thin memo over :func:`_demote_unfusable_grads`. The demotion has to build fresh
         route lists, and a fresh list means every downstream pointer cache sees a new object and
         rebuilds itself (``_WitnessedCache.built_from``) — so a tensor whose grad is PERSISTENTLY
         strided would throw away the whole bucket's index tensors on every step. Reuse the lists
         while both the partition (identity of its four lists) and the demoted SET are unchanged;
-        the contiguity sweep itself still runs every step, since that is what detects the change.
+        the contiguity + dtype sweep itself still runs every step, since that is what detects the
+        change (a grad switching dtype between steps moves the demoted set, hence the memo key).
         """
-        demoted = tuple(id(p) for sub in parts[:3] for p in sub if not p.grad.is_contiguous())
+        # Inlined _grad_unfusable (hot: one sweep per group per step): dtype, then layout.
+        demoted = tuple(id(p) for sub in parts[:3] for p in sub
+                        if (g := p.grad).dtype != p.dtype or not g.is_contiguous())
         if not demoted:
             self._fused_demoted.pop(gid, None)
             return parts
@@ -887,7 +914,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if (cached is not None and cached[0] == demoted
                 and all(a is b for a, b in zip(cached[1], parts, strict=True))):
             return cached[2]
-        out = _demote_non_contiguous_grads(*parts)
+        out = _demote_unfusable_grads(*parts)
         self._fused_demoted[gid] = (demoted, parts, out)
         return out
 
@@ -1584,7 +1611,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         for chunk in self._foreach_chunks(params, group, budget):
             if chunk.eff is not None:
                 # fp32 GC on the stacked copy for a compact-Kahan bf16 bucket (_gc_in_step)
-                gc32 = self._gc_in_step(group, chunk.plist[0].grad)
+                gc32 = self._gc_in_step(group, chunk.plist[0])   # uniform: buckets key on p.dtype
                 self._factored_bucket(chunk, beta1, beta2, eps1, lr, clip, wd, cautious,
                                       wd_full, bf16_method, codec, gc32=gc32)
             else:
@@ -1814,8 +1841,10 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         grad_fp32 = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
         ndim = grad_fp32.ndim
         factored = ndim >= 2
-        if factored and self._gc_in_step(group, p.grad) and gc_applies(p.shape):
-            # fp32 GC on the fresh fp32 copy (compact Kahan, see _gc_in_step)
+        if factored and self._gc_in_step(group, p) and gc_applies(p.shape):
+            # fp32 GC on the fresh fp32 copy (compact Kahan, see _gc_in_step). An fp32 grad on
+            # a bf16 weight IS ``p.grad`` here, so it is centralized in place — as the in-place
+            # GC it took before did.
             grad_fp32.sub_(grad_fp32.mean(dim=tuple(range(1, ndim)), keepdim=True))
 
         if factored:

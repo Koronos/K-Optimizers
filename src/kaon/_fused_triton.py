@@ -2529,7 +2529,7 @@ def sr_add_supported(target, source) -> bool:
 
     Contiguity is not a nicety: the kernel indexes both buffers as ``base + offs``, so a
     strided view would be read and written in the wrong places (the same trap
-    ``_demote_non_contiguous_grads`` exists for on the gradient side).
+    ``_demote_unfusable_grads`` exists for on the gradient side).
     """
     return (
         _HAS_TRITON

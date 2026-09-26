@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Fused path (Adakaon, Nekaon, AdaPNM): a gradient whose dtype is not the param's wrote
+  NaN/garbage weights from the first step.** The kernels type the grad pointer by the PARAM's
+  dtype, so an fp32 `.grad` on a bf16 weight (`p.grad_dtype = None` in torch 2.12, or a trainer
+  that keeps fp32 grads) was read as bf16 halves of fp32 words — on the one-block, big (batched
+  and lone) and 1-D routes, under `stochastic_rounding`, `kahan8` and `kahan16` (AdaPNM fuses
+  bf16 only under SR, so its compact-Kahan groups were never affected). The mirror case, a bf16
+  grad on an fp32 weight, read past the grad's buffer. Such a param now leaves the fused
+  kernels FOR THAT STEP, in the same per-step sweep that already demoted non-contiguous grads
+  (`_demote_unfusable_grads`, whose memo keys on the demoted set, so a grad changing dtype
+  between steps re-routes every step); the native path reads any grad dtype. The result is
+  bit-identical to `fused=False` on the same grads. With matching dtypes nothing changes: 354
+  deterministic configs (SR, kahan8, kahan16 x fused/foreach/per-param x routes, bf16 and fp32
+  weights) bit-identical to 0.7.16; the cost is one dtype compare per fused param per step
+  (~32 µs host on a 428-param bag; whole step within noise, GPU-bound). The MSAM/Nekaon fused
+  climb reads the momentum, not the grad, and was not affected.
+- Adakaon/Nekaon native foreach under `kahan8`/`kahan16` with Gradient Centralization: the
+  in-step fp32 GC was decided per bucket from the FIRST param's GRAD dtype, so a bucket of bf16
+  weights whose grads mixed bf16 and fp32 left the bf16-grad rows uncentralized (or centralized
+  the fp32-grad rows twice). The decision now keys on the param dtype, which the bucket shares;
+  an fp32 grad on a bf16 weight takes the same in-step fp32 GC as a bf16 one. `kahan16` then
+  reproduces the fp32-weight run on mixed grads bit for bit (foreach and per-param).
+
 ## [0.7.16] - 2026-09-26
 
 ### Changed

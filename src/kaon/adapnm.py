@@ -153,7 +153,7 @@ from kaon._momentum_codec import (
 # the big route's pointer arrays need. Reused rather than duplicated — ``kaon.adakaon`` imports
 # nothing from here, so there is no cycle, and a divergence between two copies of this logic is
 # exactly the class of bug the audit found.
-from kaon.adakaon import _demote_non_contiguous_grads, _same_shape_device_buckets
+from kaon.adakaon import _demote_unfusable_grads, _same_shape_device_buckets
 
 __all__ = ["AdaPNM"]
 
@@ -842,8 +842,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         downstream memo and ``_WitnessedCache`` revalidates by list identity.
 
         Grad properties deliberately stay OUT of this key: a gradient is a new tensor every
-        backward, so its contiguity is re-checked per step in
-        :func:`kaon.adakaon._demote_non_contiguous_grads` rather than frozen into the routing.
+        backward, so its contiguity and dtype are re-checked per step in
+        :func:`kaon.adakaon._demote_unfusable_grads` rather than frozen into the routing.
         """
         gid = id(group)
         witness = ft.param_witness(params)
@@ -867,7 +867,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             # ndim>2 (conv) is matrixized to (out, in*kh*kw); needs fp32/bf16 momentum (quant's
             # per-row requant would reshape the conv state) -> else native. The matrixized
             # write-back also needs a contiguous GRAD, enforced per step by
-            # _demote_non_contiguous_grads (below) and NOT here, because the grad changes every
+            # _demote_unfusable_grads (below) and NOT here, because the grad changes every
             # backward and this partition is cached across steps.
             conv_ok = p.ndim <= 2 or float_mom
             ok = bf_ok and conv_ok and ft.fused_eligible(p, cap)
@@ -919,9 +919,10 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         return fourbit_block_size(p.grad, group)
 
     def _fused_demote(self, gid: int, parts: tuple) -> tuple:
-        """This step's routing, with any non-contiguous-grad tensor moved to the native subset.
+        """This step's routing, with any tensor whose grad is non-contiguous or not of the
+        param's dtype (fp32 grad on a bf16 weight) moved to the native subset.
 
-        Thin memo over :func:`kaon.adakaon._demote_non_contiguous_grads`. Every fused kernel reads
+        Thin memo over :func:`kaon.adakaon._demote_unfusable_grads`. Every fused kernel reads
         the gradient as ``base + ri*C + ci`` (or ``base + offs``) straight off ``grad.data_ptr()``,
         so a transposed (``grad = x.t()``) or strided (``grad = buf[::2]``) gradient has the right
         shape and the wrong layout and the kernel silently steps the wrong numbers — measured at
@@ -929,10 +930,13 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
 
         The demotion has to build fresh route lists, and a fresh list means every downstream
         pointer cache re-validates; reuse the lists while both the partition (identity of its four
-        lists) and the demoted SET are unchanged. The contiguity sweep itself still runs every
-        step, since that is what detects the change.
+        lists) and the demoted SET are unchanged. The contiguity + dtype sweep itself still runs
+        every step, since that is what detects the change (a grad switching dtype between steps
+        moves the demoted set, hence the memo key).
         """
-        demoted = tuple(id(p) for sub in parts[:3] for p in sub if not p.grad.is_contiguous())
+        # Inlined _grad_unfusable (hot: one sweep per group per step): dtype, then layout.
+        demoted = tuple(id(p) for sub in parts[:3] for p in sub
+                        if (g := p.grad).dtype != p.dtype or not g.is_contiguous())
         if not demoted:
             self._fused_demoted.pop(gid, None)
             return parts
@@ -940,7 +944,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         if (cached is not None and cached[0] == demoted
                 and all(a is b for a, b in zip(cached[1], parts, strict=True))):
             return cached[2]
-        out = _demote_non_contiguous_grads(*parts)
+        out = _demote_unfusable_grads(*parts)
         self._fused_demoted[gid] = (demoted, parts, out)
         return out
 
