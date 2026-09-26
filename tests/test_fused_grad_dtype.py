@@ -327,3 +327,52 @@ def test_native_paths_read_fp32_grads_losslessly(name, gc, foreach):
         assert torch.equal(dec[a], b.detach()), (
             f"{name}/{'foreach' if foreach else 'per-param'}: param {i} differs from the fp32 "
             f"run, max|d|={(dec[a] - b.detach()).abs().max().item():.3e}")
+
+
+# ----------------------------------------------------------------- 5. GC semantics (kahan + GC)
+@pytest.mark.parametrize("foreach", [True, False], ids=["foreach", "per_param"])
+@pytest.mark.parametrize("fused,grads", [(False, "bf16"), (False, "mixed"), (True, "bf16")],
+                         ids=["native-bf16", "native-mixed", "fused-bf16"])
+def test_fp32_weights_with_bf16_grads_get_fp32_gc(fused, grads, foreach):
+    """fp32 weights in a ``kahan16`` + GC group whose grads are bf16 (all, or mixed with fp32
+    in one foreach bucket): the gradient is centralized in fp32 — on the step's fp32 copy for a
+    bf16 grad, in place for an fp32 one — so the run equals, BIT FOR BIT, the same weights
+    stepped on the exact fp32 upcast of the same grads. In-place GC of the bf16 grad (rounding
+    the mean and ``g - mean`` to bf16) was 1.49e-4 off; deciding a mixed bucket from one row
+    was 4.1e-6 off. Under ``fused=True`` only the all-bf16 case has a bit-exact oracle (every
+    param is demoted, so both sides run native); a mixed bag steps its fp32-grad rows fused."""
+    shapes = [(16, 8)] * 3
+    pa = _bag(shapes, seed=59, dtype=torch.float32)
+    pb = _clone(pa)
+    cfg = dict(foreach=foreach, weight_decay=0.02, gradient_centralization=True)
+    oa = _make("Adakaon", pa, fused, "kahan16", **cfg)
+    ob = _make("Adakaon", pb, False, "kahan16", **cfg)
+    gen = torch.Generator(device=DEV).manual_seed(61)
+    for step in range(4):
+        raw = [torch.randn(s, generator=gen, device=DEV) for s in shapes]
+        for i, (p, q, g) in enumerate(zip(pa, pb, raw, strict=True)):
+            bf16 = grads == "bf16" or (i + step) % 2 == 0
+            p.grad = g.to(torch.bfloat16 if bf16 else torch.float32, copy=True)
+            q.grad = p.grad.to(torch.float32, copy=True)
+        oa.step()
+        ob.step()
+    torch.cuda.synchronize()
+    for i, (a, b) in enumerate(zip(pa, pb, strict=True)):
+        assert torch.equal(a.detach(), b.detach()), (
+            f"param {i}: max|d|={(a.detach() - b.detach()).abs().max().item():.3e}")
+
+
+@pytest.mark.parametrize("n", [1, 3], ids=["lone", "bucket"])
+@pytest.mark.parametrize("foreach", [True, False], ids=["foreach", "per_param"])
+def test_compact_kahan_step_leaves_an_fp32_grad_uncentralized(foreach, n):
+    """Compact-Kahan contract: the step centralizes a COPY and leaves ``p.grad`` as given — for
+    an fp32 grad on a bf16 weight too, on the per-param path (where the fp32 copy IS ``p.grad``)
+    and on a lone foreach bucket (whose stack is a view of it)."""
+    ps = _bag([(16, 8)] * n, seed=67)
+    opt = _make("Adakaon", ps, False, "kahan16", foreach=foreach, gradient_centralization=True)
+    given = [torch.randn(16, 8, device=DEV) for _ in ps]
+    for p, g in zip(ps, given, strict=True):
+        p.grad = g.clone()
+    opt.step()
+    for p, g in zip(ps, given, strict=True):
+        assert torch.equal(p.grad, g), "the step centralized p.grad in place"

@@ -153,7 +153,7 @@ from kaon._momentum_codec import (
 # the big route's pointer arrays need. Reused rather than duplicated — ``kaon.adakaon`` imports
 # nothing from here, so there is no cycle, and a divergence between two copies of this logic is
 # exactly the class of bug the audit found.
-from kaon.adakaon import _demote_unfusable_grads, _same_shape_device_buckets
+from kaon.adakaon import _demote_unfusable_grads, _grad_unfusable, _same_shape_device_buckets
 
 __all__ = ["AdaPNM"]
 
@@ -698,10 +698,23 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         import kaon._fused_triton as ft
 
         for group in self.param_groups:
-            params = [p for p in group["params"] if p.grad is not None]
-            for p in params:
-                if p.grad.is_sparse:
+            # ONE pass over the grads: the None filter, the sparse check and whether any grad is
+            # one a fused kernel cannot read (dtype != param's, or non-contiguous — see
+            # _demote_unfusable_grads). ``unfusable`` False (the steady state) lets _fused_demote
+            # skip its own sweep; True for a param routed native anyway is harmless (the sweep
+            # then moves nothing). Every grad is checked, never one per bucket: a bucket can mix
+            # grad dtypes.
+            params: list[Tensor] = []
+            unfusable = False
+            for p in group["params"]:
+                g = p.grad
+                if g is None:
+                    continue
+                if g.is_sparse:
                     raise RuntimeError("AdaPNM does not support sparse gradients")
+                params.append(p)
+                if g.dtype != p.dtype or not g.is_contiguous():
+                    unfusable = True
             if not params:
                 continue
             group["step"] += 1
@@ -709,7 +722,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             pos_pref, neg_pref = self._pos_neg_prefixes(group["step"])
             parts = self._fused_partition(group, params, ft)
             # Routing is cached; grad CONTIGUITY is not cacheable (fresh tensor every backward).
-            one_block, big, one_dim, native = self._fused_demote(id(group), parts)
+            one_block, big, one_dim, native = self._fused_demote(id(group), parts,
+                                                                 unfusable)
             if native:
                 if group["gradient_centralization"]:
                     centralize_grads_(native)
@@ -918,7 +932,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             return min(st["m_pos_block"], st.get("m_neg_block", st["m_pos_block"]))
         return fourbit_block_size(p.grad, group)
 
-    def _fused_demote(self, gid: int, parts: tuple) -> tuple:
+    def _fused_demote(self, gid: int, parts: tuple, unfusable: bool = True) -> tuple:
         """This step's routing, with any tensor whose grad is non-contiguous or not of the
         param's dtype (fp32 grad on a bf16 weight) moved to the native subset.
 
@@ -930,13 +944,15 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
 
         The demotion has to build fresh route lists, and a fresh list means every downstream
         pointer cache re-validates; reuse the lists while both the partition (identity of its four
-        lists) and the demoted SET are unchanged. The contiguity + dtype sweep itself still runs
-        every step, since that is what detects the change (a grad switching dtype between steps
-        moves the demoted set, hence the memo key).
+        lists) and the demoted SET are unchanged. The check itself runs every step, since that is
+        what detects the change (a grad switching dtype between steps moves the demoted set,
+        hence the memo key) — folded into the caller's grad pass (``unfusable``), so the steady
+        state pays no second sweep here.
         """
-        # Inlined _grad_unfusable (hot: one sweep per group per step): dtype, then layout.
-        demoted = tuple(id(p) for sub in parts[:3] for p in sub
-                        if (g := p.grad).dtype != p.dtype or not g.is_contiguous())
+        # ``unfusable`` is the caller's verdict from the grad pass it already makes (False: no
+        # grad in the group is unfusable, so there is nothing to sweep for).
+        demoted = () if not unfusable else tuple(
+            id(p) for sub in parts[:3] for p in sub if _grad_unfusable(p))
         if not demoted:
             self._fused_demoted.pop(gid, None)
             return parts

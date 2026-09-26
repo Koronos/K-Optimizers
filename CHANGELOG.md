@@ -12,20 +12,27 @@ All notable changes to this project will be documented in this file.
   and lone) and 1-D routes, under `stochastic_rounding`, `kahan8` and `kahan16` (AdaPNM fuses
   bf16 only under SR, so its compact-Kahan groups were never affected). The mirror case, a bf16
   grad on an fp32 weight, read past the grad's buffer. Such a param now leaves the fused
-  kernels FOR THAT STEP, in the same per-step sweep that already demoted non-contiguous grads
-  (`_demote_unfusable_grads`, whose memo keys on the demoted set, so a grad changing dtype
-  between steps re-routes every step); the native path reads any grad dtype. The result is
-  bit-identical to `fused=False` on the same grads. With matching dtypes nothing changes: 354
-  deterministic configs (SR, kahan8, kahan16 x fused/foreach/per-param x routes, bf16 and fp32
-  weights) bit-identical to 0.7.16; the cost is one dtype compare per fused param per step
-  (~32 µs host on a 428-param bag; whole step within noise, GPU-bound). The MSAM/Nekaon fused
-  climb reads the momentum, not the grad, and was not affected.
+  kernels FOR THAT STEP, like a non-contiguous grad already did (`_demote_unfusable_grads`,
+  whose memo keys on the demoted set, so a grad changing dtype between steps re-routes every
+  step); the native path reads any grad dtype. The result is bit-identical to `fused=False` on
+  the same grads. With matching dtypes nothing changes: 354 deterministic configs (SR, kahan8,
+  kahan16 x fused/foreach/per-param x routes, bf16 and fp32 weights) bit-identical to 0.7.16.
+  The dtype/contiguity check is folded into the grad pass the fused step already made (None
+  filter + sparse check), and the demotion sweep runs only when that pass found an unfusable
+  grad: host routing cost of the 428-param LoRA bag level with 0.7.16 (167 vs 168 µs, min of
+  6 interleaved runs). The MSAM/Nekaon fused climb reads the momentum, not the grad, and was
+  not affected.
 - Adakaon/Nekaon native foreach under `kahan8`/`kahan16` with Gradient Centralization: the
-  in-step fp32 GC was decided per bucket from the FIRST param's GRAD dtype, so a bucket of bf16
-  weights whose grads mixed bf16 and fp32 left the bf16-grad rows uncentralized (or centralized
-  the fp32-grad rows twice). The decision now keys on the param dtype, which the bucket shares;
-  an fp32 grad on a bf16 weight takes the same in-step fp32 GC as a bf16 one. `kahan16` then
-  reproduces the fp32-weight run on mixed grads bit for bit (foreach and per-param).
+  in-step fp32 GC was decided per bucket from the FIRST param's GRAD dtype, so a bucket whose
+  grads mixed bf16 and fp32 left the bf16-grad rows uncentralized (or centralized the
+  fp32-grad rows twice). GC now runs in fp32 on the step's copy whenever the grad OR the weight
+  is not fp32 (an fp32 grad on an fp32 weight keeps the in-place GC), decided per row: a bf16
+  bucket is uniform, an fp32-weight bucket with mixed grads centralizes only its bf16-grad rows
+  in the step. `kahan16` then reproduces the fp32-weight run on mixed grads bit for bit
+  (foreach and per-param), and fp32 weights with bf16 grads match the fp32-upcast run exactly.
+  An fp32 grad on a bf16 weight is centralized on a copy on both paths (per-param and a lone
+  foreach bucket used to alias it), so `p.grad` is left uncentralized as the compact-Kahan
+  contract says.
 
 ## [0.7.16] - 2026-09-26
 

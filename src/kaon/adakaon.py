@@ -582,15 +582,33 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         does ``p.grad`` of a compact-Kahan group: it is left UNcentralized (the step reads
         its centralized copy).
 
-        Keyed on the PARAM's dtype, not the grad's: the foreach path decides per bucket from
-        ``chunk.plist[0]``, and a bucket is grouped by param dtype, so only a param property is
-        uniform across it. Keyed on the grad, a bucket of bf16 weights whose grads mix bf16 and
-        fp32 (``p.grad_dtype = None``) took the decision of its FIRST grad — the bf16-grad rows
-        then got no GC at all (skipped here, not centralized in the step) or the fp32-grad rows
-        got it twice. An fp32 grad on a bf16 weight now takes the same in-step fp32 GC as a
-        bf16 one (same fp32 arithmetic the in-place GC did on it)."""
-        return (group["gradient_centralization"] and p.dtype != torch.float32
-                and is_compact_kahan(group["bf16_method"]))
+        In-step exactly when the grad OR the weight is not fp32: a bf16 grad on an fp32 weight
+        is centralized on its fp32 copy as well (in place it would round the mean to bf16),
+        and an fp32 grad on a bf16 weight joins its bucket, which a bf16 weight decides whole
+        (see :meth:`_gc32_rows`). An fp32 grad on an fp32 weight keeps the in-place GC.
+        Per param, on the per-param path and in :meth:`_centralize_native`; the foreach bucket
+        resolves it per row in :meth:`_gc32_rows`, so both paths pick the same set."""
+        return (group["gradient_centralization"] and is_compact_kahan(group["bf16_method"])
+                and (p.dtype != torch.float32 or p.grad.dtype != torch.float32))
+
+    def _gc32_rows(self, group: dict[str, Any], plist: list[Tensor]) -> Any:
+        """The in-step fp32 GC decision of one foreach bucket, row for row the same as
+        :meth:`_gc_in_step` (so every row is centralized exactly once, in place by
+        :meth:`_centralize_native` or on the stacked copy): ``False`` (no row), ``True`` (every
+        row) or a per-row bool list for a MIXED bucket.
+
+        A bucket shares its param dtype (the plan keys on it), so a bf16/fp16 bucket is
+        ``True`` whole in one compare. Only an fp32-weight bucket of a compact-Kahan + GC group
+        looks at its grads — one dtype compare per row, in a group configuration (fp32 weights
+        under kahan8/kahan16) that the default setups do not produce."""
+        if not (group["gradient_centralization"] and is_compact_kahan(group["bf16_method"])):
+            return False
+        if plist[0].dtype != torch.float32:
+            return True
+        rows = [p.grad.dtype != torch.float32 for p in plist]
+        if not any(rows):
+            return False
+        return True if all(rows) else rows
 
     def _centralize_native(self, params: list[Tensor], group: dict[str, Any]) -> None:
         """Gradient Centralization for a native subset: in place on ``p.grad``, except the
@@ -646,13 +664,27 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
 
         self._t += 1
         for group in self.param_groups:
-            params = [p for p in group["params"] if p.grad is not None]
-            for p in params:
-                if p.grad.is_sparse:
+            # ONE pass over the grads: the None filter, the sparse check and whether any grad is
+            # one a fused kernel cannot read (dtype != param's, or non-contiguous — see
+            # _demote_unfusable_grads). ``unfusable`` False (the steady state) lets _fused_demote
+            # skip its own sweep; True for a param routed native anyway is harmless (the sweep
+            # then moves nothing). Every grad is checked, never one per bucket: a bucket can mix
+            # grad dtypes.
+            params: list[Tensor] = []
+            unfusable = False
+            for p in group["params"]:
+                g = p.grad
+                if g is None:
+                    continue
+                if g.is_sparse:
                     raise RuntimeError("Adakaon does not support sparse gradients")
+                params.append(p)
+                if g.dtype != p.dtype or not g.is_contiguous():
+                    unfusable = True
             parts = self._fused_partition(group, params, ft)
             # Routing is cached; grad CONTIGUITY is not cacheable (fresh tensor every backward).
-            one_block, big, one_dim, native = self._fused_demote(id(group), parts)
+            one_block, big, one_dim, native = self._fused_demote(id(group), parts,
+                                                                 unfusable)
             if native:  # GC for the native subset (fused subsets centralize in-kernel / in-reductions)
                 self._centralize_native(native, group)
                 self._native_dispatch(native, group)
@@ -892,7 +924,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         self._fused_part[gid] = (witness, gen, bf16m, one_block, big, one_dim, native)
         return one_block, big, one_dim, native
 
-    def _fused_demote(self, gid: int, parts: tuple) -> tuple:
+    def _fused_demote(self, gid: int, parts: tuple, unfusable: bool = True) -> tuple:
         """This step's routing, with any tensor whose grad is non-contiguous or not of the
         param's dtype (fp32 grad on a bf16 weight) moved to the native subset.
 
@@ -901,12 +933,14 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         rebuilds itself (``_WitnessedCache.built_from``) — so a tensor whose grad is PERSISTENTLY
         strided would throw away the whole bucket's index tensors on every step. Reuse the lists
         while both the partition (identity of its four lists) and the demoted SET are unchanged;
-        the contiguity + dtype sweep itself still runs every step, since that is what detects the
-        change (a grad switching dtype between steps moves the demoted set, hence the memo key).
+        the check itself runs every step, since that is what detects the change (a grad
+        switching dtype between steps moves the demoted set, hence the memo key) — folded into
+        the caller's grad pass (``unfusable``), so the steady state pays no second sweep here.
         """
-        # Inlined _grad_unfusable (hot: one sweep per group per step): dtype, then layout.
-        demoted = tuple(id(p) for sub in parts[:3] for p in sub
-                        if (g := p.grad).dtype != p.dtype or not g.is_contiguous())
+        # ``unfusable`` is the caller's verdict from the grad pass it already makes (False: no
+        # grad in the group is unfusable, so there is nothing to sweep for).
+        demoted = () if not unfusable else tuple(
+            id(p) for sub in parts[:3] for p in sub if _grad_unfusable(p))
         if not demoted:
             self._fused_demoted.pop(gid, None)
             return parts
@@ -1610,8 +1644,8 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         codec = self._codec(group)
         for chunk in self._foreach_chunks(params, group, budget):
             if chunk.eff is not None:
-                # fp32 GC on the stacked copy for a compact-Kahan bf16 bucket (_gc_in_step)
-                gc32 = self._gc_in_step(group, chunk.plist[0])   # uniform: buckets key on p.dtype
+                # fp32 GC on the stacked copy, row for row as _gc_in_step decides it
+                gc32 = self._gc32_rows(group, chunk.plist)
                 self._factored_bucket(chunk, beta1, beta2, eps1, lr, clip, wd, cautious,
                                       wd_full, bf16_method, codec, gc32=gc32)
             else:
@@ -1632,17 +1666,26 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         wd_full: bool,
         bf16_method: str,
         codec: _MomentumCodec,
-        gc32: bool = False,
+        gc32: Any = False,
     ) -> None:
         R, C = chunk.eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
         N = chunk.n  # noqa: N806
         rows, cols = chunk.state_views
 
         grad = chunk.grad_stack()                                         # [N, R, C]
-        if gc32 and C > 1:
+        if gc32 is not False and C > 1:
             # fp32 GC on the stacked copy (compact Kahan, see _gc_in_step); the fan-in of the
             # matrixized [out, in*kh*kw] layout is the last dim, and C > 1 is gc_applies.
-            grad.sub_(grad.mean(dim=-1, keepdim=True))
+            # A lone bucket's stack of an fp32 grad is a VIEW of ``p.grad``; copy it so the
+            # step leaves ``p.grad`` uncentralized (the compact-Kahan contract).
+            if N == 1 and grad.data_ptr() == chunk.plist[0].grad.data_ptr():
+                grad = grad.clone()
+            if gc32 is True:
+                grad.sub_(grad.mean(dim=-1, keepdim=True))
+            else:  # mixed fp32-weight bucket: only the rows _centralize_native left alone
+                idx = torch.tensor([i for i, r in enumerate(gc32) if r], device=grad.device)
+                sub = grad.index_select(0, idx)
+                grad.index_copy_(0, idx, sub.sub_(sub.mean(dim=-1, keepdim=True)))
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -1843,8 +1886,10 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         factored = ndim >= 2
         if factored and self._gc_in_step(group, p) and gc_applies(p.shape):
             # fp32 GC on the fresh fp32 copy (compact Kahan, see _gc_in_step). An fp32 grad on
-            # a bf16 weight IS ``p.grad`` here, so it is centralized in place — as the in-place
-            # GC it took before did.
+            # a bf16 weight IS ``p.grad`` here: copy it, so ``p.grad`` is left uncentralized
+            # as on the foreach path (the compact-Kahan contract).
+            if grad_fp32 is p.grad:
+                grad_fp32 = grad_fp32.clone()
             grad_fp32.sub_(grad_fp32.mean(dim=tuple(range(1, ndim)), keepdim=True))
 
         if factored:
