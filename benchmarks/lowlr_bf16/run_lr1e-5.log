@@ -1,0 +1,34 @@
+  [ada-sr] seed=0 test=0.08882 (start 0.10138, fp32 view 0.08879) train=0.08046 gap=+0.00836 ms/step=41.97 (opt 22.94, orientative)
+  [ada-kahan] seed=0 test=0.08871 (start 0.10138, fp32 view 0.08868) train=0.08033 gap=+0.00839 ms/step=61.50 (opt 41.54, orientative)
+  [ada-k8] seed=0 test=0.08872 (start 0.10138, fp32 view 0.08867) train=0.08034 gap=+0.00838 ms/step=44.94 (opt 25.22, orientative)
+  [ada-k16] seed=0 test=0.08872 (start 0.10138, fp32 view 0.08868) train=0.08033 gap=+0.00839 ms/step=42.68 (opt 24.02, orientative)
+  [ada-fp32] seed=0 test=0.08868 (start 0.10137, fp32 view 0.08868) train=0.08028 gap=+0.00840 ms/step=32.79 (opt 16.80, orientative)
+  [nek-sr] seed=0 test=0.08837 (start 0.10138, fp32 view 0.08834) train=0.07966 gap=+0.00871 ms/step=51.03 (opt 36.92, orientative)  inert-warning x1
+  [nek-kahan] seed=0 test=0.08833 (start 0.10138, fp32 view 0.08833) train=0.07959 gap=+0.00874 ms/step=95.68 (opt 79.19, orientative)  inert-warning x1
+  [nek-k8] seed=0 test=0.08833 (start 0.10138, fp32 view 0.08830) train=0.07955 gap=+0.00878 ms/step=51.17 (opt 37.53, orientative)  inert-warning x1
+  [nek-k16] seed=0 test=0.08831 (start 0.10138, fp32 view 0.08830) train=0.07956 gap=+0.00876 ms/step=56.46 (opt 41.21, orientative)  inert-warning x1
+  [nek-fp32] seed=0 test=0.08828 (start 0.10137, fp32 view 0.08828) train=0.07951 gap=+0.00878 ms/step=64.96 (opt 46.53, orientative)  inert-warning x1
+  [ada-sr] seed=1 test=0.08810 (start 0.10822, fp32 view 0.08806) train=0.08010 gap=+0.00800 ms/step=32.64 (opt 17.94, orientative)
+  [ada-kahan] seed=1 test=0.08800 (start 0.10822, fp32 view 0.08798) train=0.08002 gap=+0.00798 ms/step=35.64 (opt 24.64, orientative)
+  [ada-k8] seed=1 test=0.08800 (start 0.10822, fp32 view 0.08797) train=0.08002 gap=+0.00798 ms/step=26.48 (opt 15.16, orientative)
+  [ada-k16] seed=1 test=0.08800 (start 0.10822, fp32 view 0.08797) train=0.08002 gap=+0.00798 ms/step=27.12 (opt 15.48, orientative)
+  [ada-fp32] seed=1 test=0.08797 (start 0.10824, fp32 view 0.08797) train=0.07997 gap=+0.00800 ms/step=22.74 (opt 11.78, orientative)
+  [nek-sr] seed=1 test=0.08745 (start 0.10822, fp32 view 0.08742) train=0.07918 gap=+0.00826 ms/step=45.02 (opt 32.85, orientative)  inert-warning x1
+  [nek-kahan] seed=1 test=0.08749 (start 0.10822, fp32 view 0.08745) train=0.07919 gap=+0.00830 ms/step=79.23 (opt 65.83, orientative)  inert-warning x1
+  [nek-k8] seed=1 test=0.08746 (start 0.10822, fp32 view 0.08741) train=0.07915 gap=+0.00831 ms/step=45.99 (opt 34.03, orientative)  inert-warning x1
+  [nek-k16] seed=1 test=0.08745 (start 0.10822, fp32 view 0.08740) train=0.07915 gap=+0.00830 ms/step=58.82 (opt 42.99, orientative)  inert-warning x1
+  [nek-fp32] seed=1 test=0.08742 (start 0.10824, fp32 view 0.08742) train=0.07909 gap=+0.00833 ms/step=41.71 (opt 29.95, orientative)  inert-warning x1
+
+arm         test (+-sd)          gap (+-sd)         d_start   test_full  dist_ulp  dist_rel  ms/step  ms/opt   (ms: orientative)
+ada-sr      0.08846(+-0.00051) +0.00818(+-0.00026) -0.01634  0.08842    10.468     0.606    37.31   20.44
+ada-kahan   0.08836(+-0.00051) +0.00818(+-0.00029) -0.01644  0.08833     0.092     0.009    48.57   33.09
+ada-k8      0.08836(+-0.00051) +0.00818(+-0.00029) -0.01644  0.08832     0.134     0.010    35.71   20.19
+ada-k16     0.08836(+-0.00050) +0.00818(+-0.00029) -0.01644  0.08833     0.083     0.004    34.90   19.75
+ada-fp32    0.08832(+-0.00050) +0.00820(+-0.00028) -0.01648  0.08832         -         -    27.77   14.29
+nek-sr      0.08791(+-0.00065) +0.00849(+-0.00032) -0.01689  0.08788     8.646     0.463    48.03   34.88
+nek-kahan   0.08791(+-0.00060) +0.00852(+-0.00031) -0.01689  0.08789     1.200     0.058    87.45   72.51
+nek-k8      0.08790(+-0.00062) +0.00854(+-0.00033) -0.01690  0.08786     0.256     0.016    48.58   35.78
+nek-k16     0.08788(+-0.00061) +0.00853(+-0.00032) -0.01692  0.08785     0.192     0.009    57.64   42.10
+nek-fp32    0.08785(+-0.00061) +0.00855(+-0.00032) -0.01695  0.08785         -         -    53.33   38.24
+wrote benchmarks/lowlr_bf16/results_lr1e-5.json
+DONE

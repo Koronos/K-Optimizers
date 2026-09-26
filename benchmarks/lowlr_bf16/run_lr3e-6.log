@@ -1,0 +1,24 @@
+  [ada-sr] seed=0 test=0.09236 (start 0.10138, fp32 view 0.09233) train=0.08628 gap=+0.00608 ms/step=24.62 (opt 13.77, orientative)
+  [ada-kahan] seed=0 test=0.09230 (start 0.10138, fp32 view 0.09227) train=0.08622 gap=+0.00608 ms/step=32.71 (opt 22.70, orientative)
+  [ada-k8] seed=0 test=0.09229 (start 0.10138, fp32 view 0.09227) train=0.08620 gap=+0.00608 ms/step=21.39 (opt 12.30, orientative)
+  [ada-k16] seed=0 test=0.09228 (start 0.10138, fp32 view 0.09228) train=0.08621 gap=+0.00608 ms/step=22.81 (opt 13.03, orientative)
+  [ada-fp32] seed=0 test=0.09226 (start 0.10137, fp32 view 0.09226) train=0.08616 gap=+0.00610 ms/step=34.98 (opt 18.17, orientative)
+  [nek-sr] seed=0 test=0.09215 (start 0.10138, fp32 view 0.09212) train=0.08586 gap=+0.00629 ms/step=71.71 (opt 51.46, orientative)  inert-warning x1
+  [nek-kahan] seed=0 test=0.09216 (start 0.10138, fp32 view 0.09212) train=0.08584 gap=+0.00632 ms/step=100.99 (opt 83.46, orientative)  inert-warning x1
+  [nek-k8] seed=0 test=0.09215 (start 0.10138, fp32 view 0.09211) train=0.08582 gap=+0.00633 ms/step=49.03 (opt 35.97, orientative)  inert-warning x1
+  [nek-k16] seed=0 test=0.09215 (start 0.10138, fp32 view 0.09210) train=0.08582 gap=+0.00633 ms/step=64.99 (opt 47.59, orientative)  inert-warning x1
+  [nek-fp32] seed=0 test=0.09210 (start 0.10137, fp32 view 0.09210) train=0.08577 gap=+0.00633 ms/step=123.76 (opt 88.13, orientative)  inert-warning x1
+
+arm         test (+-sd)          gap (+-sd)         d_start   test_full  dist_ulp  dist_rel  ms/step  ms/opt   (ms: orientative)
+ada-sr      0.09236(+-0.00000) +0.00608(+-0.00000) -0.00902  0.09233     5.762     0.746    24.62   13.77
+ada-kahan   0.09230(+-0.00000) +0.00608(+-0.00000) -0.00909  0.09227     0.061     0.021    32.71   22.70
+ada-k8      0.09229(+-0.00000) +0.00608(+-0.00000) -0.00909  0.09227     0.112     0.018    21.39   12.30
+ada-k16     0.09228(+-0.00000) +0.00608(+-0.00000) -0.00910  0.09228     0.043     0.005    22.81   13.03
+ada-fp32    0.09226(+-0.00000) +0.00610(+-0.00000) -0.00910  0.09226         -         -    34.98   18.17
+nek-sr      0.09215(+-0.00000) +0.00629(+-0.00000) -0.00923  0.09212     4.778     0.577    71.71   51.46
+nek-kahan   0.09216(+-0.00000) +0.00632(+-0.00000) -0.00922  0.09212     0.149     0.031   100.99   83.46
+nek-k8      0.09215(+-0.00000) +0.00633(+-0.00000) -0.00924  0.09211     0.179     0.027    49.03   35.97
+nek-k16     0.09215(+-0.00000) +0.00633(+-0.00000) -0.00923  0.09210     0.067     0.007    64.99   47.59
+nek-fp32    0.09210(+-0.00000) +0.00633(+-0.00000) -0.00926  0.09210         -         -   123.76   88.13
+wrote benchmarks/lowlr_bf16/results_lr3e-6.json
+DONE

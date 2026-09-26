@@ -1,0 +1,517 @@
+{
+ "manifest": {
+  "commit": "5e1e9ae484dc35e4336aa9e7eca1e38707c7df8d",
+  "branch": "feature/antikaon",
+  "config": {
+   "C": 40,
+   "bs": 8,
+   "pretrain": 300,
+   "steps": 8000,
+   "lr": 1e-05,
+   "seeds": [
+    0,
+    1
+   ]
+  },
+  "pretrain_lr": 0.0012,
+  "schedule": "const",
+  "device": "cuda",
+  "dataset_fingerprint": "b0bad0f5fb622dd7a30641c8e1780b21fed818fddf8a430faf9a78b480399aef",
+  "arms": [
+   "ada-sr",
+   "ada-kahan",
+   "ada-k8",
+   "ada-k16",
+   "ada-fp32",
+   "nek-sr",
+   "nek-kahan",
+   "nek-k8",
+   "nek-k16",
+   "nek-fp32"
+  ],
+  "timing_warmup_steps": 20,
+  "timing_note": "ms/step and ms/opt are ORIENTATIVE (serial arms in one process, no power/clock control)"
+ },
+ "results": {
+  "ada-sr": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08882247749716043,
+     "train": 0.08045823220163584,
+     "gap": 0.008364245295524597,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.08878772333264351,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 10.44587601930391,
+     "dist_rel": 0.6162818775737148,
+     "ms_step": 41.9693514341101,
+     "ms_opt": 22.935107235681443,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.0880957106128335,
+     "train": 0.08009593188762665,
+     "gap": 0.007999778725206852,
+     "test_start": 0.1082153245806694,
+     "test_full": 0.08806099370121956,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 10.489249337833552,
+     "dist_rel": 0.5967090762667249,
+     "ms_step": 32.64361415829575,
+     "ms_opt": 17.94495451420471,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08845909405499697,
+   "test_std": 0.0005139017922493948,
+   "gap_mean": 0.008182012010365725,
+   "gap_std": 0.0002577167833874813,
+   "train_mean": 0.08027708204463124,
+   "train_std": 0.0002561850088619135,
+   "test_start_mean": 0.10479873977601528,
+   "test_start_std": 0.00483178056773969,
+   "test_full_mean": 0.08842435851693153,
+   "test_full_std": 0.0005138754504690755,
+   "dist_ulp_mean": 10.467562678568731,
+   "dist_rel_mean": 0.6064954769202198,
+   "ms_step_mean": 37.30648279620293,
+   "ms_opt_mean": 20.440030874943076
+  },
+  "ada-kahan": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08871336933225393,
+     "train": 0.08032511081546545,
+     "gap": 0.008388258516788483,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.08868486620485783,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.09307674091863413,
+     "dist_rel": 0.009281483828350435,
+     "ms_step": 61.500902215101966,
+     "ms_opt": 41.53557357740283,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.08799768891185522,
+     "train": 0.08002162165939808,
+     "gap": 0.007976067252457142,
+     "test_start": 0.1082153245806694,
+     "test_full": 0.08797650877386332,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.09108029235814291,
+     "dist_rel": 0.008688289794784584,
+     "ms_step": 35.6442866409034,
+     "ms_opt": 24.641123658732365,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08835552912205458,
+   "test_std": 0.0005060624784263684,
+   "gap_mean": 0.008182162884622812,
+   "gap_std": 0.0002914632381545478,
+   "train_mean": 0.08017336623743176,
+   "train_std": 0.00021459924027182075,
+   "test_start_mean": 0.10479873977601528,
+   "test_start_std": 0.00483178056773969,
+   "test_full_mean": 0.08833068748936057,
+   "test_full_std": 0.0005008843429601004,
+   "dist_ulp_mean": 0.09207851663838852,
+   "dist_rel_mean": 0.008984886811567509,
+   "ms_step_mean": 48.57259442800269,
+   "ms_opt_mean": 33.0883486180676
+  },
+  "ada-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08871937915682793,
+     "train": 0.08033547876402736,
+     "gap": 0.00838390039280057,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.0886710174381733,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.13458188633831428,
+     "dist_rel": 0.010123279536127414,
+     "ms_step": 44.94210348416092,
+     "ms_opt": 25.22235212134837,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.08799925446510315,
+     "train": 0.08002126403152943,
+     "gap": 0.007977990433573723,
+     "test_start": 0.1082153245806694,
+     "test_full": 0.08796507306396961,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.13327189364703348,
+     "dist_rel": 0.009837471275285678,
+     "ms_step": 26.477277216755954,
+     "ms_opt": 15.164435092070347,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08835931681096554,
+   "test_std": 0.000509205052818462,
+   "gap_mean": 0.008180945413187146,
+   "gap_std": 0.0002870216847204583,
+   "train_mean": 0.08017837139777839,
+   "train_std": 0.00022218336809800372,
+   "test_start_mean": 0.10479873977601528,
+   "test_start_std": 0.00483178056773969,
+   "test_full_mean": 0.08831804525107145,
+   "test_full_std": 0.0004991780541399171,
+   "dist_ulp_mean": 0.13392688999267388,
+   "dist_rel_mean": 0.009980375405706546,
+   "ms_step_mean": 35.70969035045844,
+   "ms_opt_mean": 20.193393606709357
+  },
+  "ada-k16": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08871660474687815,
+     "train": 0.08033114764839411,
+     "gap": 0.00838545709848404,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.08868253044784069,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.08430272613096913,
+     "dist_rel": 0.004598389276046722,
+     "ms_step": 42.6755989445182,
+     "ms_opt": 24.023937722853848,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.08800317998975515,
+     "train": 0.08002435974776745,
+     "gap": 0.007978820241987705,
+     "test_start": 0.1082153245806694,
+     "test_full": 0.08797306101769209,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.08087152029787764,
+     "dist_rel": 0.004205578573922641,
+     "ms_step": 27.115775366713827,
+     "ms_opt": 15.48317083392227,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08835989236831665,
+   "test_std": 0.0005044674836280344,
+   "gap_mean": 0.008182138670235872,
+   "gap_std": 0.0002875356787089388,
+   "train_mean": 0.08017775369808078,
+   "train_std": 0.00021693180491909553,
+   "test_start_mean": 0.10479873977601528,
+   "test_start_std": 0.00483178056773969,
+   "test_full_mean": 0.08832779573276639,
+   "test_full_std": 0.0005016706451026318,
+   "dist_ulp_mean": 0.08258712321442338,
+   "dist_rel_mean": 0.004401983924984682,
+   "ms_step_mean": 34.89568715561602,
+   "ms_opt_mean": 19.75355427838806
+  },
+  "ada-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08867769688367844,
+     "train": 0.08027855213731527,
+     "gap": 0.008399144746363163,
+     "test_start": 0.10136512294411659,
+     "test_full": 0.08867769688367844,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "ms_step": 32.791128930352386,
+     "ms_opt": 16.797319510407316,
+     "inert_warnings": []
+    },
+    {
+     "seed": 1,
+     "test": 0.08796906843781471,
+     "train": 0.07996548851951957,
+     "gap": 0.008003579918295145,
+     "test_start": 0.10823697503656149,
+     "test_full": 0.08796906843781471,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "ms_step": 22.74497456263779,
+     "ms_opt": 11.77911062545346,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.08832338266074657,
+   "test_std": 0.0005010759794119233,
+   "gap_mean": 0.008201362332329154,
+   "gap_std": 0.00027970657232578627,
+   "train_mean": 0.08012202032841742,
+   "train_std": 0.00022136940708613709,
+   "test_start_mean": 0.10480104899033904,
+   "test_start_std": 0.004859133213878752,
+   "test_full_mean": 0.08832338266074657,
+   "test_full_std": 0.0005010759794119233,
+   "dist_ulp_mean": null,
+   "dist_rel_mean": null,
+   "ms_step_mean": 27.76805174649509,
+   "ms_opt_mean": 14.288215067930388
+  },
+  "nek-sr": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08836623653769493,
+     "train": 0.07965632621198893,
+     "gap": 0.008709910325706005,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.08833863493055105,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 8.620902285357278,
+     "dist_rel": 0.4713819378842995,
+     "ms_step": 51.032081724229016,
+     "ms_opt": 36.916815555663334,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.88e-04); some perturbations may round to"
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08744733035564423,
+     "train": 0.07918388769030571,
+     "gap": 0.008263442665338516,
+     "test_start": 0.1082153245806694,
+     "test_full": 0.08741728402674198,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 8.670862592078795,
+     "dist_rel": 0.45439192916915067,
+     "ms_step": 45.01806837024545,
+     "ms_opt": 32.84926723334425,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.68e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.08790678344666958,
+   "test_std": 0.0006497647926022936,
+   "gap_mean": 0.00848667649552226,
+   "gap_std": 0.0003157003102263438,
+   "train_mean": 0.07942010695114732,
+   "train_std": 0.00033406448237594986,
+   "test_start_mean": 0.10479873977601528,
+   "test_start_std": 0.00483178056773969,
+   "test_full_mean": 0.08787795947864652,
+   "test_full_std": 0.0006514934719357482,
+   "dist_ulp_mean": 8.645882438718036,
+   "dist_rel_mean": 0.46288693352672505,
+   "ms_step_mean": 48.02507504723724,
+   "ms_opt_mean": 34.88304139450379
+  },
+  "nek-kahan": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08833290450274944,
+     "train": 0.07959202164784074,
+     "gap": 0.008740882854908705,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.08833243977278471,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 1.2025973043993448,
+     "dist_rel": 0.05874293052115305,
+     "ms_step": 95.67851674550757,
+     "ms_opt": 79.19089881591032,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.89e-04); some perturbations may round to"
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08749003615230322,
+     "train": 0.07918670354411006,
+     "gap": 0.008303332608193159,
+     "test_start": 0.1082153245806694,
+     "test_full": 0.08745385613292456,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 1.1976627134078612,
+     "dist_rel": 0.056331985630885616,
+     "ms_step": 79.22999511374567,
+     "ms_opt": 65.82513486102111,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.68e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.08791147032752633,
+   "test_std": 0.0005959979262480445,
+   "gap_mean": 0.008522107731550932,
+   "gap_std": 0.0003093947465624092,
+   "train_mean": 0.0793893625959754,
+   "train_std": 0.0002866031796856353,
+   "test_start_mean": 0.10479873977601528,
+   "test_start_std": 0.00483178056773969,
+   "test_full_mean": 0.08789314795285463,
+   "test_full_std": 0.0006212524495846738,
+   "dist_ulp_mean": 1.2001300089036029,
+   "dist_rel_mean": 0.05753745807601933,
+   "ms_step_mean": 87.45425592962661,
+   "ms_opt_mean": 72.50801683846572
+  },
+  "nek-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08833189681172371,
+     "train": 0.07955339085310698,
+     "gap": 0.008778505958616734,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.08830499183386564,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.2563128171544875,
+     "dist_rel": 0.01657117963032278,
+     "ms_step": 51.17094123692142,
+     "ms_opt": 37.53395148028706,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.89e-04); some perturbations may round to"
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08746177796274424,
+     "train": 0.07915324904024601,
+     "gap": 0.008308528922498226,
+     "test_start": 0.1082153245806694,
+     "test_full": 0.08740801271051168,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.2549497545839297,
+     "dist_rel": 0.016168251955264584,
+     "ms_step": 45.99100066880534,
+     "ms_opt": 34.03223475657011,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.68e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.08789683738723397,
+   "test_std": 0.0006152669385516189,
+   "gap_mean": 0.00854351744055748,
+   "gap_std": 0.0003323239492413515,
+   "train_mean": 0.07935331994667649,
+   "train_std": 0.00028294298931026734,
+   "test_start_mean": 0.10479873977601528,
+   "test_start_std": 0.00483178056773969,
+   "test_full_mean": 0.08785650227218866,
+   "test_full_std": 0.0006342600207063485,
+   "dist_ulp_mean": 0.2556312858692086,
+   "dist_rel_mean": 0.01636971579279368,
+   "ms_step_mean": 48.58097095286338,
+   "ms_opt_mean": 35.78309311842858
+  },
+  "nek-k16": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08831307291984558,
+     "train": 0.07955797109752893,
+     "gap": 0.008755101822316647,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.0882970504462719,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.19376921785048573,
+     "dist_rel": 0.009722528290985038,
+     "ms_step": 56.46045175805725,
+     "ms_opt": 41.21252983196039,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.89e-04); some perturbations may round to"
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08745395392179489,
+     "train": 0.07915300503373146,
+     "gap": 0.00830094888806343,
+     "test_start": 0.1082153245806694,
+     "test_full": 0.08740183804184198,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.1909502313730024,
+     "dist_rel": 0.009171043976703134,
+     "ms_step": 58.8203157843205,
+     "ms_opt": 42.994290058953425,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 1.50e-05) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.68e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.08788351342082024,
+   "test_std": 0.000607488869367835,
+   "gap_mean": 0.008528025355190039,
+   "gap_std": 0.00032113461950621715,
+   "train_mean": 0.0793554880656302,
+   "train_std": 0.00028635424986161784,
+   "test_start_mean": 0.10479873977601528,
+   "test_start_std": 0.00483178056773969,
+   "test_full_mean": 0.08784944424405694,
+   "test_full_std": 0.0006330107617747053,
+   "dist_ulp_mean": 0.19235972461174405,
+   "dist_rel_mean": 0.009446786133844086,
+   "ms_step_mean": 57.64038377118888,
+   "ms_opt_mean": 42.1034099454569
+  },
+  "nek-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.08828483708202839,
+     "train": 0.07950542913749814,
+     "gap": 0.008779407944530249,
+     "test_start": 0.10136512294411659,
+     "test_full": 0.08828483708202839,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "ms_step": 64.96271335678291,
+     "ms_opt": 46.533923147854054,
+     "inert_warnings": [
+      "Nekaon: the lookahead displaces the weights by only 7.4e-05 relative (norm='none', lr=1.00e-05); below ~1e-04 this heuristic flags potentially inert lookahead. "
+     ]
+    },
+    {
+     "seed": 1,
+     "test": 0.08742044400423765,
+     "train": 0.07909283367916942,
+     "gap": 0.008327610325068235,
+     "test_start": 0.10823697503656149,
+     "test_full": 0.08742044400423765,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "ms_step": 41.70725746298195,
+     "ms_opt": 29.947032574961955,
+     "inert_warnings": [
+      "Nekaon: the lookahead displaces the weights by only 7.6e-05 relative (norm='none', lr=1.00e-05); below ~1e-04 this heuristic flags potentially inert lookahead. "
+     ]
+    }
+   ],
+   "test_mean": 0.08785264054313302,
+   "test_std": 0.0006112182069165412,
+   "gap_mean": 0.008553509134799242,
+   "gap_std": 0.00031946916044552884,
+   "train_mean": 0.07929913140833378,
+   "train_std": 0.00029174904647101226,
+   "test_start_mean": 0.10480104899033904,
+   "test_start_std": 0.004859133213878752,
+   "test_full_mean": 0.08785264054313302,
+   "test_full_std": 0.0006112182069165412,
+   "dist_ulp_mean": null,
+   "dist_rel_mean": null,
+   "ms_step_mean": 53.334985409882435,
+   "ms_opt_mean": 38.240477861408
+  }
+ }
+}

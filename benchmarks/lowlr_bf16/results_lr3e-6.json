@@ -1,0 +1,366 @@
+{
+ "manifest": {
+  "commit": "5e1e9ae484dc35e4336aa9e7eca1e38707c7df8d",
+  "branch": "feature/antikaon",
+  "config": {
+   "C": 40,
+   "bs": 8,
+   "pretrain": 300,
+   "steps": 8000,
+   "lr": 3e-06,
+   "seeds": [
+    0
+   ]
+  },
+  "pretrain_lr": 0.0012,
+  "schedule": "const",
+  "device": "cuda",
+  "dataset_fingerprint": "b0bad0f5fb622dd7a30641c8e1780b21fed818fddf8a430faf9a78b480399aef",
+  "arms": [
+   "ada-sr",
+   "ada-kahan",
+   "ada-k8",
+   "ada-k16",
+   "ada-fp32",
+   "nek-sr",
+   "nek-kahan",
+   "nek-k8",
+   "nek-k16",
+   "nek-fp32"
+  ],
+  "timing_warmup_steps": 20,
+  "timing_note": "ms/step and ms/opt are ORIENTATIVE (serial arms in one process, no power/clock control)"
+ },
+ "results": {
+  "ada-sr": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09235748182982206,
+     "train": 0.08627563016489148,
+     "gap": 0.006081851664930582,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.09233011864125729,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 5.762216547330933,
+     "dist_rel": 0.7459003331642932,
+     "ms_step": 24.62058609661303,
+     "ms_opt": 13.773369819060305,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.09235748182982206,
+   "test_std": 0.0,
+   "gap_mean": 0.006081851664930582,
+   "gap_std": 0.0,
+   "train_mean": 0.08627563016489148,
+   "train_std": 0.0,
+   "test_start_mean": 0.10138215497136116,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09233011864125729,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 5.762216547330933,
+   "dist_rel_mean": 0.7459003331642932,
+   "ms_step_mean": 24.62058609661303,
+   "ms_opt_mean": 13.773369819060305
+  },
+  "ada-kahan": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09229507576674223,
+     "train": 0.08621627371758223,
+     "gap": 0.006078802049160004,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.09227449912577868,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.06082213687322385,
+     "dist_rel": 0.020602877204948057,
+     "ms_step": 32.71284578007863,
+     "ms_opt": 22.704916390799042,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.09229507576674223,
+   "test_std": 0.0,
+   "gap_mean": 0.006078802049160004,
+   "gap_std": 0.0,
+   "train_mean": 0.08621627371758223,
+   "train_std": 0.0,
+   "test_start_mean": 0.10138215497136116,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09227449912577868,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.06082213687322385,
+   "dist_rel_mean": 0.020602877204948057,
+   "ms_step_mean": 32.71284578007863,
+   "ms_opt_mean": 22.704916390799042
+  },
+  "ada-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09228754509240389,
+     "train": 0.0862045451067388,
+     "gap": 0.006082999985665083,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.09227070026099682,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.11244910011064085,
+     "dist_rel": 0.01809759642255623,
+     "ms_step": 21.39435358441862,
+     "ms_opt": 12.29628663355844,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.09228754509240389,
+   "test_std": 0.0,
+   "gap_mean": 0.006082999985665083,
+   "gap_std": 0.0,
+   "train_mean": 0.0862045451067388,
+   "train_std": 0.0,
+   "test_start_mean": 0.10138215497136116,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09227070026099682,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.11244910011064085,
+   "dist_rel_mean": 0.01809759642255623,
+   "ms_step_mean": 21.39435358441862,
+   "ms_opt_mean": 12.29628663355844
+  },
+  "ada-k16": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09228488057851791,
+     "train": 0.08620719471946359,
+     "gap": 0.006077685859054327,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.09227523673325777,
+     "dist_ref": "ada-fp32",
+     "dist_ulp": 0.04287052514902651,
+     "dist_rel": 0.0052186739087145065,
+     "ms_step": 22.807221955225284,
+     "ms_opt": 13.033476685700858,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.09228488057851791,
+   "test_std": 0.0,
+   "gap_mean": 0.006077685859054327,
+   "gap_std": 0.0,
+   "train_mean": 0.08620719471946359,
+   "train_std": 0.0,
+   "test_start_mean": 0.10138215497136116,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09227523673325777,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.04287052514902651,
+   "dist_rel_mean": 0.0052186739087145065,
+   "ms_step_mean": 22.807221955225284,
+   "ms_opt_mean": 13.033476685700858
+  },
+  "ada-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09226077701896429,
+     "train": 0.08616219274699688,
+     "gap": 0.006098584271967411,
+     "test_start": 0.10136512294411659,
+     "test_full": 0.09226077701896429,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "ms_step": 34.98329016439299,
+     "ms_opt": 18.17406030663273,
+     "inert_warnings": []
+    }
+   ],
+   "test_mean": 0.09226077701896429,
+   "test_std": 0.0,
+   "gap_mean": 0.006098584271967411,
+   "gap_std": 0.0,
+   "train_mean": 0.08616219274699688,
+   "train_std": 0.0,
+   "test_start_mean": 0.10136512294411659,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09226077701896429,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": null,
+   "dist_rel_mean": null,
+   "ms_step_mean": 34.98329016439299,
+   "ms_opt_mean": 18.17406030663273
+  },
+  "nek-sr": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09215164929628372,
+     "train": 0.0858591329306364,
+     "gap": 0.006292516365647316,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.09212255012243986,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 4.778475273314611,
+     "dist_rel": 0.5768026716929361,
+     "ms_step": 71.71063850469757,
+     "ms_opt": 51.461874029212126,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 4.50e-06) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.89e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.09215164929628372,
+   "test_std": 0.0,
+   "gap_mean": 0.006292516365647316,
+   "gap_std": 0.0,
+   "train_mean": 0.0858591329306364,
+   "train_std": 0.0,
+   "test_start_mean": 0.10138215497136116,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09212255012243986,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 4.778475273314611,
+   "dist_rel_mean": 0.5768026716929361,
+   "ms_step_mean": 71.71063850469757,
+   "ms_opt_mean": 51.461874029212126
+  },
+  "nek-kahan": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.0921575017273426,
+     "train": 0.08583899959921837,
+     "gap": 0.006318502128124237,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.09211615845561028,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.14865174349750795,
+     "dist_rel": 0.03128822906074443,
+     "ms_step": 100.99179176579143,
+     "ms_opt": 83.45938280339827,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 4.50e-06) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.89e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.0921575017273426,
+   "test_std": 0.0,
+   "gap_mean": 0.006318502128124237,
+   "gap_std": 0.0,
+   "train_mean": 0.08583899959921837,
+   "train_std": 0.0,
+   "test_start_mean": 0.10138215497136116,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09211615845561028,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.14865174349750795,
+   "dist_rel_mean": 0.03128822906074443,
+   "ms_step_mean": 100.99179176579143,
+   "ms_opt_mean": 83.45938280339827
+  },
+  "nek-k8": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09214656706899405,
+     "train": 0.08581647276878357,
+     "gap": 0.006330094300210476,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.09210529644042253,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.179487937012815,
+     "dist_rel": 0.027222991250577137,
+     "ms_step": 49.02590518941855,
+     "ms_opt": 35.971054288677706,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 4.50e-06) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.89e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.09214656706899405,
+   "test_std": 0.0,
+   "gap_mean": 0.006330094300210476,
+   "gap_std": 0.0,
+   "train_mean": 0.08581647276878357,
+   "train_std": 0.0,
+   "test_start_mean": 0.10138215497136116,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09210529644042253,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.179487937012815,
+   "dist_rel_mean": 0.027222991250577137,
+   "ms_step_mean": 49.02590518941855,
+   "ms_opt_mean": 35.971054288677706
+  },
+  "nek-k16": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09215372987091541,
+     "train": 0.08582053147256374,
+     "gap": 0.006333198398351669,
+     "test_start": 0.10138215497136116,
+     "test_full": 0.0921036833897233,
+     "dist_ref": "nek-fp32",
+     "dist_ulp": 0.06689262759608762,
+     "dist_rel": 0.007426620583808553,
+     "ms_step": 64.9914741690595,
+     "ms_opt": 47.58989583448061,
+     "inert_warnings": [
+      "Nekaon: the lookahead displacement (<= 4.50e-06) is below half a torch.bfloat16 ulp at the sampled mean weight scale (7.89e-04); some perturbations may round to"
+     ]
+    }
+   ],
+   "test_mean": 0.09215372987091541,
+   "test_std": 0.0,
+   "gap_mean": 0.006333198398351669,
+   "gap_std": 0.0,
+   "train_mean": 0.08582053147256374,
+   "train_std": 0.0,
+   "test_start_mean": 0.10138215497136116,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.0921036833897233,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": 0.06689262759608762,
+   "dist_rel_mean": 0.007426620583808553,
+   "ms_step_mean": 64.9914741690595,
+   "ms_opt_mean": 47.58989583448061
+  },
+  "nek-fp32": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "test": 0.09210436418652534,
+     "train": 0.0857745804823935,
+     "gap": 0.006329783704131842,
+     "test_start": 0.10136512294411659,
+     "test_full": 0.09210436418652534,
+     "dist_ref": null,
+     "dist_ulp": null,
+     "dist_rel": null,
+     "ms_step": 123.75919520777269,
+     "ms_opt": 88.12785605057738,
+     "inert_warnings": [
+      "Nekaon: the lookahead displaces the weights by only 2.2e-05 relative (norm='none', lr=3.00e-06); below ~1e-04 this heuristic flags potentially inert lookahead. "
+     ]
+    }
+   ],
+   "test_mean": 0.09210436418652534,
+   "test_std": 0.0,
+   "gap_mean": 0.006329783704131842,
+   "gap_std": 0.0,
+   "train_mean": 0.0857745804823935,
+   "train_std": 0.0,
+   "test_start_mean": 0.10136512294411659,
+   "test_start_std": 0.0,
+   "test_full_mean": 0.09210436418652534,
+   "test_full_std": 0.0,
+   "dist_ulp_mean": null,
+   "dist_rel_mean": null,
+   "ms_step_mean": 123.75919520777269,
+   "ms_opt_mean": 88.12785605057738
+  }
+ }
+}

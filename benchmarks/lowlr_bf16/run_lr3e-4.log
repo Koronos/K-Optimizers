@@ -1,0 +1,28 @@
+  [ada-sr] seed=0 test=0.08462 (start 0.10138, fp32 view 0.08455) train=0.05171 gap=+0.03290 ms/step=34.54 (opt 19.08, orientative)
+  [ada-k8] seed=0 test=0.08477 (start 0.10138, fp32 view 0.08475) train=0.05130 gap=+0.03346 ms/step=36.92 (opt 21.00, orientative)
+  [ada-k16] seed=0 test=0.08477 (start 0.10138, fp32 view 0.08469) train=0.05158 gap=+0.03319 ms/step=36.66 (opt 20.82, orientative)
+  [ada-fp32] seed=0 test=0.08463 (start 0.10137, fp32 view 0.08463) train=0.05151 gap=+0.03313 ms/step=29.91 (opt 15.55, orientative)
+  [nek-sr] seed=0 test=0.07776 (start 0.10138, fp32 view 0.07774) train=0.04971 gap=+0.02806 ms/step=61.66 (opt 44.51, orientative)  inert-warning x1
+  [nek-k8] seed=0 test=0.07785 (start 0.10138, fp32 view 0.07783) train=0.04965 gap=+0.02820 ms/step=66.44 (opt 48.29, orientative)  inert-warning x1
+  [nek-k16] seed=0 test=0.07811 (start 0.10138, fp32 view 0.07806) train=0.04970 gap=+0.02841 ms/step=68.85 (opt 50.00, orientative)  inert-warning x1
+  [nek-fp32] seed=0 test=0.07803 (start 0.10137, fp32 view 0.07803) train=0.04952 gap=+0.02851 ms/step=57.18 (opt 41.03, orientative)
+  [ada-sr] seed=1 test=0.08133 (start 0.10822, fp32 view 0.08132) train=0.05331 gap=+0.02802 ms/step=37.20 (opt 20.56, orientative)
+  [ada-k8] seed=1 test=0.08080 (start 0.10822, fp32 view 0.08076) train=0.05290 gap=+0.02790 ms/step=37.04 (opt 21.11, orientative)
+  [ada-k16] seed=1 test=0.08084 (start 0.10822, fp32 view 0.08081) train=0.05296 gap=+0.02788 ms/step=37.44 (opt 21.35, orientative)
+  [ada-fp32] seed=1 test=0.08070 (start 0.10824, fp32 view 0.08070) train=0.05287 gap=+0.02783 ms/step=31.32 (opt 16.21, orientative)
+  [nek-sr] seed=1 test=0.07733 (start 0.10822, fp32 view 0.07728) train=0.05092 gap=+0.02641 ms/step=62.78 (opt 45.29, orientative)  inert-warning x1
+  [nek-k8] seed=1 test=0.07764 (start 0.10822, fp32 view 0.07764) train=0.05073 gap=+0.02692 ms/step=68.13 (opt 49.50, orientative)  inert-warning x1
+  [nek-k16] seed=1 test=0.07753 (start 0.10822, fp32 view 0.07746) train=0.05072 gap=+0.02681 ms/step=63.60 (opt 46.40, orientative)  inert-warning x1
+  [nek-fp32] seed=1 test=0.07768 (start 0.10824, fp32 view 0.07768) train=0.05060 gap=+0.02708 ms/step=59.96 (opt 42.83, orientative)
+
+arm         test (+-sd)          gap (+-sd)         d_start   test_full  dist_ulp  dist_rel  ms/step  ms/opt   (ms: orientative)
+ada-sr      0.08297(+-0.00232) +0.03046(+-0.00345) -0.02183  0.08293    29.038     0.373    35.87   19.82
+ada-k8      0.08278(+-0.00280) +0.03068(+-0.00393) -0.02202  0.08276     1.349     0.016    36.98   21.05
+ada-k16     0.08280(+-0.00278) +0.03053(+-0.00375) -0.02200  0.08275     1.296     0.015    37.05   21.08
+ada-fp32    0.08267(+-0.00278) +0.03048(+-0.00374) -0.02214  0.08267         -         -    30.61   15.88
+nek-sr      0.07755(+-0.00030) +0.02724(+-0.00116) -0.02725  0.07751    28.324     0.294    62.22   44.90
+nek-k8      0.07775(+-0.00015) +0.02756(+-0.00091) -0.02705  0.07774     7.493     0.073    67.28   48.90
+nek-k16     0.07782(+-0.00041) +0.02761(+-0.00113) -0.02698  0.07776     7.363     0.071    66.22   48.20
+nek-fp32    0.07785(+-0.00025) +0.02780(+-0.00101) -0.02695  0.07785         -         -    58.57   41.93
+wrote benchmarks/lowlr_bf16/results_lr3e-4.json
+DONE
