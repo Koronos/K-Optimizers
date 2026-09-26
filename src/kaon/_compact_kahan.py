@@ -65,6 +65,25 @@ sub-ulp part of ``e`` COHERENTLY every step — measured 25 ulp over 300 Nekaon 
 kahan8-aware: it perturbs and restores the DECODED value and re-encodes (with the residual's
 stochastic rounding), so the clean value survives to ~1/256 ulp per cycle, unbiased.
 
+**``kahan8ld``** (EXPERIMENTAL) is the ``kahan8`` codec and state (the same ``uint8``
+``kahan_lo``; a switch between the two is free) with the residual's stochastic rounding
+replaced by a LOW-DISCREPANCY dither: the 8-bit noise of write ``n`` on element ``i`` is
+
+    u8 = (h8(i) + r8(i, n // 256) + 159 * n) mod 256
+
+with ``h8`` a fixed per-element hash (the parameter's id and the element's flat index, never
+its slot in a stack), ``159 = round(0.618 * 256)`` a golden-ratio Weyl increment and ``r8`` a
+per-(element, 256-write block) random phase. Over the hash each write is unbiased like SR;
+along ``n`` the thresholds are a Weyl sequence, so a sub-grid step is realised like a
+sigma-delta modulator (bounded error instead of a ``sqrt(N)`` walk: 0.005 vs 0.5 ulp on a
+coherent drift and 0.24 vs 0.46 ulp on an Adam-like stream at 100k steps). The block phase
+is what keeps it safe: the pure Weyl dither ALIASES with an update of period 2 or 3 (1.9 /
+1.6 ulp at 100k with a -0.1 ulp directional bias, against 0.66 / 0.63 for ``kahan8``), and
+re-randomising the phase every 256 writes cuts that to 0.15 / 0.12 ulp (a residual -0.008 /
+-0.004 ulp directional bias remains). See ``docs/research/compact-kahan/lowdisc/``. The
+noise is deterministic, so every writer (torch per-param, stacked, Triton) produces the same
+bits; the counter ``n`` comes from the owner's checkpointed step (:class:`LDNoise`).
+
 The Triton kernels in :mod:`kaon._fused_triton` (``ck_decode`` / ``ck_store``, and the
 one-launch ``ck_add_`` the native writers prefer on CUDA) implement the identical bit
 manipulation; the torch functions here are the reference and the CPU / non-contiguous path.
@@ -80,8 +99,11 @@ from torch import Tensor
 from kaon._stochastic_rounding import SRStream, _device_generator
 
 __all__ = [
+    "CK_LD8",
     "COMPACT_KAHAN_BITS",
     "COMPACT_KAHAN_METHODS",
+    "LDNoise",
+    "LD_METHODS",
     "RESIDUAL_KEY",
     "compensated_add_",
     "convert_residual",
@@ -89,6 +111,9 @@ __all__ = [
     "encode_",
     "init_residual",
     "is_compact_kahan",
+    "is_low_discrepancy",
+    "ld_key",
+    "ld_noise",
     "residual_bits",
     "residual_bits_of",
     "residual_dtype",
@@ -99,8 +124,17 @@ __all__ = [
 #: ``_foreach_copy_`` on CUDA, so the bits are stored in the signed type and every reader
 #: masks them back to ``[0, 2**16)``). With 16 bits the pair ``(w, lo)`` IS an fp32: the
 #: residual is the fp32's low half, bit for bit, and ``w`` its high half rounded half-away.
-COMPACT_KAHAN_BITS: dict[str, int] = {"kahan8": 8, "kahan16": 16}
+COMPACT_KAHAN_BITS: dict[str, int] = {"kahan8": 8, "kahan16": 16, "kahan8ld": 8}
 COMPACT_KAHAN_METHODS = tuple(COMPACT_KAHAN_BITS)
+
+#: Compact-Kahan methods whose residual rounding is the low-discrepancy dither (EXPERIMENTAL,
+#: see the module doc). Every write under them needs an :class:`LDNoise`.
+LD_METHODS = ("kahan8ld",)
+
+#: The fused kernels' ``CK`` constexpr for ``kahan8ld``: the 8-bit codec with the LD dither
+#: (``8`` / ``16`` are the plain widths). The residual pointer array of a ``CK_LD8`` launch is
+#: interleaved ``[ptr_0, key_0, ptr_1, key_1, ...]`` and its ``seed`` is the write counter.
+CK_LD8 = 9
 
 #: The per-parameter state key holding the residual (``p.shape``; ``torch.uint8`` under
 #: ``kahan8``, ``torch.int16`` under ``kahan16`` — the dtype says which codec wrote it).
@@ -114,6 +148,10 @@ _FLT_MAX = 3.4028234663852886e38
 
 def is_compact_kahan(bf16_method: str) -> bool:
     return bf16_method in COMPACT_KAHAN_BITS
+
+
+def is_low_discrepancy(bf16_method: str) -> bool:
+    return bf16_method in LD_METHODS
 
 
 def residual_bits(bf16_method: str) -> int:
@@ -224,6 +262,105 @@ def encode_(z: Tensor, p: Tensor, lo: Tensor, bits: int = 8, noise: Tensor | Non
     lo.copy_(q)                                  # uint8 (bits <= 8) or int16 (bits == 16)
 
 
+# ----------------------------------------------------------------------------- kahan8ld
+#: Fixed salt of the per-parameter keys (any constant: it only picks WHICH fixed dither
+#: pattern every run uses; a resume reproduces it because it is a constant).
+_LD_SEED = 0x6A09E667
+_LD_GOLDEN = 0x9E3779B1
+#: Salt of the per-block phase, so ``r8`` is not a function of ``h8`` alone.
+_LD_BLOCK_SALT = 0x3C6EF372
+#: Golden-ratio Weyl increment at 8 bits (odd): ``round(0.618034 * 256)``.
+LD_INCREMENT = 159
+#: Writes per random-phase block (``r8`` is re-drawn every ``2**LD_BLOCK_SHIFT`` writes).
+LD_BLOCK_SHIFT = 8
+
+
+def _mix32(x: int) -> int:
+    """lowbias32 (C. Wellons): a 32-bit avalanche bijection. Python ints; the tensor twin is
+    :func:`_mix32_t` and the Triton one ``kaon._fused_triton.ld_mix32`` — all bit-identical."""
+    x &= 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x ^= x >> 15
+    x = (x * 0x846CA68B) & 0xFFFFFFFF
+    x ^= x >> 16
+    return x
+
+
+def ld_key(pid: int) -> int:
+    """The 32-bit hash key of parameter number ``pid`` (its ordinal in the optimizer)."""
+    return _mix32(((pid + 1) * _LD_GOLDEN) ^ _LD_SEED)
+
+
+def ld_block_mix(n: int) -> int:
+    """The 32-bit mix of write ``n``'s random-phase block (shared by every element)."""
+    return _mix32((((n >> LD_BLOCK_SHIFT) + 1) * _LD_GOLDEN) ^ _LD_BLOCK_SALT)
+
+
+def _mul32_t(x: Tensor, c: int) -> Tensor:
+    """``(x * c) mod 2**32`` for an int64 tensor ``x`` in ``[0, 2**32)``, exactly: split in
+    16-bit halves so no product leaves int64 (a plain ``x * c`` would overflow it)."""
+    lo = (x & 0xFFFF) * c
+    hi = ((x >> 16) * (c & 0xFFFF)) << 16
+    return (lo + hi) & 0xFFFFFFFF
+
+
+def _mix32_t(x: Tensor) -> Tensor:
+    """:func:`_mix32` on an int64 tensor in ``[0, 2**32)``."""
+    x = x ^ (x >> 16)
+    x = _mul32_t(x, 0x7FEB352D)
+    x ^= x >> 15
+    x = _mul32_t(x, 0x846CA68B)
+    x ^= x >> 16
+    return x
+
+
+@torch.no_grad()
+def ld_noise(keys: tuple[int, ...] | list[int], row_len: int, n: int,
+             device: torch.device | str) -> Tensor:
+    """The ``kahan8ld`` residual noise (int32 in ``[0, 256)``, shape ``[len(keys), row_len]``)
+    of write ``n`` over rows keyed ``keys`` whose elements are ``0 .. row_len-1``:
+
+        h = mix32(i ^ key);  r = mix32(h ^ block_mix(n))
+        u8 = ((h >> 24) + (r >> 24) + 159 * n) mod 256
+
+    Reference (torch) implementation; ``kaon._fused_triton.ld_noise_dev`` is its bit twin.
+    """
+    k = torch.tensor(list(keys), dtype=torch.int64, device=device).view(-1, 1)
+    h = _mix32_t(torch.arange(row_len, dtype=torch.int64, device=device).view(1, -1) ^ k)
+    r = _mix32_t(h ^ ld_block_mix(n))
+    u = (h >> 24).add_(r >> 24).add_((n * LD_INCREMENT) & 0xFF).bitwise_and_(0xFF)
+    return u.to(torch.int32)
+
+
+class LDNoise:
+    """The noise of ONE ``kahan8ld`` write, handed to the compact-Kahan writers in the slot
+    that otherwise takes the owner's :class:`~kaon._stochastic_rounding.SRStream` (``sr=``).
+
+    ``keys``: one :func:`ld_key` per ROW of the written tensor (one for a per-param write, one
+    per stacked param for a foreach bucket / climb). ``n``: the write counter — derived by the
+    owner from its checkpointed step, one distinct value per write of a step (the climb, the
+    removal and the base step each get their own), so a resume reproduces the dither exactly.
+    """
+
+    __slots__ = ("keys", "n")
+
+    def __init__(self, keys: tuple[int, ...] | list[int], n: int) -> None:
+        if n < 0 or n >= 1 << 31:
+            raise ValueError(f"kahan8ld write counter out of range: {n}")
+        self.keys = tuple(keys)
+        self.n = int(n)
+
+    def noise(self, shape: torch.Size, device: torch.device) -> Tensor:
+        numel = 1
+        for s in shape:
+            numel *= s
+        rows = len(self.keys)
+        if rows == 0 or numel % rows:
+            raise ValueError(f"kahan8ld: {rows} keys do not tile a tensor of {numel} elements")
+        return ld_noise(self.keys, numel // rows, self.n, device).view(shape)
+
+
 @torch.no_grad()
 def compensated_add_(
     p: Tensor,
@@ -231,7 +368,7 @@ def compensated_add_(
     delta: Tensor,
     alpha: float = 1.0,
     bits: int = 8,
-    sr: SRStream | None = None,
+    sr: SRStream | LDNoise | None = None,
     stochastic: bool = True,
     rows: bool = False,
 ) -> None:
@@ -252,7 +389,13 @@ def compensated_add_(
     write uses, so a resume reproduces it and a stacked (foreach) draw consumes the same
     sequence as the equivalent per-param draws (the torch path's ``foreach == per-param``
     identity). ``None`` falls back to the process-wide generator.
+
+    ``sr`` may instead be an :class:`LDNoise` (``kahan8ld``): the residual is then rounded with
+    that write's deterministic low-discrepancy dither (8 bits only).
     """
+    ld = isinstance(sr, LDNoise)
+    if ld and bits != 8:
+        raise ValueError(f"the low-discrepancy residual rounding is 8-bit only (bits={bits})")
     z = decode(p, lo, bits)
     d = delta if delta.dtype == torch.float32 else delta.float()
     if rows and bits == 16 and z.ndim > 1:
@@ -260,7 +403,9 @@ def compensated_add_(
     else:
         z.add_(d, alpha=alpha)
     noise = None
-    if stochastic and bits < 16:
+    if ld:
+        noise = sr.noise(z.shape, z.device)
+    elif stochastic and bits < 16:
         gen = _device_generator(z.device) if sr is None else sr.generator(z.device)
         noise = torch.randint(0, 1 << (16 - bits), z.shape, dtype=torch.int32,
                               device=z.device, generator=gen)

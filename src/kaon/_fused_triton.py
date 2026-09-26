@@ -441,17 +441,59 @@ if _HAS_TRITON:
         return tl.where(finite, rounded, ibits).to(tl.float32, bitcast=True)
 
     @triton.jit
+    def ld_mix32(x):
+        """lowbias32 on ``uint32`` lanes — the bit twin of ``kaon._compact_kahan._mix32``."""
+        x = x ^ (x >> 16)
+        x = x * 0x7FEB352D
+        x = x ^ (x >> 15)
+        x = x * 0x846CA68B
+        x = x ^ (x >> 16)
+        return x
+
+    @triton.jit
+    def ld_noise_dev(key, idx, n):
+        """``kahan8ld`` residual noise in ``[0, 256)`` (int32) of write ``n`` (``uint32``) on
+        the elements ``idx`` of the parameter keyed ``key`` (``uint32``) — the bit twin of
+        ``kaon._compact_kahan.ld_noise``: ``h = mix32(i ^ key)``, ``r = mix32(h ^ mix32(
+        (n // 256 + 1) * golden ^ salt))``, ``u8 = (h>>24 + r>>24 + 159 n) mod 256``."""
+        h = ld_mix32(idx.to(tl.uint32) ^ key)
+        bm = ld_mix32((((n >> 8) + 1) * 0x9E3779B1) ^ 0x3C6EF372)
+        r = ld_mix32(h ^ bm)
+        u = ((h >> 24) + (r >> 24) + ((n * 159) & 0xFF)) & 0xFF
+        return u.to(tl.int32)
+
+    @triton.jit
     def ck_ptr(c_addr, t, BITS: tl.constexpr):
         """The residual pointer of tensor ``t`` in a compact-Kahan pointer array: ``uint8``
-        for ``kahan8``, ``int16`` (the uint16 pattern in signed storage) for ``kahan16``."""
-        base = tl.load(c_addr + t)
-        if BITS == 16:
-            return base.to(tl.pointer_type(tl.int16))
+        for ``kahan8``, ``int16`` (the uint16 pattern in signed storage) for ``kahan16``.
+
+        ``BITS == 9`` (``kahan8ld``, ``kaon._compact_kahan.CK_LD8``): the array is interleaved
+        ``[ptr, key]`` per tensor and the HANDLE returned is the tuple ``(uint8 ptr, key, t)``
+        that :func:`ck_decode` / :func:`ck_store` unpack — so no kernel body changes: the
+        caller's ``seed + t`` becomes the write counter again inside ``ck_store`` (the host
+        passes the counter as ``seed``), and the key is the parameter's, not its slot's."""
+        if BITS == 9:
+            base = tl.load(c_addr + 2 * t)
+            key = tl.load(c_addr + 2 * t + 1).to(tl.uint32)
+            return base.to(tl.pointer_type(tl.uint8)), key, t
         else:
-            return base.to(tl.pointer_type(tl.uint8))
+            base = tl.load(c_addr + t)
+            if BITS == 16:
+                return base.to(tl.pointer_type(tl.int16))
+            else:
+                return base.to(tl.pointer_type(tl.uint8))
 
     @triton.jit
     def ck_decode(pp, cp, idx, mask, BITS: tl.constexpr):
+        """:func:`ck_decode_w` for a ``CK`` code: ``9`` (``kahan8ld``) decodes the 8-bit codec
+        through the ``(ptr, key, t)`` handle of :func:`ck_ptr`."""
+        if BITS == 9:
+            return ck_decode_w(pp, cp[0], idx, mask, 8)
+        else:
+            return ck_decode_w(pp, cp, idx, mask, BITS)
+
+    @triton.jit
+    def ck_decode_w(pp, cp, idx, mask, BITS: tl.constexpr):
         """Compact Kahan: the exact compensated fp32 value of ``(bf16 weight, residual)``.
 
         Integer-only mirror of :func:`kaon._compact_kahan.decode`: the pair IS an fp32 whose
@@ -499,6 +541,18 @@ if _HAS_TRITON:
 
     @triton.jit
     def ck_store(pp, cp, idx, mask, res, seed, BITS: tl.constexpr):
+        """:func:`ck_store_sr` for a ``CK`` code. ``9`` (``kahan8ld``): ``cp`` is the
+        ``(ptr, key, t)`` handle of :func:`ck_ptr` and ``seed`` the caller's ``counter + t``;
+        the residual is rounded with the deterministic low-discrepancy dither of write
+        ``counter`` (:func:`ld_noise_dev`) instead of a Philox draw."""
+        if BITS == 9:
+            n = (seed - cp[2]).to(tl.uint32)
+            ck_store_noise(pp, cp[0], idx, mask, res, ld_noise_dev(cp[1], idx, n), 8)
+        else:
+            ck_store_sr(pp, cp, idx, mask, res, seed, BITS)
+
+    @triton.jit
+    def ck_store_sr(pp, cp, idx, mask, res, seed, BITS: tl.constexpr):
         """:func:`ck_store_noise` with stochastic rounding: the same ``tl.rand(seed, idx)``
         draw ``sr_round`` uses, scaled to the ``2**(16-BITS)`` dropped bits instead of the 16 a
         bf16 cast drops — unbiased at the finer grid. The clamp to ``UNIT-1`` is a guard, not
@@ -557,6 +611,22 @@ if _HAS_TRITON:
         z = ck_decode(p_ptr, c_ptr, offs, mask, BITS)
         d = tl.load(d_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         ck_store(p_ptr, c_ptr, offs, mask, z + alpha * d, seed, BITS)
+
+    @triton.jit(do_not_specialize=["ctr"])   # a counter of 1 must not become a constexpr
+    def _ck_axpy_ld_kernel(p_ptr, c_ptr, d_ptr, alpha, n, key_ptr, L, ctr, BLOCK: tl.constexpr):
+        """:func:`_ck_axpy_kernel` for ``kahan8ld``: ``(p, lo) += alpha * d`` over ``n``
+        elements laid out as rows of ``L`` (one param per row, keyed ``key_ptr[row]``), the
+        residual rounded with write ``ctr``'s low-discrepancy dither — the torch reference's
+        (``kaon._compact_kahan.compensated_add_`` with an ``LDNoise``) bits exactly."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        row = offs // L
+        key = tl.load(key_ptr + row, mask=mask, other=0).to(tl.uint32)
+        z = ck_decode_w(p_ptr, c_ptr, offs, mask, 8)
+        d = tl.load(d_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        noise = ld_noise_dev(key, offs - row * L, ctr.to(tl.uint32))
+        ck_store_noise(p_ptr, c_ptr, offs, mask, z + alpha * d, noise, 8)
 
     @triton.jit
     def dequant_int8(code_ptr, idx, mask, scale_ptr, rr, R):
@@ -2502,15 +2572,39 @@ def ck_add_supported(target, lo, source, bits: int = 8) -> bool:
     )
 
 
+def ld_ptr_array(residuals: list, keys, device) -> torch.Tensor:
+    """The ``CK_LD8`` (``kahan8ld``) residual pointer array: ``[ptr_0, key_0, ptr_1, key_1,
+    ...]`` as int64 on ``device`` — see :func:`ck_ptr`."""
+    flat = []
+    for lo, key in zip(residuals, keys, strict=True):
+        flat += [lo.data_ptr(), int(key)]
+    return torch.tensor(flat, dtype=torch.int64, device=device)
+
+
 @torch.no_grad()
 def ck_add_(target, lo, source, alpha: float = 1.0, bits: int = 8, sr: SRStream | None = None) -> None:
     """``(target, lo) += alpha * source`` with the compact-Kahan codec, in ONE Triton launch.
 
     The caller must have checked :func:`ck_add_supported`. ``sr`` is the caller's noise
     stream, exactly as for :func:`sr_add_` (its next draw seeds the residual's stochastic
-    rounding; checkpointed, so a resume reproduces it).
+    rounding; checkpointed, so a resume reproduces it). An
+    :class:`~kaon._compact_kahan.LDNoise` instead (``kahan8ld``) takes the low-discrepancy
+    kernel, keyed per row: bit-identical to the torch reference.
     """
     n = target.numel()
+    from kaon._compact_kahan import LDNoise
+    if isinstance(sr, LDNoise):
+        if bits != 8:
+            raise ValueError(f"the low-discrepancy residual rounding is 8-bit only (bits={bits})")
+        rows = len(sr.keys)
+        if rows == 0 or n % rows:
+            raise ValueError(f"kahan8ld: {rows} keys do not tile a tensor of {n} elements")
+        keys = torch.tensor(sr.keys, dtype=torch.int64).to(target.device, non_blocking=True)
+        with torch.cuda.device(target.device):
+            _ck_axpy_ld_kernel[((n + 1023) // 1024,)](
+                target, lo, source, alpha, n, keys, n // rows, sr.n, BLOCK=1024,
+            )
+        return
     stream = _PROCESS_SR_STREAM if sr is None else sr
     seed = stream.next_seed(target.device)
     with torch.cuda.device(target.device):

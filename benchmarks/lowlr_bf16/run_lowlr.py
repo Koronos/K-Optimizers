@@ -10,7 +10,7 @@ rationale) that does NOT depend on Antikaon: two rules, every ``bf16_method``.
   (``--pretrain`` steps, cached per seed under ``cache/``), rounded ONCE to bf16; every arm
   fine-tunes from that same bf16-representable start with the same data order.
 
-Arms (``--arms``, comma-separated keys): ``{ada,nek}-{sr,kahan,k8,k16,fp32}``
+Arms (``--arms``, comma-separated keys): ``{ada,nek}-{sr,kahan,k8,k8ld,k16,fp32}``
 
   ada-*   Adakaon-nomom (registry config: betas (0, 0.999), cautious off, bf16 momentum)
   nek-*   Nekaon (registry config: k 1.5, betas (0.5, 0.999), wd 0.1, 4-bit momentum)
@@ -18,13 +18,15 @@ Arms (``--arms``, comma-separated keys): ``{ada,nek}-{sr,kahan,k8,k16,fp32}``
   *-kahan bf16 weights, legacy ``kahan`` (bf16 ``shift`` buffer, +2 B/param, PER-PARAM path
           only — foreach/fused reject it, so its ms/step is the per-param loop's)
   *-k8    bf16 weights, ``kahan8`` (uint8 residual, +1 B/param, every path)
+  *-k8ld  bf16 weights, ``kahan8ld`` (EXPERIMENTAL: kahan8's state with the residual rounded
+          by a low-discrepancy dither instead of SR — ``docs/research/compact-kahan/lowdisc/``)
   *-k16   bf16 weights, ``kahan16`` (int16 residual, +2 B/param: an fp32 master split in two)
   *-fp32  fp32 weights — the ceiling and the reference each rule's distances are taken to
 
 Metrics per arm and seed (the ``antikaon_lowlr`` set): held-out ``test`` and ``train`` loss at
 the CLEAN weights (``evald``: eval()/train() bracket — Nekaon is scored without its climb),
 ``gap = test - train``, ``test_start``, ``test_full`` (the same clean iterate at its FULL value
-in an fp32 copy of the net: ``decode(p, kahan_lo)`` for kahan8/kahan16, ``p + shift`` for the
+in an fp32 copy of the net: ``decode(p, kahan_lo)`` for kahan8/kahan8ld/kahan16, ``p + shift`` for the
 legacy kahan, ``p`` otherwise), and the distance of that full value to the rule's fp32 arm:
 ``dist_ulp`` (RMS in bf16 ulps of the reference, per tensor at its RMS magnitude) and
 ``dist_rel = ||z - z_fp32|| / ||z_fp32 - z_start||``.
@@ -37,8 +39,9 @@ speed comparison needs a dedicated serial benchmark.
 
 Usage (from the repo root, ``PYTHONPATH=src``):
     python benchmarks/lowlr_bf16/run_lowlr.py --smoke                  # plumbing: few steps, all arms
-    python benchmarks/lowlr_bf16/run_lowlr.py                          # 10 arms x seeds 0,1, 8000 steps
+    python benchmarks/lowlr_bf16/run_lowlr.py                          # 12 arms x seeds 0,1, 8000 steps
     python benchmarks/lowlr_bf16/run_lowlr.py --lr 1e-5 --seeds 0,1 --steps 8000 --arms ada-k8,ada-k16,ada-fp32
+    python benchmarks/lowlr_bf16/run_lowlr.py --arms ada-k8,ada-k8ld,ada-fp32,nek-k8,nek-k8ld,nek-fp32
 """
 from __future__ import annotations
 
@@ -106,7 +109,8 @@ def _nek(method):
 
 
 BF, FP = torch.bfloat16, torch.float32
-METHODS = {"sr": "stochastic_rounding", "kahan": "kahan", "k8": "kahan8", "k16": "kahan16"}
+METHODS = {"sr": "stochastic_rounding", "kahan": "kahan", "k8": "kahan8", "k8ld": "kahan8ld",
+           "k16": "kahan16"}
 RULES = {"ada": _ada, "nek": _nek}
 # key -> (make, weight dtype, rule id: arms of the same rule share the fp32 reference)
 ARMS: dict[str, tuple] = {}

@@ -65,7 +65,15 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kaon._backend import _ck_write_, ensure_residuals
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits, residual_bits_of
+from kaon._compact_kahan import (
+    CK_LD8,
+    LD_METHODS,
+    RESIDUAL_KEY,
+    LDNoise,
+    is_compact_kahan,
+    residual_bits,
+    residual_bits_of,
+)
 from kaon._foreach_plan import state_generation
 from kaon._wrappers import CodecBuffer, WrapsInnerOptimizer
 
@@ -238,6 +246,13 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                     f"Use a base with a kaon-codec first moment (Adakaon, Lion, …), "
                     f"or set rho=0 for a passthrough."
                 )
+        # kahan8ld (experimental): three weight writes per step — the removal at the top, the
+        # base step, the climb at the end — each with its own low-discrepancy write counter
+        # ``n = 3*_t + {0, 1, 2}`` off the owner's checkpointed step (see _ld_noise).
+        if self.rho != 0.0:
+            owner = self._momentum_owner()
+            if hasattr(owner, "_ld_stride"):
+                owner._ld_stride, owner._ld_slot = 3, 1
         # Live weights carry the perturbation only while (training mode AND a momentum
         # exists). eval()/train() toggle the mode; _has_e tracks whether a perturbation
         # is currently defined (false until the first inner step populates momentum).
@@ -326,6 +341,28 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             for key, (plist, states, g) in by_key.items()
         ]
         return self._bucket_cache
+
+    def _ld_noise(self, plist: list[Tensor], sign: float) -> LDNoise:
+        """The ``kahan8ld`` noise of a climb (``sign > 0``, slot 2 of step ``_t``) or a removal
+        (slot 0 of step ``_t + 1``: the removal runs before the owner advances ``_t``), keyed
+        by the OWNER's per-param keys so the climb and the base step dither the same elements
+        with the same pattern. An ``eval()``/``train()`` pair re-uses the counters of the
+        surrounding removal/climb (deterministic, so a resume from an eval-mode checkpoint
+        reproduces it)."""
+        return LDNoise(self._ld_owner()._ld_keys_for(plist), self._ld_n(sign))
+
+    def _ld_owner(self) -> Any:
+        owner = self._momentum_owner()
+        if not hasattr(owner, "_ld_counter"):
+            raise NotImplementedError(
+                f"bf16_method='kahan8ld' needs a base that threads the low-discrepancy noise "
+                f"(Adakaon), not {type(owner).__name__}"
+            )
+        return owner
+
+    def _ld_n(self, sign: float) -> int:
+        """The ``kahan8ld`` write counter of a climb / removal — see :meth:`_ld_noise`."""
+        return self._ld_owner()._ld_counter(2 if sign > 0.0 else 3)
 
     def _climb_bound(self, group: dict[str, Any], sign: float) -> float:
         """Per-element cap on the climb: ``|e_i| <= |rho| * clip_threshold * lr``.
@@ -532,7 +569,9 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
                 # this wrapper's own stream, so it is checkpointed like the SR write's.
                 weights = torch.stack([p.data for p in plist])
                 lows = torch.stack([st[RESIDUAL_KEY] for st in states])
-                _ck_write_(weights, lows, m, 1.0, ck_bits, sr=self.sr_stream)
+                noise = (self._ld_noise(plist, sign) if group.get("bf16_method") in LD_METHODS
+                         else self.sr_stream)
+                _ck_write_(weights, lows, m, 1.0, ck_bits, sr=noise)
                 torch._foreach_copy_([p.data for p in plist], list(weights.unbind(0)))
                 torch._foreach_copy_([st[RESIDUAL_KEY] for st in states], list(lows.unbind(0)))
             else:  # low-precision weights: round-to-nearest, deliberately NOT stochastic
@@ -576,6 +615,8 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             ck = _ck_ready(group, plist, states, sign > 0.0)
             if ck and not all(st[RESIDUAL_KEY].is_contiguous() for st in states):
                 ok = False
+            if ck == 8 and group.get("bf16_method") in LD_METHODS:
+                ck = CK_LD8          # kahan8ld: keyed residual array + counter seed (below)
             if ok:
                 block = states[0].get("m_block", 1)
                 row_width = plist[0].numel() // plist[0].shape[0] if plist[0].ndim >= 2 else plist[0].numel()
@@ -601,9 +642,11 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             # retained Tensor refs: a base that reassigns st["m"] keeps the old Tensor
             # alive in a witness field (its data_ptr never changes) while the dict
             # already points at a new buffer — the plan would stay falsely valid.
+            lows = [st[RESIDUAL_KEY] for st in states] if ck else None
             buckets.append(dict(
                 p_addr=ft.ptr_array(plist, dev),
-                c_addr=ft.ptr_array([st[RESIDUAL_KEY] for st in states], dev) if ck else None,
+                c_addr=(ft.ld_ptr_array(lows, self._ld_owner()._ld_keys_for(plist), dev)
+                        if ck == CK_LD8 else ft.ptr_array(lows, dev) if ck else None),
                 ck=ck,                                   # residual width (8/16), 0 = plain
                 plist=plist,
                 states=states,
@@ -659,9 +702,11 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
             # one removal + one climb. O(1) per bucket unless the method and the plan
             # disagree. A kahan8 <-> kahan16 conversion replaces the residual tensors: the
             # c_addrs check below.
-            if (bk.get("lowp")
-                    and bool(bk["ck"]) != is_compact_kahan(bk["group"].get("bf16_method", ""))):
-                return False
+            if bk.get("lowp"):
+                method = bk["group"].get("bf16_method", "")
+                if (bool(bk["ck"]) != is_compact_kahan(method)
+                        or (bk["ck"] == CK_LD8) != (method in LD_METHODS)):   # kahan8 <-> kahan8ld
+                    return False
             c_addrs = bk.get("c_addrs")
             if c_addrs is not None and (
                 any(RESIDUAL_KEY not in st for st in states)
@@ -680,13 +725,20 @@ class MSAM(WrapsInnerOptimizer, Optimizer):
     def _launch_fused(self, cache: dict[str, Any], sign: float, scale: float, ft: Any) -> None:
         """Launch a cached fused perturbation plan."""
         self._axpy_seed += 1
+        ld_n = None
         for bk in cache["buckets"]:
             alpha = sign * self.rho * scale * self._climb_step_scale(bk["group"], sign)
+            if bk["ck"] == CK_LD8:               # kahan8ld: the seed IS the write counter
+                if ld_n is None:
+                    ld_n = self._ld_n(sign)
+                seed = ld_n
+            else:
+                seed = _climb_seed(self._axpy_seed)
             ft._axpy_momentum_batched[(bk["N"] * bk["K"],)](
                 bk["p_addr"], bk["c_addr"] if bk["c_addr"] is not None else bk["p_addr"],
                 bk["m_addr"], bk["sc_addr"], alpha,
                 self._climb_bound(bk["group"], sign), bk["n"], bk["K"], bk["row_width"],
-                _climb_seed(self._axpy_seed), MOM=bk["mom"], FBLOCK=bk["block"],
+                seed, MOM=bk["mom"], FBLOCK=bk["block"],
                 # SR=False: round-to-nearest, matching the torch path. See the bf16 note.
                 # CK (kahan8/kahan16): decoded-value climb — see the kernel's doc.
                 LOWP=bk["lowp"], SR=False, BLOCK=1024, CK=bk["ck"],

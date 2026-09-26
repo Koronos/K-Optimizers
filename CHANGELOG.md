@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **EXPERIMENTAL: `bf16_method="kahan8ld"` — `kahan8` with a low-discrepancy residual
+  dither.** Same codec and state as `kahan8` (one `uint8` `kahan_lo` per bf16 param; a switch
+  between the two reuses the residual as is), but the residual's 8 dropped bits are rounded
+  with `u8 = (h8(i) + r8(i, n // 256) + 159·n) mod 256` instead of fresh SR noise: `h8` a
+  fixed hash of the parameter's ordinal in the optimizer and the element's flat index (never
+  its slot in a stack), `159` the golden-ratio Weyl increment, `r8` a random phase re-drawn
+  every 256 writes, and `n` the write counter derived from the checkpointed step (Adakaon's
+  `_t`, which the native path now advances too) — one distinct `n` per write of a step, so
+  under MSAM/Nekaon the removal, the base step and the climb use `3t`, `3t+1`, `3t+2`. Each
+  block of 256 writes takes every noise value once per element, so the rounding is exactly
+  unbiased over a period; along time it acts like a sigma-delta modulator. Simulated at 100k
+  steps (`docs/research/compact-kahan/lowdisc/`): coherent drift 0.005 vs 0.5 ulp for
+  `kahan8`, Adam-like 0.24 vs 0.46, noise-dominated 0.42 vs 0.60; the block phase is the
+  remedy against the pure Weyl dither's aliasing with period-2/3 updates (1.9/1.6 ulp with a
+  −0.1 ulp directional bias → 0.15/0.12 ulp; a small −0.008/−0.004 ulp directional bias
+  remains). Worst case over the nine simulated regimes: 0.71× `kahan8`'s error. The noise is
+  deterministic, so per-param and foreach writes are bit-identical, a resume continues
+  bit-identically, and the Triton paths (Adakaon's fused kernels through a keyed `ck_ptr`
+  handle, `CK=9`; the one-launch native CUDA writer; the MSAM/Nekaon fused climb) produce the
+  torch reference's bits for the same inputs. Accepted by Adakaon and MSAM/Nekaon over it
+  only: the other optimizers refuse it at construction and any writer handed no
+  low-discrepancy noise (a group switched to it on another optimizer, Lookahead's sync)
+  raises instead of silently falling back to SR. Whether the simulated gain shows up in
+  training is still to be measured: `benchmarks/lowlr_bf16/run_lowlr.py` has the
+  `ada-k8ld` / `nek-k8ld` arms.
+
 ## [0.7.15] - 2026-09-25
 
 Includes the entries below that shipped without their own heading in 0.7.14.

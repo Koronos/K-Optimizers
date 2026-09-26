@@ -34,7 +34,9 @@ import torch
 from torch import Tensor
 
 from kaon._compact_kahan import (
+    LD_METHODS,
     RESIDUAL_KEY,
+    LDNoise,
     compensated_add_,
     convert_residual,
     init_residual,
@@ -83,10 +85,26 @@ def is_low_precision(t: Tensor) -> bool:
     return t.dtype in LOW_PRECISION
 
 
-def validate_bf16_method(bf16_method: str) -> None:
-    if bf16_method not in BF16_METHODS:
+def validate_bf16_method(bf16_method: str, low_discrepancy: bool = False) -> None:
+    """Refuse an unknown ``bf16_method``. ``low_discrepancy=True`` also admits the EXPERIMENTAL
+    ``"kahan8ld"`` (:data:`kaon._compact_kahan.LD_METHODS`) — only for an optimizer whose
+    writers hand an :class:`~kaon._compact_kahan.LDNoise` to every weight write (Adakaon, and
+    MSAM/Nekaon over it); the others would have nothing to derive the dither's counter from."""
+    allowed = BF16_METHODS + (LD_METHODS if low_discrepancy else ())
+    if bf16_method not in allowed:
         raise ValueError(
-            f"bf16_method must be one of {'/'.join(BF16_METHODS)}, got {bf16_method!r}"
+            f"bf16_method must be one of {'/'.join(allowed)}, got {bf16_method!r}"
+        )
+
+
+def _check_ld_noise(bf16_method: str, sr: Any) -> None:
+    """A ``kahan8ld`` write without its :class:`LDNoise` (an optimizer that does not thread
+    one, e.g. a group switched to it on Lion or a Lookahead sync) is REFUSED rather than
+    silently rounded with plain stochastic rounding."""
+    if bf16_method in LD_METHODS and not isinstance(sr, LDNoise):
+        raise NotImplementedError(
+            f"bf16_method={bf16_method!r} (experimental) is only supported by Adakaon and "
+            "MSAM/Nekaon over it: this writer got no low-discrepancy noise (LDNoise)"
         )
 
 
@@ -290,7 +308,7 @@ def _ck_write_(
     alpha: float,
     bits: int,
     triton: bool | None = None,
-    sr: SRStream | None = None,
+    sr: SRStream | LDNoise | None = None,
     rows: bool = False,
 ) -> None:
     """``(target, lo) += alpha * source`` with the compact-Kahan codec, through Triton when
@@ -426,6 +444,7 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
     """
     low = is_low_precision(p)
     if low and is_compact_kahan(bf16_method):
+        _check_ld_noise(bf16_method, sr)
         bits = residual_bits(bf16_method)
         if not residual_ok(state, bits):
             ensure_residuals([p], [state], bits)  # method switched mid-run: see ensure_residuals
@@ -485,6 +504,7 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
                 "residual views (comp=...); the caller must route this method per-param "
                 "or hand over ForeachChunk.cviews"
             )
+        _check_ld_noise(bf16_method, sr)
         bits = residual_bits(bf16_method)
         want = residual_dtype(bits)
         # EVERY view, not the stack: torch.stack promotes a uint8 + int16 mix to int16, which
