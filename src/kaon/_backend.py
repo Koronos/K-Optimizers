@@ -37,6 +37,7 @@ from kaon._compact_kahan import (
     RESIDUAL_KEY,
     compensated_add_,
     convert_residual,
+    decode,
     init_residual,
     is_compact_kahan,
     residual_bits,
@@ -67,6 +68,7 @@ __all__ = [
     "subtract_batched_",
     "subtract_one_",
     "validate_bf16_method",
+    "weight_value",
 ]
 
 LOW_PRECISION = (torch.bfloat16, torch.float16)
@@ -166,6 +168,34 @@ def residual_ok(state: dict, bits: int) -> bool:
     writers' fast check before :func:`ensure_residuals`.)"""
     lo = state.get(RESIDUAL_KEY)
     return lo is not None and lo.dtype == residual_dtype(bits)
+
+
+@torch.no_grad()
+def weight_value(p: Tensor, state: dict, bf16_method: str) -> Tensor:
+    """The fp32 value of ``p`` an update term that READS the weight must use.
+
+    Under ``kahan8`` / ``kahan16`` a bf16 weight is only the rounded half of the value the
+    optimizer is tracking: the full value is ``(p, state['kahan_lo'])`` decoded
+    (:func:`kaon._compact_kahan.decode`). Decoupled weight decay (``delta += wd * p``) reading
+    the bare bf16 instead rounds ``p`` to the bf16 grid inside the update — at wd=0.1 that
+    was the whole gap between a ``kahan16`` run and its fp32 twin (2.3 / 7.4 ulp at lr
+    1e-4 / 3e-4, ``benchmarks/lowlr_bf16``). With the decoded value ``kahan16`` is the fp32
+    run bit for bit and ``kahan8`` reads its ~1/256-ulp value.
+
+    Every other case is the historical read: ``p.data`` itself for an fp32 param (an ALIAS —
+    callers only read it) and ``p.data.float()`` otherwise, so SR / none / legacy ``kahan``
+    and fp32 params are bit-identical to before. A missing / other-width residual (method
+    switched mid-run) goes through :func:`ensure_residuals` first, the same lazy contract as
+    the writer that follows.
+    """
+    if p.dtype == torch.float32:
+        return p.data
+    if p.dtype == torch.bfloat16 and is_compact_kahan(bf16_method):
+        bits = residual_bits(bf16_method)
+        if not residual_ok(state, bits):
+            ensure_residuals([p], [state], bits)
+        return decode(p.data, state[RESIDUAL_KEY], bits)
+    return p.data.float()
 
 
 def init_bf16_state(p: Tensor, state: dict, bf16_method: str) -> None:

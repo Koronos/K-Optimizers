@@ -478,8 +478,8 @@ def _mixed_bag(dtype_bf=torch.bfloat16, device="cpu"):
 def test_lookahead_kahan16_mixed_precision(foreach):
     """A group mixing fp32 and bf16 params: only the bf16 ones carry an int16 residual (the
     INNER's — it belongs to the weight), the sync writes through it on both sync routes, and
-    the run stays within a fraction of an ulp of the all-fp32 Lookahead (the sync reads the
-    bare bf16 ``theta`` — docs §8)."""
+    — since 0.7.16 the sync reads the DECODED ``theta`` (docs §8.5) — the run IS the
+    all-fp32 Lookahead, bit for bit."""
     p16, p32 = _mixed_bag(), _mixed_bag(torch.float32)
     kw = dict(lr=1e-4, k=2, foreach=foreach, gradient_centralization=False)
     la16 = kaon.Lookahead(p16, bf16_method="kahan16", **kw)
@@ -492,9 +492,7 @@ def test_lookahead_kahan16_mixed_precision(foreach):
         assert torch.isfinite(z).all()
         if a.dtype == torch.bfloat16:
             assert st[RESIDUAL_KEY].dtype == torch.int16
-            assert float((z - b.data).abs().max()) < 0.5 * _ulp_ref(b.data)
-        else:
-            assert torch.equal(z, b.data)
+        assert _bits_equal(z, b.data), float((z - b.data).abs().max())
 
 
 # ------------------------------------------------------------------------------ mid-run switches

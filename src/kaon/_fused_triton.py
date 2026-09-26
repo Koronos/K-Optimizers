@@ -473,6 +473,19 @@ if _HAS_TRITON:
         return b.to(tl.float32, bitcast=True)
 
     @triton.jit
+    def wd_value(pp, c_addr, t, idx, mask, CK: tl.constexpr):
+        """The weight value a decay term (``wd * p``) reads for tensor ``t`` of a pointer-array
+        launch: the decoded compact-Kahan value under ``CK`` (the full bf16 + residual value,
+        as the apply kernels' ``zc``), else the stored weight. Used by the cautious KEEP
+        passes, so their survivor count sees the same ``delta`` the apply pass writes with —
+        a count taken on the bare bf16 would disagree with the apply's mask whenever
+        ``delta + wd * p`` changes sign within the residual."""
+        if CK:
+            return ck_decode(pp, ck_ptr(c_addr, t, CK), idx, mask, CK)
+        else:
+            return tl.load(pp + idx, mask=mask, other=0.0).to(tl.float32)
+
+    @triton.jit
     def ck_store_noise(pp, cp, idx, mask, res, noise, BITS: tl.constexpr):
         """Compact Kahan: store fp32 ``res`` as ``(bf16 weight, residual byte)``, rounding the
         residual with the GIVEN int32 ``noise`` in ``[0, 2**(16-BITS))`` (mirror of
@@ -812,6 +825,7 @@ if _HAS_TRITON:
         if CK:
             cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, idx, m2, CK)
+            p_old = zc  # decay (WD) reads the full decoded value, never the bare bf16
         delta = m_new
         if WD and not WDFULL:
             delta = delta + wd * p_old                 # momentum requant above used m_new (sans wd)
@@ -849,9 +863,9 @@ if _HAS_TRITON:
     # a flat view, so a big weight matrix costs ~few memory passes instead of native's ~30.
 
     @triton.jit
-    def _chunked_mom(g_ptr, m_ptr, p_ptr, rfac_ptr, cfac_ptr, keep_ptr, C, n, inv_rms, wd, beta1,
-                     CAUTIOUS: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr,
-                     WDFULL: tl.constexpr = False):
+    def _chunked_mom(g_ptr, m_ptr, p_ptr, c_ptr, rfac_ptr, cfac_ptr, keep_ptr, C, n, inv_rms, wd,
+                     beta1, CAUTIOUS: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr,
+                     WDFULL: tl.constexpr = False, CK: tl.constexpr = 0):
         """Momentum EMA of the normalized (LR-independent) update over a flat chunk; accumulates
         the cautious keep count (on delta incl. wd under ``cautious_wd="masked"``, on the bare
         momentum under ``"full"`` — matching native either way; the mask is invariant to the
@@ -871,7 +885,10 @@ if _HAS_TRITON:
         if CAUTIOUS:
             delta = m
             if WD and not WDFULL:
-                delta = delta + wd * tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+                if CK:  # the decoded value, as _chunked_apply's decay reads it
+                    delta = delta + wd * ck_decode(p_ptr, c_ptr, offs, mask, CK)
+                else:
+                    delta = delta + wd * tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr, tl.sum(keep.to(tl.int32)))
 
@@ -889,6 +906,7 @@ if _HAS_TRITON:
         if CK:
             cp = c_ptr
             zc = ck_decode(p_ptr, cp, offs, mask, CK)
+            p = zc  # decay (WD) reads the full decoded value, never the bare bf16
         delta = m
         if WD and not WDFULL:
             delta = delta + wd * p
@@ -927,10 +945,10 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_mom_batched(
-        g_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, inv_rms_ptr,
+        g_ptr, m_addr, p_addr, c_addr, rfac_ptr, cfac_ptr, keep_ptr, inv_rms_ptr,
         wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
-        BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
+        BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """Batched pass 1: momentum EMA of the normalized update over a flat chunk of tensor ``t``;
         accumulates the cautious keep-count (on delta incl. WD unless ``WDFULL``, matching native)
@@ -967,8 +985,7 @@ if _HAS_TRITON:
                     pp = pi.to(tl.pointer_type(tl.bfloat16))
                 else:
                     pp = pi.to(tl.pointer_type(tl.float32))
-                p_old = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
-                delta = delta + wd * p_old
+                delta = delta + wd * wd_value(pp, c_addr, t, offs, mask, CK)
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -996,6 +1013,7 @@ if _HAS_TRITON:
         if CK:
             cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
+            p = zc  # decay (WD) reads the full decoded value, never the bare bf16
         delta = m
         if WD and not WDFULL:
             delta = delta + wd * p
@@ -1226,10 +1244,10 @@ if _HAS_TRITON:
     # mom/apply that read grad via the pointer array (+ GC via rowmean) instead of a stacked g_ptr.
     @triton.jit
     def _chunked_mom_batched_g(
-        g_addr, rowmean_ptr, m_addr, p_addr, rfac_ptr, cfac_ptr, keep_ptr, rms_ptr,
+        g_addr, rowmean_ptr, m_addr, p_addr, c_addr, rfac_ptr, cfac_ptr, keep_ptr, rms_ptr,
         clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
-        WD: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
+        WD: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """As ``_chunked_mom_batched`` but grad comes from the pointer array (GC via rowmean[t, row])."""
         pid = tl.program_id(0)
@@ -1264,7 +1282,7 @@ if _HAS_TRITON:
             if WD and not WDFULL:
                 pi = tl.load(p_addr + t)
                 pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
-                delta = delta + wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+                delta = delta + wd * wd_value(pp, c_addr, t, offs, mask, CK)
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -1291,6 +1309,7 @@ if _HAS_TRITON:
         if CK:
             cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
+            p = zc  # decay (WD) reads the full decoded value, never the bare bf16
         delta = m
         if WD and not WDFULL:
             delta = delta + wd * p
@@ -1412,6 +1431,7 @@ if _HAS_TRITON:
         if CK:
             cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
+            p_old = zc  # decay (WD) reads the full decoded value, never the bare bf16
         if WD and not WDFULL:                          # ``cautious_wd`` — see _adakaon_tile_kernel
             delta = delta + wd * p_old
         if CAUTIOUS:
@@ -1909,10 +1929,10 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_nomom_keep_batched_g(
-        g_addr, rowmean_ptr, p_addr, rfac_ptr, cfac_ptr, keep_ptr,
+        g_addr, rowmean_ptr, p_addr, c_addr, rfac_ptr, cfac_ptr, keep_ptr,
         rms_ptr, clip, wd, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
-        BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
+        BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """Count cautious survivors for a no-momentum chunked update."""
         pid = tl.program_id(0)
@@ -1933,7 +1953,7 @@ if _HAS_TRITON:
         if WD and not WDFULL:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-            delta += wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+            delta += wd * wd_value(pp, c_addr, t, offs, mask, CK)
         keep = ((delta * g) > 0.0) & mask
         tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -1967,6 +1987,7 @@ if _HAS_TRITON:
         if CK:
             cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
+            p = zc  # decay (WD) reads the full decoded value, never the bare bf16
         if WD and not WDFULL:
             delta += wd * p
         if CAUTIOUS:
@@ -1987,10 +2008,11 @@ if _HAS_TRITON:
 
     @triton.jit
     def _chunked_4bit_keep_batched_g(
-        g_addr, rowmean_ptr, packed_addr, scale_addr, p_addr, rfac_ptr, cfac_ptr,
+        g_addr, rowmean_ptr, packed_addr, scale_addr, p_addr, c_addr, rfac_ptr, cfac_ptr,
         keep_ptr, rms_ptr, clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
         FBLOCK: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
+        CK: tl.constexpr = 0,
     ):
         """Count cautious survivors from the exact pre-requantized 4-bit EMA.
 
@@ -2024,7 +2046,7 @@ if _HAS_TRITON:
         if WD and not WDFULL:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-            delta += wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+            delta += wd * wd_value(pp, c_addr, t, offs, mask, CK)
         keep = ((delta * g) > 0.0) & mask
         tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -2070,6 +2092,7 @@ if _HAS_TRITON:
         if CK:
             cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
+            p = zc  # decay (WD) reads the full decoded value, never the bare bf16
         delta = momentum
         if WD and not WDFULL:
             delta += wd * p
@@ -2079,7 +2102,12 @@ if _HAS_TRITON:
             # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
             delta = delta * tl.where(keep, n.to(tl.float32) / tl.maximum(count, 1.0), 0.0)
         if WD and WDFULL:
-            delta += wd * p
+            # EXPLICIT fma: ``delta * scale + wd * p`` has two legal contractions, and the
+            # compiler picked ``fma(wd, p, delta*scale)`` for the fp32 variant but
+            # ``fma(delta, scale, wd*p)`` for the CK one — kahan16 then left its fp32 twin by
+            # an fp32 ulp per step. Pinning the one the fp32 / SR variants already compiled
+            # to keeps them bit-identical and makes CK agree.
+            delta = tl.fma(wd, p, delta)
         if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
             ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
         else:
@@ -2138,10 +2166,10 @@ if _HAS_TRITON:
     # variant per distinct big shape; the host already caches per shape bucket.
     @triton.jit
     def _chunked_int8_keep_batched_g(
-        g_addr, rowmean_ptr, code_addr, scale_addr, p_addr, rfac_ptr, cfac_ptr,
+        g_addr, rowmean_ptr, code_addr, scale_addr, p_addr, c_addr, rfac_ptr, cfac_ptr,
         keep_ptr, rms_ptr, clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr,
-        WDFULL: tl.constexpr = False,
+        WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
     ):
         """Count cautious survivors from the exact pre-requantized int8 EMA.
 
@@ -2172,7 +2200,7 @@ if _HAS_TRITON:
         if WD and not WDFULL:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-            delta += wd * tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+            delta += wd * wd_value(pp, c_addr, t, offs, mask, CK)
         keep = ((delta * g) > 0.0) & mask
         tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -2216,6 +2244,7 @@ if _HAS_TRITON:
         if CK:
             cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, offs, mask, CK)
+            p = zc  # decay (WD) reads the full decoded value, never the bare bf16
         delta = momentum
         if WD and not WDFULL:
             delta += wd * p
@@ -2225,7 +2254,12 @@ if _HAS_TRITON:
             # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
             delta = delta * tl.where(keep, n.to(tl.float32) / tl.maximum(count, 1.0), 0.0)
         if WD and WDFULL:
-            delta += wd * p
+            # EXPLICIT fma: ``delta * scale + wd * p`` has two legal contractions, and the
+            # compiler picked ``fma(wd, p, delta*scale)`` for the fp32 variant but
+            # ``fma(delta, scale, wd*p)`` for the CK one — kahan16 then left its fp32 twin by
+            # an fp32 ulp per step. Pinning the one the fp32 / SR variants already compiled
+            # to keeps them bit-identical and makes CK agree.
+            delta = tl.fma(wd, p, delta)
         if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
             ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
         else:

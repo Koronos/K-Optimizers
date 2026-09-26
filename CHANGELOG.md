@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Adakaon / Nekaon under `kahan8` / `kahan16`: weight decay and Gradient Centralization
+  read the full value.** The decoupled decay (`delta += wd·p`, both `cautious_wd`
+  placements) now reads the decoded `bf16 + residual` value instead of the bare bf16 weight —
+  per-param (`kaon._backend.weight_value`), foreach (`ForeachChunk.value_stack`) and fused
+  (`zc` in the `WD` term of the eight apply kernels AND in the six cautious keep passes, so the
+  survivor count sees the same `delta` the apply writes with). Native GC of a bf16 gradient in
+  a compact-Kahan group runs in fp32 on the copy the update reads (as the fused kernels always
+  did); `p.grad` is then left uncentralized. Lookahead's sync reads the decoded `theta` too.
+  Result: given the same gradients, `kahan16` Adakaon/Nekaon (and Lookahead) reproduce the
+  fp32-weight run of the same route **bit for bit with the shipped defaults** (wd 0.1, GC,
+  cautious) on every route incl. every fused sub-route — before, only with wd=0 and GC off.
+  **`kahan8`'s numerics change slightly and intentionally** (its decay/GC/theta read its
+  ~ulp/256 value). SR, `none`, legacy `kahan` and fp32 params are bit-identical to 0.7.15
+  (checked on 360 configs across routes). An explicit `tl.fma` pins one FMA contraction in the
+  direct 4-bit/int8 apply kernels under `cautious_wd="full"` (the CK variant had compiled the
+  other one). The other optimizers' decay still reads the bf16 weight (follow-up).
+- `load_state_dict` warns when the checkpoint replaces a group's `bf16_method` (torch restores
+  every group hyperparameter): a `kahan8` Nekaon loading an SR checkpoint used to train with SR
+  from then on, silently.
+
+### Added
+- `kaon.decode_weights(opt)` / `kaon.full_precision_state_dict(model, opt)`: the fp32
+  full-precision weights of any kaon optimizer using `kahan8`/`kahan16` (decoded residual;
+  `kahan16` = the fp32 master bit for bit), through wrapper chains; refused while Nekaon/MSAM
+  carry the climb (call `eval()`) or Lookahead shows its slow weights.
+- docs/nekaon.md "Low LR / Kahan": when to use SR / `kahan8` / `kahan16` with Nekaon, memory
+  (0.56 / 1.56 / 2.56 B/param), load the optimizer AFTER the model, save in eval mode, fp32
+  export.
+
+### Fixed
+- MSAM/Nekaon: in a group mixing fp32 and bf16 params of the SAME shape, the torch-path climb
+  keyed its leftover buckets without the dtype, so one of the two buckets overwrote the other
+  and its params were never climbed (any `bf16_method`, CPU and non-Triton paths).
+- `add_param_group` on a wrapper (Nekaon, MSAM, SAM, Lookahead) raised a bare
+  `AttributeError: ... no attribute 'defaults'`; it now delegates to the inner optimizer (and
+  back-fills the wrapper's own group keys).
+
 ## [0.7.15] - 2026-09-25
 
 Includes the entries below that shipped without their own heading in 0.7.14.

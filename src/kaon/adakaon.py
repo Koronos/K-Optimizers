@@ -57,6 +57,7 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
     validate_bf16_method,
+    weight_value,
 )
 from kaon._compact_kahan import is_compact_kahan, residual_bits
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
@@ -545,10 +546,38 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("Adakaon does not support sparse gradients")
-            if group["gradient_centralization"]:
-                centralize_grads_(params)
+            self._centralize_native(params, group)
             self._native_dispatch(params, group)
         return loss
+
+    @staticmethod
+    def _gc_in_step(group: dict[str, Any], grad: Tensor) -> bool:
+        """Does the native step centralize this gradient ITSELF, in fp32 (instead of
+        :func:`kaon._backend.centralize_grads_` in place on ``p.grad``)?
+
+        Under ``kahan8`` / ``kahan16`` a low-precision gradient is centralized on the fp32
+        copy the update reads, not in its own dtype: ``centralize_grads_`` on a bf16
+        ``p.grad`` rounds both the row mean and ``g - mean`` to bf16, an input error of up to
+        half a bf16 ulp of the gradient per step that the compensated weight then faithfully
+        integrates — the other half (with weight decay) of the gap between a ``kahan16``
+        run and its fp32 twin. The fused kernels always did GC in fp32 registers; this makes
+        the native routes agree. Free: the update already materializes that fp32 copy (the
+        per-param ``p.grad.float()``, the foreach ``grad_stack()``), and it saves the
+        separate stack + copy-back ``centralize_grads_`` does. The group's other methods
+        (SR, none, legacy kahan) keep the historical in-place bf16 GC, bit for bit — and so
+        does ``p.grad`` of a compact-Kahan group: it is left UNcentralized (the step reads
+        its centralized copy)."""
+        return (group["gradient_centralization"] and grad.dtype != torch.float32
+                and is_compact_kahan(group["bf16_method"]))
+
+    def _centralize_native(self, params: list[Tensor], group: dict[str, Any]) -> None:
+        """Gradient Centralization for a native subset: in place on ``p.grad``, except the
+        gradients the step centralizes itself in fp32 (:meth:`_gc_in_step`)."""
+        if not group["gradient_centralization"]:
+            return
+        if is_compact_kahan(group["bf16_method"]):
+            params = [p for p in params if not self._gc_in_step(group, p.grad)]
+        centralize_grads_(params)
 
     @torch.no_grad()
     def _native_dispatch(self, params: list[Tensor], group: dict[str, Any]) -> None:
@@ -603,8 +632,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             # Routing is cached; grad CONTIGUITY is not cacheable (fresh tensor every backward).
             one_block, big, one_dim, native = self._fused_demote(id(group), parts)
             if native:  # GC for the native subset (fused subsets centralize in-kernel / in-reductions)
-                if group["gradient_centralization"]:
-                    centralize_grads_(native)
+                self._centralize_native(native, group)
                 self._native_dispatch(native, group)
             if one_block:
                 self._fused_one_block(one_block, group, ft)
@@ -632,8 +660,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         serialize the whole step. ``self._fused_big_lone_batched=False`` reverts to the per-tensor
         kernel (the A/B baseline)."""
         if len(big) >= 2 and not self._fused_big_batched:
-            if group["gradient_centralization"]:
-                centralize_grads_(big)
+            self._centralize_native(big, group)
             self._native_dispatch(big, group)
             return
         # Group by EXACT shape (and dtype and DEVICE); same-shape buckets of >=2 take the
@@ -1025,9 +1052,10 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             mf = st["m"].reshape(-1)
         keep = torch.zeros(1, dtype=torch.int32, device=p.device)
         gf, pf = g.reshape(-1), p.reshape(-1)
+        cf = st["kahan_lo"].reshape(-1) if ck else pf
         grid = ((n + 1023) // 1024,)
-        ft._chunked_mom[grid](gf, mf, pf, r, c, keep, C, n, inv_rms, wd, b1,
-                              CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full)
+        ft._chunked_mom[grid](gf, mf, pf, cf, r, c, keep, C, n, inv_rms, wd, b1,
+                              CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full, CK=ck)
         if quant:
             # Requant IN PLACE: cached pointer tables (MSAM's fused axpy plan, batched-step
             # plans) hold raw data_ptrs into these buffers — replacing the tensors leaves the
@@ -1041,7 +1069,6 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                 st["m"].copy_(packed)
                 st["m_scale"].copy_(sc)
         inv_mean = 1.0 / max(keep.item() / n, 1e-8) if cautious else 1.0
-        cf = st["kahan_lo"].reshape(-1) if ck else pf
         ft._chunked_apply[grid](gf, mf, pf, cf, n, inv_mean, lr, wd, self._t,
                                 CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024, WDFULL=wd_full,
                                 CK=ck)
@@ -1176,9 +1203,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if direct_int8 and fused_red:
             if cautious:
                 ft._chunked_int8_keep_batched_g[grid](
-                    g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
+                    g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
                     keep, rms, clip, wd, b1, R, C, n, K,
-                    LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
+                    LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full, CK=ck,
                 )
             ft._chunked_int8_apply_batched_g[grid](
                 g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
@@ -1191,9 +1218,10 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             block = states[0]["m_block"]
             if cautious:
                 ft._chunked_4bit_keep_batched_g[grid](
-                    g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, r, c,
+                    g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
                     keep, rms, clip, wd, b1, R, C, n, K,
                     LOWP=lowp, GC=gc, WD=wd != 0, FBLOCK=block, BLOCK=1024, WDFULL=wd_full,
+                    CK=ck,
                 )
             ft._chunked_4bit_apply_batched_g[grid](
                 g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
@@ -1231,13 +1259,15 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             mom = ft.MOM_BF16 if md == "bfloat16" else ft.MOM_FP32
         if fused_red:
             ft._chunked_mom_batched_g[grid](
-                g_addr, rowmean, m_addr, p_addr, r, c, keep, rms, clip, wd, b1, R, C, n, K,
+                g_addr, rowmean, m_addr, p_addr, c_addr, r, c, keep, rms, clip, wd, b1, R, C, n, K,
                 LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
+                CK=ck,
             )
         else:
             ft._chunked_mom_batched[grid](
-                g, m_addr, p_addr, r, c, keep, inv_rms, wd, b1, R, C, n, K,
+                g, m_addr, p_addr, c_addr, r, c, keep, inv_rms, wd, b1, R, C, n, K,
                 LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
+                CK=ck,
             )
         if quant:  # requant the updated fp32 temp back into per-tensor storage (apply reads the temp)
             # Batched requant (same write pattern as ema_stacked: in-place copies keep the
@@ -1280,8 +1310,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         ``gc`` is the caller's effective per-bucket flag (``cache.gc``); the native fallback
         below goes through ``centralize_grads_``, which applies the same predicate itself."""
         if not self._fused_reductions:
-            if group["gradient_centralization"]:
-                centralize_grads_(plist)
+            self._centralize_native(plist, group)
             self._native_dispatch(plist, group)
             return
         N = len(plist)  # noqa: N806
@@ -1300,8 +1329,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         keep = cache.keep          # already zeroed with colsum/rms (one launch)
         if cautious:
             ft._chunked_nomom_keep_batched_g[grid](
-                g_addr, rowmean, p_addr, r, c, keep, rms, clip,
+                g_addr, rowmean, p_addr, c_addr, r, c, keep, rms, clip,
                 wd, R, C, n, K, LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
+                CK=ck,
             )
         ft._chunked_nomom_apply_batched_g[grid](
             g_addr, rowmean, p_addr, c_addr, r, c, rms, clip, keep,
@@ -1522,8 +1552,14 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         codec = self._codec(group)
         for chunk in self._foreach_chunks(params, group, budget):
-            bucket = self._factored_bucket if chunk.eff is not None else self._nonfactored_bucket
-            bucket(chunk, beta1, beta2, eps1, lr, clip, wd, cautious, wd_full, bf16_method, codec)
+            if chunk.eff is not None:
+                # fp32 GC on the stacked copy for a compact-Kahan bf16 bucket (_gc_in_step)
+                gc32 = self._gc_in_step(group, chunk.plist[0].grad)
+                self._factored_bucket(chunk, beta1, beta2, eps1, lr, clip, wd, cautious,
+                                      wd_full, bf16_method, codec, gc32=gc32)
+            else:
+                self._nonfactored_bucket(chunk, beta1, beta2, eps1, lr, clip, wd, cautious,
+                                         wd_full, bf16_method, codec)
 
     @torch.no_grad()
     def _factored_bucket(
@@ -1539,12 +1575,17 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         wd_full: bool,
         bf16_method: str,
         codec: _MomentumCodec,
+        gc32: bool = False,
     ) -> None:
         R, C = chunk.eff  # noqa: N806 — matrix dims (stacked tensor is [N, R, C])
         N = chunk.n  # noqa: N806
         rows, cols = chunk.state_views
 
         grad = chunk.grad_stack()                                         # [N, R, C]
+        if gc32 and C > 1:
+            # fp32 GC on the stacked copy (compact Kahan, see _gc_in_step); the fan-in of the
+            # matrixized [out, in*kh*kw] layout is the last dim, and C > 1 is gc_applies.
+            grad.sub_(grad.mean(dim=-1, keepdim=True))
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -1619,15 +1660,18 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         else:
             delta = update
 
+        # The decay reads the weight's full VALUE: under kahan8/kahan16 the decoded
+        # (bf16 + residual) value, bit-identical to param_stack() for every other method
+        # (see kaon._backend.weight_value).
         if wd != 0 and not wd_full:                  # "masked": decay inside the mask
-            p_fp32 = chunk.param_stack()
+            p_fp32 = chunk.value_stack(bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
         if wd_full:                                  # "full": decay outside the mask
-            p_fp32 = chunk.param_stack()
+            p_fp32 = chunk.value_stack(bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         # lr rides the weight write (``alpha``) instead of a separate ``delta.mul_(lr)``
@@ -1701,15 +1745,18 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         else:
             delta = update
 
+        # The decay reads the weight's full VALUE: under kahan8/kahan16 the decoded
+        # (bf16 + residual) value, bit-identical to param_stack() for every other method
+        # (see kaon._backend.weight_value).
         if wd != 0 and not wd_full:                  # "masked": decay inside the mask
-            p_fp32 = chunk.param_stack()
+            p_fp32 = chunk.value_stack(bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
         if wd_full:                                  # "full": decay outside the mask
-            p_fp32 = chunk.param_stack()
+            p_fp32 = chunk.value_stack(bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         if self._write_fold_lr:                      # see _factored_bucket
@@ -1735,6 +1782,9 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         grad_fp32 = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
         ndim = grad_fp32.ndim
         factored = ndim >= 2
+        if factored and self._gc_in_step(group, p.grad) and gc_applies(p.shape):
+            # fp32 GC on the fresh fp32 copy (compact Kahan, see _gc_in_step)
+            grad_fp32.sub_(grad_fp32.mean(dim=tuple(range(1, ndim)), keepdim=True))
 
         if factored:
             matrixize = ndim > 2  # conv kernels always reshape to 2-D before factoring
@@ -1765,16 +1815,18 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         # outside it ("full": every coordinate decays by the same lr*wd, only the update is
         # masked — the Cautious Optimizers paper's own placement). With ``cautious=False`` the
         # two branches are the same ``add_`` on an untouched delta, hence bit-identical.
+        # The decay reads the weight's full VALUE (decoded under kahan8/kahan16; the
+        # historical ``p.data`` / ``p.data.float()`` otherwise) — see kaon._backend.weight_value.
         wd_full = wd != 0 and group["cautious_wd"] == "full"
         if wd != 0 and not wd_full:
-            p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
+            p_fp32 = weight_value(p, state, bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_one_(delta, grad_fp32)
 
         if wd_full:
-            p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
+            p_fp32 = weight_value(p, state, bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         # lr rides the write, exactly as the foreach buckets do — the two must fold it the

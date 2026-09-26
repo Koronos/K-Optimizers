@@ -152,6 +152,80 @@ sample_or_checkpoint(model)
 opt.train()   # back to the lookahead point
 ```
 
+## Low LR / Kahan (`bf16_method="kahan8"` / `"kahan16"`)
+
+With bf16 weights every write rounds to the bf16 grid (ulp = 2⁻⁸ relative). When the
+per-step update is a fraction of an ulp — full fine-tunes at lr ≲ 1e-5, long low-LR tails —
+stochastic rounding (the default) stays unbiased but random-walks away from the fp32
+trajectory. The compact-Kahan methods keep the missing bits in a per-parameter residual
+(`state["kahan_lo"]`, see [`docs/research/compact-kahan.md`](research/compact-kahan.md)):
+
+```python
+opt = Nekaon(model.parameters(), lr=1e-5, bf16_method="kahan8")   # no other configuration
+```
+
+| method | extra state | total optimizer state (4-bit momentum) | what it tracks |
+|---|---|---|---|
+| `"stochastic_rounding"` (default) | 0 | **0.56 B/param** | the bf16 weight, unbiased |
+| `"kahan8"` | +1 B/param (uint8) | **1.56 B/param** | the value to ulp/256 (SR at the residual's grid) |
+| `"kahan16"` | +2 B/param (int16) | **2.56 B/param** | an fp32 master, exactly |
+
+When to use which:
+
+* **SR** — steps of about an ulp or more (LoRA/adapter LRs, pre-training), or when every
+  byte counts. On the low-LR proxy (`benchmarks/lowlr_bf16`, 8000 steps) its test loss was
+  within seed noise of fp32 even where it drifted 8–28 ulp from the fp32 trajectory.
+* **`kahan8`** — sub-ulp LRs; the default choice for low-LR bf16 fine-tunes. Measured with
+  Nekaon at lr 1e-5: 0.26 ulp from the fp32 run vs 8.6 for SR (0.7.15, before the decoded
+  decay below). Its residual walk grows as √steps (~0.2 ulp at 10k, 0.5 at 100k).
+* **`kahan16`** — fp32-master numerics: very long sub-ulp runs, reference arms, or whenever
+  +2 B/param is affordable. Given the same gradients, a `kahan16` Nekaon **is** the
+  fp32-weight Nekaon of the same route, bit for bit — with the defaults (wd 0.1, Gradient
+  Centralization, cautious), on per-param, foreach and every fused route (since 0.7.16: the
+  decay reads the decoded value and GC runs in fp32 — see below).
+
+What Nekaon does with the residual:
+
+* The lookahead climb and its removal go through the DECODED value (`bf16 + residual`), so
+  the climb/removal pair leaves the clean value intact (to ~ulp/256 for `kahan8`, exactly for
+  `kahan16`). The forward sees the nearest bf16, which moves when the decoded value crosses a
+  rounding boundary — an unbiased dither of the sub-ulp climb. The inert-lookahead warning
+  knows this (it compares with the residual grid, not the bf16 ulp): at lr 1e-5 it fires for
+  SR and not for `kahan8`/`kahan16`.
+* Weight decay (`delta += wd·p`, both `cautious_wd` placements, native and fused, keep pass
+  included) reads the decoded value. Gradient Centralization of a bf16 gradient runs in fp32
+  on the copy the update reads; `p.grad` itself is left uncentralized under these methods.
+* Every route and option works unchanged: fused / foreach / per-param, `low_vram_above` (the
+  momentum-free group is compensated too), mixed fp32/bf16 groups (only bf16 params get a
+  residual), `add_param_group`, parameters without gradients, every `momentum_dtype`,
+  `cautious`, GC, eval/train, and a mid-run method switch (SR → kahan: zero residual, one
+  warning; kahan8 ↔ kahan16: converted, one warning; kahan → SR: the stale residual is ignored).
+
+Checkpoints and export — **the residual only means something next to the bf16 weight it was
+written for**:
+
+* **Save in eval mode** (as always with Nekaon): `opt.eval()`, save the model and the
+  optimizer, `opt.train()`. The model's bf16 tensor is then the *nearest* bf16 to the full
+  value — the right thing for bf16 inference; the full value is bf16 + residual.
+* **Resume: load the optimizer AFTER the model.** Load the model weights first, then build
+  the optimizer (or keep it) and `opt.load_state_dict(...)`. Loading model weights after the
+  optimizer state (or re-initialising, pruning, EMA-swapping them) leaves residuals attached
+  to bf16 values they were not written for. A checkpoint saved with another `bf16_method`
+  brings its method with it (torch restores every group hyperparameter) — the load warns;
+  set `opt.param_groups[i]["bf16_method"]` afterwards to switch back.
+* **fp32 export** — to save the full-precision weights (an fp32 checkpoint, serving in fp32,
+  continuing elsewhere without the optimizer), decode them; works for any kaon optimizer
+  using `kahan8`/`kahan16`:
+
+  ```python
+  opt.eval()
+  torch.save(kaon.full_precision_state_dict(model, opt), "model_fp32.pt")  # names + buffers
+  values = kaon.decode_weights(opt)          # or {param: fp32 tensor}
+  opt.train()
+  ```
+
+  Both refuse to run while Nekaon's live weights carry the climb (call `eval()` first).
+
 ## Knobs
 
 * `k` (default `1.5`) — lookahead distance in steps; the loss↔gap dial (`0` = Adakaon,

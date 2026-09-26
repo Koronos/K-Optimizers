@@ -117,7 +117,11 @@ class Nekaon(AutoLRMixin, MSAM):
             precedent that momentum-free Adakaon wants roughly half of Nekaon's LR.
         **adakaon_kwargs: forwarded verbatim to the inner
             :class:`~kaon.adakaon.Adakaon` (``eps``, ``cautious``,
-            ``gradient_centralization``, ``foreach``, ...).
+            ``gradient_centralization``, ``foreach``, ...). For low-LR bf16 training pass
+            ``bf16_method="kahan8"`` (+1 B/param) or ``"kahan16"`` (+2 B/param, an exact fp32
+            master): the climb, the decay and GC then work on the full (bf16 + residual)
+            value — see "Low LR / Kahan" in ``docs/nekaon.md`` (load the optimizer AFTER the
+            model; :func:`kaon.full_precision_state_dict` for an fp32 export).
     """
 
     def __init__(

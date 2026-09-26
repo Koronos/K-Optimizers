@@ -40,7 +40,14 @@ import torch
 from torch import Tensor
 
 from kaon._backend import ensure_residuals, flat_view
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits, residual_dtype
+from kaon._compact_kahan import (
+    RESIDUAL_KEY,
+    decode,
+    is_compact_kahan,
+    residual_bits,
+    residual_bits_of,
+    residual_dtype,
+)
 
 if TYPE_CHECKING:  # annotations only — ``_momentum_codec`` does not import this module,
     # so a runtime import would not cycle either; it is deferred to keep the import
@@ -654,6 +661,23 @@ class ForeachChunk:
         if self.single_alias and self.n == 1:
             return self.pviews[0].unsqueeze(0).float()
         return torch.stack(self.pviews).float()
+
+    def value_stack(self, bf16_method: str) -> Tensor:
+        """The stacked fp32 VALUE of the weights ``[N, *eff]`` for a term that reads them
+        (weight decay): :meth:`param_stack`, except that a bf16 bucket under ``kahan8`` /
+        ``kahan16`` decodes ``(weight, residual)`` — the stacked twin of
+        :func:`kaon._backend.weight_value`. The residual views are the ones the plan already
+        normalized for this step's write (:attr:`cviews`), decoded with the width they are
+        stored in."""
+        cv = self.cviews
+        if (cv is None or not is_compact_kahan(bf16_method)
+                or self.pviews[0].dtype != torch.bfloat16):
+            return self.param_stack()
+        if self.single_alias and self.n == 1:
+            w, lo = self.pviews[0].unsqueeze(0), cv[0].unsqueeze(0)
+        else:
+            w, lo = torch.stack(self.pviews), torch.stack(cv)
+        return decode(w, lo, residual_bits_of(lo))
 
 
 class ForeachPlan:

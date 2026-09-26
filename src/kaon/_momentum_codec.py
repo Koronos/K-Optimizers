@@ -785,6 +785,27 @@ def warn_if_4bit_high_beta1(beta1: float, momentum_dtype: str) -> None:
         )
 
 
+def _warn_bf16_method_replaced(before: list[Any], groups: list[dict[str, Any]]) -> None:
+    """Warn when a load REPLACED a group's ``bf16_method``.
+
+    ``torch.optim.Optimizer.load_state_dict`` restores every group hyperparameter from the
+    checkpoint, ``bf16_method`` included: ``Nekaon(..., bf16_method="kahan8")`` loading a
+    stochastic-rounding checkpoint silently trained with SR from then on (no residual, no
+    compensation — the audit of 0.7.16 found it). The checkpoint still wins (that is torch's
+    contract, and switching back is one assignment), but it no longer happens silently.
+    """
+    for i, (old, group) in enumerate(zip(before, groups, strict=False)):
+        new = group.get("bf16_method")
+        if old is not None and new is not None and old != new:
+            warnings.warn(
+                f"load_state_dict: the checkpoint's bf16_method={new!r} replaced the "
+                f"optimizer's {old!r} on param group {i} (every group hyperparameter is "
+                f"restored from the checkpoint). To keep {old!r}, set "
+                f"optimizer.param_groups[{i}]['bf16_method'] = {old!r} after loading.",
+                stacklevel=3,
+            )
+
+
 def load_state_dict_preserving_dtypes(
     optimizer: torch.optim.Optimizer, state_dict: dict[str, Any]
 ) -> None:
@@ -835,7 +856,9 @@ def load_state_dict_preserving_dtypes(
 
     sd = dict(state_dict)
     sd["state"] = normalized_state
+    methods_before = [g.get("bf16_method") for g in optimizer.param_groups]
     torch.optim.Optimizer.load_state_dict(optimizer, sd)
+    _warn_bf16_method_replaced(methods_before, optimizer.param_groups)
 
     params = [p for group in optimizer.param_groups for p in group["params"]]
     for i, p in enumerate(params):

@@ -310,6 +310,20 @@ class WrapsInnerOptimizer(SRSeedState):
     def zero_grad(self, set_to_none: bool = True) -> None:  # noqa: FBT001, FBT002
         self.inner.zero_grad(set_to_none=set_to_none)
 
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        """Add a group through the INNER optimizer, which owns ``param_groups`` (shared with
+        this wrapper), their defaults and their validation (e.g. the fp16 / bf16_method
+        checks). ``torch.optim.Optimizer.add_param_group`` on the wrapper itself read
+        ``self.defaults`` — which a wrapper does not have unless it keeps its OWN per-group
+        keys — and failed with a bare ``AttributeError`` (``Nekaon(...).add_param_group``).
+        A wrapper that does keep own keys (Lookahead's ``k``/``alpha``/...) gets them
+        back-filled on the new group from its ``defaults``, exactly as at construction."""
+        self.inner.add_param_group(param_group)
+        own = self.__dict__.get("defaults")
+        if own:
+            for key, value in own.items():
+                self.param_groups[-1].setdefault(key, value)
+
     def _flat_params(self) -> list[Tensor]:
         return [p for group in self.param_groups for p in group["params"]]
 

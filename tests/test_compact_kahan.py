@@ -185,11 +185,18 @@ def _drive(opts, params_lists, steps=8, seed=7):
 ])
 def test_foreach_matches_per_param_bit_exact_with_pinned_noise(cfg, monkeypatch):
     """The torch path is one deterministic codec once the residual noise is pinned: per-param
-    and foreach must then agree bit-for-bit (weights AND residual bytes)."""
+    and foreach must then agree bit-for-bit (weights AND residual bytes).
+
+    Gradient Centralization off: since 0.7.16 a compact-Kahan group centralizes its bf16
+    gradients in fp32 (full-precision values instead of bf16-rounded ones), and on
+    full-precision inputs the fp32 update math itself differs between foreach and per-param
+    by SIMD tails (an fp32-weight Adakaon does too — see test_kahan16's tail-bucket test);
+    the codec's own route-invariance is what this test pins."""
     monkeypatch.setattr(bk, "SR_TRITON", False)
     real = torch.randint
     monkeypatch.setattr(torch, "randint", lambda *a, **k: torch.zeros_like(real(*a, **k)))
     pa, pb = _bag(), _bag()
+    cfg = {"gradient_centralization": False, **cfg}
     oa = Adakaon(pa, lr=1e-4, foreach=True, bf16_method="kahan8", **cfg)
     ob = Adakaon(pb, lr=1e-4, foreach=False, bf16_method="kahan8", **cfg)
     _drive([oa, ob], [pa, pb])

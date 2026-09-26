@@ -30,6 +30,7 @@ Quickstart::
     )
 """
 
+from kaon._full_precision import decode_weights, full_precision_state_dict
 from kaon._stochastic_rounding import reseed_generators as reseed_stochastic_rounding
 from kaon._version import __version__
 from kaon.adabelief import AdaBelief
@@ -63,5 +64,7 @@ __all__ = [
     "SAM",
     "ScheduleFree",
     "__version__",
+    "decode_weights",
+    "full_precision_state_dict",
     "reseed_stochastic_rounding",
 ]

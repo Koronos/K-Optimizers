@@ -68,8 +68,9 @@ from kaon._backend import (
     per_param_only_bf16_method,
     subtract_batched_,
     subtract_one_,
+    weight_value,
 )
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits
+from kaon._compact_kahan import RESIDUAL_KEY, decode, is_compact_kahan, residual_bits, residual_bits_of
 from kaon._momentum_codec import _FOURBIT_BLOCK
 from kaon._wrappers import CodecBuffer, TrainEvalWeights, WrapsInnerOptimizer
 from kaon.adakaon import Adakaon
@@ -168,7 +169,8 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
                     continue
                 st = self.state[p]
                 if "phi" not in st:
-                    CodecBuffer.alloc(st, "phi", p, group["slow_dtype"], group["slow_4bit_block"])
+                    CodecBuffer.alloc(st, "phi", self._theta(p, group), group["slow_dtype"],
+                                      group["slow_4bit_block"])
         # 1) fast step: theta advances via the inner Adakaon.
         loss = self.inner.step(closure)
         # 2) per group, count the step and sync every k.
@@ -204,12 +206,31 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
             for p in synced:
                 self._sync_one(p, group, alpha, md, bf16_method)
 
+    def _theta(self, p: Tensor, group: dict[str, Any]) -> Tensor:
+        """The fast weights' VALUE: the decoded ``(bf16, residual)`` under ``kahan8`` /
+        ``kahan16`` when the inner already holds a residual for ``p``, else ``p`` itself.
+
+        Reading the bare bf16 would round ``theta`` to the bf16 grid on every sync (and at
+        ``phi``'s first snapshot) — exactly the sub-ulp information the residual exists to
+        keep; with the decoded value a ``kahan16`` Lookahead is its fp32 twin bit for bit.
+        Never allocates: a param whose inner state has no residual yet (``phi`` is
+        snapshotted BEFORE the first inner step) holds ``p == value`` anyway."""
+        if p.dtype == torch.bfloat16 and is_compact_kahan(group["bf16_method"]):
+            lo = self.inner.state.get(p, {}).get(RESIDUAL_KEY)
+            if lo is not None:
+                return decode(p.data, lo, residual_bits_of(lo))
+        return p.detach()
+
     @torch.no_grad()
     def _sync_one(
         self, p: Tensor, group: dict[str, Any], alpha: float, md: str, bf16_method: str
     ) -> None:
         st = self.state[p]
-        theta = p.detach().clone().float()          # fast weights (clone: not a p alias)
+        if p.dtype == torch.bfloat16 and is_compact_kahan(bf16_method):
+            # the full (decoded) value, never the bare bf16 — see _theta. Fresh fp32.
+            theta = weight_value(p, self.inner.state[p], bf16_method)
+        else:
+            theta = p.detach().clone().float()      # fast weights (clone: not a p alias)
         phi = CodecBuffer.read(st, "phi", md, p)    # slow weights, fresh fp32
         phi.lerp_(theta, alpha)                     # phi += alpha*(theta - phi)
         CodecBuffer.write(st, "phi", md, phi)
@@ -243,11 +264,6 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
             for i in range(0, len(plist), n_per):
                 chunk = plist[i:i + n_per]
                 states = [self.state[p] for p in chunk]
-                theta = torch.stack([p.detach() for p in chunk]).float()        # [N, *shape]
-                phi = CodecBuffer.read_stacked(states, "phi", md, shape)        # [N, *shape]
-                phi.lerp_(theta, alpha)
-                CodecBuffer.write_stacked(states, "phi", md, phi)
-                delta = theta.sub_(phi)                                         # theta - phi_new
                 # kahan8/kahan16: the residual belongs to the WEIGHT, so it is the inner's
                 # ``kahan_lo`` (same reasoning as ``_sync_one`` handing over the inner's state
                 # for ``shift``). Buckets are keyed by dtype, so the chunk is uniformly bf16 or
@@ -259,6 +275,15 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
                     inner_states = [self.inner.state[p] for p in chunk]
                     ensure_residuals(chunk, inner_states, ck_bits)
                     comp = [st[RESIDUAL_KEY] for st in inner_states]
+                    # theta = the full decoded value, never the bare bf16 (see _theta)
+                    theta = decode(torch.stack([p.detach() for p in chunk]), torch.stack(comp),
+                                   ck_bits)                                     # [N, *shape]
+                else:
+                    theta = torch.stack([p.detach() for p in chunk]).float()    # [N, *shape]
+                phi = CodecBuffer.read_stacked(states, "phi", md, shape)        # [N, *shape]
+                phi.lerp_(theta, alpha)
+                CodecBuffer.write_stacked(states, "phi", md, phi)
+                delta = theta.sub_(phi)                                         # theta - phi_new
                 subtract_batched_([p.data for p in chunk], delta, bf16_method, sr=self.sr_stream,
                                   comp=comp)
 

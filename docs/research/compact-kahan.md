@@ -456,19 +456,41 @@ axpy is elementwise and layout-invariant already.
 
 ### 8.5 Where `kahan16` is NOT the fp32 run (by design, documented)
 
-* **Weight decay** (every optimizer, every path) and **AdamP's projection** read the stored
-  bf16 `p`, where an fp32 run reads its master: the difference is `wd·lr·(z − w)` per step,
-  ≤ `wd·lr·½ulp` — far below the write's own resolution, but not zero. Making the decay read
-  the decoded value is a change to every optimizer's delta and to the fused kernels' `WD`
-  term (the delta would then use `zc` where it uses `p`); not done here.
-* **Gradient Centralization** runs on `p.grad` in the grad's dtype (bf16 for a bf16 param):
-  an input-preprocessing difference, not a storage one.
-* **Lookahead's sync** lerps `phi` toward the bare bf16 `theta` (`torch.stack(p).float()`),
-  not the decoded value, and writes `p ← p − (theta − phi)` through the residual: `z` then
-  lands at `phi + (z − w)`, i.e. the sync carries the ≤ ½-ulp forward rounding into the slow
-  weights. Measured < 0.5 ulp from an all-fp32 Lookahead over 6 steps (k=2). Reading the
-  decoded `theta` would make it exact for `kahan16` (and tighten `kahan8`), but changes
-  `kahan8`'s reviewed numerics: left as a follow-up.
+**0.7.16 closed the three Adakaon/Nekaon gaps this section used to list** (the reason
+`kahan16` Nekaon drifted 2.3 / 7.4 ulp from fp32 at lr 1e-4 / 3e-4 in `benchmarks/lowlr_bf16`,
+where Nekaon runs wd=0.1 and GC):
+
+* **Weight decay** now reads the decoded value `z` (`kaon._backend.weight_value` per-param,
+  `ForeachChunk.value_stack` foreach; the fused kernels use `zc` in the `WD` term of all eight
+  apply kernels AND in the six cautious KEEP passes — `wd_value` — so the survivor count is
+  taken on the same `delta` the apply writes with). One compiler detail had to be pinned: in
+  the direct 4-bit / int8 apply kernels under `cautious_wd="full"`, `delta·scale + wd·p` has
+  two legal FMA contractions and the CK variant compiled the other one; an explicit
+  `tl.fma(wd, p, delta)` pins the one the fp32/SR variants already had (SR/fp32 unchanged,
+  checked bit for bit against 0.7.15 on 360 configs).
+* **Gradient Centralization** of a low-precision gradient in a compact-Kahan group runs in
+  fp32 on the copy the update reads (the per-param `p.grad.float()`, the foreach
+  `grad_stack()`), not in place on the bf16 `p.grad` — which is left uncentralized. The fused
+  kernels always did GC in fp32 registers. SR / none / legacy kahan keep the in-place bf16 GC.
+* **Lookahead's sync** reads the decoded `theta` (and snapshots `phi` from it): a `kahan16`
+  Lookahead is now its fp32 twin bit for bit.
+
+With the three, Adakaon and Nekaon under `kahan16` reproduce the fp32 run of the same route
+bit for bit **with the shipped defaults** (wd, GC, cautious, both `cautious_wd`) on every
+route incl. every fused sub-route (`tests/test_nekaon_kahan.py`). `kahan8`'s numerics change
+intentionally (its decay/GC/theta now read its ~ulp/256 value instead of the bf16).
+
+What is still NOT the fp32 run:
+
+* **The other optimizers' weight decay** (Lion, AdaBelief, ADOPT, KProdigy, AdaMuon, AdaPNM,
+  AdamP) still reads the stored bf16 `p` — `wd·lr·(z − w)` per step, ≤ `wd·lr·½ulp`. The
+  helper is there (`weight_value` / `value_stack`); wiring each optimizer (and AdaPNM's fused
+  kernels) is a follow-up. **AdamP's projection** reads the bf16 weight too. Their native GC
+  also still runs in the grad's dtype.
+* The fp32 reference itself is not invariant to bucket composition on CUDA (a foreach bucket
+  of N same-shape tensors reduces differently from N-1), so a mixed fp32/bf16 group is
+  bit-comparable only against a reference with the same bucketing.
+
 * (Fixed in the review round) MSAM's inert-climb warning was not method-aware: it compared
   the displacement with half a bf16 ulp even when the climb goes through the residual. It now
   compares with half the residual grid (`ulp/2^bits`: ulp/256 under `kahan8`, ulp/65536
