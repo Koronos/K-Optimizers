@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.16] - 2026-09-26
+
 ### Changed
 - **Adakaon / Nekaon under `kahan8` / `kahan16`: weight decay and Gradient Centralization
   read the full value.** The decoupled decay (`delta += wd·p`, both `cautious_wd`
