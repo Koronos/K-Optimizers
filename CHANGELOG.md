@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.17] - 2026-09-26
+
 ### Fixed
 - **Fused path (Adakaon, Nekaon, AdaPNM): a gradient whose dtype is not the param's wrote
   NaN/garbage weights from the first step.** The kernels type the grad pointer by the PARAM's
