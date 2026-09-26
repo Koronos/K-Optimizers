@@ -461,7 +461,11 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
             ensure_residuals([p], [state], bits)  # method switched mid-run: see ensure_residuals
         _ck_write_(p.data, state[RESIDUAL_KEY], delta_fp32, -alpha, bits, triton, sr)
     elif low and bf16_method == "kahan":
-        shift = state["shift"]
+        shift = state.get("shift")
+        if shift is None:
+            # switched to legacy kahan after the state existed: start compensating from a
+            # zero buffer (a bare KeyError otherwise), like ensure_residuals does for kahan8/16
+            shift = state["shift"] = torch.zeros_like(p)
         shift.sub_((delta_fp32 * alpha if alpha != 1.0 else delta_fp32).to(p.dtype))
         p_before = p.detach().clone()
         p.add_(shift)

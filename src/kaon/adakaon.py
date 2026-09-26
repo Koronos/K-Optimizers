@@ -400,8 +400,8 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         # off this marker; optimizers without it keep lr-scaled momentum.
         self._momentum_is_unscaled = True
         self._t = 0
-        # group id -> (param witness, state-identity generation, one_block, big, one_dim,
-        # native). The two leading fields are the cache KEY; read the routes off the END
+        # group id -> (param witness, state-identity generation, bf16_method, one_block, big,
+        # one_dim, native). The three leading fields are the cache KEY; read the routes off the END
         # (``entry[-4:]``) so a future field cannot silently break a positional consumer.
         self._fused_part: dict[int, tuple] = {}
         self._fused_demoted: dict[int, tuple] = {}       # group id -> memo of the non-contiguous-grad demotion
@@ -794,9 +794,17 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         witness = ft.param_witness(params)
         gen = state_generation(self.state)
         cached = self._fused_part.get(gid)
-        if cached is not None and cached[1] == gen and cached[0] == witness:
-            return cached[2], cached[3], cached[4], cached[5]
-        md, bf16m, cap = group["momentum_dtype"], group["bf16_method"], self._fused_tile_cap
+        bf16m = group["bf16_method"]
+        # ``bf16_method`` is a ROUTING input too (a bf16 param is fused-eligible only under SR
+        # or compact Kahan), and a group dict can be switched mid-run. Without it in the key a
+        # switch kahan16 -> "none" (or legacy "kahan") kept the bf16 params on the cached
+        # fused routes, whose kernels then wrote them with stochastic rounding (``SR = lowp
+        # and not CK``) — neither the method asked for nor what native does; found by the
+        # 0.7.16 stale-residual twin test. One string compare per group per step.
+        if (cached is not None and cached[1] == gen and cached[2] == bf16m
+                and cached[0] == witness):
+            return cached[-4:]
+        md, cap = group["momentum_dtype"], self._fused_tile_cap
         one_block: list[Tensor] = []
         big: list[Tensor] = []
         one_dim: list[Tensor] = []
@@ -858,7 +866,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     f"[census] one_block={len(one_block)} big={len(big)} one_dim={len(one_dim)} "
                     f"native={len(native)} noncontig_grads={noncontig[:8]} disable={sorted(_FUSED_DISABLE)}\n"
                 )
-        self._fused_part[gid] = (witness, gen, one_block, big, one_dim, native)
+        self._fused_part[gid] = (witness, gen, bf16m, one_block, big, one_dim, native)
         return one_block, big, one_dim, native
 
     def _fused_demote(self, gid: int, parts: tuple) -> tuple:

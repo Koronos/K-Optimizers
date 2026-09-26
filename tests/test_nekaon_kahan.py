@@ -543,24 +543,37 @@ def test_export_decodes_one_tensor_at_a_time(monkeypatch):
 
 @pytest.mark.skipif(not CUDA, reason="GPU memory peak")
 def test_export_gpu_peak_is_one_tensor_not_the_model():
+    """Streaming to CPU: after each tensor the GPU holds nothing extra (``memory_allocated``
+    back to the baseline), and the PEAK is one tensor's decode, independent of the model
+    size. Measured: :func:`kaon._compact_kahan.decode` on a 1M-element bf16 tensor peaks at
+    17 MiB = 4.25x its fp32 size (the int32 pattern and residual, the carry temporaries and
+    the fp32 result) — so the bound is 4.5x the largest tensor, against a 64 MiB fp32 model."""
+    import kaon._full_precision as fp
     torch.manual_seed(0)
     ps = [torch.nn.Parameter((torch.randn(1024, 1024, device="cuda") * 0.05).to(torch.bfloat16))
-          for _ in range(8)]
+          for _ in range(16)]
     o = Nekaon(ps, lr=1e-3, bf16_method="kahan16", foreach=True)
     for p in ps:
         p.grad = (torch.randn_like(p, dtype=torch.float32) * 0.02).to(torch.bfloat16)
     o.step()
     o.eval()
+    for p in ps:
+        p.grad = None
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
+    for _p, v in fp._iter_decoded(o, "cpu"):                          # one tensor at a time
+        assert v.device.type == "cpu"
+        assert torch.cuda.memory_allocated() == base                  # nothing left behind
     sd = kaon.full_precision_state_dict(torch.nn.ParameterList(ps), o)
     torch.cuda.synchronize()
     extra = torch.cuda.max_memory_allocated() - base
-    model_fp32 = sum(4 * p.numel() for p in ps)                      # 32 MiB
-    assert extra <= model_fp32 // 2, (extra, model_fp32)             # ~one tensor + scratch
+    largest = max(4 * p.numel() for p in ps)                          # 4 MiB
+    model_fp32 = sum(4 * p.numel() for p in ps)                       # 64 MiB
+    assert extra <= 4.5 * largest, (extra, largest)
+    assert extra < model_fp32 // 3, (extra, model_fp32)
     assert all(t.device.type == "cpu" for t in sd.values())
-    vals = kaon.decode_weights(o)                                    # device=None: on GPU
+    vals = kaon.decode_weights(o)                                     # device=None: on GPU
     assert all(v.is_cuda for v in vals.values())
 
 
@@ -593,3 +606,22 @@ def test_export_view_rules_for_schedulefree_and_lookahead():
     la.eval()
     with pytest.raises(RuntimeError, match="slow weights phi"):
         kaon.decode_weights(la)
+
+
+@pytest.mark.skipif(not FUSED, reason="Triton fused kernels need CUDA + Triton")
+@pytest.mark.parametrize("dst", ["none", "kahan"])
+def test_fused_partition_follows_a_bf16_method_switch(dst):
+    """Regression: the fused partition cache was keyed on the param witness and the state
+    generation only, so after a mid-run switch to a method the kernels cannot write
+    ("none", legacy "kahan") the bf16 params stayed on the fused routes and were written
+    with stochastic rounding. They must move to the native path on the next step."""
+    ps = _bag(device="cuda")
+    o = Adakaon(ps, lr=1e-3, bf16_method="kahan16", fused=True)
+    _drive([o], [ps], steps=2)
+    routes = next(iter(o._fused_part.values()))[-4:]
+    assert sum(map(len, routes[:3])) > 0                              # fused before
+    o.param_groups[0]["bf16_method"] = dst
+    _drive([o], [ps], steps=1, seed=3)
+    one_block, big, one_dim, native = next(iter(o._fused_part.values()))[-4:]
+    assert not (one_block or big or one_dim)
+    assert len(native) == len(ps)

@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
   the other and its params were never climbed (any `bf16_method`). Reached whenever Triton is
   importable and the params are ineligible for the fused climb (CPU params, non-contiguous
   weights); a Triton-less install took the dtype-keyed torch buckets and was not affected.
+- Adakaon fused: the routing cache was not keyed on `bf16_method`, so after a mid-run switch
+  to `"none"` or legacy `"kahan"` the bf16 params stayed on the fused routes and were written
+  with stochastic rounding instead of moving to the native path. A mid-run switch to legacy
+  `"kahan"` also raised a bare `KeyError: 'shift'` (the buffer is now allocated lazily, zero).
 - `add_param_group` on a wrapper (Nekaon, MSAM, SAM, Lookahead) raised a bare
   `AttributeError: ... no attribute 'defaults'`; it now delegates to the inner optimizer (and
   back-fills the wrapper's own group keys).
