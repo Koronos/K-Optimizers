@@ -14,6 +14,7 @@ git log graveyard/<name>                             # its history (unchanged fr
 
 | tag | sha (short) | experiment | verdict |
 |---|---|---|---|
+| `graveyard/kahan8-ld` | `097ebaf` | `bf16_method="kahan8ld"`: kahan8 with a low-discrepancy (block-randomized) residual dither | 🅿 PARKED for tuning — 10–25 % closer to fp32 than kahan8 in real training, identical test loss |
 | `graveyard/antikaon` | `50c12d9` | Antikaon (momentum-free Adakaon + seeded Anti-PGD/RWP noise) | ⛔ REJECTED — slides loss/gap, no frontier win (gate C=40, seeds 0/1) |
 | `graveyard/lr-servo-momentum` | `c2c6b2f` | Momentum LR servo / "adjuster" | ⛔ REJECTED — no consistent quality gain across Adakaon/Nekaon/Lion |
 | `graveyard/ngnm-prototype` | `6d0ca0d` | NGN-MDv1 (exact loss-aware LR reference) | ⛔ REJECTED as autonomous discovery — stable high-side stabilizer, can't grow from a too-low `c`, 8 B/param |
@@ -177,6 +178,32 @@ renga-flow Anima LoKr real-config A/B. Verdicts (RTX 4080), **native-foreach →
 ---
 
 ## ⛔ REJECTED / ARCHIVED — 2026-09 batch
+
+- **Low-discrepancy weight rounding (2026-09-25/26) — parked for tuning.** Tag
+  `graveyard/kahan8-ld` (`097ebaf`): implementation (`bf16_method="kahan8ld"`, Adakaon
+  per-param/foreach/fused + MSAM/Nekaon climb, reviewed). Inside the tag: simulator and results
+  at `docs/research/compact-kahan/lowdisc/`, real-training runs at
+  `benchmarks/lowlr_bf16/results_k8ld_*.json`.
+  - **Low-discrepancy SR of the whole bf16 weight** (threshold `h(i)+n·φ`, zero cost) —
+    **rejected**: bounded error on coherent steps (3–10× better than SR) but collapses under
+    periodic updates (period 2: 135 ulp, 60 % of the movement lost) and carries a significant
+    directional bias; the per-element state correlates with its next threshold, so the step is
+    no longer a martingale.
+  - **kahan8 with a low-discrepancy residual dither** — pure form fails at 100k steps on
+    period-2/3 updates (1.86/1.56 ulp vs kahan8's 0.66/0.63, bias −0.109 ulp); the kept variant
+    randomizes the phase every 256 writes (`b256`): never worse than kahan8 in any simulated
+    regime (worst case 0.71×), coherent 0.005 vs 0.505 ulp, Adam-like 0.241 vs 0.455, periodic
+    0.12–0.15. Residual directional bias −0.008 ulp at 100k (13× below the pure form).
+  - **Real training** (proxy U-Net, bf16, 8000 steps): distance to the fp32 trajectory
+    Adakaon 0.111 vs 0.133 ulp (lr 1e-5, 2 seeds), 0.086 vs 0.113 (3e-6); Nekaon 0.230 vs 0.256,
+    0.139 vs 0.180 — **10–25 % closer, test loss identical**. Far below the simulated gain:
+    real gradients are noise-dominated and most of the remaining distance comes from the bf16
+    forward, not the write.
+  - **Why parked, not shipped:** the fidelity gain does not change quality and costs kernel
+    complexity (an extra CK=9 path, `Adakaon._t` advancing on the native path, LD tables per
+    cache, Adakaon-only coverage). **To resume:** rebase on main (it predates 0.7.16's
+    value-reading decay and 0.7.17's grad-dtype demotion), re-measure on a long run or Anima
+    where fidelity might matter, and consider seeding the LD pattern per run.
 
 - **Antikaon (2026-09-24/25)** — Adakaon-nomom + seeded Anti-PGD/RWP noise (0 B/param, `σ =
   k_sigma·lr·clip`, rank-1 shape of the factored `v`). Tag `graveyard/antikaon` (`50c12d9`).
