@@ -473,17 +473,40 @@ if _HAS_TRITON:
         return b.to(tl.float32, bitcast=True)
 
     @triton.jit
-    def wd_value(pp, c_addr, t, idx, mask, CK: tl.constexpr):
-        """The weight value a decay term (``wd * p``) reads for tensor ``t`` of a pointer-array
-        launch: the decoded compact-Kahan value under ``CK`` (the full bf16 + residual value,
-        as the apply kernels' ``zc``), else the stored weight. Used by the cautious KEEP
-        passes, so their survivor count sees the same ``delta`` the apply pass writes with —
-        a count taken on the bare bf16 would disagree with the apply's mask whenever
-        ``delta + wd * p`` changes sign within the residual."""
+    def wd_keep_flat(delta, g, wd, pp, cp, idx, mask, CK: tl.constexpr):
+        """``delta + wd * value(p)`` for a cautious KEEP pass (only its sign against ``g``
+        matters): the survivor count must see the same ``delta`` the apply pass writes with,
+        i.e. the DECODED compact-Kahan value under ``CK``.
+
+        Decoding every lane made the keep pass read the residual too (+1-2 B/elem on a
+        memory-bound kernel: ``_chunked_nomom_keep_batched_g`` 200 -> 292 us, retime-016).
+        The decision only depends on the decoded value where the bare-bf16 ``x_p = delta +
+        wd*p`` is within reach of it: ``|z - p| <= |p|*2^-7`` (+ a subnormal-sized term at
+        ``p == 0``), so the residual is loaded (masked load: untouched sectors are not
+        fetched) only for lanes with ``|x_p| <= 4*wd*(|p|*2^-7) + 1e-36`` or ``|x_p*g| <
+        1e-30`` (product near underflow). Elsewhere ``x_p`` and ``x_z`` have the same sign and
+        neither product underflows, so ``keep`` is bit-identical to the full decode.
+        Non-finite ``p``/``delta`` give NaN/inf on both sides alike. ``cp``: typed residual
+        pointer (ignored without ``CK``)."""
+        p = tl.load(pp + idx, mask=mask, other=0.0).to(tl.float32)
+        x = delta + wd * p
         if CK:
-            return ck_decode(pp, ck_ptr(c_addr, t, CK), idx, mask, CK)
+            thr = 4.0 * wd * (tl.abs(p) * 0.0078125) + 1e-36
+            amb = mask & ((tl.abs(x) <= thr) | (tl.abs(x * g) < 1e-30))
+            # Block-uniform skip: ambiguous lanes are rare (a sign within ~1% of the decay term
+            # of a zero crossing), so most blocks never run the decode at all.
+            if tl.max(amb.to(tl.int32)) > 0:
+                z = ck_decode(pp, cp, idx, amb, CK)
+                x = tl.where(amb, delta + wd * z, x)
+        return x
+
+    @triton.jit
+    def wd_keep(delta, g, wd, pp, c_addr, t, idx, mask, CK: tl.constexpr):
+        """:func:`wd_keep_flat` for tensor ``t`` of a pointer-array launch."""
+        if CK:
+            return wd_keep_flat(delta, g, wd, pp, ck_ptr(c_addr, t, CK), idx, mask, CK)
         else:
-            return tl.load(pp + idx, mask=mask, other=0.0).to(tl.float32)
+            return delta + wd * tl.load(pp + idx, mask=mask, other=0.0).to(tl.float32)
 
     @triton.jit
     def ck_store_noise(pp, cp, idx, mask, res, noise, BITS: tl.constexpr):
@@ -570,6 +593,17 @@ if _HAS_TRITON:
         z = ck_decode(p_ptr, c_ptr, offs, mask, BITS)
         d = tl.load(d_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         ck_store(p_ptr, c_ptr, offs, mask, z + alpha * d, seed, BITS)
+
+    @triton.jit
+    def _ck_decode_kernel(p_ptr, c_ptr, out_ptr, n, BITS: tl.constexpr, BLOCK: tl.constexpr):
+        """``out = decode(p, lo)`` as fp32, one launch (the torch reference,
+        ``kaon._compact_kahan.decode``, is ~10 integer kernels with three int32 temporaries —
+        measured +50-80% self-CUDA on a foreach Adakaon step when the weight-decay read went
+        through it). Integer-identical: ``ck_decode`` is the same bit manipulation."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        tl.store(out_ptr + offs, ck_decode(p_ptr, c_ptr, offs, mask, BITS), mask=mask)
 
     @triton.jit
     def dequant_int8(code_ptr, idx, mask, scale_ptr, rr, R):
@@ -767,6 +801,18 @@ if _HAS_TRITON:
         m2 = (ri < R) & (ci < C)
         idx = ri * C + ci
         g = tl.load(gp + idx, mask=m2, other=0.0).to(tl.float32)
+        if CK == 8:
+            # Where the decode sits is a MEASURED choice (same formula anywhere, but the
+            # compiler's FMA contraction of the later terms can follow the placement: kahan16
+            # stays late, where it is bit-exact to the fp32 variant). kahan8: UP FRONT,
+            # so its loads overlap the second-moment and momentum math — decoding where the
+            # decay first needs it (before the cautious tl.sum) put the residual load + integer
+            # decode on the critical path of this latency-bound kernel: +27% (4-bit) / +36% (no
+            # momentum) on a LoRA bag with wd>0 + cautious (retime-016); up front it is at or
+            # below 0.7.15. kahan16: up front measured +19-23% (the 16-bit residual tile held
+            # across the whole kernel), late +1% / +8%, so it decodes late (below).
+            cp = ck_ptr(c_addr, t, CK)
+            zc = ck_decode(pp, cp, idx, m2, CK)
 
         # --- REUSABLE (factored family): GC + row/col second moment -> r/c factors ---
         if GC:
@@ -822,9 +868,10 @@ if _HAS_TRITON:
         # rejected coordinate decays by ~0 and a survivor by wd/keep. WDFULL=True ("full"): applied
         # AFTER the mask to every coordinate at the same lr*wd (the Cautious Optimizers placement).
         p_old = tl.load(pp + idx, mask=m2, other=0.0).to(tl.float32)
-        if CK:
+        if CK == 16:  # late for kahan16 — see the measured note where kahan8 decodes
             cp = ck_ptr(c_addr, t, CK)
             zc = ck_decode(pp, cp, idx, m2, CK)
+        if CK:
             p_old = zc  # decay (WD) reads the full decoded value, never the bare bf16
         delta = m_new
         if WD and not WDFULL:
@@ -885,10 +932,8 @@ if _HAS_TRITON:
         if CAUTIOUS:
             delta = m
             if WD and not WDFULL:
-                if CK:  # the decoded value, as _chunked_apply's decay reads it
-                    delta = delta + wd * ck_decode(p_ptr, c_ptr, offs, mask, CK)
-                else:
-                    delta = delta + wd * tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+                # the decoded value where it can matter, as _chunked_apply's decay reads it
+                delta = wd_keep_flat(delta, g, wd, p_ptr, c_ptr, offs, mask, CK)
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr, tl.sum(keep.to(tl.int32)))
 
@@ -985,7 +1030,7 @@ if _HAS_TRITON:
                     pp = pi.to(tl.pointer_type(tl.bfloat16))
                 else:
                     pp = pi.to(tl.pointer_type(tl.float32))
-                delta = delta + wd * wd_value(pp, c_addr, t, offs, mask, CK)
+                delta = wd_keep(delta, g, wd, pp, c_addr, t, offs, mask, CK)
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -1282,7 +1327,7 @@ if _HAS_TRITON:
             if WD and not WDFULL:
                 pi = tl.load(p_addr + t)
                 pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
-                delta = delta + wd * wd_value(pp, c_addr, t, offs, mask, CK)
+                delta = wd_keep(delta, g, wd, pp, c_addr, t, offs, mask, CK)
             keep = ((delta * g) > 0.0) & mask
             tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -1953,7 +1998,7 @@ if _HAS_TRITON:
         if WD and not WDFULL:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-            delta += wd * wd_value(pp, c_addr, t, offs, mask, CK)
+            delta = wd_keep(delta, g, wd, pp, c_addr, t, offs, mask, CK)
         keep = ((delta * g) > 0.0) & mask
         tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -2046,7 +2091,7 @@ if _HAS_TRITON:
         if WD and not WDFULL:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-            delta += wd * wd_value(pp, c_addr, t, offs, mask, CK)
+            delta = wd_keep(delta, g, wd, pp, c_addr, t, offs, mask, CK)
         keep = ((delta * g) > 0.0) & mask
         tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -2200,7 +2245,7 @@ if _HAS_TRITON:
         if WD and not WDFULL:
             pbase = tl.load(p_addr + t)
             pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
-            delta += wd * wd_value(pp, c_addr, t, offs, mask, CK)
+            delta = wd_keep(delta, g, wd, pp, c_addr, t, offs, mask, CK)
         keep = ((delta * g) > 0.0) & mask
         tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
 
@@ -2534,6 +2579,33 @@ def ck_add_supported(target, lo, source, bits: int = 8) -> bool:
         and target.numel() == source.numel() == lo.numel()
         and lo.device == target.device
     )
+
+
+def ck_decode_supported(p, lo) -> bool:
+    """Can :func:`ck_decode_fast` take this pair? bf16 CUDA weight, a uint8 / int16 residual,
+    both contiguous, same numel and device."""
+    return (
+        _HAS_TRITON
+        and p.is_cuda
+        and p.dtype == torch.bfloat16
+        and lo.dtype in (torch.uint8, torch.int16)
+        and p.is_contiguous()
+        and lo.is_contiguous()
+        and p.numel() == lo.numel()
+        and lo.device == p.device
+    )
+
+
+@torch.no_grad()
+def ck_decode_fast(p, lo, bits: int):
+    """The fp32 value of ``(p, lo)`` in ONE Triton launch (caller checked
+    :func:`ck_decode_supported`); bit-identical to :func:`kaon._compact_kahan.decode`."""
+    out = torch.empty(p.shape, dtype=torch.float32, device=p.device)
+    n = p.numel()
+    if n:
+        with torch.cuda.device(p.device):
+            _ck_decode_kernel[((n + 1023) // 1024,)](p, lo, out, n, BITS=bits, BLOCK=1024)
+    return out
 
 
 @torch.no_grad()

@@ -171,6 +171,18 @@ def residual_ok(state: dict, bits: int) -> bool:
 
 
 @torch.no_grad()
+def decode_value(p: Tensor, lo: Tensor, bits: int) -> Tensor:
+    """:func:`kaon._compact_kahan.decode` through a single Triton launch when it applies
+    (CUDA, contiguous; ``SR_TRITON`` is the same torch-path pin as for the writers). Exact
+    either way — the kernel is the same integer bit manipulation."""
+    if SR_TRITON:
+        from kaon import _fused_triton as ft
+        if ft.ck_decode_supported(p, lo):
+            return ft.ck_decode_fast(p, lo, bits)
+    return decode(p, lo, bits)
+
+
+@torch.no_grad()
 def weight_value(p: Tensor, state: dict, bf16_method: str) -> Tensor:
     """The fp32 value of ``p`` an update term that READS the weight must use.
 
@@ -194,7 +206,7 @@ def weight_value(p: Tensor, state: dict, bf16_method: str) -> Tensor:
         bits = residual_bits(bf16_method)
         if not residual_ok(state, bits):
             ensure_residuals([p], [state], bits)
-        return decode(p.data, state[RESIDUAL_KEY], bits)
+        return decode_value(p.data, state[RESIDUAL_KEY], bits)
     return p.data.float()
 
 
@@ -484,7 +496,8 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
 def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
                       alpha: float = 1.0, triton: bool | None = None,
                       sr: SRStream | None = None,
-                      comp: list[Tensor] | None = None) -> None:
+                      comp: list[Tensor] | None = None,
+                      stacked: tuple[Tensor, Tensor] | None = None) -> None:
     """In-place ``p -= alpha * delta`` over a foreach bucket of (matrixized) param views.
 
     ``pviews`` is the list of N same-shape param views (each ``[*shape]``); ``delta`` is
@@ -529,8 +542,9 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
                 f"other width ({sorted({str(c.dtype) for c in comp})}, want {want}); convert "
                 "them first with kaon._backend.ensure_residuals"
             )
-        weights = torch.stack(pviews)
-        lows = torch.stack(comp)
+        # ``stacked``: the (weights, residuals) stack the caller already built this step for
+        # the decoded decay read (ForeachChunk.value_and_stacks) — same views, unwritten since.
+        weights, lows = stacked if stacked is not None else (torch.stack(pviews), torch.stack(comp))
         _ck_write_(weights, lows, delta, -alpha, bits, triton, sr, rows=True)
         torch._foreach_copy_(pviews, list(weights.unbind(0)))
         torch._foreach_copy_(comp, list(lows.unbind(0)))

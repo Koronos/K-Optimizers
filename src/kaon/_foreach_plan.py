@@ -39,10 +39,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import Tensor
 
-from kaon._backend import ensure_residuals, flat_view
+from kaon._backend import decode_value, ensure_residuals, flat_view
 from kaon._compact_kahan import (
     RESIDUAL_KEY,
-    decode,
     is_compact_kahan,
     residual_bits,
     residual_bits_of,
@@ -669,15 +668,25 @@ class ForeachChunk:
         :func:`kaon._backend.weight_value`. The residual views are the ones the plan already
         normalized for this step's write (:attr:`cviews`), decoded with the width they are
         stored in."""
+        return self.value_and_stacks(bf16_method)[0]
+
+    def value_and_stacks(self, bf16_method: str) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+        """:meth:`value_stack`, plus — for a decoded compact-Kahan bucket — the stacked
+        ``(weights, residuals)`` it decoded from, which the caller hands to the weight write
+        (:func:`kaon._backend.subtract_batched_` ``stacked=``) so the same bucket is not
+        stacked twice per step (``None`` otherwise). Valid until the weights are written.
+        The decode is ONE Triton launch on CUDA (:func:`kaon._backend.decode_value`); the
+        torch reference's ~10 integer kernels over the stack were a +30-80% self-CUDA
+        regression of the foreach kahan8/kahan16 step (retime-016)."""
         cv = self.cviews
         if (cv is None or not is_compact_kahan(bf16_method)
                 or self.pviews[0].dtype != torch.bfloat16):
-            return self.param_stack()
+            return self.param_stack(), None
         if self.single_alias and self.n == 1:
             w, lo = self.pviews[0].unsqueeze(0), cv[0].unsqueeze(0)
         else:
             w, lo = torch.stack(self.pviews), torch.stack(cv)
-        return decode(w, lo, residual_bits_of(lo))
+        return decode_value(w, lo, residual_bits_of(lo)), (w, lo)
 
 
 class ForeachPlan:

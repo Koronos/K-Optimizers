@@ -21,6 +21,14 @@ All notable changes to this project will be documented in this file.
   (checked on 360 configs across routes). An explicit `tl.fma` pins one FMA contraction in the
   direct 4-bit/int8 apply kernels under `cautious_wd="full"` (the CK variant had compiled the
   other one). The other optimizers' decay still reads the bf16 weight (follow-up).
+  Cost, measured (retime-016, `docs/research/compact-kahan/retime-016/fix_after.md`): the first
+  cut decoded the decay's value on the foreach path with ~10 ATen integer kernels over a second
+  stack of the bucket (+30-80% self-CUDA per step); it is now ONE Triton decode launch whose
+  stacks the weight write reuses — foreach kahan8/16 at or below 0.7.15 on the UNet bag. The
+  fused cautious keep passes decode only the lanes whose sign can depend on the residual
+  (bit-identical mask; that kernel +15%, ~+2% of the step) and the one-block tile decodes at a
+  measured placement (kahan8 up front, kahan16 late): fused steps within noise of 0.7.15 except
+  the LoRA tile kernel, +6-8% — the price of reading the full value there.
 - `load_state_dict` warns when the checkpoint replaces a group's `bf16_method` (torch restores
   every group hyperparameter): a `kahan8` Nekaon loading an SR checkpoint used to train with SR
   from then on, silently.

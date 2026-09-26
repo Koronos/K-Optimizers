@@ -1693,26 +1693,27 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         # The decay reads the weight's full VALUE: under kahan8/kahan16 the decoded
         # (bf16 + residual) value, bit-identical to param_stack() for every other method
         # (see kaon._backend.weight_value).
+        ck_stacks = None                             # reused by the write (no second stack)
         if wd != 0 and not wd_full:                  # "masked": decay inside the mask
-            p_fp32 = chunk.value_stack(bf16_method)
+            p_fp32, ck_stacks = chunk.value_and_stacks(bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
         if wd_full:                                  # "full": decay outside the mask
-            p_fp32 = chunk.value_stack(bf16_method)
+            p_fp32, ck_stacks = chunk.value_and_stacks(bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         # lr rides the weight write (``alpha``) instead of a separate ``delta.mul_(lr)``
         # pass over the stacked bucket - see :func:`kaon._backend.subtract_batched_`.
         if self._write_fold_lr:
             subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream,
-                              comp=chunk.cviews)
+                              comp=chunk.cviews, stacked=ck_stacks)
         else:                                        # A/B baseline (pre-0.7.12 order)
             delta.mul_(lr)
             subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream,
-                          comp=chunk.cviews)
+                          comp=chunk.cviews, stacked=ck_stacks)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -1778,24 +1779,25 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         # The decay reads the weight's full VALUE: under kahan8/kahan16 the decoded
         # (bf16 + residual) value, bit-identical to param_stack() for every other method
         # (see kaon._backend.weight_value).
+        ck_stacks = None                             # reused by the write (no second stack)
         if wd != 0 and not wd_full:                  # "masked": decay inside the mask
-            p_fp32 = chunk.value_stack(bf16_method)
+            p_fp32, ck_stacks = chunk.value_and_stacks(bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
         if wd_full:                                  # "full": decay outside the mask
-            p_fp32 = chunk.value_stack(bf16_method)
+            p_fp32, ck_stacks = chunk.value_and_stacks(bf16_method)
             delta = delta.add_(p_fp32, alpha=wd)
 
         if self._write_fold_lr:                      # see _factored_bucket
             subtract_batched_(chunk.pviews, delta, bf16_method, alpha=lr, sr=self.sr_stream,
-                              comp=chunk.cviews)
+                              comp=chunk.cviews, stacked=ck_stacks)
         else:
             delta.mul_(lr)
             subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream,
-                          comp=chunk.cviews)
+                          comp=chunk.cviews, stacked=ck_stacks)
 
     @torch.no_grad()
     def _step_one_param(self, p: Tensor, group: dict[str, Any]) -> None:
