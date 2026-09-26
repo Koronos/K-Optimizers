@@ -1,0 +1,84 @@
+kaon: C:\Users\Koronos\AppData\Local\Temp\claude\C--Users-Koronos-Documents-Repos-K-Optimizers\78593ade-87c4-49ac-91af-2d6bea9fb51a\scratchpad\abba016\6201c1f\src\kaon\__init__.py
+torch: 2.12.0+cu130 cuda: 13.0
+C:\Users\Koronos\Documents\Repos\Rengu-Flow\.venv\lib\site-packages\torch\cuda\__init__.py:1289: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\torch\csrc\cuda\Module.cpp:1003.)
+  torch._C._cuda_set_sync_debug_mode(debug_mode)
+C:\Users\Koronos\Documents\Repos\Rengu-Flow\.venv\lib\site-packages\torch\profiler\profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-09-26 03:59:30 111312:96992 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-26 03:59:30 111312:96992 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+PROF A_6201c1f adakaon_fused_sr: syncs=0 cuda_events=8 HtoD=0 DtoH=0 wall_ms=0.6220
+USDT:2026-09-26 03:59:30 111312:96992 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-26 03:59:30 111312:96992 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                            Optimizer.step#Adakaon.step         0.00%       0.000us         0.00%       0.000us       0.000us     419.592us       103.85%     419.592us     419.592us             1  
+                         _chunked_nomom_apply_batched_g         0.00%       0.000us         0.00%       0.000us       0.000us     191.939us        47.51%     191.939us     191.939us             1  
+                          _chunked_nomom_keep_batched_g         0.00%       0.000us         0.00%       0.000us       0.000us      78.978us        19.55%      78.978us      78.978us             1  
+                                         _reduce_rowcol         0.00%       0.000us         0.00%       0.000us       0.000us      71.841us        17.78%      71.841us      71.841us             1  
+                                            _reduce_rms         0.00%       0.000us         0.00%       0.000us       0.000us      38.848us         9.61%      38.848us      38.848us             1  
+                                        _adam_1d_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      17.217us         4.26%      17.217us      17.217us             1  
+                                 _factor_rowcol_batched         0.00%       0.000us         0.00%       0.000us       0.000us       3.648us         0.90%       3.648us       3.648us             1  
+                            Optimizer.step#Adakaon.step        11.01%     715.200us        52.72%       3.423ms       3.423ms       0.000us         0.00%       3.136us       3.136us             1  
+                                            aten::zero_         0.36%      23.700us        40.52%       2.631ms       2.631ms       0.000us         0.00%       3.136us       3.136us             1  
+                                            aten::fill_         1.05%      68.100us        40.16%       2.607ms       2.607ms       1.568us         0.39%       3.136us       3.136us             1  
+                                Activity Buffer Request        21.56%       1.400ms        21.56%       1.400ms       1.400ms       1.568us         0.39%       1.568us       1.568us             1  
+_ZN2at6native29vectorized_elementwise_kernelILi4ENS0...         0.00%       0.000us         0.00%       0.000us       0.000us       1.568us         0.39%       1.568us       1.568us             1  
+                                       cudaLaunchKernel        17.55%       1.139ms        17.55%       1.139ms       1.139ms       0.000us         0.00%       0.000us       0.000us             1  
+                                       cuLaunchKernelEx         1.18%      76.700us         1.18%      76.700us      12.783us       0.000us         0.00%       0.000us       0.000us             6  
+                                  cudaDeviceSynchronize        47.28%       3.070ms        47.28%       3.070ms       1.535ms       0.000us         0.00%       0.000us       0.000us             2  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 6.493ms
+Self CUDA time total: 404.039us
+
+PROF A_6201c1f adakaon_fused_kahan8: syncs=0 cuda_events=8 HtoD=0 DtoH=0 wall_ms=0.6833
+USDT:2026-09-26 03:59:30 111312:96992 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-26 03:59:30 111312:96992 C:\actions-runner\_work\pytorch\pytorch\third_party\kineto\libkineto\src\ActivityProfilerController.cpp:455] profiler_stop
+C:\Users\Koronos\AppData\Local\Temp\claude\C--Users-Koronos-Documents-Repos-K-Optimizers\78593ade-87c4-49ac-91af-2d6bea9fb51a\scratchpad\abba016\6201c1f\src\kaon\msam.py:823: UserWarning: Nekaon: the lookahead displacement (<= 1.50e-04) is below half a torch.bfloat16 ulp at the sampled mean weight scale (1.56e-04); some perturbations may round to zero. Use fp32 weights for these parameters, or set rho/k=0 to drop the cost.
+  self._warn_if_inert()
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                            Optimizer.step#Adakaon.step         0.00%       0.000us         0.00%       0.000us       0.000us     855.203us       129.94%     855.203us     855.203us             1  
+                         _chunked_nomom_apply_batched_g         0.00%       0.000us         0.00%       0.000us       0.000us     295.436us        44.89%     295.436us     295.436us             1  
+                          _chunked_nomom_keep_batched_g         0.00%       0.000us         0.00%       0.000us       0.000us     200.392us        30.45%     200.392us     200.392us             1  
+                                         _reduce_rowcol         0.00%       0.000us         0.00%       0.000us       0.000us      95.940us        14.58%      95.940us      95.940us             1  
+                                            _reduce_rms         0.00%       0.000us         0.00%       0.000us       0.000us      38.082us         5.79%      38.082us      38.082us             1  
+                                        _adam_1d_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      22.977us         3.49%      22.977us      22.977us             1  
+                                 _factor_rowcol_batched         0.00%       0.000us         0.00%       0.000us       0.000us       3.744us         0.57%       3.744us       3.744us             1  
+                            Optimizer.step#Adakaon.step        29.78%     617.000us        87.62%       1.815ms       1.815ms       0.000us         0.00%       3.200us       3.200us             1  
+                                            aten::zero_         0.86%      17.900us        51.89%       1.075ms       1.075ms       0.000us         0.00%       3.200us       3.200us             1  
+                                            aten::fill_         2.19%      45.400us        51.03%       1.057ms       1.057ms       1.600us         0.24%       3.200us       3.200us             1  
+                                Activity Buffer Request        46.16%     956.300us        46.16%     956.300us     956.300us       1.600us         0.24%       1.600us       1.600us             1  
+_ZN2at6native29vectorized_elementwise_kernelILi4ENS0...         0.00%       0.000us         0.00%       0.000us       0.000us       1.600us         0.24%       1.600us       1.600us             1  
+                                       cudaLaunchKernel         2.68%      55.500us         2.68%      55.500us      55.500us       0.000us         0.00%       0.000us       0.000us             1  
+                                       cuLaunchKernelEx         5.95%     123.300us         5.95%     123.300us      20.550us       0.000us         0.00%       0.000us       0.000us             6  
+                                  cudaDeviceSynchronize        12.38%     256.500us        12.38%     256.500us     128.250us       0.000us         0.00%       0.000us       0.000us             2  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 2.072ms
+Self CUDA time total: 658.171us
+
+PROF A_6201c1f nekaon_fused_sr: syncs=0 cuda_events=12 HtoD=0 DtoH=0 wall_ms=0.9627
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                            Optimizer.step#Adakaon.step         0.00%       0.000us         0.00%       0.000us       0.000us     767.289us        89.00%     767.289us     767.289us             1  
+                          _chunked_4bit_apply_batched_g         0.00%       0.000us         0.00%       0.000us       0.000us     269.032us        31.20%     269.032us     269.032us             1  
+                           _chunked_4bit_keep_batched_g         0.00%       0.000us         0.00%       0.000us       0.000us     207.174us        24.03%     207.174us     207.174us             1  
+                                 _axpy_momentum_batched         0.00%       0.000us         0.00%       0.000us       0.000us     172.230us        19.98%     172.230us      43.058us             4  
+                                         _reduce_rowcol         0.00%       0.000us         0.00%       0.000us       0.000us     126.308us        14.65%     126.308us     126.308us             1  
+                                        _adam_1d_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      43.873us         5.09%      43.873us      43.873us             1  
+                                            _reduce_rms         0.00%       0.000us         0.00%       0.000us       0.000us      38.209us         4.43%      38.209us      38.209us             1  
+                                 _factor_rowcol_batched         0.00%       0.000us         0.00%       0.000us       0.000us       3.936us         0.46%       3.936us       3.936us             1  
+                            Optimizer.step#Adakaon.step        21.09%     407.600us        27.61%     533.500us     533.500us       0.000us         0.00%       1.408us       1.408us             1  
+                                            aten::zero_         0.67%      12.900us         3.63%      70.100us      70.100us       0.000us         0.00%       1.408us       1.408us             1  
+                                            aten::fill_         1.19%      23.000us         2.96%      57.200us      57.200us       1.408us         0.16%       1.408us       1.408us             1  
+_ZN2at6native29vectorized_elementwise_kernelILi4ENS0...         0.00%       0.000us         0.00%       0.000us       0.000us       1.408us         0.16%       1.408us       1.408us             1  
+                                Activity Buffer Request        46.23%     893.300us        46.23%     893.300us     893.300us       0.000us         0.00%       0.000us       0.000us             1  
+                                       cuLaunchKernelEx         6.99%     135.100us         6.99%     135.100us      13.510us       0.000us         0.00%       0.000us       0.000us            10  
+                                       cudaLaunchKernel         1.77%      34.200us         1.77%      34.200us      34.200us       0.000us         0.00%       0.000us       0.000us             1  
+                                  cudaDeviceSynchronize        22.06%     426.400us        22.06%     426.400us     213.200us       0.000us         0.00%       0.000us       0.000us             2  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.933ms
+Self CUDA time total: 862.170us
+

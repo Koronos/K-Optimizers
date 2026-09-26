@@ -1,0 +1,80 @@
+=== battery 3_B_026621d start @ 2026-09-26 03:26:06 ===
+kaon: C:\Users\Koronos\AppData\Local\Temp\claude\C--Users-Koronos-Documents-Repos-K-Optimizers\78593ade-87c4-49ac-91af-2d6bea9fb51a\scratchpad\abba016\026621d\src\kaon\__init__.py
+torch: 2.12.0+cu130 cuda: 13.0
+name, power.limit [W], power.draw [W], clocks.max.sm [MHz], clocks.current.sm [MHz], temperature.gpu, utilization.gpu [%]
+NVIDIA RTX 3000 Ada Generation Laptop GPU, [N/A], 15.60 W, 3105 MHz, 1530 MHz, 56, 0 %
+--- shape unet @ 2026-09-26 03:26:07 ---
+  adakaon/no_momentum start @ 2026-09-26 03:26:07
+    adakaon no_momentum    fused_stochastic_rounding median=0.7936ms [0.7322,0.8899]
+    adakaon no_momentum    fused_kahan8           median=0.8218ms [0.7875,0.8970]
+    adakaon no_momentum    fused_kahan16          median=0.9498ms [0.8940,1.0383]
+    adakaon no_momentum    foreach_stochastic_rounding median=4.9900ms [4.6520,5.1384]
+    adakaon no_momentum    foreach_kahan8         median=8.4931ms [7.8561,8.5934]
+    adakaon no_momentum    foreach_kahan16        median=8.8463ms [8.2637,9.0102]
+  adakaon/momentum_4bit start @ 2026-09-26 03:26:10
+    adakaon momentum_4bit  fused_stochastic_rounding median=0.8397ms [0.7936,1.0179]
+    adakaon momentum_4bit  fused_kahan8           median=0.8847ms [0.8182,1.0076]
+    adakaon momentum_4bit  fused_kahan16          median=0.9861ms [0.9155,1.1162]
+    adakaon momentum_4bit  foreach_stochastic_rounding median=7.3446ms [7.2438,7.7025]
+    adakaon momentum_4bit  foreach_kahan8         median=10.5994ms [10.4919,10.7059]
+    adakaon momentum_4bit  foreach_kahan16        median=11.0566ms [10.8923,11.2026]
+  nekaon start @ 2026-09-26 03:26:12
+C:\Users\Koronos\AppData\Local\Temp\claude\C--Users-Koronos-Documents-Repos-K-Optimizers\78593ade-87c4-49ac-91af-2d6bea9fb51a\scratchpad\abba016\026621d\src\kaon\msam.py:828: UserWarning: Nekaon: the lookahead displacement (<= 1.50e-04) is below half a torch.bfloat16 ulp at the sampled mean weight scale (1.56e-04); some perturbations may round to zero. Use fp32 weights for these parameters, or set rho/k=0 to drop the cost.
+  self._warn_if_inert()
+    nekaon fused_stochastic_rounding median=1.4454ms [1.2472,1.6845]
+    nekaon fused_kahan8           median=1.5503ms [1.4797,1.6712]
+    nekaon fused_kahan16          median=1.7213ms [1.6138,1.9261]
+    nekaon foreach_stochastic_rounding median=9.2621ms [8.0599,11.1534]
+    nekaon foreach_kahan8         median=11.8011ms [11.5507,13.1502]
+    nekaon foreach_kahan16        median=12.3612ms [12.1006,13.2086]
+  adapnm start @ 2026-09-26 03:26:14
+    adapnm fused_stochastic_rounding median=1.6835ms [1.4572,2.0019]
+--- shape big @ 2026-09-26 03:26:15 ---
+  adakaon/no_momentum start @ 2026-09-26 03:26:15
+    adakaon no_momentum    fused_stochastic_rounding median=0.4265ms [0.4045,0.4751]
+    adakaon no_momentum    fused_kahan8           median=0.4004ms [0.3768,0.4413]
+    adakaon no_momentum    fused_kahan16          median=0.3881ms [0.3686,0.4178]
+    adakaon no_momentum    foreach_stochastic_rounding median=1.3097ms [1.2247,1.5923]
+    adakaon no_momentum    foreach_kahan8         median=1.6655ms [1.5718,1.8555]
+    adakaon no_momentum    foreach_kahan16        median=1.6768ms [1.5770,1.8452]
+  adakaon/momentum_4bit start @ 2026-09-26 03:26:15
+    adakaon momentum_4bit  fused_stochastic_rounding median=0.9124ms [0.7209,1.0496]
+    adakaon momentum_4bit  fused_kahan8           median=0.6973ms [0.5437,0.9380]
+    adakaon momentum_4bit  fused_kahan16          median=0.6292ms [0.5069,1.0035]
+    adakaon momentum_4bit  foreach_stochastic_rounding median=3.9322ms [3.0136,5.3371]
+    adakaon momentum_4bit  foreach_kahan8         median=3.9644ms [3.1877,5.7661]
+    adakaon momentum_4bit  foreach_kahan16        median=4.0474ms [3.4734,4.8742]
+  nekaon start @ 2026-09-26 03:26:16
+    nekaon fused_stochastic_rounding median=0.8991ms [0.7875,1.0138]
+    nekaon fused_kahan8           median=0.7962ms [0.7199,0.9800]
+    nekaon fused_kahan16          median=0.7209ms [0.6502,0.8919]
+    nekaon foreach_stochastic_rounding median=3.5210ms [3.1652,4.0663]
+    nekaon foreach_kahan8         median=3.9025ms [3.5041,4.4032]
+    nekaon foreach_kahan16        median=3.7330ms [3.2195,4.0643]
+  adapnm start @ 2026-09-26 03:26:17
+    adapnm fused_stochastic_rounding median=1.1633ms [1.0752,1.2841]
+--- shape lora @ 2026-09-26 03:26:17 ---
+  adakaon/no_momentum start @ 2026-09-26 03:26:17
+    adakaon no_momentum    fused_stochastic_rounding median=111.9657ms [103.3595,121.0409]
+    adakaon no_momentum    fused_kahan8           median=107.7949ms [98.3951,136.8535]
+    adakaon no_momentum    fused_kahan16          median=112.3215ms [99.3905,135.5039]
+    adakaon no_momentum    foreach_stochastic_rounding median=603.8482ms [560.6533,660.5568]
+    adakaon no_momentum    foreach_kahan8         median=831.7834ms [737.8217,959.4798]
+    adakaon no_momentum    foreach_kahan16        median=813.4226ms [727.9186,990.8859]
+  adakaon/momentum_4bit start @ 2026-09-26 03:28:47
+    adakaon momentum_4bit  fused_stochastic_rounding median=154.0291ms [138.0792,197.4753]
+    adakaon momentum_4bit  fused_kahan8           median=169.0604ms [155.8006,195.2676]
+    adakaon momentum_4bit  fused_kahan16          median=174.1747ms [155.5169,198.1379]
+    adakaon momentum_4bit  foreach_stochastic_rounding median=1033.4269ms [946.5109,1111.7137]
+    adakaon momentum_4bit  foreach_kahan8         median=1200.0159ms [1126.2146,1320.6733]
+    adakaon momentum_4bit  foreach_kahan16        median=1212.1512ms [1099.9603,1337.8314]
+  nekaon start @ 2026-09-26 03:32:33
+    nekaon fused_stochastic_rounding median=184.0092ms [168.1900,211.7059]
+    nekaon fused_kahan8           median=221.0263ms [186.4735,242.9471]
+    nekaon fused_kahan16          median=203.7135ms [180.3663,256.5591]
+    nekaon foreach_stochastic_rounding median=1102.9361ms [953.6655,1205.3801]
+    nekaon foreach_kahan8         median=1233.0220ms [1140.4800,1431.8593]
+    nekaon foreach_kahan16        median=1256.9200ms [1165.6182,1429.0688]
+  adapnm start @ 2026-09-26 03:36:31
+    adapnm fused_stochastic_rounding median=374.8142ms [341.0514,424.0353]
+=== battery 3_B_026621d done, wall=644.6s @ 2026-09-26 03:36:51 ===
