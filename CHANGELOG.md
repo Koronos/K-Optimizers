@@ -59,7 +59,8 @@ All notable changes to this project will be documented in this file.
   `"stochastic_rounding"`; a bf16 bucket under a method no fused kernel implements is refused
   with an error instead of written with SR). SR/compact-Kahan launches compile the same
   variants as before (bit-identical on 144 fused SR configs). A mid-run switch to legacy
-  `"kahan"` also raised a bare `KeyError: 'shift'` (the buffer is now allocated lazily, zero).
+  `"kahan"` also raised a bare `KeyError: 'shift'` (the buffer is now allocated lazily, seeded
+  from a compact-Kahan residual when there is one — the value's sub-ulp part — else zero).
 - `add_param_group` on a wrapper (Nekaon, MSAM, SAM, Lookahead) raised a bare
   `AttributeError: ... no attribute 'defaults'`; it now delegates to the inner optimizer (and
   back-fills the wrapper's own group keys).

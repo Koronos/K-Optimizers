@@ -41,6 +41,7 @@ from kaon._compact_kahan import (
     init_residual,
     is_compact_kahan,
     residual_bits,
+    residual_bits_of,
     residual_dtype,
 )
 from kaon._stochastic_rounding import SRStream, add_stochastic_
@@ -475,9 +476,16 @@ def subtract_one_(p: Tensor, delta_fp32: Tensor, state: dict, bf16_method: str,
     elif low and bf16_method == "kahan":
         shift = state.get("shift")
         if shift is None:
-            # switched to legacy kahan after the state existed: start compensating from a
-            # zero buffer (a bare KeyError otherwise), like ensure_residuals does for kahan8/16
-            shift = state["shift"] = torch.zeros_like(p)
+            # switched to legacy kahan after the state existed (a bare KeyError otherwise):
+            # seed the bf16 compensation from a compact-Kahan residual when there is one (the
+            # value's sub-ulp part, rounded to bf16), else start from zero like
+            # ensure_residuals does for kahan8/16.
+            lo = state.get(RESIDUAL_KEY)
+            if lo is not None and p.dtype == torch.bfloat16:
+                shift = (decode(p.data, lo, residual_bits_of(lo)) - p.data.float()).to(p.dtype)
+            else:
+                shift = torch.zeros_like(p)
+            state["shift"] = shift
         shift.sub_((delta_fp32 * alpha if alpha != 1.0 else delta_fp32).to(p.dtype))
         p_before = p.detach().clone()
         p.add_(shift)

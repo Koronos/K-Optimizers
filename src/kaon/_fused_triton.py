@@ -483,7 +483,7 @@ if _HAS_TRITON:
         The decision only depends on the decoded value where the bare-bf16 ``x_p = delta +
         wd*p`` is within reach of it: ``|z - p| <= |p|*2^-7`` (+ a subnormal-sized term at
         ``p == 0``), so the residual is loaded (masked load: untouched sectors are not
-        fetched) only for lanes with ``|x_p| <= 4*wd*(|p|*2^-7) + 1e-36`` or ``|x_p*g| <
+        fetched) only for lanes with ``|x_p| <= 4*|wd|*(|p|*2^-7) + 1e-36`` or ``|x_p*g| <
         1e-30`` (product near underflow). Elsewhere ``x_p`` and ``x_z`` have the same sign and
         neither product underflows, so ``keep`` is bit-identical to the full decode.
         Non-finite ``p``/``delta`` give NaN/inf on both sides alike. ``cp``: typed residual
@@ -491,7 +491,9 @@ if _HAS_TRITON:
         p = tl.load(pp + idx, mask=mask, other=0.0).to(tl.float32)
         x = delta + wd * p
         if CK:
-            thr = 4.0 * wd * (tl.abs(p) * 0.0078125) + 1e-36
+            # |wd|: weight_decay is not validated >= 0, and a negative wd made thr negative —
+            # no lane was ambiguous and the mask stopped matching the full decode.
+            thr = 4.0 * tl.abs(wd) * (tl.abs(p) * 0.0078125) + 1e-36
             amb = mask & ((tl.abs(x) <= thr) | (tl.abs(x * g) < 1e-30))
             # Block-uniform skip: ambiguous lanes are rare (a sign within ~1% of the decay term
             # of a zero crossing), so most blocks never run the decode at all.

@@ -638,3 +638,41 @@ def test_adakaon_fused_sr_flag_follows_the_method():
     for m in ("none", "kahan"):
         with pytest.raises(RuntimeError, match="stale routing"):
             f({"bf16_method": m}, True)
+
+
+@pytest.mark.skipif(not FUSED, reason="Triton fused kernels need CUDA + Triton")
+@pytest.mark.parametrize("cls", [Adakaon, Nekaon])
+@pytest.mark.parametrize("md", ["4bit", "int8", "bfloat16"])
+def test_kahan16_negative_weight_decay_is_the_fp32_run(cls, md):
+    """weight_decay is not validated >= 0. The fused keep passes decode only the lanes whose
+    cautious sign can depend on the residual, with a threshold proportional to wd: it has to
+    use |wd|, or a negative wd leaves no lane ambiguous and the mask diverges from the full
+    decode (regression caught in review: 274k mismatching lanes of 25M at wd=-0.1)."""
+    p32 = _bag(torch.float32, "cuda", big=True)
+    p16 = _bag(torch.bfloat16, "cuda", big=True)
+    kw = dict(lr=1e-3, momentum_dtype=md, weight_decay=-0.1, cautious=True, cautious_wd="masked",
+              fused=True, deterministic_reductions=True)
+    o32 = cls(p32, **kw)
+    o16 = cls(p16, bf16_method="kahan16", **kw)
+    _drive([o32, o16], [p32, p16])
+    for a, b in zip(p16, p32, strict=True):
+        assert _bits_equal(_z(o16, a), b.data), (md, tuple(a.shape))
+
+
+def test_switch_to_legacy_kahan_seeds_shift_from_the_residual():
+    """kahan16 -> legacy "kahan" mid-run: the new bf16 ``shift`` starts at the value's sub-ulp
+    part (decoded residual, rounded to bf16), not at zero — so the value the legacy pair
+    ``p + shift`` carries after the switch is the kahan16 value to bf16-of-residual precision
+    (a zero seed would drop up to half an ulp)."""
+    ps = _bag()
+    o = Adakaon(ps, lr=1e-3, bf16_method="kahan16", foreach=False)
+    _drive([o], [ps], steps=3)
+    z = {p: _z(o, p) for p in ps}
+    o.param_groups[0]["bf16_method"] = "kahan"
+    from kaon._backend import subtract_one_
+    for p in ps:
+        subtract_one_(p, torch.zeros(p.shape), o.state[p], "kahan")   # a zero step
+        carried = p.data.float() + o.state[p]["shift"].float()
+        ulp = torch.exp2(torch.floor(torch.log2(z[p].abs().clamp_min(1e-30))) - 7)
+        assert float(((carried - z[p]).abs() / ulp).max()) < 0.01, tuple(p.shape)
+        assert float(((p.data.float() - z[p]).abs() / ulp).max()) > 0.05   # there WAS a residual
