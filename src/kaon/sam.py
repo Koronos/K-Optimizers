@@ -243,7 +243,16 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         Requires ``p.grad`` already populated (the loop did the first backward). For each
         param: ``e = scale * (w^2 if adaptive else 1) * g`` with
         ``scale = rho / (global_grad_norm + eps)``; the climb ``w += e`` is bf16-correct.
+
+        A previous ``first_step`` whose ``second_step`` never ran (an aborted step: the
+        perturbed forward was skipped, raised, or produced a non-finite loss) is undone
+        FIRST — its ``old_p`` snapshot is copied back — so this climb starts from, and
+        snapshots, the true weights. Without that the new ``old_p`` was the perturbed
+        weight and the first climb stayed in the model for good (measured 1.9e-2 max
+        drift in fp32). Restoring rather than raising keeps the "skip this batch and
+        carry on" loop pattern working; the true weights can never be lost.
         """
+        self._restore_climb()
         grad_norm = self._grad_norm()
         for group in self.param_groups:
             adaptive = group["adaptive"]
@@ -254,6 +263,7 @@ class SAM(WrapsInnerOptimizer, Optimizer):
                 n_per = max(1, budget // max(p.numel() for p in plist))
                 for i in range(0, len(plist), n_per):
                     self._climb_chunk(plist[i:i + n_per], scale=scale, adaptive=adaptive)
+        self._climbed = True
         if zero_grad:
             self.zero_grad()
 
@@ -267,14 +277,29 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         ``w``. The restore is an exact ``copy_`` of the pre-climb snapshot, so no climb
         rounding leaks into the final weights.
         """
-        for group in self.param_groups:
-            for p in group["params"]:
-                old_p = self.state[p].pop("old_p", None)
-                if old_p is not None:
-                    p.data.copy_(old_p)
+        self._restore_climb(force=True)
         self.base_optimizer.step()
         if zero_grad:
             self.zero_grad()
+
+    @torch.no_grad()
+    def _restore_climb(self, force: bool = False) -> None:
+        """Copy every pending ``old_p`` snapshot back into its weight (exact) and drop it.
+
+        ``first_step`` only walks the params when a climb is known to be pending (the
+        flag, which ``load_state_dict`` re-derives from the restored state), so the
+        normal ``first_step``/``second_step`` cycle pays nothing extra; ``second_step``
+        always walks them, as it always has."""
+        if not (force or getattr(self, "_climbed", False)):
+            return
+        state = self.state
+        for group in self.param_groups:
+            for p in group["params"]:
+                st = state.get(p)
+                old_p = st.pop("old_p", None) if st else None
+                if old_p is not None:
+                    p.data.copy_(old_p)
+        self._climbed = False
 
     # ------------------------------------------------------------------ combined
     @torch.no_grad()
@@ -312,6 +337,8 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         """
         self._load_wrapped(state_dict, lambda inner, sd: inner.load_state_dict(sd))
         self.base_optimizer = self.inner
+        # A checkpoint taken between first_step and second_step carries old_p snapshots.
+        self._climbed = any("old_p" in st for st in self.state.values())
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)

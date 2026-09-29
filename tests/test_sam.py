@@ -376,6 +376,52 @@ def test_first_step_without_any_grad_and_empty_first_group():
     assert torch.equal(b.detach(), b0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_repeated_first_step_restores_before_climbing(dtype):
+    """An aborted SAM step (``first_step`` with no ``second_step`` — e.g. the perturbed
+    forward was skipped) followed by another ``first_step`` must not snapshot the
+    PERTURBED weights as ``old_p``: that baked the first climb into the weights for good
+    (1.9e-2 max drift in fp32). The second ``first_step`` restores first, so the restore
+    after it lands on the original weights exactly."""
+    g = torch.Generator().manual_seed(3)
+    w = torch.randn(16, 16, generator=g).to(dtype).requires_grad_(True)
+    w0 = w.detach().clone()
+    opt = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    w.grad = torch.randn(16, 16, generator=g).to(dtype)
+    opt.first_step()                  # climb 1, never completed
+    w.grad = torch.randn(16, 16, generator=g).to(dtype)
+    g2 = w.grad.clone()
+    opt.first_step()                  # climb 2 must start from w0
+    if dtype == torch.float32:
+        scale = torch.tensor(0.1 / (float(g2.double().norm()) + 1e-12), dtype=torch.float32)
+        torch.testing.assert_close(w.detach(), w0 + g2 * scale, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(opt.state[w]["old_p"], w0, rtol=0, atol=0)
+    w.grad = None                     # base step is a no-op without a grad
+    opt.second_step()
+    assert torch.equal(w.detach(), w0)
+
+
+def test_pending_climb_survives_a_checkpoint():
+    """A checkpoint taken between first_step and second_step carries old_p; a resumed
+    SAM whose next call is first_step must restore it before climbing again."""
+    import copy
+
+    w = torch.randn(6, 5).requires_grad_(True)
+    w0 = w.detach().clone()
+    opt = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    w.grad = torch.randn(6, 5)
+    opt.first_step()
+    sd = copy.deepcopy(opt.state_dict())
+    opt2 = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    opt2.load_state_dict(sd)
+    w.grad = torch.randn(6, 5)
+    opt2.first_step()
+    torch.testing.assert_close(opt2.state[w]["old_p"], w0, rtol=0, atol=0)
+    w.grad = None
+    opt2.second_step()
+    assert torch.equal(w.detach(), w0)
+
+
 def test_add_param_group_after_construction():
     a = torch.randn(4, 3).requires_grad_(True)
     c = torch.randn(5).requires_grad_(True)
