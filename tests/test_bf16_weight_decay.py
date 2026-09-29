@@ -7,6 +7,9 @@ rounds every coordinate back to itself, so the decay was a silent no-op (200 ste
 ``lr=1e-4, wd=0.1`` on a bf16 ones matrix moved it by exactly 0.0). The decay now rides the
 fp32 delta (``delta += lr*wd*p``, the decoded value under kahan8/kahan16) and goes through
 the same SR / Kahan write as the update, like Adakaon's.
+
+Also here: the factored reconstruction with ``eps == 0`` and an all-zero gradient, which
+used to be ``0 / 0`` -> NaN on AdaBelief and AdamP.
 """
 from __future__ import annotations
 
@@ -109,3 +112,43 @@ def test_kahan16_with_decay_is_the_fp32_run(cls, extra, route, md, cautious):
         z = _value(o16, a)
         assert torch.equal(z.view(torch.int32), b.data.contiguous().view(torch.int32)), (
             tuple(a.shape), float((z - b.data).abs().max()))
+
+
+@pytest.mark.parametrize("cls", [AdaBelief, AdamP, ADOPT])
+@pytest.mark.parametrize("route", ROUTES)
+def test_eps_zero_all_zero_grad_stays_finite(cls, route):
+    """eps=0 (no eps1 inside the factored square) + an all-zero gradient: the row mean is 0
+    and the reconstruction used to be 0/0 -> NaN weights. A zero second moment with a zero
+    first moment is a zero update."""
+    dev = _dev(route)
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter(torch.randn(s, device=dev)) for s in [(8, 6), (8, 6), (4, 3, 3)]]
+    p0 = [p.detach().clone() for p in ps]
+    eps = 1e-6 if cls is ADOPT else 0.0  # ADOPT's eps is a cap (> 0); its eps1 is always 0
+    opt = cls(ps, lr=1e-3, eps=eps, foreach=route != "per_param")
+    for _ in range(3):
+        for p in ps:
+            p.grad = torch.zeros_like(p)
+        opt.step()
+    for p, q in zip(ps, p0, strict=True):
+        assert torch.isfinite(p).all()
+        assert torch.equal(p.detach(), q)
+
+
+@pytest.mark.parametrize("cls", [AdaBelief, AdamP])
+@pytest.mark.parametrize("route", ROUTES)
+def test_eps_zero_dead_row_stays_finite(cls, route):
+    """eps=0 and ONE output row whose gradient is always zero (a dead unit): its row
+    statistic is exactly 0, so ``rsqrt`` of it is inf and ``0 * inf`` NaN'd the row."""
+    dev = _dev(route)
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter(torch.randn(8, 6, device=dev)) for _ in range(2)]
+    opt = cls(ps, lr=1e-3, eps=0.0, gradient_centralization=False, foreach=route != "per_param")
+    for _ in range(3):
+        for p in ps:
+            g = torch.randn_like(p)
+            g[2] = 0.0
+            p.grad = g
+        opt.step()
+    for p in ps:
+        assert torch.isfinite(p).all()

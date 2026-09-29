@@ -121,6 +121,28 @@ from kaon._momentum_codec import (
 
 __all__ = ["AdaBelief"]
 
+def _zero_safe_inv_sqrt_factors(row: Tensor, col: Tensor) -> tuple[Tensor, Tensor]:
+    """``factored_inv_sqrt_factors`` for ``eps1 == 0``, where exact-zero statistics are reachable.
+
+    With no ``eps1`` inside the square, a row (or column) whose gradient has always been
+    exactly zero keeps a statistic of exactly 0 — a dead unit, a frozen input, or a whole
+    all-zero gradient. ``rsqrt(0) = inf`` then meets a first moment that is 0 there too, and
+    ``0 * inf`` NaN'd the weights; a whole all-zero ``row`` was already ``0 / 0`` in the
+    mean. A zero second moment with a zero first moment is a zero update, so those factors
+    are 0 instead. Only an EXACTLY zero mean is replaced (not floored: a subnormal mean is a
+    finite update, see ``kaon._factored``), and NaNs from the gradient still propagate (they
+    are not inf). Called only when ``eps1 == 0``: every other configuration keeps the plain
+    reconstruction, bit for bit. Shapes as ``factored_inv_sqrt_factors`` (any leading dims).
+    """
+    row_mean = row.mean(dim=-1, keepdim=True)
+    row_mean.masked_fill_(row_mean == 0, 1.0)
+    r_factor = row.div(row_mean).rsqrt_()
+    r_factor.masked_fill_(r_factor.isinf(), 0.0)
+    c_factor = col.rsqrt()
+    c_factor.masked_fill_(c_factor.isinf(), 0.0)
+    return r_factor.unsqueeze(-1), c_factor.unsqueeze(-2)
+
+
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
 # Performance / memory knobs mirror Adakaon (see that module for the rationale).
@@ -525,8 +547,11 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
-        r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
-        c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
+        if eps1 > 0:
+            r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
+            c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
+        else:  # exact-zero statistics are reachable: 0 * inf would NaN
+            r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
         inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])                        # 1/sqrt(s_hat)
 
         delta = m.mul_(inv_denom).mul_(c["step_size"])                    # m / de_nom * step_size
@@ -622,7 +647,10 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             # residual (NOT its square): update_factored_state squares internally.
             residual = gv - m
             update_factored_state(residual, state["row"], state["col"], c["beta2"], eps)
-            r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
+            if eps > 0:
+                r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
+            else:  # exact-zero statistics are reachable: 0 * inf would NaN
+                r_factor, c_factor = _zero_safe_inv_sqrt_factors(state["row"], state["col"])
             inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])           # 1/sqrt(s_hat)
             delta = m.mul_(inv_denom).mul_(c["step_size"])
             if matrixize:
