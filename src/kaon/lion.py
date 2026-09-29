@@ -257,6 +257,10 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
                 loss = closure()
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None]
+            if not params:
+                # Nothing to step (frozen group / gradient release): the foreach budget
+                # below reads ``params[0].device`` and would IndexError on an empty list.
+                continue
             for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("Lion does not support sparse gradients")

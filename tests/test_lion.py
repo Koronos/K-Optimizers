@@ -649,3 +649,22 @@ def test_transposed_2d_weight_actually_gets_its_update():
     )
     for p, r in zip(params, ref, strict=True):
         torch.testing.assert_close(p.detach(), r.detach(), rtol=0, atol=0)
+
+
+# ------------------------------------------------ 0.7.18 audit: empty group / cautious_wd
+@pytest.mark.parametrize("foreach", [True, False])
+def test_group_without_any_grad_is_skipped(foreach):
+    """A param group where NO param has a grad this step (frozen block, gradient release,
+    a second group that did not participate) must be skipped, not crash: the foreach path
+    read ``params[0].device`` off an empty list (IndexError)."""
+    a = torch.nn.Parameter(torch.randn(4, 4))
+    b = torch.nn.Parameter(torch.randn(4, 4))
+    b0 = b.detach().clone()
+    opt = Lion([{"params": [a]}, {"params": [b]}], lr=1e-3, foreach=foreach)
+    a0 = a.detach().clone()
+    a.grad = torch.randn(4, 4)
+    opt.step()
+    assert not torch.equal(a.detach(), a0)
+    assert torch.equal(b.detach(), b0)
+    assert b not in opt.state or not opt.state[b]
+
