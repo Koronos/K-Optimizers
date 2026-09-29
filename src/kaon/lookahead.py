@@ -88,7 +88,13 @@ from kaon._backend import (
     subtract_one_,
     weight_value,
 )
-from kaon._compact_kahan import RESIDUAL_KEY, decode, is_compact_kahan, residual_bits, residual_bits_of
+from kaon._compact_kahan import (
+    RESIDUAL_KEY,
+    decode,
+    is_compact_kahan,
+    residual_bits,
+    residual_bits_of,
+)
 from kaon._momentum_codec import _FOURBIT_BLOCK
 from kaon._wrappers import CodecBuffer, TrainEvalWeights, WrapsInnerOptimizer
 from kaon.adakaon import Adakaon
