@@ -152,27 +152,50 @@ class SAM(WrapsInnerOptimizer, Optimizer):
     def _grad_norm(self) -> Tensor:
         """Global L2 norm of the gradient over all params, ``sqrt(sum_i ||g_i||^2)``.
 
-        Batched via ``torch._foreach_norm``; per-tensor norms are stacked and reduced
-        in **fp32** (a bf16 norm stack would change the global value). The returned
-        ``scale = rho / (norm + eps)`` is therefore fp32 even when weights/grads are
-        bf16 — slightly more accurate than the pre-0.7.12 per-param bf16 accumulation.
-        With ``adaptive=True`` each gradient is scaled by ``|w|`` first (ASAM).
+        Batched via ``torch._foreach_norm(..., dtype=torch.float32)``: every per-tensor
+        norm is ACCUMULATED and returned in fp32 even for bf16 grads (without the
+        ``dtype`` the per-tensor norms came back as bf16 scalars — 8 mantissa bits, up to
+        ~2e-3 relative error — before any ``.float()`` could help), then stacked on one
+        device and reduced in fp32. The returned norm, and so ``scale = rho / (norm +
+        eps)``, is fp32 whatever the weight/grad dtype. With ``adaptive=True`` each
+        gradient is scaled by ``|w|`` first (ASAM); that product is materialized one
+        stack-budget chunk at a time, never for every param at once (+1x the weights).
+        Params may live on different devices: the per-tensor norms are moved to the
+        first one's device before the final reduction.
         """
         norms: list[Tensor] = []
+        plain: list[Tensor] = []
         for group in self.param_groups:
-            adaptive = group["adaptive"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g = p.grad
-                if adaptive:
-                    g = p.abs() * g
-                norms.append(g)
+            with_grad = [p for p in group["params"] if p.grad is not None]
+            if not with_grad:
+                continue
+            if not group["adaptive"]:
+                plain.extend(p.grad for p in with_grad)
+                continue
+            budget = self._chunk_budget(with_grad)
+            chunk: list[Tensor] = []
+            size = 0
+            for p in with_grad:
+                if chunk and size + p.numel() > budget:
+                    norms.extend(self._adaptive_norms(chunk))
+                    chunk, size = [], 0
+                chunk.append(p)
+                size += p.numel()
+            norms.extend(self._adaptive_norms(chunk))
+        if plain:
+            norms = list(torch._foreach_norm(plain, 2, dtype=torch.float32)) + norms  # type: ignore[attr-defined]
         if not norms:
-            dev = self.param_groups[0]["params"][0].device
-            return torch.zeros((), device=dev)
-        per = torch._foreach_norm(norms)  # type: ignore[attr-defined]
-        return torch.linalg.vector_norm(torch.stack(per).float())
+            # No grad anywhere: nothing will climb, so the device is immaterial (and the
+            # first group's param list may itself be empty).
+            return torch.zeros(())
+        dev = norms[0].device
+        return torch.linalg.vector_norm(torch.stack([n.to(dev) for n in norms]))
+
+    @staticmethod
+    def _adaptive_norms(chunk: list[Tensor]) -> list[Tensor]:
+        """fp32 per-tensor norms of ASAM's ``|w| * g`` for one bounded chunk."""
+        return list(torch._foreach_norm([p.abs() * p.grad for p in chunk], 2,  # type: ignore[attr-defined]
+                                        dtype=torch.float32))
 
     @staticmethod
     def _bucket_params(params: list[Tensor]) -> dict[tuple[Any, ...], list[Tensor]]:
