@@ -100,6 +100,7 @@ from kaon._momentum_codec import (
 __all__ = ["Lion"]
 
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
+CautiousWD = Literal["masked", "full"]
 
 # Performance cutoff (mirrors Adakaon): weights larger than this loop instead
 # of being stacked — batching only pays off while per-tensor kernel-launch
@@ -141,6 +142,16 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             Lion's pure-sign update this filters coordinates where the
             momentum-interpolated direction disagrees with the instantaneous
             gradient.
+        cautious_wd: where decoupled ``weight_decay`` sits relative to the cautious
+            mask — the same option, with the same semantics, as
+            :class:`~kaon.adakaon.Adakaon`'s. ``"masked"`` (default, historical
+            behaviour) folds ``wd*p`` into the delta BEFORE the mask, so a coordinate
+            the mask rejects gets **no** decay and a survivor gets it multiplied by the
+            survivor rescale ``1/keep`` (the per-coordinate decay is erratic; only the
+            aggregate is preserved). ``"full"`` masks only the sign update and applies
+            ``lr*wd*p`` to **every** coordinate outside the mask — the Cautious
+            Optimizers paper's placement. With ``cautious=False`` or
+            ``weight_decay=0`` the two modes are bit-identical.
         bf16_method: weight-update strategy for low-precision params —
             ``"stochastic_rounding"`` (default), ``"kahan8"`` (+1 B/param,
             compact fixed-point Kahan, see ``docs/research/compact-kahan.md``),
@@ -169,6 +180,7 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         momentum_dtype: MomentumDtype = "bfloat16",
         momentum_4bit_block: int = _FOURBIT_BLOCK,
         cautious: bool = True,
+        cautious_wd: CautiousWD = "masked",
         gradient_centralization: bool = True,
         bf16_method: str = "stochastic_rounding",
         foreach: bool = True,
@@ -192,6 +204,8 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             raise ValueError(
                 f"momentum_dtype must be bfloat16/float32/int8/4bit, got {momentum_dtype!r}"
             )
+        if cautious_wd not in ("masked", "full"):
+            raise ValueError(f"cautious_wd must be 'masked' or 'full', got {cautious_wd!r}")
         validate_bf16_method(bf16_method)
         if foreach_batch_cutoff < 1:
             raise ValueError(f"foreach_batch_cutoff must be >= 1, got {foreach_batch_cutoff}")
@@ -214,6 +228,7 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             "momentum_dtype": momentum_dtype,
             "momentum_4bit_block": momentum_4bit_block,
             "cautious": cautious,
+            "cautious_wd": cautious_wd,
             "gradient_centralization": gradient_centralization,
             "bf16_method": bf16_method,
         }
@@ -386,9 +401,10 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         lr = group["lr"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
+        wd_full = wd != 0 and group["cautious_wd"] == "full"   # see _step_one_param
         codec = self._codec(group["momentum_dtype"])
         for chunk in self._foreach_chunks(params, group, budget):
-            self._bucket(chunk, codec, beta1, beta2, lr, wd, cautious, bf16_method)
+            self._bucket(chunk, codec, beta1, beta2, lr, wd, cautious, bf16_method, wd_full)
 
     @torch.no_grad()
     def _bucket(
@@ -401,6 +417,7 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         wd: float,
         cautious: bool,
         bf16_method: str,
+        wd_full: bool = False,
     ) -> None:
         # ``[N, R, C]`` for a matrix/conv bucket, ``[N, L]`` for the flat one (0-D params
         # ride it as length-1 rows).
@@ -419,11 +436,14 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         m.mul_(beta2).add_(grad, alpha=1.0 - beta2)
         codec.store_stacked(states, m, views=views)
 
-        if wd != 0:
+        if wd != 0 and not wd_full:
             delta = delta.add_(chunk.param_stack(), alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
+
+        if wd_full:
+            delta = delta.add_(chunk.param_stack(), alpha=wd)
 
         delta.mul_(lr)
         subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream,
@@ -454,12 +474,22 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         m.mul_(beta2).add_(grad, alpha=1.0 - beta2)
         codec.store_one(state, m)
 
-        if wd != 0:
+        # ``cautious_wd`` (same semantics as Adakaon's): "masked" folds the decay into the
+        # delta BEFORE the cautious mask (historical: rejected coordinates get no decay,
+        # survivors get it rescaled by 1/keep); "full" masks only the sign update and
+        # decays every coordinate by the same lr*wd. With cautious=False both are the same
+        # add on an untouched delta, hence bit-identical.
+        wd_full = wd != 0 and group["cautious_wd"] == "full"
+        if wd != 0 and not wd_full:
             p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
             delta = delta.add_(p_fp32, alpha=wd)
 
         if cautious:
             delta = cautious_one_(delta, grad)
+
+        if wd_full:
+            p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
+            delta = delta.add_(p_fp32, alpha=wd)
 
         delta.mul_(lr)
         subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
