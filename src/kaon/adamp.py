@@ -39,9 +39,9 @@ exactly as the official ``clovaai/AdamP``.
             perturb -= p_n * <p_n, perturb>_row             # remove the radial component
             wd_ratio = wd_ratio_hp                          # and damp WD on this weight
             break                                           # channel view wins if it triggers
-    # decoupled weight decay (scaled by wd_ratio when the projection fired):
-    p *= (1 - lr*weight_decay*wd_ratio)
-    p -= (lr/bc1) * perturb
+    # decoupled weight decay (scaled by wd_ratio when the projection fired), on the
+    # pre-step weight and folded into the same fp32 write as the step:
+    p -= (lr/bc1) * perturb + lr*weight_decay*wd_ratio * p
 
 **1-D params (biases, norm scales)** are never projected (``len(p.shape) > 1``
 gate in the official) — they *are* the scale parameters. They take the plain Adam
@@ -97,7 +97,9 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
     validate_bf16_method,
+    weight_value,
 )
+from kaon._decoupled_wd import decay_batched_, decay_one_
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
@@ -129,10 +131,12 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             path it follows the **official** placement ``denom = sqrt(v)/sqrt(bc2) +
             eps``. On the factored path it is folded into the Adafactor ``eps1``
             (added to ``grad**2`` before the row/col reductions). Default ``1e-8``.
-        weight_decay: decoupled (AdamW-style) weight decay, applied multiplicatively
-            ``p *= (1 - lr*weight_decay*wd_ratio)`` *before* the parameter update.
-            When the projection fires on a weight, ``wd_ratio`` is used (see below).
-            Default ``0``.
+        weight_decay: decoupled (AdamW-style) weight decay,
+            ``p *= (1 - lr*weight_decay*wd_ratio)`` on the pre-step weight. When the
+            projection fires on a weight, ``wd_ratio`` is used (see below). Added to the
+            fp32 step after the cautious mask, so bf16 weights decay through stochastic
+            rounding / Kahan instead of rounding the factor away (see
+            ``kaon._decoupled_wd``). Default ``0``.
         delta: cosine-similarity threshold for the scale-invariance proxy. The
             projection fires when ``max_row |cos(g, p)| < delta / sqrt(view_dim)``.
             Default ``0.1`` (official).
@@ -635,21 +639,24 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         else:
             perturb = m.mul(inv_denom)                                            # [N, R, C]
 
-        # AdamP projection (per-channel radial removal on the matrixized [R, C] view).
-        p_stack = chunk.param_stack()                                             # [N, R, C]
+        # AdamP projection (per-channel radial removal on the matrixized [R, C] view). It
+        # reads the weight's full value: decoded under kahan8/kahan16 (the decoded stacks are
+        # reused by the write), the plain fp32 stack otherwise (kaon._backend.weight_value).
+        p_stack, stacks = chunk.value_and_stacks(bf16_method)                     # [N, R, C]
         perturb, wd_ratio = self._project_stacked(
             p_stack, grad, perturb, group["delta"], group["eps"], group["wd_ratio"]
         )
 
-        # Decoupled weight decay (scaled per-slice by wd_ratio), then the step.
-        if wd != 0:
-            scale = (1.0 - group["lr"] * wd * wd_ratio)                           # [N, 1, 1]
-            torch._foreach_mul_(pviews, list(scale.reshape(-1)))
-
         delta = perturb.mul_(c["step_size"])
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
+        # Decoupled weight decay (scaled per-slice by wd_ratio) on the pre-step value the
+        # projection read, in the fp32 delta, outside the mask (kaon._decoupled_wd).
+        if wd != 0:
+            decay_batched_(delta, chunk, bf16_method, group["lr"] * wd, ratio=wd_ratio,
+                           value=p_stack)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=stacks)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -700,13 +707,12 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             perturb = m.div(de_nom)
 
         # ndim<=1 params are NEVER projected (official: len(p.shape) > 1 gate). Full WD.
-        if wd != 0:
-            torch._foreach_mul_(pviews, 1.0 - group["lr"] * wd)
-
         delta = perturb.mul_(c["step_size"])
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
+        stacks = decay_batched_(delta, chunk, bf16_method, group["lr"] * wd) if wd != 0 else None
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=stacks)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
@@ -739,10 +745,10 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             else:
                 perturb = m.mul(inv_denom)                               # [R, C] matrixized view
             # Projection operates on the ORIGINAL-shape p / grad (official views).
+            # (the decoded full value under kahan8/kahan16 — see kaon._backend.weight_value)
+            p_value = weight_value(p, state, bf16_method)
             perturb_orig = perturb.reshape_as(grad)
-            perturb_orig, wd_ratio = self._project_one(p.data, grad, perturb_orig, group)
-            if wd != 0:
-                p.data.mul_(1.0 - group["lr"] * wd * wd_ratio)
+            perturb_orig, wd_ratio = self._project_one(p_value, grad, perturb_orig, group)
             delta = perturb_orig.mul_(c["step_size"])
         else:
             v = state["v"]
@@ -756,10 +762,14 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             else:
                 perturb = m.div(de_nom)
             # 1-D params are never projected; full decoupled WD.
-            if wd != 0:
-                p.data.mul_(1.0 - group["lr"] * wd)
+            p_value, wd_ratio = None, None
             delta = perturb.mul_(c["step_size"])
 
         if cautious:
             delta = cautious_one_(delta, grad)
+        # Decoupled weight decay p*(1 - lr*wd*wd_ratio) - delta, folded into the fp32 delta
+        # so a bf16 weight decays through SR / Kahan too (see kaon._decoupled_wd).
+        if wd != 0:
+            delta = decay_one_(delta, p, state, bf16_method, group["lr"] * wd,
+                               ratio=wd_ratio, value=p_value)
         subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)

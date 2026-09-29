@@ -30,12 +30,11 @@ and the kozistr ``pytorch_optimizer`` port), with the internal step 0-indexed:
     # (decoupled weight decay is also skipped on step 0)
 
     # step t >= 1, with v holding the second moment from grads up to t-1:
-    p          *= (1 - lr * weight_decay)          # decoupled (AdamW) WD, skipped at t=0
     denom       = clamp(sqrt(v), min=eps)          # eps is a FLOOR (max(sqrt v, eps))
     normed_grad = g_t / denom                      # normalize by the PRE-update v
     normed_grad = clamp(normed_grad, -c_t, +c_t)   # c_t = step ** 0.25  (Algorithm 2 clip)
     m           = beta1 * m + (1 - beta1) * normed_grad
-    p          -= lr * m
+    p          -= lr * m + lr * weight_decay * p   # decoupled (AdamW) WD, skipped at t=0
     v           = beta2 * v + (1 - beta2) * g_t ** 2   # fold g_t in AFTER using it
 
 There is **no bias correction** on either moment (the step-0 ``v`` init and the
@@ -139,6 +138,7 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
+from kaon._decoupled_wd import decay_batched_, decay_one_
 from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
@@ -172,9 +172,11 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             ``1/sqrt(v)``. Default ``1e-6`` (the official default). Applied on both
             the factored and 1-D paths; the factored Adafactor ``eps1`` is left at 0
             to match the official (no eps inside ``g**2``).
-        weight_decay: decoupled (AdamW-style) weight decay, ``p *= (1 - lr*wd)``,
-            applied *before* the moment ops and **skipped on the step-0 init**
-            (matching the official ``decouple=True`` path).
+        weight_decay: decoupled (AdamW-style) weight decay, ``p *= (1 - lr*wd)``
+            (matching the official ``decouple=True`` path), **skipped on the step-0
+            init**. It is folded into the fp32 step (``delta += lr*wd*p``, outside the
+            cautious mask) so bf16 weights decay through stochastic rounding / Kahan
+            instead of rounding the factor away (see ``kaon._decoupled_wd``).
         clip: enable ADOPT's Algorithm-2 per-step clip of the normalized gradient to
             ``[-c_t, +c_t]`` with ``c_t = step ** 0.25`` (``step`` 0-indexed, so the
             first updating step clips at 1.0). **On by default** (the official
@@ -487,10 +489,6 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             torch._foreach_copy_(cols, list(grad_sq.mean(dim=-2).unbind(0)))
             return
 
-        # Decoupled weight decay BEFORE the moment ops.
-        if wd != 0:
-            torch._foreach_mul_(pviews, 1.0 - group["lr"] * wd)
-
         # --- normalize by the PRE-update (lagged) v ---
         # ``clamp_min_`` on the divisor: with eps1 == 0 an all-zero grad leaves row == 0,
         # and 0/0 would NaN past the cap below. See kaon._factored (same floor, same reason).
@@ -510,7 +508,10 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
+        # Decoupled weight decay rides the fp32 delta, outside the mask (kaon._decoupled_wd).
+        stacks = decay_batched_(delta, chunk, bf16_method, group["lr"] * wd) if wd != 0 else None
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=stacks)
 
         # --- fold g_t into v AFTER it has been used (the v-lag) ---
         grad_sq = grad * grad
@@ -550,9 +551,6 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             torch._foreach_copy_(vs, list((grad * grad).unbind(0)))       # v = g_0^2
             return
 
-        if wd != 0:
-            torch._foreach_mul_(pviews, 1.0 - group["lr"] * wd)
-
         # normalize by the PRE-update v: denom = max(sqrt(v), eps).
         denom = v.sqrt().clamp_(min=c["eps"])
         normed = grad / denom
@@ -566,7 +564,9 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
         if cautious:
             delta = cautious_batched_(delta, grad)
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
+        stacks = decay_batched_(delta, chunk, bf16_method, group["lr"] * wd) if wd != 0 else None
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=stacks)
 
         # fold g_t into v AFTER use.
         v.mul_(c["beta2"]).addcmul_(grad, grad, value=1.0 - c["beta2"])
@@ -601,10 +601,6 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             return
 
         c = self._coeffs(group, pstep)
-
-        # Decoupled weight decay BEFORE the moment ops.
-        if wd != 0:
-            p.data.mul_(1.0 - group["lr"] * wd)
 
         if factored:
             matrixize = ndim > 2
@@ -642,5 +638,9 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
         if cautious:
             delta = cautious_one_(delta, grad)
+        # Decoupled weight decay: p*(1 - lr*wd) - delta, folded into the fp32 delta so a bf16
+        # weight decays through SR / Kahan too (see kaon._decoupled_wd).
+        if wd != 0:
+            delta = decay_one_(delta, p, state, bf16_method, group["lr"] * wd)
         subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
         state["step"] = pstep + 1

@@ -778,12 +778,15 @@ def test_bucket_order_is_anchored_without_an_extra_key(name):
 _FROZEN_SR_SHAPES = [(4, 3), (4, 3), (), ()]
 _FROZEN_SR_LAGGING = (0, 2)          # no gradient on step 2 -> one step behind for good
 _FROZEN_SR_BITS = {
-    # captured from ee8f871 (pre-refactor), torch 2.12.0+cu130, CPU
+    # captured from ee8f871 (pre-refactor), torch 2.12.0+cu130, CPU. ADOPT / AdaBelief
+    # re-captured in 0.7.18 (bugfix/a18-optims), the one intended math change since: the
+    # decoupled decay moved from a bf16 ``p *= 1 - lr*wd`` into the SR-written fp32 delta,
+    # which moves 1 (ADOPT) / 2 (AdaBelief) of these 26 bf16 values by one ulp.
     "ADOPT": [49193, 15725, 16296, 49037, 15984, 16006, 48992, 16243, 49040, 16305,
-              48801, 48908, 15914, 48793, 49037, 16315, 48873, 16205, 48717, 49024,
+              48801, 48908, 15914, 48793, 49037, 16315, 48873, 16205, 48716, 49024,
               16064, 16151, 49208, 48644, 48829, 49108],
-    "AdaBelief": [49195, 15711, 16298, 49042, 15971, 16023, 48996, 16248, 49042, 16307,
-                  48822, 48903, 15945, 48811, 49035, 16307, 48836, 16197, 48735, 49021,
+    "AdaBelief": [49194, 15711, 16298, 49042, 15971, 16023, 48996, 16248, 49042, 16307,
+                  48821, 48903, 15945, 48811, 49035, 16307, 48836, 16197, 48735, 49021,
                   16066, 16161, 49210, 48563, 48819, 49104],
     "AdaMuon": [49194, 15733, 16297, 49039, 15981, 16009, 48993, 16245, 49041, 16305,
                 48802, 48907, 15910, 48798, 49036, 16315, 48871, 16204, 48698, 49024,

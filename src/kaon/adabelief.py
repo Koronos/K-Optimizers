@@ -27,8 +27,9 @@ authors' benchmarks.
     de_nom = (sqrt(s) + eps) / bc2_sq                      # s already has +eps folded in
     p     -= (lr / bc1) * m / de_nom
 
-    # decoupled (AdamW-style) weight decay, applied BEFORE the moment updates:
-    p     *= (1 - lr * weight_decay)
+    # decoupled (AdamW-style) weight decay on the weight as it was BEFORE this step
+    # (``p_old * (1 - lr * weight_decay) - update``), folded into the fp32 update:
+    p     -= lr * weight_decay * p_old
 
 Two eps placements are carried over verbatim from kozistr: ``eps`` is added **both**
 inside the second-moment EMA (``+ eps`` after the ``(g-m)**2`` term) **and** to
@@ -106,6 +107,7 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
+from kaon._decoupled_wd import decay_batched_, decay_one_
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
@@ -142,10 +144,11 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             factored 2-D path only the first placement applies (folded into the
             Adafactor ``eps1``); the denominator ``eps`` has no factored analogue
             and is dropped there. Default ``1e-16`` per the paper.
-        weight_decay: decoupled (AdamW-style) weight decay, applied
-            multiplicatively ``p *= (1 - lr*weight_decay)`` *before* the moment
-            updates (kozistr ``weight_decouple=True``; not folded into the cautious
-            delta — cautious does not gate weight decay).
+        weight_decay: decoupled (AdamW-style) weight decay, ``p *= (1 - lr*weight_decay)``
+            on the pre-step weight (kozistr ``weight_decouple=True``). Cautious does not
+            gate it: it is added to the fp32 step AFTER the mask, so bf16 weights decay
+            through stochastic rounding / Kahan instead of rounding the factor away
+            (see ``kaon._decoupled_wd``).
         cautious: cautious masking (Liang et al. 2024) on the final step vs the
             gradient. **On by default.**
         gradient_centralization: subtract each ``ndim>=2`` gradient's fan-in mean
@@ -502,10 +505,6 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
-        # Decoupled weight decay BEFORE moment updates (kozistr order): p *= (1 - lr*wd).
-        if wd != 0:
-            self._apply_decoupled_wd_batched(pviews, group["lr"] * wd)
-
         # First-moment EMA (read both, mutate, store). m must update BEFORE the
         # residual second moment so the residual (g - m) uses the *new* m.
         codec = self._codec(md)
@@ -534,8 +533,11 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
         if cautious:
             delta = cautious_batched_(delta, grad)
+        # Decoupled weight decay rides the fp32 delta, outside the mask (kaon._decoupled_wd).
+        stacks = decay_batched_(delta, chunk, bf16_method, group["lr"] * wd) if wd != 0 else None
 
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=stacks)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -567,9 +569,6 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         grad = chunk.grad_stack()                                         # [N, L]
         s = torch.stack(ss)                                               # [N, L]
 
-        if wd != 0:
-            self._apply_decoupled_wd_batched(pviews, group["lr"] * wd)
-
         # First-moment EMA before the residual second moment.
         codec = self._codec(md)
         views = chunk.momentum_views(codec)
@@ -588,14 +587,11 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
         if cautious:
             delta = cautious_batched_(delta, grad)
+        # Decoupled weight decay rides the fp32 delta, outside the mask (kaon._decoupled_wd).
+        stacks = decay_batched_(delta, chunk, bf16_method, group["lr"] * wd) if wd != 0 else None
 
-        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
-
-    @staticmethod
-    @torch.no_grad()
-    def _apply_decoupled_wd_batched(pviews: list[Tensor], factor: float) -> None:
-        """In-place decoupled WD ``p *= (1 - factor)`` on the cached (matrixized) views."""
-        torch._foreach_mul_(pviews, 1.0 - factor)
+        subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=stacks)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
@@ -612,10 +608,6 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         grad = p.grad if p.grad.dtype == torch.float32 else p.grad.float()
         ndim = grad.ndim
         factored = ndim >= 2
-
-        # Decoupled weight decay BEFORE the moment updates (kozistr order).
-        if wd != 0:
-            p.data.mul_(1.0 - group["lr"] * wd)
 
         if factored:
             matrixize = ndim > 2
@@ -649,5 +641,9 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
         if cautious:
             delta = cautious_one_(delta, grad)
+        # Decoupled weight decay: p*(1 - lr*wd) - delta, folded into the fp32 delta so a bf16
+        # weight decays through SR / Kahan too (see kaon._decoupled_wd).
+        if wd != 0:
+            delta = decay_one_(delta, p, state, bf16_method, group["lr"] * wd)
 
         subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
