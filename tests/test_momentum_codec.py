@@ -15,6 +15,7 @@ gone. These tests pin behaviour including bf16/fp32-EMA agreement.
 from __future__ import annotations
 
 import copy
+import math
 import warnings
 
 import pytest
@@ -378,3 +379,46 @@ def test_warn_if_4bit_high_beta1():
     msgs = [str(x.message) for x in w if issubclass(x.category, UserWarning)]
     assert len(msgs) == 1
     assert "1/sqrt" in msgs[0] or "amplif" in msgs[0].lower()
+
+
+# ------------------------------------------------------------- empty tensors (int8)
+# ``(0,)`` / ``(5, 0)`` / ``(3, 0, 2)`` used to raise out of ``amax`` ("reduction over a
+# zero-size dimension") on every int8 entry point; 4-bit already survived (its blocks view
+# reduces over a size-1 block). A zero-element param is legal (a pruned / zero-width layer)
+# and every other codec steps it as a no-op.
+EMPTY_SHAPES = [(0,), (5, 0), (3, 0, 2), (0, 4)]
+
+
+@pytest.mark.parametrize("shape", EMPTY_SHAPES)
+def test_int8_quant_of_an_empty_tensor(shape):
+    m = torch.zeros(shape)
+    q, scale = _quant_int8(m)
+    assert q.shape == m.shape and q.dtype == torch.int8
+    dims = tuple(range(1, m.ndim)) if m.ndim >= 2 else ()
+    expect = torch.zeros(shape).amax(dim=dims, keepdim=True).shape if m.numel() else None
+    if expect is not None:
+        assert scale.shape == expect
+    # stacked, in the effective row layout the foreach buckets use
+    row = shape[0] if len(shape) >= 2 else 1
+    stack = torch.zeros((3, row, math.prod(shape[1:]) if len(shape) >= 2 else 0))
+    qs, ss = _quant_int8_stacked(stack)
+    assert qs.shape == stack.shape and ss.shape == (*stack.shape[:-1], 1)
+
+
+@pytest.mark.parametrize("md", DTYPES)
+@pytest.mark.parametrize("shape", EMPTY_SHAPES)
+def test_every_codec_steps_an_empty_tensor(md, shape):
+    codec = _make_codec(md)
+    like = torch.zeros(shape)
+    eff = ((shape[0], math.prod(shape[1:])) if len(shape) >= 2 else (math.prod(shape),))
+    mat = (lambda t: t.reshape(eff))
+    s1, s2 = _ema_state(codec, shape), _ema_state(codec, shape)
+    d = codec.ema_one(s1, like.clone(), 0.9)
+    assert d.numel() == 0
+    codec.store_one(s1, like.clone())
+    assert codec.dequant_one(s1, like).shape == like.shape
+    upd = torch.zeros((2, *eff))
+    states = [s2, _ema_state(codec, shape)]
+    codec.ema_stacked(states, upd.clone(), mat, eff, 0.9)
+    codec.store_stacked(states, upd.clone())
+    assert codec.dequant_stacked(states, mat, eff).shape == upd.shape

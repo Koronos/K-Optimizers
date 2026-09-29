@@ -75,6 +75,34 @@ _FOURBIT_ZERO = 8        # +8 shift maps signed [-7, 7] -> unsigned nibble [1, 1
 _ABSMAX_FLOOR = 1e-12    # floor on absmax so an all-zero row/block can't divide by zero
 
 
+def _absmax(x: Tensor, dims: int | tuple[int, ...]) -> Tensor:
+    """``|x|.amax(dims, keepdim=True)`` floored at :data:`_ABSMAX_FLOOR`, empty-safe.
+
+    ``amax`` refuses to reduce over a zero-size dimension, which is every int8 reduction
+    of a zero-element param (``(0,)``, ``(5, 0)``, ``(3, 0, 2)``): the floor is exactly the
+    scale such a tensor gets, so it is produced directly (same shape ``keepdim`` gives).
+    """
+    if x.numel() == 0:
+        red = range(x.ndim) if dims == () else (dims,) if isinstance(dims, int) else dims
+        red = {d % x.ndim for d in red}
+        shape = [1 if i in red else n for i, n in enumerate(x.shape)]
+        return x.new_full(shape, _ABSMAX_FLOOR)
+    return x.abs().amax(dim=dims, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
+
+
+def _row_rest(shape: tuple[int, ...]) -> tuple[int, int]:
+    """``(row, rest)`` of the int8 requant's ``[row, rest]`` layout for a per-param shape.
+
+    ``rest = per // row`` — exact for every non-empty shape (``per`` is a multiple of
+    ``row``). An empty shape gets ``rest = 0`` (and a zero-row one no division), so the
+    ``[row, rest]`` view of its zero elements is well-formed: the old ``max(per // row, 1)``
+    asked a zero-element tensor for ``row`` elements, and ``(0, 4)`` divided by zero.
+    """
+    per = math.prod(shape) if shape else 1
+    row = shape[0] if len(shape) >= 2 else 1
+    return row, (per // row if row else 0)
+
+
 def _quant_int8(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     """Quantize a momentum tensor to int8 with a per-row (dim-0) absmax scale.
 
@@ -83,7 +111,7 @@ def _quant_int8(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     tensors use a single scalar scale.
     """
     dims = tuple(range(1, m_fp32.ndim)) if m_fp32.ndim >= 2 else ()
-    absmax = m_fp32.abs().amax(dim=dims, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
+    absmax = _absmax(m_fp32, dims)
     scale = absmax / _INT8_ABSMAX
     q = (m_fp32 / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP).to(torch.int8)
     return q, scale
@@ -116,7 +144,7 @@ def _quant_int8_stacked(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     Reducing only the trailing axis here is element-for-element the same set of
     values the per-param path reduces per tensor, so the scales match exactly.
     """
-    absmax = m_fp32.abs().amax(dim=-1, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
+    absmax = _absmax(m_fp32, -1)
     scale = absmax / _INT8_ABSMAX
     q = (m_fp32 / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP).to(torch.int8)
     return q, scale
@@ -507,7 +535,7 @@ class _Int8Codec(_MomentumCodec):
         # ``_quant_int8`` does not mutate ``m`` (uses ``/``, not ``div_``); return it
         # as delta and write codes with a non-mutating ``/`` so the EMA value stays.
         dims = tuple(range(1, m.ndim)) if m.ndim >= 2 else ()
-        absmax = m.abs().amax(dim=dims, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
+        absmax = _absmax(m, dims)
         scale = absmax / _INT8_ABSMAX
         state["m"].copy_((m / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP))
         state["m_scale"].copy_(scale.reshape_as(state["m_scale"]))
@@ -529,8 +557,7 @@ class _Int8Codec(_MomentumCodec):
         if len(eff) not in (1, 2) or not _stacked_cacheable(states, scale=True):
             return None
         rowshape = (eff[0], 1) if len(eff) == 2 else (1,)
-        row = eff[0] if len(eff) == 2 else 1
-        rest = max(math.prod(eff) // row, 1)
+        row, rest = _row_rest(eff)
         return _StackedViews(
             eff,
             [view(s["m"]) for s in states],
@@ -575,9 +602,7 @@ class _Int8Codec(_MomentumCodec):
     ) -> None:
         n = m_fp32.shape[0]
         shape = tuple(m_fp32.shape[1:])
-        per = math.prod(shape) if shape else 1
-        row = shape[0] if len(shape) >= 2 else 1
-        rest = max(per // row, 1)
+        row, rest = _row_rest(shape)
         q, new_scale = _quant_int8_stacked(m_fp32.reshape(n, row, rest))
         qs = list(q.unbind(0))
         if views is not None and views.eff == shape:
