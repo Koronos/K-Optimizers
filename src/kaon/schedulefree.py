@@ -168,6 +168,8 @@ from kaon._momentum_codec import (
     _quant_int8,
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
+    store_stochastic_,
+    store_stochastic_stacked_,
 )
 from kaon._stochastic_rounding import SRStream
 from kaon._wrappers import CodecBuffer, TrainEvalWeights
@@ -475,6 +477,9 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
         temporaries per bucket — measured 0.73x the step and +98 MiB of transient on the
         UNet/DiT bag before this went through the shared primitive.
         """
+        if md in ("int8", "4bit"):
+            store_stochastic_(state, "z", md, z_fp32, sr)
+            return
         if md != "bfloat16":
             CodecBuffer.write(state, "z", md, z_fp32)
             return
@@ -505,6 +510,9 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
         transfers per bucket for nothing. The arithmetic and the number of drawn
         elements are unchanged.
         """
+        if md in ("int8", "4bit"):
+            store_stochastic_stacked_(states, "z", md, z_fp32, sr)
+            return
         if md != "bfloat16":
             CodecBuffer.write_stacked(states, "z", md, z_fp32)
             return

@@ -32,6 +32,7 @@ import torch
 from torch import Tensor
 
 from kaon._backend import SRSeedState
+from kaon._stochastic_rounding import SRStream, _device_generator
 
 __all__ = [
     "MomentumDtype",
@@ -54,6 +55,8 @@ __all__ = [
     "_dequant_4bit_stacked",
     "fourbit_block_size",
     "int8_scale_shape",
+    "store_stochastic_",
+    "store_stochastic_stacked_",
 ]
 
 MomentumDtype = ("bfloat16", "float32", "int8", "4bit")
@@ -103,17 +106,37 @@ def _row_rest(shape: tuple[int, ...]) -> tuple[int, int]:
     return row, (per // row if row else 0)
 
 
-def _quant_int8(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
+def _round_(x: Tensor, gen: torch.Generator | None) -> Tensor:
+    """Round the quantizer's grid coordinates ``x`` in place: to nearest, or stochastically.
+
+    ``gen=None`` is round-half-to-even, the codecs' historical (and default) behaviour.
+    With a generator it is UNBIASED stochastic rounding, ``floor(x + u)`` with
+    ``u ~ U[0, 1)``: ``x`` rounds up with probability equal to its fractional part, so
+    ``E[q] = x`` exactly. That is what a requant inside a slow EMA / iterate needs — a
+    round-to-nearest write of ``m_new = m_q + delta`` with ``|delta| < scale / 2`` writes
+    ``m_q`` straight back, and the buffer stops moving (the stall
+    ``ScheduleFree._store_z`` documents for bf16 ``z``). The codes stay in the symmetric
+    range: ``x`` is in ``[-absmax/scale, absmax/scale]`` and ``floor(x + u)`` never leaves
+    ``[floor(-L), floor(L + u)] = [-L, L]`` for an integer level ``L``; the callers' clamp is
+    kept regardless.
+    """
+    if gen is None:
+        return x.round_()
+    return x.add_(torch.rand(x.shape, generator=gen, device=x.device, dtype=x.dtype)).floor_()
+
+
+def _quant_int8(m_fp32: Tensor, gen: torch.Generator | None = None) -> tuple[Tensor, Tensor]:
     """Quantize a momentum tensor to int8 with a per-row (dim-0) absmax scale.
 
     Per-row scaling keeps a single outlier from collapsing the whole tensor's
     resolution (a coarse stand-in for bitsandbytes' block-wise scheme). 1-D
-    tensors use a single scalar scale.
+    tensors use a single scalar scale. ``gen`` selects stochastic rounding
+    (see :func:`_round_`); ``None`` is the bit-exact historical round-to-nearest.
     """
     dims = tuple(range(1, m_fp32.ndim)) if m_fp32.ndim >= 2 else ()
     absmax = _absmax(m_fp32, dims)
     scale = absmax / _INT8_ABSMAX
-    q = (m_fp32 / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP).to(torch.int8)
+    q = _round_(m_fp32 / scale, gen).clamp_(-_INT8_CLAMP, _INT8_CLAMP).to(torch.int8)
     return q, scale
 
 
@@ -136,7 +159,9 @@ def int8_scale_shape(m: Tensor) -> tuple[int, ...]:
     return (1,) * m.ndim
 
 
-def _quant_int8_stacked(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
+def _quant_int8_stacked(
+    m_fp32: Tensor, gen: torch.Generator | None = None
+) -> tuple[Tensor, Tensor]:
     """Batched :func:`_quant_int8` for a stacked momentum tensor.
 
     ``m_fp32`` is the stacked momentum in its *effective row layout* — either
@@ -146,7 +171,7 @@ def _quant_int8_stacked(m_fp32: Tensor) -> tuple[Tensor, Tensor]:
     """
     absmax = _absmax(m_fp32, -1)
     scale = absmax / _INT8_ABSMAX
-    q = (m_fp32 / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP).to(torch.int8)
+    q = _round_(m_fp32 / scale, gen).clamp_(-_INT8_CLAMP, _INT8_CLAMP).to(torch.int8)
     return q, scale
 
 
@@ -172,7 +197,9 @@ def _unpack_nibbles(packed: Tensor, k: int) -> Tensor:
     return out[..., :k]
 
 
-def _quant_4bit(m_fp32: Tensor, block_size: int) -> tuple[Tensor, Tensor, int]:
+def _quant_4bit(
+    m_fp32: Tensor, block_size: int, gen: torch.Generator | None = None
+) -> tuple[Tensor, Tensor, int]:
     """Quantize ``m_fp32`` to signed linear 4-bit with a per-block absmax scale.
 
     Returns ``(packed_uint8[ceil(numel/2)], scale_fp32[nblocks], numel)``. The
@@ -188,7 +215,7 @@ def _quant_4bit(m_fp32: Tensor, block_size: int) -> tuple[Tensor, Tensor, int]:
     blocks = flat.view(nblocks, block_size)
     absmax = blocks.abs().amax(dim=1, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
     scale = absmax / _FOURBIT_ABSMAX
-    q = (blocks / scale).round_().clamp_(-_FOURBIT_CLAMP, _FOURBIT_CLAMP).to(torch.int8)
+    q = _round_(blocks / scale, gen).clamp_(-_FOURBIT_CLAMP, _FOURBIT_CLAMP).to(torch.int8)
     nib = (q + _FOURBIT_ZERO).to(torch.uint8).reshape(-1)[:numel]
     packed = _pack_nibbles(nib)
     return packed, scale.reshape(nblocks), numel
@@ -206,7 +233,9 @@ def _dequant_4bit(packed: Tensor, scale: Tensor, numel: int, block_size: int) ->
     return q.reshape(-1)[:numel]
 
 
-def _quant_4bit_stacked(m_fp32: Tensor, block_size: int) -> tuple[Tensor, Tensor]:
+def _quant_4bit_stacked(
+    m_fp32: Tensor, block_size: int, gen: torch.Generator | None = None
+) -> tuple[Tensor, Tensor]:
     """Batched :func:`_quant_4bit` for a stacked ``[N, ...]`` momentum tensor.
 
     Each of the ``N`` slices is flattened and block-quantized independently, so the
@@ -223,7 +252,7 @@ def _quant_4bit_stacked(m_fp32: Tensor, block_size: int) -> tuple[Tensor, Tensor
     blocks = flat.view(n, nblocks, block_size)
     absmax = blocks.abs().amax(dim=2, keepdim=True).clamp_(min=_ABSMAX_FLOOR)
     scale = absmax / _FOURBIT_ABSMAX
-    q = (blocks / scale).round_().clamp_(-_FOURBIT_CLAMP, _FOURBIT_CLAMP).to(torch.int8)
+    q = _round_(blocks / scale, gen).clamp_(-_FOURBIT_CLAMP, _FOURBIT_CLAMP).to(torch.int8)
     nib = (q + _FOURBIT_ZERO).to(torch.uint8).reshape(n, -1)[:, :per]
     packed = _pack_nibbles(nib)                          # [N, ceil(per/2)]
     return packed, scale.reshape(n, nblocks)
@@ -251,6 +280,72 @@ def fourbit_block_size(grad: Tensor, group: dict[str, Any]) -> int:
     bs = group["momentum_4bit_block"]
     numel = grad.numel()
     return numel if bs <= 0 else min(bs, numel) if numel > 0 else 1
+
+
+# ----------------------------------------------- stochastic requant of a codec buffer
+# The same storage layout :class:`kaon._wrappers.CodecBuffer` writes (``key``,
+# ``f"{key}_scale"``, ``f"{key}_block"``), requantized with UNBIASED stochastic rounding
+# (:func:`_round_`) and noise from the owner's checkpointed :class:`SRStream` — its
+# reference-path generator (:meth:`SRStream.generator`), the one a bf16 ``z`` written through
+# ``add_stochastic_`` already draws from. That keeps both of the bf16 ``z``'s properties: the
+# position is checkpointed (``_sr_meta["gen"]``), so a resume continues the exact noise; and a
+# stacked draw of ``N * M`` numbers consumes the same sequence as ``N`` per-param draws of
+# ``M`` (the requant noise is laid out param-major in both), so foreach == per-param bit for
+# bit whenever nothing else draws in between (fp32 weights / ``bf16_method != "stochastic_
+# rounding"``), and in expectation otherwise — exactly the contract of a bf16 ``z``. Used
+# for Schedule-Free's ``z`` at ``momentum_dtype="int8"``/``"4bit"``: its per-step move
+# ``lr_t * d`` sits far below half a quant step (``absmax/254`` int8, ``absmax/14`` 4-bit),
+# so the codec's round-to-nearest wrote the old code back and ``z`` froze — measured at
+# lr=1e-5, |w|~0.02, 50 steps: mean|dz| 2.0e-5 int8 vs 5.7e-5 fp32. Writes are in place
+# (``copy_``), keeping the storage-identity contract of every codec buffer.
+def _requant_generator(sr: SRStream | None, device: torch.device) -> torch.Generator:
+    """``sr``'s reference-path generator; the module fallback (not checkpointed) without one."""
+    return _device_generator(device) if sr is None else sr.generator(device)
+
+
+def store_stochastic_(
+    state: dict[str, Any], key: str, md: str, value_fp32: Tensor, sr: SRStream | None,
+) -> None:
+    """Per-param stochastic requant of ``value_fp32`` into ``state[key]`` (int8 / 4bit)."""
+    gen = _requant_generator(sr, value_fp32.device)
+    if md == "int8":
+        q, sc = _quant_int8(value_fp32.reshape(state[key].shape), gen)
+        state[key].copy_(q)
+        state[f"{key}_scale"].copy_(sc.reshape(state[f"{key}_scale"].shape))
+        return
+    if md != "4bit":
+        raise ValueError(f"store_stochastic_: no quantized codec for {md!r}")
+    packed, scale, _ = _quant_4bit(value_fp32, state[f"{key}_block"], gen)
+    state[key].copy_(packed)
+    state[f"{key}_scale"].copy_(scale)
+
+
+def store_stochastic_stacked_(
+    states: list[dict[str, Any]], key: str, md: str, value_fp32: Tensor, sr: SRStream | None,
+) -> None:
+    """Stacked :func:`store_stochastic_` over ``[N, *shape]``: ONE noise draw per bucket.
+
+    Same draws as ``N`` per-param calls on the reference generator (see the section note).
+    """
+    n = value_fp32.shape[0]
+    shape = tuple(value_fp32.shape[1:])
+    gen = _requant_generator(sr, value_fp32.device)
+    if md == "int8":
+        row, rest = _row_rest(shape)
+        q, new_scale = _quant_int8_stacked(value_fp32.reshape(n, row, rest), gen)
+        torch._foreach_copy_([s[key].view(row, rest) for s in states], list(q.unbind(0)))
+        for s, sc in zip(states, new_scale.unbind(0), strict=True):
+            s[f"{key}_scale"].copy_(sc.reshape(s[f"{key}_scale"].shape))
+        return
+    if md != "4bit":
+        raise ValueError(f"store_stochastic_stacked_: no quantized codec for {md!r}")
+    per = math.prod(shape)
+    new_packed, new_scale = _quant_4bit_stacked(
+        value_fp32.reshape(n, per), states[0][f"{key}_block"], gen
+    )
+    torch._foreach_copy_([s[key] for s in states], list(new_packed.unbind(0)))
+    for s, sc in zip(states, new_scale.unbind(0), strict=True):
+        s[f"{key}_scale"].copy_(sc)
 
 
 # --------------------------------------------------------------------- codecs
