@@ -411,7 +411,10 @@ def test_every_codec_steps_an_empty_tensor(md, shape):
     codec = _make_codec(md)
     like = torch.zeros(shape)
     eff = ((shape[0], math.prod(shape[1:])) if len(shape) >= 2 else (math.prod(shape),))
-    mat = (lambda t: t.reshape(eff))
+
+    def mat(t):
+        return t.reshape(eff)
+
     s1, s2 = _ema_state(codec, shape), _ema_state(codec, shape)
     d = codec.ema_one(s1, like.clone(), 0.9)
     assert d.numel() == 0
