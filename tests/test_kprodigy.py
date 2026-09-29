@@ -697,3 +697,27 @@ def test_non_contiguous_conv_falls_back_under_factored(layout):
     assert math.isclose(opt.get_d(), opt_ref.get_d(), rel_tol=1e-6)
     for p, r in zip(fast, ref, strict=True):
         torch.testing.assert_close(p.detach(), r.detach(), rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("foreach", [True, False])
+def test_factored_eps_zero_with_an_all_zero_grad_stays_finite(foreach):
+    """``eps_factored=0`` and an all-zero gradient history leave ``row == 0``, and
+    ``row / mean(row)`` was ``0/0`` — a NaN that the ``1/(d*eps)`` cap cannot remove.
+    Flooring the divisor (ADOPT's ``_MIN_NORMAL``) turns it into ``inf``, which the cap
+    collapses to ``1/(d*eps)``; with a zero numerator the update is exactly zero."""
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.randn(8, 6)) for _ in range(3)]
+    opt = KProdigy(params, second_moment="factored", eps_factored=0.0, foreach=foreach)
+    before = [p.detach().clone() for p in params]
+    for p in params:
+        p.grad = torch.zeros_like(p)
+    opt.step()
+    for p, b in zip(params, before, strict=True):
+        assert torch.equal(p.detach(), b)
+    g = torch.Generator().manual_seed(3)
+    for _ in range(3):
+        for p in params:
+            p.grad = torch.randn(p.shape, generator=g)
+        opt.step()
+    assert all(torch.isfinite(p).all() for p in params)
+    assert math.isfinite(opt.get_d())

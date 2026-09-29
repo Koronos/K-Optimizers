@@ -79,7 +79,7 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
-from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -103,6 +103,27 @@ _UPDATE_RMS = 0.2
 # standalone module, not coupled to adakaon.py internals). See
 # docs/foreach-batching.md for the rationale behind each constant.
 _STACK_BYTES_PER_ELEM = 48
+
+
+def _zero_safe_inv_sqrt_factors(row: Tensor, col: Tensor) -> tuple[Tensor, Tensor]:
+    """``factored_inv_sqrt_factors`` for ``eps1 == 0``, where a stat can be exactly zero.
+
+    With no ``eps1`` an all-zero momentum (step 1 of a layer behind a zero-init gate,
+    LoRA ``A`` behind a zero-init ``B``) orthogonalizes to zero, so ``row == 0`` and
+    ``row / mean(row)`` is ``0/0``; an all-zero row or column (Newton-Schulz preserves
+    them) gives ``rsqrt(0) = inf`` and ``0 * inf = NaN``, which the per-slice RMS clip
+    then spreads over the whole weight. Nothing caps the reconstruction, so ADOPT's lone
+    divisor floor would only trade the NaN for an ``inf``: this floors the divisor AND
+    both rsqrt arguments at the smallest normal fp32, bounding each factor by
+    ``rsqrt(_MIN_NORMAL) = 2**63`` (the product stays finite), so a zero-stat coordinate
+    gets a zero update. Only zero/subnormal stats are touched; NaNs still propagate.
+    Only the ``eps1 == 0`` branch calls this, so ``eps1 > 0`` stays bit-identical.
+    (Same helper as ScheduleFree's; kept local so this module stays standalone.)
+    """
+    row_mean = row.mean(dim=-1, keepdim=True).clamp_min_(_MIN_NORMAL)
+    r_factor = row.div(row_mean).clamp_min_(_MIN_NORMAL).rsqrt_().unsqueeze(-1)
+    c_factor = col.clamp_min(_MIN_NORMAL).rsqrt_().unsqueeze(-2)
+    return r_factor, c_factor
 
 
 
@@ -228,8 +249,11 @@ def _factored_math(
     row.lerp_(ortho_sq.mean(dim=-1), omb)
     col.lerp_(ortho_sq.mean(dim=-2), omb)
 
-    r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
-    c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
+    if eps1 > 0:
+        r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
+        c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
+    else:
+        r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
     update = ortho.mul(r_factor).mul_(c_factor)                               # [N, R, C], RMS≈1
     if bc_scale is not None:
         update.mul_(bc_scale)
@@ -312,7 +336,10 @@ def _factored_one_math(
     tensors themselves (updated in place). Returns the ``[R, C]`` delta."""
     ortho = zeropower_via_newtonschulz5(m, ns_steps).float()          # [R, C]
     update_factored_state(ortho, row, col, beta2, eps1)
-    r_factor, c_factor = factored_inv_sqrt_factors(row, col)
+    if eps1 > 0:
+        r_factor, c_factor = factored_inv_sqrt_factors(row, col)
+    else:
+        r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
     update = ortho.mul(r_factor).mul_(c_factor)                       # [R, C], RMS≈1
     if bc_scale is not None:
         update.mul_(bc_scale)

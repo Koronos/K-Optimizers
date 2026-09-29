@@ -79,7 +79,7 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
-from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -877,7 +877,10 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
             denom = state["v"].sqrt().clamp_(min=d * eps)
             delta = numer.div_(denom)
         else:
-            r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
+            # ``eps_factored == 0``: floor the row-mean divisor like ADOPT (0/0 -> inf,
+            # which the 1/(d*eps) cap below collapses). Off otherwise -> bit-identical.
+            floor = _MIN_NORMAL if not group["eps_factored"] > 0 else 0.0
+            r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"], floor=floor)
             inv_denom = r_factor.mul(c_factor).div_(d).clamp_(max=1.0 / (d * eps))
             inv_denom = self._unmatrixize(inv_denom, grad_fp32, group)
             delta = numer.mul_(inv_denom)
@@ -982,7 +985,12 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         rows = torch.stack(row_views)                                        # [N, R]
         cols = torch.stack(col_views)                                        # [N, C]
 
-        r_factor = rows.div(rows.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
+        row_mean = rows.mean(dim=-1, keepdim=True)
+        if not group["eps_factored"] > 0:
+            # All-zero grad history + eps_factored == 0 -> 0/0 NaN that the cap below
+            # cannot remove. ADOPT's floor turns it into inf, which the cap collapses.
+            row_mean.clamp_min_(_MIN_NORMAL)
+        r_factor = rows.div(row_mean).rsqrt_().unsqueeze(-1)                         # [N, R, 1]
         c_factor = cols.rsqrt().unsqueeze(-2)                                        # [N, 1, C]
         inv_denom = (r_factor * c_factor).div_(d).clamp_(max=1.0 / (d * eps))        # [N, R, C]
 
