@@ -125,8 +125,6 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
-    ensure_residuals,
-    flat_view,
     foreach_budget,
     gc_applies,
     init_bf16_state,
@@ -137,12 +135,18 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
-from kaon._foreach_plan import WatchedStateMixin, state_generation
+from kaon._foreach_plan import (
+    ForeachChunk,
+    ForeachPlanMixin,
+    ForeachSpec,
+    WatchedStateMixin,
+    state_generation,
+)
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _make_codec,
+    _MomentumCodec,
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
     warn_if_4bit_high_beta1,
@@ -302,22 +306,27 @@ def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
 
 
 
-def _residual_views(plist: list[Tensor], states: list[dict[str, Any]], bf16_method: str,
-                    view: Any) -> list[Tensor] | None:
-    """The bucket's ``kahan_lo`` views for a bf16 ``kahan8`` / ``kahan16`` bucket, else ``None``.
+def _lag_key(state: dict[str, Any], group: dict[str, Any]) -> int:
+    """The foreach plan's extra bucket key: how many group steps this param is behind.
 
-    Missing residuals (a group switched to kahan8/kahan16 after its state existed) are
-    allocated here with :func:`kaon._backend.ensure_residuals` — one warning, zero
-    residuals — and residuals of the other width are converted, the same lazy contract as
-    the foreach plan and the per-param writer, instead of letting the batched writer refuse
-    the bucket.
-    """
-    if not (plist and plist[0].dtype == torch.bfloat16 and is_compact_kahan(bf16_method)):
-        return None
-    ensure_residuals(plist, states, residual_bits(bf16_method))
-    return [view(s[RESIDUAL_KEY]) for s in states]
+    Constant while a group's params advance in lockstep (the plan then survives every
+    step) and distinct per bias correction, which is what a bucket must share."""
+    return group["step"] - state["step"]
 
-class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
+
+_CODECS: dict[str, _MomentumCodec] = {}
+
+
+def _codec_for(momentum_dtype: str) -> _MomentumCodec:
+    """One shared codec instance per ``momentum_dtype`` (stateless; the chunk memos key on
+    the instance, so a fresh one per step would rebuild them every step)."""
+    codec = _CODECS.get(momentum_dtype)
+    if codec is None:
+        codec = _CODECS[momentum_dtype] = _make_codec(momentum_dtype)
+    return codec
+
+
+class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     """AdaPNM (Adam + Positive-Negative Momentum) on Adakaon's memory backend.
 
     Args:
@@ -498,6 +507,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         self._fused_big_caches.clear()
         self._fused_big_buckets.clear()
         self._fused_demoted.clear()
+        self._clear_foreach_plans()
 
     def _autolr_reset_base_state(self) -> None:
         """Reset AdaPNM's base optimizer after an AutoLR rollback/contact."""
@@ -577,21 +587,6 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
     @staticmethod
     def _store_one(state: dict[str, Any], prefix: str, md: str, m_fp32: Tensor) -> None:
         _make_codec(md).store_one(AdaPNM._codec_state(state, prefix), m_fp32)
-
-    @staticmethod
-    def _dequant_stacked(
-        states: list[dict[str, Any]], prefix: str, md: str, shape: tuple[int, ...]
-    ) -> Tensor:
-        aliases = [AdaPNM._codec_state(state, prefix) for state in states]
-        mat = lambda tensor: tensor.reshape(shape)  # noqa: E731
-        return _make_codec(md).dequant_stacked(aliases, mat, shape)
-
-    @staticmethod
-    def _store_stacked(
-        states: list[dict[str, Any]], prefix: str, md: str, m_fp32: Tensor
-    ) -> None:
-        aliases = [AdaPNM._codec_state(state, prefix) for state in states]
-        _make_codec(md).store_stacked(aliases, m_fp32)
 
     def _prepare_param_steps(self, params: list[Tensor], group: dict[str, Any]) -> None:
         """Initialize state and advance each parameter's bias-correction counter.
@@ -1391,82 +1386,120 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             return p.data.is_contiguous() and p.grad.is_contiguous()
         return True
 
+    # Bucketing, chunking and the cached view plan live in kaon._foreach_plan, shared with
+    # Adakaon and the rest of the batched optimizers. The bucket key carries the param's
+    # LAG behind the group step (``extra_key``): every slice of a bucket must share one
+    # bias correction, and the lag — unlike the local step itself — is constant while the
+    # params advance in lockstep, so the plan survives every step that keeps the param set
+    # (only the coefficients, read off ``chunk.key``, change per step). ``row``/``col`` and
+    # ``v`` are the state buffers the bucket bodies stack and write back through.
+    # The two momenta go through the shared codec under per-chunk ALIAS dicts
+    # (``{"m": state["m_pos"], ...}``) plus the codec's cached stacked views, both built once
+    # per chunk in :meth:`_chunk_momentum` instead of on every step. The pos/neg role swap is
+    # only a choice of which alias list to read as positive, so it does not enter the key.
+    _FOREACH_SPEC = ForeachSpec(
+        factored_state=("row", "col"),
+        flat_state=("v",),
+        extra_key=_lag_key,
+    )
+
+    def _clear_foreach_plans(self) -> None:
+        """Drop every cached plan and, with them, the per-chunk momentum aliases."""
+        super()._clear_foreach_plans()
+        memo = self.__dict__.get("_pnm_momentum_memo")
+        if memo:
+            memo.clear()
+
+    def _drop_foreach_plan(self, group: dict[str, Any]) -> None:
+        super()._drop_foreach_plan(group)
+        memo = self.__dict__.get("_pnm_momentum_memo")
+        if memo:
+            memo.pop(id(group), None)
+
+    def _chunk_memos(self, group: dict[str, Any], chunks: list[ForeachChunk]) -> list[dict]:
+        """One momentum memo per chunk, valid for as long as the plan hands back ``chunks``.
+
+        :meth:`~kaon._foreach_plan.ForeachPlan.rechunk` returns the SAME list object while
+        neither the plan nor the split moved, and a fresh one otherwise (witness, state
+        generation, lag partition or budget split changed), so list identity is exactly the
+        plan's own validity and the memo can never outlive the chunks it describes.
+        """
+        memo = self.__dict__.get("_pnm_momentum_memo")
+        if memo is None:
+            memo = self.__dict__["_pnm_momentum_memo"] = {}
+        hit = memo.get(id(group))
+        if hit is None or hit[0] is not chunks:
+            hit = memo[id(group)] = (chunks, [{} for _ in chunks])
+        return hit[1]
+
+    @staticmethod
+    def _chunk_momentum(
+        memo: dict, chunk: ForeachChunk, prefix: str, codec: _MomentumCodec
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """``(codec alias dicts, codec stacked views)`` of one momentum buffer of ``chunk``.
+
+        Built once per chunk and prefix: the aliases only re-label buffers the state
+        already owns (the codec writes through them in place — its storage-identity
+        contract — so they never go stale while the plan stands), and the views are the
+        codec's own cached per-param view lists (``None`` when it declines the layout).
+        """
+        hit = memo.get(prefix)
+        if hit is None or hit[0] is not codec:
+            aliases = [AdaPNM._codec_state(s, prefix) for s in chunk.states]
+            eff = chunk.eff if chunk.eff is not None else (chunk.length,)
+            hit = memo[prefix] = (codec, aliases, codec.stacked_views(aliases, chunk.view, eff))
+        return hit[1], hit[2]
+
     @torch.no_grad()
     def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
         """Batched step. Factored (ndim>=2) and non-factored (ndim<=1) buckets, by shape.
 
         0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
-        with real shape-(1,) params."""
+        with real shape-(1,) params. The bucketing and every view it derives come from the
+        cached :class:`~kaon._foreach_plan.ForeachPlan`."""
         md = group["momentum_dtype"]
         pos, neg = self._pos_neg_prefixes(group["step"])
         group_step = group["step"]
         assert group_step >= 1, "AdaPNM foreach step requires an advanced group step"
-
-        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        for p in params:
-            state = self.state[p]
-            assert state and state.get("step", 0) >= 1, (
-                "AdaPNM parameter state must be prepared before foreach step"
-            )
-            lag = group_step - state["step"]
+        codec = _codec_for(md)
+        chunks = self._foreach_chunks(params, group, budget)
+        memos = self._chunk_memos(group, chunks)
+        coeffs: dict[int, dict[str, float]] = {}
+        for chunk, memo in zip(chunks, memos, strict=True):
+            lag = chunk.key
             assert lag >= 0, "AdaPNM parameter step cannot exceed its group step"
-            g = p.grad
-            # The DEVICE belongs in both keys: a bucket is stepped with ``torch.stack`` /
-            # ``_foreach_*`` over its members, so a CPU and a CUDA weight of the same shape landing
-            # in one bucket raised "Expected all tensors to be on the same device" and took the
-            # WHOLE step down. Same fix (and same reason) as Adakaon's foreach plan.
-            if g.ndim >= 2:
-                matrixize = g.ndim > 2
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                key = (eff, p.dtype, p.device, matrixize, lag)
-                factored_buckets.setdefault(key, []).append(p)
-            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                key = (g.numel(), p.dtype, p.device, lag)
-                flat_buckets.setdefault(key, []).append(p)
-
-        for (eff, _dtype, _dev, matrixize, lag), plist in factored_buckets.items():
-            c = self._coeffs(group, group_step - lag)
-            stepn = max(1, budget // max(eff[0] * eff[1], 1))
-            for i in range(0, len(plist), stepn):
-                self._factored_bucket(plist[i:i + stepn], eff, matrixize, md, pos, neg, c, group)
-        for (length, _dtype, _dev, lag), plist in flat_buckets.items():
-            c = self._coeffs(group, group_step - lag)
-            stepn = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), stepn):
-                self._nonfactored_bucket(plist[i:i + stepn], length, md, pos, neg, c, group)
+            c = coeffs.get(lag)
+            if c is None:
+                c = coeffs[lag] = self._coeffs(group, group_step - lag)
+            if chunk.eff is not None:
+                self._factored_bucket(chunk, memo, codec, pos, neg, c, group)
+            else:
+                self._nonfactored_bucket(chunk, memo, codec, pos, neg, c, group)
 
     @torch.no_grad()
     def _factored_bucket(
         self,
-        plist: list[Tensor],
-        eff: tuple[int, int],
-        matrixize: bool,
-        md: str,
+        chunk: ForeachChunk,
+        memo: dict,
+        codec: _MomentumCodec,
         pos: str,
         neg: str,
         c: dict[str, float],
         group: dict[str, Any],
     ) -> None:
-        R, C = eff  # noqa: N806
+        R, C = chunk.eff  # noqa: N806
         eps1 = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
+        rows, cols = chunk.state_views
 
-        def mat(t: Tensor) -> Tensor:
-            return t.view(R, C) if matrixize else t
-
-        states = [self.state[p] for p in plist]
-        rows = [s["row"] for s in states]
-        cols = [s["col"] for s in states]
-
-        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
+        grad = chunk.grad_stack()                                         # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
         # Decoupled weight decay BEFORE moment updates (kozistr order): p *= (1 - lr*wd).
         if wd != 0:
-            self._apply_decoupled_wd_batched(plist, mat, group["lr"] * wd)
+            torch._foreach_mul_(chunk.pviews, 1.0 - group["lr"] * wd)
 
         # Factored second-moment EMA (HF eps1 placement).
         omb2 = 1.0 - c["beta2"]
@@ -1483,7 +1516,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])                        # 1/sqrt(v_hat)
 
         # Positive-negative momentum mixing (read both, EMA only the positive).
-        pn = self._pn_stacked(states, pos, neg, md, (R, C), grad, c)               # [N, R, C]
+        pn = self._pn_stacked(memo, chunk, codec, pos, neg, (R, C), grad, c)       # [N, R, C]
 
         update = _rms_clip_batched_(pn.mul_(inv_denom), group["clip_threshold"])   # rms(u)<=clip
         delta = update.mul_(c["step_size"])                                        # full step
@@ -1491,15 +1524,14 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method, sr=self.sr_stream,
-                          comp=_residual_views(plist, states, bf16_method, mat))
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
 
     @torch.no_grad()
     def _nonfactored_bucket(
         self,
-        plist: list[Tensor],
-        length: int,
-        md: str,
+        chunk: ForeachChunk,
+        memo: dict,
+        codec: _MomentumCodec,
         pos: str,
         neg: str,
         c: dict[str, float],
@@ -1517,15 +1549,14 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         ams_bound = group["ams_bound"]
+        length = chunk.length
+        (vs,) = chunk.state_views
 
-        states = [self.state[p] for p in plist]
-        vs = [flat_view(s["v"]) for s in states]
-
-        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
+        grad = chunk.grad_stack()                                         # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
         if wd != 0:
-            self._apply_decoupled_wd_batched(plist, flat_view, group["lr"] * wd)
+            torch._foreach_mul_(chunk.pviews, 1.0 - group["lr"] * wd)
 
         # Full per-coordinate second moment (1-D). eps here goes on the denominator
         # (kozistr), NOT folded into grad^2; eps1==eps for the 1-D path.
@@ -1533,7 +1564,10 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
         if ams_bound:
-            max_vs = [flat_view(s["max_v"]) for s in states]
+            # ``max_v`` exists only under ams_bound, so it is not a spec key: its views are
+            # built here, on the (rare) opt-in path only.
+            view = chunk.view
+            max_vs = [view(s["max_v"]) for s in chunk.states]
             max_v = torch.stack(max_vs)
             torch.maximum(max_v, v, out=max_v)
             torch._foreach_copy_(max_vs, list(max_v.unbind(0)))
@@ -1542,49 +1576,45 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             de_nom = v.add(1e-15).sqrt_().add_(eps1)
         de_nom.div_(c["bc2_sq"])                                          # v_hat denom
 
-        pn = self._pn_stacked(states, pos, neg, md, (length,), grad, c)   # [N, L]
+        pn = self._pn_stacked(memo, chunk, codec, pos, neg, (length,), grad, c)   # [N, L]
         update = _rms_clip_batched_(pn.div_(de_nom), group["clip_threshold"])
         delta = update.mul_(c["step_size"])
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method,
-                          sr=self.sr_stream,
-                          comp=_residual_views(plist, states, bf16_method, flat_view))
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
 
     def _pn_stacked(
         self,
-        states: list[dict[str, Any]],
+        memo: dict,
+        chunk: ForeachChunk,
+        codec: _MomentumCodec,
         pos: str,
         neg: str,
-        md: str,
         shape: tuple[int, ...],
         grad: Tensor,
         c: dict[str, float],
     ) -> Tensor:
         """Stacked positive-negative momentum numerator (EMA the positive buffer).
 
-        ``grad`` is the stacked, reshaped, post-WD gradient (``[N, *shape]``). Reads
-        both momenta as fp32, EMA-updates only the positive buffer with the raw
-        gradient (decay ``beta1**2``), stores it back, and returns the renormalized
+        ``grad`` is the stacked, reshaped gradient (``[N, *shape]``). Reads both momenta
+        as fp32, EMA-updates only the positive buffer with the raw gradient (decay
+        ``beta1**2``), stores it back, and returns the renormalized
         ``((1+beta0)*m_pos - beta0*m_neg)/noise_norm``.
         """
         n = grad.shape[0]
-        m_pos = self._dequant_stacked(states, pos, md, shape).reshape((n, *shape))
-        m_neg = self._dequant_stacked(states, neg, md, shape).reshape((n, *shape))
+        view = chunk.view
+        pos_states, pos_views = self._chunk_momentum(memo, chunk, pos, codec)
+        neg_states, neg_views = self._chunk_momentum(memo, chunk, neg, codec)
+        m_pos = codec.dequant_stacked(pos_states, view, shape, views=pos_views).reshape((n, *shape))
+        m_neg = codec.dequant_stacked(neg_states, view, shape, views=neg_views).reshape((n, *shape))
         m_pos.mul_(c["beta1_sq"]).add_(grad, alpha=1.0 - c["beta1_sq"])
-        self._store_stacked(states, pos, md, m_pos.reshape((n, *shape)))
-        # m_pos is a fresh stacked tensor (torch.stack copies) and is already stored, so
+        codec.store_stacked(pos_states, m_pos, views=pos_views)
+        # m_pos is a fresh stacked tensor (the dequant copies) and is already stored, so
         # the pos-neg mix can run in-place on it — no extra [N, *shape] allocation.
         pn = m_pos.mul_(1.0 + c["beta0"]).add_(m_neg, alpha=-c["beta0"]).mul_(1.0 / c["noise_norm"])
         return pn
-
-    @torch.no_grad()
-    def _apply_decoupled_wd_batched(self, plist: list[Tensor], mat: Any, factor: float) -> None:
-        """In-place decoupled WD ``p *= (1 - factor)`` on the (matrixized) weights."""
-        scale = 1.0 - factor
-        torch._foreach_mul_([mat(p.data) for p in plist], scale)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()

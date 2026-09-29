@@ -637,9 +637,9 @@ def test_foreach_scalar_and_vector_with_same_local_step_share_bucket(monkeypatch
     bucket_shapes = []
     original = AdaPNM._nonfactored_bucket
 
-    def spy(self, plist, *args, **kwargs):
-        bucket_shapes.append([tuple(p.shape) for p in plist])
-        return original(self, plist, *args, **kwargs)
+    def spy(self, chunk, *args, **kwargs):
+        bucket_shapes.append([tuple(p.shape) for p in chunk.plist])
+        return original(self, chunk, *args, **kwargs)
 
     monkeypatch.setattr(AdaPNM, "_nonfactored_bucket", spy)
     scalar = torch.nn.Parameter(torch.tensor(0.1))
