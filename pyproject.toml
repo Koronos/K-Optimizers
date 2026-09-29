@@ -1,6 +1,6 @@
 [project]
 name = "kaon"
-description = "K-Optimizers: memory-efficient PyTorch optimizers for bf16 diffusion fine-tuning (Adakaon, Muon)."
+description = "K-Optimizers: memory-efficient PyTorch optimizers for bf16 diffusion fine-tuning (Adakaon, Nekaon, AdaMuon, Lion, AdaPNM, KProdigy, SAM/MSAM, Lookahead, Schedule-Free)."
 authors = [
     { name = "Koronos" }
 ]
@@ -14,6 +14,9 @@ keywords = [
     "optimizer",
     "adafactor",
     "muon",
+    "lion",
+    "sam",
+    "schedule-free",
     "diffusion",
     "memory-efficient",
     "stochastic-rounding",

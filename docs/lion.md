@@ -35,8 +35,9 @@ there is no preconditioner blow-up to clip; each step is bounded by construction
 ## Memory & the no-second-moment win
 
 One momentum buffer, no second moment: **~2 B/param (bf16) / ~1 B (int8) / ~0.5 B (4bit)**.
-The int8 path (~1 B/param) is the practical cheap default for Lion; 4bit (0.5 B/param) is
-lighter still but **not recommended** for Lion (sign flips — see caveat below). Memory remains
+The default is `momentum_dtype="bfloat16"` (~2 B/param). `int8` (~1 B/param, near
+loss-equivalent to bf16) is the **recommended cheap option** — opt in explicitly; 4bit
+(0.5 B/param) is lighter still but **not recommended** for Lion (sign flips — see caveat below). Memory remains
 Lion's strongest axis versus Adakaon (factored second moment) and AdamW (8 B).
 
 > **Caveat (measured): prefer `int8` over `4bit` for Lion.** Unlike the factored-Adam optimizers
@@ -56,7 +57,12 @@ Lion's strongest axis versus Adakaon (factored second moment) and AdamW (8 B).
   `kahan` / `none`) — bf16-correct, no Kahan buffer / CPU offload by default.
 - **Cautious masking** (`cautious=True`, default): zero the coordinates where the update sign
   disagrees with the gradient (`update·g <= 0`), rescale the survivors. For Lion's pure-sign
-  update this is a per-coordinate agreement filter.
+  update this is a per-coordinate agreement filter. `cautious_wd` (same option and semantics
+  as Adakaon's) places the decoupled weight decay: `"masked"` (default, historical) folds
+  `wd·p` into the delta before the mask — rejected coordinates get no decay, survivors get it
+  rescaled by `1/keep`; `"full"` masks only the sign update and decays every coordinate by
+  the same `lr·wd` (the Cautious Optimizers paper's placement). Identical when
+  `cautious=False` or `weight_decay=0`.
 - **Foreach batching** (`foreach`, `foreach_batch_cutoff`, `foreach_stack_budget`): stacked
   multi-tensor ops bucketed by shape — **bit-exact vs the per-parameter path** (verified). This
   is the decisive win for **LoRA/LoKr** (hundreds of tiny adapter tensors → one stacked op
@@ -73,7 +79,7 @@ Lion's strongest axis versus Adakaon (factored second moment) and AdamW (8 B).
 ```python
 Lion(
     params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0, *,
-    cautious=True, momentum_dtype="bfloat16", momentum_4bit_block=128,
+    cautious=True, cautious_wd="masked", momentum_dtype="bfloat16", momentum_4bit_block=128,
     bf16_method="stochastic_rounding", foreach=True,
     foreach_batch_cutoff=2_000_000, foreach_stack_budget=None,
 )
