@@ -680,12 +680,13 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                 self._step_foreach(fast, group, chunk_budget)
                 for p in slow:
                     self._step_one_param(p, group)
-            else:
-                for p in params:
-                    self._step_one_param(p, group)
-        else:
-            for p in params:
-                self._step_one_param(p, group)
+                return
+        # Per-parameter fallback for the whole group: drop its cached foreach plan (and the
+        # momentum memos hanging off it), so a cached plan only ever describes a group the
+        # foreach path actually stepped — the same invariant as Adakaon._native_dispatch.
+        self._drop_foreach_plan(group)
+        for p in params:
+            self._step_one_param(p, group)
 
     # ----------------------------------------------------------- fused (Triton) step
     @torch.no_grad()
