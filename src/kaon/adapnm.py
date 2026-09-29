@@ -486,6 +486,9 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         self._fused_ob_caches: dict[tuple[int, int], Any] = {}
         self._fused_od_caches: dict[tuple[int, int], Any] = {}
         self._fused_big_caches: dict[tuple, Any] = {}
+        # Same keys as ``_fused_big_caches``: (cache it was built for, row/col pointer arrays,
+        # one-launch zeroed accumulators) — see _big_sidecar.
+        self._fused_big_sidecars: dict[tuple, tuple] = {}
         # (group id, lag) -> (the ``big`` list the buckets were split from, the buckets)
         self._fused_big_buckets: dict[tuple[int, int], tuple[list, list]] = {}
         self._fused_demoted: dict[int, tuple] = {}
@@ -505,6 +508,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         self._fused_ob_caches.clear()
         self._fused_od_caches.clear()
         self._fused_big_caches.clear()
+        self._fused_big_sidecars.clear()
         self._fused_big_buckets.clear()
         self._fused_demoted.clear()
         self._clear_foreach_plans()
@@ -735,6 +739,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                 self._fused_od_caches, gid, set(one_dim_buckets))
             self._fused_big_caches = self._prune_lag_caches(
                 self._fused_big_caches, gid, set(big_buckets))
+            self._fused_big_sidecars = self._prune_lag_caches(
+                self._fused_big_sidecars, gid, set(big_buckets))
             self._fused_big_buckets = self._prune_lag_caches(
                 self._fused_big_buckets, gid, set(big_buckets))
             for lag, plist in one_block_buckets.items():
@@ -1221,12 +1227,16 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         gc = gc_flag and cache.gc_ok
         fused_red = self._fused_reductions
         if fused_red:  # grad via pointer array, no [N,R,C] stack (candidate #4); rowmean carries GC
+            side = self._big_sidecar(cache_key, cache, ft)
             g_addr, rowmean, r, cfac = self._chunked_reductions_fused(
-                plist, group, ft, R, C, lowp, cache, gc
+                plist, group, ft, R, C, lowp, cache, gc, side
             )
+            keep, rms_acc = side[4], side[5]        # zeroed by the reductions' single launch
         else:
             g, r, cfac = self._chunked_reductions_batched(plist, group, gc)  # g [N,R,C], r, c
             gf = g.reshape(-1)
+            keep = cache.keep.zero_()
+            rms_acc = cache.rms_acc.zero_()
         sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
 
         quant = md in ("int8", "4bit")
@@ -1243,8 +1253,6 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
             pos_addr, neg_addr = cache.momenta(pos_pref == "m_pos")
             mom = ft.MOM_BF16 if md == "bfloat16" else ft.MOM_FP32
         p_addr = cache.p_addr
-        keep = cache.keep.zero_()
-        rms_acc = cache.rms_acc.zero_()
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         if fused_red:
@@ -1263,8 +1271,11 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                 self._store_one(st, pos_pref, md, pos_temp[i])
         # Per-tensor Adafactor RMS-clip: rms_u = bc2_sq * sqrt(rms_acc / n); fold into sc_apply[N].
         if clip > 0.0:
-            rms_u = rms_acc.div_(n).sqrt_().mul_(c["bc2_sq"])             # [N]
-            sc_apply = (sc / rms_u.div_(clip).clamp_(min=1.0)).contiguous()
+            # max(rms_u / clip, 1) as ONE scaled sqrt, sqrt(acc * bc2^2 / (n * clip^2)): four
+            # launches where ``(sc / (sqrt(acc/n)*bc2/clip).clamp(1)).contiguous()`` took six.
+            # Same value up to fp32 rounding of the clip factor.
+            k = c["bc2_sq"] * c["bc2_sq"] / (n * clip * clip)
+            sc_apply = rms_acc.mul_(k).sqrt_().clamp_(min=1.0).reciprocal_().mul_(sc)   # [N]
         else:
             sc_apply = torch.full((N,), sc, dtype=torch.float32, device=dev)
         inv_mean = (1.0 / (keep.float() / n).clamp_(min=1e-8)) if cautious else torch.ones(N, device=dev)
@@ -1281,40 +1292,69 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                 SR=sr, BLOCK=1024,
             )
 
+    def _big_sidecar(self, key: tuple, cache: Any, ft: Any) -> tuple:
+        """Per-``BigPnmCache`` extras the fused reductions need and the cache does not carry.
+
+        ``(cache, row_addr, col_addr, zeros, colsum, keep, rms_acc)``: pointer arrays to the
+        persistent ``row``/``col`` EMA state (so :func:`kaon._fused_triton._factor_rowcol_batched`
+        can update it in place — the kernel Adakaon's batched-big route uses), and the three
+        per-step atomic accumulators as adjacent slices of ONE buffer, so a single ``zero_()``
+        clears them (``keep`` is an int32 view of its fp32 slice; all-zero bits are 0 in both).
+        Rebuilt exactly when the cache is (identity), so it can never point at state the cache
+        itself no longer trusts. ``BigPointerCache`` (Adakaon) carries all of this itself; the
+        cache's own ``colsum``/``keep``/``rms_acc`` stay unused on this route.
+        """
+        side = self._fused_big_sidecars.get(key)
+        if side is not None and side[0] is cache:
+            return side[1:]
+        dev = cache.dev
+        states = [self.state[p] for p in cache.plist]
+        n_c = cache.N * cache.C
+        zeros = torch.zeros(n_c + 2 * cache.N, dtype=torch.float32, device=dev)
+        side = (cache, ft.ptr_array([s["row"] for s in states], dev),
+                ft.ptr_array([s["col"] for s in states], dev), zeros, zeros[:n_c],
+                zeros[n_c + cache.N:].view(torch.int32), zeros[n_c:n_c + cache.N])
+        self._fused_big_sidecars[key] = side
+        return side[1:]
+
     @torch.no_grad()
-    def _chunked_reductions_fused(self, plist, group, ft, R, C, lowp, cache, gc):  # noqa: N803
+    def _chunked_reductions_fused(self, plist, group, ft, R, C, lowp, cache, gc, side):  # noqa: N803
         """Candidate #4 for AdaPNM: row/col EMA factors via the Triton reduction kernel reading grad
         from a pointer array (no [N,R,C] stack; GC in-kernel). No rms here — AdaPNM's clip is computed
         in the mom kernel. Returns (g_addr, rowmean, r_factor[N,R], c_factor[N,C]).
 
-        ``cache`` supplies the grad pointer array and the three scratch buffers; they were
-        reallocated here on every step, which is exactly what the cache exists to avoid.
+        ``cache`` supplies the grad pointer array and the ``rowmean``/``rowsum`` scratch;
+        ``side`` (:meth:`_big_sidecar`) the row/col state pointers and the accumulators.
+        Three launches per bucket, the same set Adakaon's route runs: ONE ``zero_()`` for
+        ``colsum`` + ``keep`` + ``rms_acc``, the reduction, and ``_factor_rowcol_batched``,
+        which updates the ``row``/``col`` EMA IN PLACE through the pointer arrays and emits the
+        factors. That replaces a torch chain of two ``stack``s, ``div``/``add_``/``lerp_`` x2,
+        two ``_foreach_copy_`` write-backs, ``mean``/``div``/``rsqrt_``/``rsqrt`` and two
+        ``contiguous`` copies (plus the two separate accumulator ``zero_()``s) — a fixed
+        per-bucket launch cost. The factors are written over ``rowsum``/``colsum`` (program
+        ``t`` reads and writes the same indices; see ``BigPointerCache``).
 
         ``gc`` is the caller's effective per-bucket flag and MUST be the same one the mom/apply
         kernels get — they re-apply GC from the ``rowmean`` written here."""
         b2, eps1 = group["betas"][1], group["eps"]
         N = len(plist)  # noqa: N806
-        states = [self.state[p] for p in plist]
+        row_addr, col_addr, zeros, colsum = side[0], side[1], side[2], side[3]
         g_addr = cache.g_addr
         BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806
         rowmean = cache.rowmean
         rowsum = cache.rowsum
-        colsum = cache.colsum.zero_()  # atomic target
+        zeros.zero_()  # colsum (atomic target) + keep + rms_acc, one launch
         ft._reduce_rowcol[(N * RB,)](
             g_addr, rowmean, rowsum, colsum, R, C, RB,
             LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
         )
-        rowsum = rowsum.view(N, R)
-        colsum = colsum.view(N, C)
-        row = torch.stack([s["row"] for s in states])
-        col = torch.stack([s["col"] for s in states])
-        row.lerp_(rowsum.div(C).add_(eps1), 1.0 - b2)
-        col.lerp_(colsum.div(R).add_(eps1), 1.0 - b2)
-        torch._foreach_copy_([s["row"] for s in states], list(row.unbind(0)))
-        torch._foreach_copy_([s["col"] for s in states], list(col.unbind(0)))
-        r = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().contiguous()
-        cfac = col.rsqrt().contiguous()
-        return g_addr, rowmean, r, cfac
+        FR = ft.triton.next_power_of_2(R)  # noqa: N806
+        FC = ft.triton.next_power_of_2(C)  # noqa: N806
+        ft._factor_rowcol_batched[(N,)](
+            row_addr, col_addr, rowsum, colsum, rowsum, colsum, R, C, b2, eps1,
+            BR=FR, BC=FC, num_warps=ft.warps_for(max(FR, FC)),
+        )
+        return g_addr, rowmean, rowsum, colsum
 
     def state_dict(self) -> dict[str, Any]:
         """Base state + the auto_lr tuner blob (via AutoLRMixin) when auto_lr is on."""
