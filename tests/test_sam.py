@@ -440,7 +440,7 @@ def test_add_param_group_after_construction():
     assert "old_p" not in opt.state[c]
 
 
-@pytest.mark.filterwarnings("ignore:Detected call of `lr_scheduler.step\(\)`")
+@pytest.mark.filterwarnings("ignore:Detected call of `lr_scheduler.step")
 def test_torch_lr_scheduler_drives_the_inner_lr():
     """A torch LR scheduler built on the SAM wrapper must change the lr the BASE optimizer
     actually steps with (shared ``param_groups``)."""
