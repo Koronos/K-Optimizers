@@ -721,3 +721,51 @@ def test_factored_eps_zero_with_an_all_zero_grad_stays_finite(foreach):
         opt.step()
     assert all(torch.isfinite(p).all() for p in params)
     assert math.isfinite(opt.get_d())
+
+
+@pytest.mark.parametrize("momentum_dtype", ["float32", "bfloat16", "int8", "4bit"])
+@pytest.mark.parametrize("second_moment", ["full", "factored"])
+def test_pass1_chunking_tracks_the_unchunked_run(momentum_dtype, second_moment):
+    """Pass 1 is chunked by the same ``foreach_stack_budget`` as pass 2 (it used to
+    stack whole shape buckets and keep every param's fp32 grad alive). Splitting a
+    bucket must not move D or the weights beyond the module's 1e-6 pass-1 contract."""
+    g = torch.Generator().manual_seed(0)
+    shapes = [(32, 16)] * 5 + [(8, 4, 3, 3)] * 3 + [(16,)] * 4 + [(3, 7)] * 3
+    base = [torch.nn.Parameter(torch.randn(*s, generator=g) * 0.1) for s in shapes]
+    pa = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in base]
+    kw = dict(momentum_dtype=momentum_dtype, second_moment=second_moment, d0=1e-6)
+    d_big, _ = _run_kprodigy_opt(pa, foreach=True, **kw)
+    # 600 elements: every 2-D / conv bucket splits into chunks of one or two params.
+    d_small, _ = _run_kprodigy_opt(pb, foreach=True, foreach_stack_budget=600, **kw)
+    _assert_d_climbed(d_big, kw["d0"])
+    for a, b in zip(d_big, d_small, strict=True):
+        assert a == pytest.approx(b, rel=1e-6, abs=0)
+    for a, b in zip(pa, pb, strict=True):
+        _assert_params_close(a, b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("second_moment", ["full", "factored"])
+def test_pass1_peak_is_bounded_by_the_stack_budget(second_moment):
+    """A bf16 bag of identical blocks (the DiT case): pass 1 used to widen EVERY
+    gradient to fp32 and keep it until the end of the pass, and to stack each whole
+    shape bucket, so the step's transient peak grew with the model. Chunked, it is a
+    few budget-sized stacks, independent of the number of blocks."""
+    torch.manual_seed(0)
+    n, shape, budget = 80, (256, 1024), 1 << 19
+    ps = [torch.nn.Parameter(torch.randn(shape, device="cuda").bfloat16()) for _ in range(n)]
+    opt = KProdigy(ps, second_moment=second_moment, foreach_stack_budget=budget)
+    for _ in range(2):  # step 1 allocates the state; measure the steady-state step
+        for p in ps:
+            p.grad = torch.randn(shape, device="cuda").bfloat16()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        opt.step()
+        torch.cuda.synchronize()
+    transient = torch.cuda.max_memory_allocated() - base
+    # The old pass 1 held every widened grad at once, so its transient could not drop
+    # below this (measured 600 MiB here vs 40 MiB chunked, on an 80 MiB bound).
+    all_fp32_grads = n * math.prod(shape) * 4
+    assert transient < all_fp32_grads, (transient / 2**20, all_fp32_grads / 2**20)
