@@ -437,43 +437,53 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         if g_stack.dtype != work:
             g_stack = g_stack.to(work)
 
-        # --- channel view: [N, R, C], cosine per (slice, row) over C ---
-        cos_ch = torch.nn.functional.cosine_similarity(
-            g_stack, p_stack, dim=-1, eps=eps
-        ).abs_()  # [N, R]
+        # Every quantity the projection needs is a per-row statistic of three [N, R, C]
+        # stacks — ||p||, ||g||, p.g and p.perturb over C — plus the flat ||p|| of the layer
+        # view. Each is ONE reduction pass (bmm rows for the dots), and the layer cosine is
+        # assembled from the row ones. ``F.cosine_similarity`` instead normalizes both
+        # inputs into fresh [N, R, C] copies, twice (channel and layer view), which was
+        # ~40% of AdamP's step on DiT shapes. Its formula is kept: each norm is clamped at
+        # ``eps`` separately, ``g.p / (max(||g||, eps) * max(||p||, eps))``. The cosines
+        # only feed the two fire comparisons, so this moves no weight unless a cosine sits
+        # within rounding (~3e-8 relative) of its threshold.
+        rows = n * r
+        g_norm = torch.linalg.vector_norm(g_stack, dim=-1)                       # [N, R]
+        p_norm = torch.linalg.vector_norm(p_stack, dim=-1)                       # [N, R]
+        gp_dot = torch.bmm(g_stack.reshape(rows, 1, c), p_stack.reshape(rows, c, 1)).view(n, r)
+
+        # --- channel view: cosine per (slice, row) over C ---
+        cos_ch = gp_dot.div(g_norm.clamp_min(eps).mul_(p_norm.clamp_min(eps))).abs_()  # [N, R]
         ch_fire = cos_ch.amax(dim=1) < (delta / math.sqrt(c))  # [N] bool
 
-        # --- layer view: [N, 1, R*C], cosine per slice over R*C ---
-        gflat = g_stack.reshape(n, 1, r * c)
-        pflat = p_stack.reshape(n, 1, r * c)
-        cos_ly = torch.nn.functional.cosine_similarity(
-            gflat, pflat, dim=-1, eps=eps
-        ).abs_()  # [N, 1]
-        ly_fire = (cos_ly.amax(dim=1) < (delta / math.sqrt(r * c))) & (~ch_fire)  # [N] bool
+        # --- layer view: cosine per slice over R*C, from the row statistics ---
+        ly_norm = p_stack.reshape(n, r * c).norm(dim=-1)                          # [N]
+        g_ly = g_norm.square().sum(dim=1).sqrt_()                                 # [N]
+        cos_ly = gp_dot.sum(dim=1).div_(g_ly.clamp_min_(eps).mul_(ly_norm.clamp_min(eps))).abs_()
+        ly_fire = (cos_ly < (delta / math.sqrt(r * c))) & (~ch_fire)  # [N] bool
 
         ch_mask = ch_fire.view(n, 1, 1)
         ly_mask = ly_fire.view(n, 1, 1)
 
         # radial = p * (sum(p * perturb) / (||p|| + eps)^2). bmm produces only
-        # [N,R,1] coefficients; addcmul_ applies them without any [N,R,C] radial
+        # [N,R,1] coefficients; one addcmul_ applies them without any [N,R,C] radial
         # or normalized-weight temporaries. Layer fire excludes channel fire, so
-        # the pre-channel row dots are also valid for every layer-fired slice.
+        # the pre-channel row dots are also valid for every layer-fired slice, and the
+        # two coefficients are never both non-zero: their sum is exactly the one that
+        # fired, so a single pass replaces the channel pass + layer pass bit for bit.
         row_dot = torch.bmm(
-            p_stack.reshape(n * r, 1, c),
-            perturb.reshape(n * r, c, 1),
+            p_stack.reshape(rows, 1, c),
+            perturb.reshape(rows, c, 1),
         ).reshape(n, r, 1)
-        ch_norm = p_stack.norm(dim=-1, keepdim=True).add_(eps)
+        ch_norm = p_norm.unsqueeze(-1).add_(eps)
         zero = perturb.new_zeros(())
         ch_coef = torch.where(ch_mask, row_dot.div(ch_norm.square()), zero)
-        perturb.addcmul_(p_stack, ch_coef, value=-1.0)
-
-        ly_norm = p_stack.reshape(n, r * c).norm(dim=-1).view(n, 1, 1).add_(eps)
+        ly_norm = ly_norm.view(n, 1, 1).add_(eps)
         ly_coef = torch.where(
             ly_mask,
             row_dot.sum(dim=1, keepdim=True).div_(ly_norm.square()),
             zero,
         )
-        perturb.addcmul_(p_stack, ly_coef, value=-1.0)
+        perturb.addcmul_(p_stack, ch_coef.add_(ly_coef), value=-1.0)
 
         fired = (ch_fire | ly_fire).view(n, 1, 1)
         wd_ratio = torch.where(
