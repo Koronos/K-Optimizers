@@ -728,6 +728,63 @@ def test_int8_stacked_store_keeps_per_param_scale_layout():
         assert all(torch.isfinite(p).all() for p in batched), shape
 
 
+# ============================================================ decoupled weight decay on bf16
+# The decay used to be a separate ``p.mul_(1 - lr*wd)`` (per-param) / ``_foreach_mul_``
+# (foreach) on the bf16 weight: round-to-nearest in bf16, no SR, no Kahan — so any
+# ``lr*wd`` below half a bf16 ulp (2^-9 near 1.0) was a literal no-op, and under
+# kahan8/kahan16 it also moved the weight without its residual. The decay now rides the
+# fp32 delta (``delta += lr*wd * value(p_old)``, after cautious, so it stays ungated —
+# kozistr's order: the decay reads the PRE-step weight) and goes through the SR/Kahan write.
+@pytest.mark.parametrize("foreach", [False, True])
+@pytest.mark.parametrize("shape", [(256, 256), (65536,)])
+def test_bf16_weight_decay_is_not_a_noop(foreach, shape):
+    """bf16 ones, lr=1e-4, wd=0.01, zero grads: the decay alone must shrink the weight to
+    ~(1 - 1e-6)^200 == 0.9998 (it used to stay at exactly 1.0). The mean of the SR-written
+    weights is unbiased; its noise over 2x65536 elements is ~5e-6."""
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.ones(shape, dtype=torch.bfloat16)) for _ in range(2)]
+    opt = AdaPNM(params, lr=1e-4, weight_decay=0.01, cautious=False, foreach=foreach)
+    for _ in range(200):
+        for p in params:
+            p.grad = torch.zeros_like(p)
+        opt.step()
+    ideal = (1.0 - 1e-6) ** 200
+    for p in params:
+        mean = p.float().mean().item()
+        assert abs(mean - ideal) < 3e-5, (mean, ideal)
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+@pytest.mark.parametrize("cautious", [False, True])
+def test_kahan16_weight_decay_tracks_the_fp32_run(foreach, cautious):
+    """kahan16 carries an exact fp32 master: with weight decay its decoded weight must
+    follow the fp32-weight run of the same gradients (the old separate bf16 ``mul_``
+    moved the bf16 half without the residual and broke that)."""
+    from kaon._compact_kahan import RESIDUAL_KEY, decode
+
+    shapes = [(16, 24), (40,), (4, 3, 3, 3)]
+    torch.manual_seed(5)
+    init = [torch.randn(s) for s in shapes]
+    p16 = [torch.nn.Parameter(t.to(torch.bfloat16)) for t in init]
+    p32 = [torch.nn.Parameter(t.to(torch.bfloat16).float()) for t in init]
+    # GC off: on a bf16 grad it centralizes in bf16 (rounding the grad) while the fp32 run
+    # centralizes in fp32 — a separate, pre-existing difference this test is not about.
+    cfg = dict(lr=1e-3, weight_decay=0.05, cautious=cautious, foreach=foreach,
+               momentum_dtype="float32", gradient_centralization=False)
+    o16 = AdaPNM(p16, bf16_method="kahan16", **cfg)
+    o32 = AdaPNM(p32, **cfg)
+    gg = torch.Generator().manual_seed(9)
+    for _ in range(12):
+        for a, b in zip(p16, p32, strict=True):
+            g = (torch.randn(a.shape, generator=gg) * 0.01).to(torch.bfloat16)
+            a.grad, b.grad = g.clone(), g.float()
+        o16.step()
+        o32.step()
+    for a, b in zip(p16, p32, strict=True):
+        z = decode(a.data, o16.state[a][RESIDUAL_KEY], 16)
+        torch.testing.assert_close(z, b.detach(), rtol=0, atol=1e-6)
+
+
 @pytest.mark.parametrize("foreach", [False, True])
 @pytest.mark.parametrize("ams_bound", [False, True])
 def test_one_dim_eps_is_not_scaled_by_the_bias_correction(foreach, ams_bound):

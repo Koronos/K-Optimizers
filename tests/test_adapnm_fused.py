@@ -1363,3 +1363,30 @@ def test_a_bf16_bucket_under_another_method_never_launches_fused():
     assert _fused_sr({"bf16_method": "none"}, False) is False       # fp32 bucket: no SR
     with pytest.raises(RuntimeError, match="stale routing"):
         _fused_sr({"bf16_method": "none"}, True)
+
+
+# ----------------------------------------------------------------- bf16 weight decay
+@pytest.mark.parametrize("shapes", [[(128, 128)] * 2, [(1024, 512)] * 2, [(1024, 512)],
+                                    [(8192,)] * 2], ids=["one_block", "big_batched",
+                                                        "lone_big", "one_dim"])
+@pytest.mark.parametrize("fused", [True, False])
+def test_bf16_weight_decay_moves_the_weight_on_every_route(shapes, fused):
+    """bf16 ones, lr=1e-4, wd=0.01, zero grads: every route must decay to ~(1-1e-6)^200.
+
+    The fused kernels always folded the decay into the SR write (``p*(1-lr*wd) - delta`` in
+    fp32, then SR); the native path used a separate round-to-nearest bf16 ``mul_`` that was
+    a no-op (mean stayed 1.0 exactly). Both must now agree with the ideal decay."""
+    ps = [torch.ones(s, device=DEV, dtype=torch.bfloat16).requires_grad_(True) for s in shapes]
+    opt = AdaPNM(ps, lr=1e-4, weight_decay=0.01, cautious=False, fused=fused)
+    for _ in range(200):
+        for p in ps:
+            p.grad = torch.zeros_like(p)
+        opt.step()
+    torch.cuda.synchronize()
+    if fused:
+        ob, big, od, nat = _parts(opt)
+        assert not nat, "a bf16 SR weight fell to native on the fused optimizer"
+    ideal = (1.0 - 1e-6) ** 200
+    for p in ps:
+        mean = p.detach().float().mean().item()
+        assert abs(mean - ideal) < 4e-5, (mean, ideal)

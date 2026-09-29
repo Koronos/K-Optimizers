@@ -134,7 +134,9 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
     validate_bf16_method,
+    weight_value,
 )
+from kaon._compact_kahan import is_compact_kahan
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import (
     ForeachChunk,
@@ -353,6 +355,20 @@ def _grad_stack_fp32(chunk: ForeachChunk) -> Tensor:
     return out if reshape is None else out.view(reshape)
 
 
+def _decay_value_stacked(chunk: ForeachChunk, bf16_method: str) -> tuple[Tensor, Any]:
+    """The stacked VALUE of a low-precision bucket's weights for the folded weight decay,
+    plus the ``stacked=`` hand-off for the write (see :func:`kaon._backend.subtract_batched_`).
+
+    Under kahan8/kahan16 that is the decoded ``(bf16, residual)`` value
+    (:meth:`~kaon._foreach_plan.ForeachChunk.value_and_stacks`, whose stacks the write then
+    reuses). Otherwise it is the raw bf16/fp16 stack: ``delta.add_(bf16, alpha=)`` promotes
+    to fp32 inside the kernel, bit-identical to adding ``.float()`` of it, without the
+    [N, *eff] fp32 copy."""
+    if is_compact_kahan(bf16_method) and chunk.pviews[0].dtype == torch.bfloat16:
+        return chunk.value_and_stacks(bf16_method)
+    return torch.stack(chunk.pviews), None
+
+
 _CODECS: dict[str, _MomentumCodec] = {}
 
 
@@ -403,10 +419,14 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
             unclamped PNM update — diverges on real diffusion training, kept only for
             ablation). Set looser (e.g. ``> 1``) to recover more of the raw PNM step if
             a generalization measurement shows the clip costs gap.
-        weight_decay: decoupled (AdamW-style) weight decay. Applied multiplicatively
-            ``p *= (1 - lr*weight_decay)`` *before* the moment updates, matching
-            kozistr's ``weight_decouple=True`` default (not folded into the cautious
-            delta — so cautious does not gate weight decay, unlike Adakaon).
+        weight_decay: decoupled (AdamW-style) weight decay, kozistr's
+            ``weight_decouple=True`` semantics: ``p *= (1 - lr*weight_decay)`` from the
+            *pre-step* weight, i.e. ``p -= delta + lr*weight_decay*p_old``. Not gated by
+            cautious (unlike Adakaon's default). fp32 weights apply it as that in-place
+            multiply; bf16/fp16 weights fold the term into the fp32 delta so it goes
+            through the stochastic-rounding / Kahan write (a separate bf16 multiply
+            rounds any ``lr*wd`` below half an ulp away, and under kahan8/kahan16 it
+            would skip the residual) and read the full decoded value under kahan8/kahan16.
         cautious: cautious masking (Liang et al. 2024) on the final pos-neg step vs
             the gradient. **On by default.** See the class docstring: it interacts
             with — and partially damps — PNM's noise-manipulation mechanism; ablate
@@ -1583,8 +1603,11 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
-        # Decoupled weight decay BEFORE moment updates (kozistr order): p *= (1 - lr*wd).
-        if wd != 0:
+        # Decoupled weight decay (kozistr order: it reads the PRE-step weight). fp32 weights
+        # keep the in-place ``p *= 1 - lr*wd``; low-precision ones fold it into the delta
+        # below — see _step_one_param.
+        fold_wd = wd != 0 and chunk.pviews[0].dtype != torch.float32
+        if wd != 0 and not fold_wd:
             torch._foreach_mul_(chunk.pviews, 1.0 - group["lr"] * wd)
 
         # Factored second-moment EMA (HF eps1 placement).
@@ -1615,7 +1638,12 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
+        ck_stacks = None
+        if fold_wd:                                    # after cautious: the decay is ungated
+            p_val, ck_stacks = _decay_value_stacked(chunk, bf16_method)
+            delta = delta.add_(p_val, alpha=group["lr"] * wd)
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=ck_stacks)
 
     @torch.no_grad()
     def _nonfactored_bucket(
@@ -1646,7 +1674,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         grad = _grad_stack_fp32(chunk)                                    # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
-        if wd != 0:
+        fold_wd = wd != 0 and chunk.pviews[0].dtype != torch.float32   # see _factored_bucket
+        if wd != 0 and not fold_wd:
             torch._foreach_mul_(chunk.pviews, 1.0 - group["lr"] * wd)
 
         # Full per-coordinate second moment (1-D). eps here goes on the denominator
@@ -1676,7 +1705,12 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews)
+        ck_stacks = None
+        if fold_wd:
+            p_val, ck_stacks = _decay_value_stacked(chunk, bf16_method)
+            delta = delta.add_(p_val, alpha=group["lr"] * wd)
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=ck_stacks)
 
     def _pn_stacked(
         self,
@@ -1728,8 +1762,18 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         ndim = grad.ndim
         factored = ndim >= 2
 
-        # Decoupled weight decay BEFORE the moment updates (kozistr order).
-        if wd != 0:
+        # Decoupled weight decay, kozistr order: the decay reads the PRE-step weight
+        # (``p *= 1 - lr*wd`` then ``p -= delta`` is ``p -= delta + lr*wd*p_old``). On an fp32
+        # weight that is the in-place multiply it always was. On a low-precision weight it is
+        # FOLDED into the fp32 delta and goes through the same SR / Kahan write as the step:
+        # a separate bf16 ``mul_`` rounds to nearest, so any ``lr*wd`` under half a bf16 ulp
+        # (2^-9 near 1.0 — every realistic fine-tune) was a silent no-op, and under
+        # kahan8/kahan16 it moved the bf16 half without its residual. The folded term reads
+        # the full value (decoded under kahan8/kahan16, see kaon._backend.weight_value) and
+        # is added AFTER the cautious mask, so cautious still does not gate the decay.
+        # Same result as the fused kernels' ``p*(1 - lr*wd) - delta`` up to fp32 rounding.
+        fold_wd = wd != 0 and is_low_precision(p)
+        if wd != 0 and not fold_wd:
             p.data.mul_(1.0 - group["lr"] * wd)
 
         if factored:
@@ -1763,6 +1807,13 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
 
         if cautious:
             delta = cautious_one_(delta, grad)
+
+        if fold_wd:
+            # bf16 ``p.data`` is added as-is (promoted to fp32 in the kernel, bit-identical
+            # to ``.float()`` without the copy); only compact Kahan needs the decode.
+            p_val = (weight_value(p, state, bf16_method) if is_compact_kahan(bf16_method)
+                     else p.data)
+            delta = delta.add_(p_val, alpha=group["lr"] * wd)
 
         subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
 
