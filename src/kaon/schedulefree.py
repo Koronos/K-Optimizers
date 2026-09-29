@@ -757,6 +757,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
             grad_sq = grad_sq.add_(eps1)
         row.lerp_(grad_sq.mean(dim=-1), omb2)
         col.lerp_(grad_sq.mean(dim=-2), omb2)
+        del grad_sq  # a full [N, R, C] fp32 that would otherwise live through the y/z update
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
@@ -767,13 +768,18 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
             r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
         inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])                        # 1/sqrt(v_hat)
 
+        # ``inv_denom`` is consumed (it becomes ``d`` on the no-inner-momentum path).
         d = self._normalized_d_stacked(states, md, grad, inv_denom, (R, C), c)     # [N, R, C]
+        del inv_denom
 
         if wd != 0:
             d.add_(chunk.param_stack(), alpha=wd)                                  # at y
 
         if cautious:
             d = cautious_batched_(d, grad)
+        # Last use of the stacked grad: a bf16 weight's is a fresh fp32 [N, R, C], which
+        # must not stay alive through the z dequant and the y stack below.
+        del grad
 
         z = self._dequant_full_stacked(states, "z", md, (R, C))                    # [N, R, C]
         ys = chunk.pviews
@@ -870,6 +876,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
                 r_factor, c_factor = _zero_safe_inv_sqrt_factors(state["row"], state["col"])
             inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])            # 1/sqrt(v_hat)
             d = self._normalized_d_one(state, md, gv, inv_denom, c)        # [R, C]
+            del inv_denom
             if matrixize:
                 d = d.reshape_as(grad)
                 gv = grad
