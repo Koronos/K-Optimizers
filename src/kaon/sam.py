@@ -220,20 +220,51 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         scale: Tensor,
         adaptive: bool,
     ) -> None:
-        weights = torch.stack([p.data for p in plist])
-        old_stack = weights.clone()
-        grads = torch.stack([p.grad for p in plist])
-        if adaptive:
-            e_w = grads * scale.to(weights.device) * (weights * weights)
+        """Climb one same-(shape, dtype, device) chunk: ``w += e`` and snapshot ``old_p``.
+
+        Every route computes ``e = (g * scale) [* (w * w)]`` with the same ops in the same
+        order and writes it with the same primitive, so all three are bit-identical to the
+        historical stack -> clone -> add -> copy-back (including the stochastic-rounding
+        stream: the torch SR draw depends only on the element count and logical order).
+        What differs is the transient: the historical route held a weight stack, its
+        clone, a grad stack and ``e`` (~4-5x the chunk) and paid a copy-back.
+
+        * fp32 weights + fp32 grads: no stack at all — ``_foreach`` ops in place on the
+          live weights; only the ``old_p`` snapshot and ``e`` are allocated.
+        * a single contiguous low-precision weight (a unique shape, or one above the stack
+          budget — e.g. a 3072x3072 DiT MLP): stacking one tensor is pure overhead, so it
+          climbs in place.
+        * otherwise (bf16 buckets of N >= 2) one stacked SR write, with ``e`` computed in
+          place in the grad stack.
+        """
+        s = scale.to(plist[0].device)
+        pdata = [p.data for p in plist]
+        grads = [p.grad for p in plist]
+        if plist[0].dtype == torch.float32 and all(g.dtype == torch.float32 for g in grads):
+            olds = [pdata[0].clone()] if len(pdata) == 1 else list(torch.stack(pdata).unbind(0))
+            e = torch._foreach_mul(grads, s)  # type: ignore[attr-defined]
+            if adaptive:
+                torch._foreach_mul_(e, torch._foreach_mul(pdata, pdata))  # type: ignore[attr-defined]
+            torch._foreach_add_(pdata, e)  # type: ignore[attr-defined]
+        elif len(pdata) == 1 and pdata[0].is_contiguous():
+            w = pdata[0]
+            olds = [w.clone()]
+            e1 = grads[0] * s
+            if adaptive:
+                e1 = e1 * (w * w)
+            add_stochastic_(w, e1, alpha=1.0, sr=self.sr_stream)
         else:
-            e_w = grads * scale.to(weights.device)
-        if weights.dtype == torch.float32:
-            weights.add_(e_w)
-        else:
+            weights = torch.stack(pdata)
+            olds = list(weights.clone().unbind(0))
+            e_w = torch.stack(grads).mul_(s)
+            if adaptive:
+                ww = weights * weights
+                # in place only when it cannot narrow (bf16 grads on fp32 weights promote)
+                e_w = e_w.mul_(ww) if e_w.dtype == ww.dtype else e_w * ww
             add_stochastic_(weights, e_w, alpha=1.0, sr=self.sr_stream)
-        for p, old in zip(plist, old_stack.unbind(0), strict=True):
+            torch._foreach_copy_(pdata, list(weights.unbind(0)))  # type: ignore[attr-defined]
+        for p, old in zip(plist, olds, strict=True):
             self.state[p]["old_p"] = old
-        torch._foreach_copy_([p.data for p in plist], list(weights.unbind(0)))  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------ pass 1
     @torch.no_grad()
