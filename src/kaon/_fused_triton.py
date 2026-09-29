@@ -50,6 +50,8 @@ What is already optimizer-AGNOSTIC vs Adakaon-SPECIFIC here:
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
 from kaon._backend import gc_applies
@@ -360,8 +362,15 @@ def eff_2d(p: torch.Tensor) -> tuple[int, int]:
     CONTIGUOUS tensor's row-major storage is identical under that reshape, the fused kernels (which
     index the flat buffer as ``ri*C + ci``) operate on a conv exactly as on the 2-D view, with no
     copy. The row/col second-moment state is already allocated in this matrixized shape (see each
-    optimizer's ``_init_state``)."""
-    return p.shape[0], p.numel() // p.shape[0]
+    optimizer's ``_init_state``).
+
+    A zero-row tensor (``shape[0] == 0``) has ``C`` = the product of the inner dims: the
+    ``numel // shape[0]`` shortcut divided by zero there, inside the partition, before any
+    eligibility guard ran — taking the WHOLE fused step down for one empty tensor."""
+    r = p.shape[0]
+    if r == 0:
+        return 0, math.prod(p.shape[1:])
+    return r, p.numel() // r
 
 
 def warps_for(lanes: int) -> int:
@@ -383,9 +392,11 @@ def fused_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP) -> bool:
     Optimizer-agnostic: any single-block fused kernel shares this predicate. ``ndim>2`` conv kernels
     are matrixized to ``(out, in*kh*kw)`` via :func:`eff_2d` (valid because they're contiguous); the
     caller must also confirm the GRAD is contiguous (the matrixized write-back needs it). Everything
-    that returns False is routed to the native fallback.
+    that returns False is routed to the native fallback. So is a ZERO-ELEMENT tensor: there is
+    nothing to step, and a zero tile extent is not a valid ``tl.arange`` (fan-in 0 failed to
+    compile, zero rows divided by zero in :func:`eff_2d`).
     """
-    if p.ndim < 2 or not p.is_cuda or not p.is_contiguous():
+    if p.ndim < 2 or not p.is_cuda or not p.is_contiguous() or p.numel() == 0:
         return False
     if p.dtype not in (torch.float32, torch.bfloat16):  # fp16 SR unsupported -> native
         return False
@@ -403,8 +414,9 @@ def fused_1d_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP_1D) -> bool:
 
     Note the default is :data:`TILE_CAP_1D`, **not** the 2-D :data:`TILE_CAP`: falling off this
     cap means dropping to the native foreach path, not to the chunked kernel, so the two bounds
-    are unrelated. Callers pass no cap — ``fused_tile_cap=`` tunes the 2-D crossover only."""
-    if p.ndim != 1 or not p.is_cuda or not p.is_contiguous():
+    are unrelated. Callers pass no cap — ``fused_tile_cap=`` tunes the 2-D crossover only.
+    A zero-length tensor is never eligible (a zero-extent ``tl.arange`` does not compile)."""
+    if p.ndim != 1 or not p.is_cuda or not p.is_contiguous() or p.numel() == 0:
         return False
     if p.dtype not in (torch.float32, torch.bfloat16):
         return False
