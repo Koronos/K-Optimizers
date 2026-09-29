@@ -51,6 +51,24 @@ train.** Bracket sampling/validation with ``eval()``/``train()``::
     opt.train()      # back to the fast weights for more training
 
 (:meth:`train` / :meth:`eval` are idempotent — a no-op if already in that mode.)
+
+Checkpointing
+-------------
+Either mode resumes **exactly**; they differ in what goes where:
+
+* **train mode** — the live weights (your model checkpoint) are the fast ``theta`` and the
+  optimizer state holds ``phi``. Nothing is duplicated.
+* **eval mode** — the live weights are the slow ``phi`` (what you want to ship / sample),
+  so the fast ``theta`` exists nowhere else: the optimizer ``state_dict`` carries it as
+  ``backup`` (one extra copy of the trainable weights at their own dtype). This is
+  deliberate — dropping it would make every eval-mode resume silently reset
+  ``theta <- phi`` (a partial sync that throws away up to ``k - 1`` fast steps). The
+  checkpoint also records ``train_mode=False``, so after ``load_state_dict`` the
+  optimizer is in eval mode: ``step()`` refuses until you call :meth:`train`, which
+  restores that ``backup`` byte-exact.
+
+If optimizer-checkpoint size matters more than exact resumption, checkpoint in train mode
+(same exactness, no ``backup``), or call :meth:`train` before ``state_dict()``.
 """
 
 from __future__ import annotations
@@ -147,7 +165,10 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
 
     # ====================================================== train/eval view hooks
     def _to_eval_view(self, p: Tensor, st: dict[str, Any], group: dict[str, Any]) -> None:
-        """eval: back up the fast ``theta`` and show the slow ``phi`` (codec-exact)."""
+        """eval: back up the fast ``theta`` and show the slow ``phi`` (codec-exact).
+
+        ``backup`` is the only copy of ``theta`` while in eval mode, which is why an
+        eval-mode ``state_dict`` carries it (see "Checkpointing" in the module docstring)."""
         if "phi" in st:
             st["backup"] = p.detach().clone()
             p.data.copy_(CodecBuffer.read(st, "phi", group["slow_dtype"], p).to(p.dtype))
