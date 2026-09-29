@@ -555,8 +555,9 @@ def _add_stochastic_bf16_(
     # stays in-range; large finites may stochastically round to inf like RNE).
     # One extra kernel: fold the NaN test into the add operand. +-inf need no mask
     # (0x7F800000 + noise <= 0x7F80FFFF and the AND below restores it). Measured
-    # cheaper than isfinite() + mul_ (two kernels) on CUDA and CPU.
-    noise = torch.where(result_fp32 != result_fp32, 0, noise)
+    # cheaper than isfinite() + mul_ (two kernels) on CUDA and CPU. In place
+    # (``masked_fill_``, not ``torch.where``): same two kernels, one int32 temporary fewer.
+    noise.masked_fill_(result_fp32 != result_fp32, 0)
     # In two's complement, ``-0x10000`` is the int32 mask ``0xFFFF0000``.
     bits.add_(noise).bitwise_and_(-0x10000)
 

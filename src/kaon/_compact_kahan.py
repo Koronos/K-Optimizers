@@ -198,24 +198,37 @@ def encode_(z: Tensor, p: Tensor, lo: Tensor, bits: int = 8, noise: Tensor | Non
     unit = 1 << (16 - bits)
     b = z.view(torch.int32)
     finite = z.abs() <= _FLT_MAX                 # bool; False for NaN and +-inf
+    # All-finite fast path, CPU ONLY: when every lane is finite the mask is all-True, so the
+    # two ``mul_(finite)`` and the final ``where`` are identities and the bf16 fallback
+    # pattern ``pf`` is never selected — skipping them is bit-identical and saves four passes
+    # plus a param-sized int16 temporary. Deciding it needs ``finite.all()`` on the host,
+    # which on CUDA is a device sync per call; this torch path only runs on CUDA when the
+    # Triton kernel declines a tensor, so there it keeps the sync-free masked form.
+    masked = z.device.type != "cpu" or not bool(finite.all())
     # The non-finite lanes' bf16 pattern, taken BEFORE the low bits are touched (a NaN
     # whose payload sits only in the low bits would otherwise be masked into an inf).
-    pf = z.to(torch.bfloat16).view(torch.int16)
+    pf = z.to(torch.bfloat16).view(torch.int16) if masked else None
     if noise is None:
         b.add_(unit >> 1)
         q = b >> (16 - bits)
     else:
-        noise.mul_(finite)                       # no rounding offset on non-finite lanes
+        if masked:
+            noise.mul_(finite)                   # no rounding offset on non-finite lanes
         b.add_(noise)
         q = noise                                # reuse the buffer as the residual scratch
         torch.bitwise_right_shift(b, 16 - bits, out=q)
-    q.bitwise_and_((1 << bits) - 1).mul_(finite)
+    q.bitwise_and_((1 << bits) - 1)
+    if masked:
+        q.mul_(finite)
     b.bitwise_and_(-unit)
     w = b >> 16
     w.bitwise_and_(0xFFFF).add_(q >> (bits - 1))
     # ``0x8000..0xFFFF`` are negative patterns: sign-extend before narrowing to int16.
     w.bitwise_left_shift_(16).bitwise_right_shift_(16)
-    p.view(torch.int16).copy_(torch.where(finite, w.to(torch.int16), pf))
+    if masked:
+        p.view(torch.int16).copy_(torch.where(finite, w.to(torch.int16), pf))
+    else:
+        p.view(torch.int16).copy_(w)             # int32 -> int16 narrowing, as ``.to`` does
     if bits == 16:
         # int16 storage of the uint16 pattern: sign-extend explicitly rather than rely on
         # the int32 -> int16 narrowing wrapping (it does on CPU and CUDA, but it is
