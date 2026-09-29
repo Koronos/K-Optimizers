@@ -495,8 +495,8 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         row_mean = row.mean(dim=-1, keepdim=True).clamp_min_(_MIN_NORMAL)
         r_factor = row.div(row_mean).rsqrt_().unsqueeze(-1)                        # [N, R, 1]
         c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
-        inv_denom = (r_factor * c_factor).clamp_(max=1.0 / c["eps"])               # 1/max(sqrt v, eps)
-        normed = grad * inv_denom
+        # 1/max(sqrt v, eps), then * g in the same buffer (no second [N, R, C] temporary).
+        normed = (r_factor * c_factor).clamp_(max=1.0 / c["eps"]).mul_(grad)
         if c["clip"] is not None:
             normed.clamp_(-c["clip"], c["clip"])
 
@@ -512,6 +512,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         stacks = decay_batched_(delta, chunk, bf16_method, group["lr"] * wd) if wd != 0 else None
         subtract_batched_(pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
                           stacked=stacks)
+        del normed, m, delta, stacks                  # dead [N, R, C] buffers before grad_sq
 
         # --- fold g_t into v AFTER it has been used (the v-lag) ---
         grad_sq = grad * grad
@@ -613,8 +614,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             r_factor, c_factor = factored_inv_sqrt_factors(
                 state["row"], state["col"], floor=_MIN_NORMAL
             )
-            inv_denom = (r_factor * c_factor).clamp_(max=1.0 / c["eps"])
-            normed = gv * inv_denom
+            normed = (r_factor * c_factor).clamp_(max=1.0 / c["eps"]).mul_(gv)
             if c["clip"] is not None:
                 normed.clamp_(-c["clip"], c["clip"])
             # Codec stores momentum in the param's ORIGINAL shape; reshape the

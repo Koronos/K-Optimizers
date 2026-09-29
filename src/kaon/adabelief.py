@@ -544,6 +544,7 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             res_sq = res_sq.add_(eps1)
         row.lerp_(res_sq.mean(dim=-1), omb2)
         col.lerp_(res_sq.mean(dim=-2), omb2)
+        del residual, res_sq                          # dead [N, R, C] before inv_denom
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
@@ -647,6 +648,7 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             # residual (NOT its square): update_factored_state squares internally.
             residual = gv - m
             update_factored_state(residual, state["row"], state["col"], c["beta2"], eps)
+            del residual                              # dead [R, C] before inv_denom
             if eps > 0:
                 r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
             else:  # exact-zero statistics are reachable: 0 * inf would NaN

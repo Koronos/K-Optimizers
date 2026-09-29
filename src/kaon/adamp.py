@@ -652,6 +652,7 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             grad_sq = grad_sq.add_(eps1)
         row.lerp_(grad_sq.mean(dim=-1), omb2)
         col.lerp_(grad_sq.mean(dim=-2), omb2)
+        del grad_sq                                   # dead [N, R, C] before inv_denom / m
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
@@ -669,10 +670,12 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
         codec.store_stacked(states, m.reshape((chunk.n, R, C)), views=views)
 
+        # perturb is written into inv_denom's buffer (the product commutes: same bits).
         if nesterov:
-            perturb = (m.mul(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])).mul_(inv_denom)
+            perturb = inv_denom.mul_(m.mul(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"]))
         else:
-            perturb = m.mul(inv_denom)                                            # [N, R, C]
+            perturb = inv_denom.mul_(m)                                           # [N, R, C]
+        del m, inv_denom
 
         # AdamP projection (per-channel radial removal on the matrixized [R, C] view). It
         # reads the weight's full value: decoded under kahan8/kahan16 (the decoded stacks are
@@ -778,10 +781,12 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             m = self._dequant_one(state, md, gv)
             m.mul_(c["beta1"]).add_(gv, alpha=1.0 - c["beta1"])
             self._store_one(state, md, m)
+            # perturb is written into inv_denom's buffer (the product commutes: same bits).
             if nesterov:
-                perturb = (m.mul(c["beta1"]).add_(gv, alpha=1.0 - c["beta1"])).mul_(inv_denom)
+                perturb = inv_denom.mul_(m.mul(c["beta1"]).add_(gv, alpha=1.0 - c["beta1"]))
             else:
-                perturb = m.mul(inv_denom)                               # [R, C] matrixized view
+                perturb = inv_denom.mul_(m)                              # [R, C] matrixized view
+            del m, inv_denom
             # Projection operates on the ORIGINAL-shape p / grad (official views).
             # (the decoded full value under kahan8/kahan16 — see kaon._backend.weight_value)
             p_value = weight_value(p, state, bf16_method)
