@@ -349,9 +349,11 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
             load-bearing); ``beta0=1`` is the canonical PNM ``(2*m_pos-m_neg)/sqrt(5)``.
             Default ``0.5`` (the measured sweet spot — best loss/gap on the proxy).
         eps: term added to the second-moment denominator for stability. On the
-            non-factored (1-D) path it is added to ``sqrt(v_hat)`` exactly as
-            kozistr does. On the factored path it is folded into the Adafactor
-            ``eps1`` (added to ``grad**2`` before the row/col reductions).
+            non-factored (1-D) path the denominator is ``sqrt(v_hat) + eps`` (the bias
+            correction scales ``sqrt(v)`` only — before 0.7.18 it also divided eps,
+            i.e. ``sqrt(v_hat) + eps/sqrt(1-beta2^t)``). On the factored path it is
+            folded into the Adafactor ``eps1`` (added to ``grad**2`` before the
+            row/col reductions).
         clip_threshold: Adafactor-style RMS clip on the (v_hat-normalized) update —
             ``rms(pn / sqrt(v_hat)) <= clip_threshold`` before the lr scale, exactly as
             Adakaon. **On by default (``1.0``).** This is the stability guard for the
@@ -1055,6 +1057,10 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
         cautious, clip = group["cautious"], group["clip_threshold"]
         inv_noise = 1.0 / c["noise_norm"]
+        # The kernel computes ``(sqrt(v + 1e-15) + eps) / bc2_sq``; handing it ``eps * bc2_sq``
+        # makes that ``sqrt(v_hat) + eps`` — the native denominator (see _step_one_param) —
+        # without touching the kernel.
+        eps_k = eps * c["bc2_sq"]
         for bk in cache.buckets:
             # which physical buffer plays positive this step (alternation): the m_pos slot if odd.
             kpos, kneg = (bk["pos_addr"], bk["neg_addr"]) if odd else (bk["neg_addr"], bk["pos_addr"])
@@ -1062,7 +1068,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                 ft._adapnm_1d_kernel[(len(bk["plist"]),)](
                     bk["g_addr"], bk["p_addr"], kpos, kneg, bk["v_addr"], bk["Ls"],
                     c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], c["step_size"], c["bc2_sq"],
-                    eps, lr * wd, clip, group["step"], LOWP=bk["lowp"], MOM=bk["mom"],
+                    eps_k, lr * wd, clip, group["step"], LOWP=bk["lowp"], MOM=bk["mom"],
                     CAUTIOUS=cautious, WD=wd != 0, CLIP=clip > 0.0, SR=_fused_sr(group, bk["lowp"]),
                     BL=bk["BL"],
                     num_warps=ft.warps_for(bk["BL"]),
@@ -1612,10 +1618,10 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
             max_v = torch.stack(max_vs)
             torch.maximum(max_v, v, out=max_v)
             torch._foreach_copy_(max_vs, list(max_v.unbind(0)))
-            de_nom = max_v.add(1e-15).sqrt_().add_(eps1)
+            de_nom = max_v.add(1e-15).sqrt_()
         else:
-            de_nom = v.add(1e-15).sqrt_().add_(eps1)
-        de_nom.div_(c["bc2_sq"])                                          # v_hat denom
+            de_nom = v.add(1e-15).sqrt_()
+        de_nom.div_(c["bc2_sq"]).add_(eps1)                               # sqrt(v_hat) + eps
 
         pn = self._pn_stacked(memo, chunk, codec, pos, neg, (length,), grad, c)   # [N, L]
         update = _rms_clip_batched_(pn.div_(de_nom), group["clip_threshold"])
@@ -1697,10 +1703,14 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
             if ams_bound:
                 max_v = state["max_v"]
                 torch.maximum(max_v, v, out=max_v)
-                de_nom = max_v.add(1e-15).sqrt_().add_(eps1)
+                de_nom = max_v.add(1e-15).sqrt_()
             else:
-                de_nom = v.add(1e-15).sqrt_().add_(eps1)
-            de_nom.div_(c["bc2_sq"])
+                de_nom = v.add(1e-15).sqrt_()
+            # sqrt(v_hat) + eps, the class docstring's denominator: the bias correction scales
+            # sqrt(v) only. The old ``(sqrt(v) + eps) / bc2`` was sqrt(v_hat) + eps/bc2, i.e.
+            # eps inflated ~31.6x at step 1 (beta2=0.999). The 1e-15 floor stays: it is what
+            # keeps eps=0 finite on an all-zero-gradient coordinate.
+            de_nom.div_(c["bc2_sq"]).add_(eps1)
             pn = self._pn_one(state, pos, neg, md, grad, c)
             update = _rms_clip_one_(pn.div_(de_nom), group["clip_threshold"])
             delta = update.mul_(c["step_size"])
