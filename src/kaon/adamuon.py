@@ -130,7 +130,9 @@ def _zero_safe_inv_sqrt_factors(row: Tensor, col: Tensor) -> tuple[Tensor, Tenso
 def zeropower_via_newtonschulz5(grad: Tensor, steps: int) -> Tensor:
     """Newton-Schulz quintic iteration: approximate the orthogonal factor of ``grad``.
 
-    Returns ``U`` (≈ ``U @ V.T`` of ``grad = U S V.T``) in bf16. Runs in bf16 for
+    Returns ``U`` (≈ ``U @ V.T`` of ``grad = U S V.T``) in bf16 — for a tall ``grad``
+    (``R > C``) as a transposed view, so widen it with ``memory_format`` if the layout
+    matters. Runs in bf16 for
     speed/memory — the iteration is robust to it. ``grad`` must be 2-D. (Muon's
     orthogonalization, Jordan et al.; the per-parameter path uses it directly, the
     foreach path the batched ``_stacked`` variant below.)
@@ -144,10 +146,12 @@ def zeropower_via_newtonschulz5(grad: Tensor, steps: int) -> Tensor:
     x = x / (x.norm() + 1e-7)
     for _ in range(steps):
         aa = x @ x.mT
-        bb = b * aa + c * (aa @ aa)
-        x = a * x + bb @ x
+        # b*aa + c*(aa@aa) and a*x + bb@x as GEMM epilogues: one kernel each instead of
+        # a matmul + 2-3 elementwise launches and their bf16 temporaries.
+        bb = torch.addmm(aa, aa, aa, beta=b, alpha=c)
+        x = torch.addmm(x, bb, x, beta=a)
     if transposed:
-        x = x.mT
+        x = x.mT  # a transposed VIEW: the GEMM epilogues write the inner-dim layout
     return x
 
 
@@ -175,8 +179,9 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
     x = x / fro
     for _ in range(steps):
         aa = torch.bmm(x, x.mT)
-        bb = b * aa + c * torch.bmm(aa, aa)
-        x = a * x + torch.bmm(bb, x)
+        # Fused GEMM epilogues, as in the per-matrix helper above.
+        bb = torch.baddbmm(aa, aa, aa, beta=b, alpha=c)
+        x = torch.baddbmm(x, bb, x, beta=a)
     if transposed:
         x = x.mT
     return x
@@ -239,7 +244,10 @@ def _factored_math(
     written back by the caller). Returns ``(row, col, delta)``.
     """
     N, R, C = m.shape  # noqa: N806 — matrix dims
-    ortho = zeropower_via_newtonschulz5_stacked(m, ns_steps).float()   # [N, R, C]
+    # Contiguous widening: on a tall matrix the Newton-Schulz result is a transposed view,
+    # and every elementwise op below plus the weight write want the weight's own layout.
+    ortho = zeropower_via_newtonschulz5_stacked(m, ns_steps).to(
+        torch.float32, memory_format=torch.contiguous_format)          # [N, R, C]
 
     # Factored second moment OF the orthogonalized signal (HF eps placement).
     omb = 1.0 - beta2
@@ -248,13 +256,15 @@ def _factored_math(
         ortho_sq = ortho_sq.add_(eps1)
     row.lerp_(ortho_sq.mean(dim=-1), omb)
     col.lerp_(ortho_sq.mean(dim=-2), omb)
+    del ortho_sq  # a full [N, R, C] fp32: do not keep it alive next to ortho and update
 
     if eps1 > 0:
         r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
         c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
     else:
         r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
-    update = ortho.mul(r_factor).mul_(c_factor)                               # [N, R, C], RMS≈1
+    # In place: ``ortho`` is the fresh fp32 widening of the bf16 Newton-Schulz output.
+    update = ortho.mul_(r_factor).mul_(c_factor)                              # [N, R, C], RMS≈1
     if bc_scale is not None:
         update.mul_(bc_scale)
 
@@ -334,13 +344,15 @@ def _factored_one_math(
 ) -> Tensor:
     """Per-parameter 2-D core. Tensors are ``[R, C]``; ``row`` / ``col`` are the state
     tensors themselves (updated in place). Returns the ``[R, C]`` delta."""
-    ortho = zeropower_via_newtonschulz5(m, ns_steps).float()          # [R, C]
+    ortho = zeropower_via_newtonschulz5(m, ns_steps).to(
+        torch.float32, memory_format=torch.contiguous_format)          # [R, C], see above
     update_factored_state(ortho, row, col, beta2, eps1)
     if eps1 > 0:
         r_factor, c_factor = factored_inv_sqrt_factors(row, col)
     else:
         r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
-    update = ortho.mul(r_factor).mul_(c_factor)                       # [R, C], RMS≈1
+    # In place: ``ortho`` is a fresh fp32 copy (see _factored_math).
+    update = ortho.mul_(r_factor).mul_(c_factor)                      # [R, C], RMS≈1
     if bc_scale is not None:
         update.mul_(bc_scale)
     if clip > 0:
