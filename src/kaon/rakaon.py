@@ -17,6 +17,29 @@ from kaon._momentum_codec import load_state_dict_preserving_dtypes
 __all__ = ["Rakaon"]
 
 
+def _stacked_fp32(tensors):
+    """``[N, *shape]`` fp32 stack of same-shape tensors, materialized ONCE.
+
+    ``stack([t.float() ...])`` built N fp32 upcasts and then copied them into the stack;
+    stacking first and upcasting the stack is the same values with one allocation fewer.
+    A single tensor is not copied at all (an fp32 one is returned as a view): every
+    caller only READS the result."""
+    if len(tensors) == 1:
+        return tensors[0].float().unsqueeze(0)
+    return torch.stack(tensors).float()
+
+
+def _bias_correction(states, beta, device):
+    """``[1 - beta**step]`` per state as an fp32 device vector, without a per-chunk H2D
+    copy when every state is at the same step (the normal case): ``full`` is a fill
+    kernel, and its fp32 value is the same rounding of the same float64 as the
+    ``torch.tensor`` list it replaces."""
+    steps = [state["step"] for state in states]
+    if all(s == steps[0] for s in steps):
+        return torch.full((len(steps),), 1 - beta ** steps[0], device=device, dtype=torch.float32)
+    return torch.tensor([1 - beta ** s for s in steps], device=device, dtype=torch.float32)
+
+
 class Rakaon(SRSeedState, Optimizer):
     """Factored variance shrinkage and RMS update clipping; no momentum by default.
 
@@ -108,25 +131,27 @@ class Rakaon(SRSeedState, Optimizer):
                 states = [self.state[p] for p in chunk]
                 for state in states:
                     state["step"] += 1
-                g = torch.stack([p.grad.float().reshape(-1) for p in chunk])
+                g = _stacked_fp32([p.grad.reshape(-1) for p in chunk])
                 if padded != elements:
                     g = torch.nn.functional.pad(g, (0, padded - elements))
                 g = g.reshape(len(chunk), blocks, width)
                 counts = g.new_full((blocks,), width)
                 counts[-1] = elements - (blocks - 1) * width
                 energy = g.square().sum(-1) / counts
-                variance = torch.stack([state["variance"] for state in states])
                 beta = group["beta2"]
-                variance.lerp_(energy + group["eps"], 1 - beta)
-                torch._foreach_copy_([state["variance"] for state in states], list(variance.unbind()))
-                correction = g.new_tensor([1 - beta ** state["step"] for state in states])
-                scale = (variance / correction[:, None]).clamp_min_(group["eps"]).rsqrt_()
+                # EMA in place on the state tensors, then ONE stack for the math (was:
+                # stack -> lerp -> copy back into the states).
+                torch._foreach_lerp_([state["variance"] for state in states],
+                                     list((energy + group["eps"]).unbind()), 1 - beta)
+                variance = torch.stack([state["variance"] for state in states])
+                correction = _bias_correction(states, beta, g.device)
+                scale = variance.div_(correction[:, None]).clamp_min_(group["eps"]).rsqrt_()
                 update_rms = (energy * scale.square() * counts).sum(1).div_(elements).sqrt_()
                 scale.div_((update_rms / group["clip_threshold"]).clamp_min_(1)[:, None])
                 update = (g * scale[:, :, None]).reshape(len(chunk), padded)[:, :elements]
                 update = update.reshape(len(chunk), *chunk[0].shape)
                 if group["weight_decay"]:
-                    update.add_(torch.stack([p.float() for p in chunk]), alpha=group["weight_decay"])
+                    update.add_(torch.stack(chunk), alpha=group["weight_decay"])
                 method = "stochastic_rounding" if group["stochastic_rounding"] else "none"
                 subtract_batched_(chunk, update, method, alpha=group["lr"], sr=self.sr_stream)
 
@@ -152,29 +177,23 @@ class Rakaon(SRSeedState, Optimizer):
                 states = [self.state[p] for p in chunk]
                 for state in states:
                     state["step"] += 1
-                g = torch.stack([p.grad.float() for p in chunk])
+                g = _stacked_fp32([p.grad for p in chunk])
                 energy = g.reshape(len(chunk), -1).square().mean(1)
-                variance = torch.stack([state["variance"] for state in states])
                 beta = group["beta2"]
-                variance.lerp_(energy + group["eps"], 1 - beta)
-                torch._foreach_copy_([state["variance"] for state in states],
-                                     list(variance.unbind()))
-                correction = torch.tensor([1 - beta ** state["step"] for state in states],
-                                          device=g.device, dtype=torch.float32)
-                scale = (variance / correction).clamp_min_(group["eps"]).rsqrt_()
+                torch._foreach_lerp_([state["variance"] for state in states],
+                                     list((energy + group["eps"]).unbind()), 1 - beta)
+                variance = torch.stack([state["variance"] for state in states])
+                correction = _bias_correction(states, beta, g.device)
+                scale = variance.div_(correction).clamp_min_(group["eps"]).rsqrt_()
                 scale.div_((energy.sqrt() * scale / group["clip_threshold"]).clamp_min_(1))
                 update = g * scale.reshape(-1, *([1] * chunk[0].ndim))
                 if group["beta1"]:
-                    momentum = torch.stack([state["momentum"] for state in states])
-                    momentum.lerp_(update, 1 - group["beta1"])
-                    torch._foreach_copy_([state["momentum"] for state in states],
-                                         list(momentum.unbind()))
-                    correction1 = torch.tensor(
-                        [1 - group["beta1"] ** state["step"] for state in states],
-                        device=g.device, dtype=torch.float32)
-                    update = momentum / correction1.reshape(-1, *([1] * chunk[0].ndim))
+                    moms = [state["momentum"] for state in states]
+                    torch._foreach_lerp_(moms, list(update.unbind()), 1 - group["beta1"])
+                    correction1 = _bias_correction(states, group["beta1"], g.device)
+                    update = torch.stack(moms).div_(correction1.reshape(-1, *([1] * chunk[0].ndim)))
                 if group["weight_decay"]:
-                    update.add_(torch.stack([p.float() for p in chunk]), alpha=group["weight_decay"])
+                    update.add_(torch.stack(chunk), alpha=group["weight_decay"])
                 method = "stochastic_rounding" if group["stochastic_rounding"] else "none"
                 subtract_batched_(chunk, update, method, alpha=group["lr"], sr=self.sr_stream)
 
@@ -236,15 +255,22 @@ class Rakaon(SRSeedState, Optimizer):
                     mean = variance.mean()
                 del sq
                 s = group["shrinkage"]
-                if s in (0, 1):
+                # Same ops in the same order as before, but in place wherever the operand is
+                # a temporary: a matrix's reconstructed ``variance`` is one (a vector's is the
+                # STATE, so its first op still allocates), and ``g / denom`` lands in
+                # ``denom``'s buffer. ~3 fewer weight-sized fp32 temporaries per param.
+                if matrix:
+                    denom = variance if s in (0, 1) else variance.mul_(1 - s).add_(mean * s)
+                    denom.div_(correction)
+                elif s in (0, 1):
                     denom = variance / correction
                 else:
-                    denom = variance.mul(1 - s).add(mean * s).div_(correction)
-                update = g / denom.clamp_min_(group["eps"]).sqrt_()
+                    denom = variance.mul(1 - s).add_(mean * s).div_(correction)
+                update = torch.div(g, denom.clamp_min_(group["eps"]).sqrt_(), out=denom)
                 update.div_((update.square().mean().sqrt() / group["clip_threshold"]).clamp_min_(1))
                 update = update.reshape(p.shape)
                 if group["weight_decay"]:
-                    update.add_(p.float(), alpha=group["weight_decay"])
+                    update.add_(p, alpha=group["weight_decay"])
                 update.mul_(group["lr"])
                 method = "stochastic_rounding" if group["stochastic_rounding"] else "none"
                 subtract_one_(p, update, state, method, sr=self.sr_stream)
