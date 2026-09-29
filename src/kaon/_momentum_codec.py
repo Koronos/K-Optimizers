@@ -57,6 +57,7 @@ __all__ = [
     "int8_scale_shape",
     "store_stochastic_",
     "store_stochastic_stacked_",
+    "STOCHASTIC_MOMENTUM_REQUANT",
 ]
 
 MomentumDtype = ("bfloat16", "float32", "int8", "4bit")
@@ -104,6 +105,33 @@ def _row_rest(shape: tuple[int, ...]) -> tuple[int, int]:
     per = math.prod(shape) if shape else 1
     row = shape[0] if len(shape) >= 2 else 1
     return row, (per // row if row else 0)
+
+
+#: OPT-IN, experimental: requantize the int8 / 4-bit MOMENTUM (``state["m"]``) with unbiased
+#: stochastic rounding instead of round-to-nearest. OFF by default (bit-identical to 0.7.17).
+#:
+#: Why it exists: under ``m = beta*m_q + (1-beta)*g`` a coordinate whose EMA sits below half
+#: its row/block's quant step (``absmax/254`` int8, ``absmax/14`` 4-bit) is rounded to 0 on
+#: every write, so next to an outlier most of a block is flattened for good — measured on a
+#: 128-block with one 5.0 outlier and the rest N(0, 0.1^2), beta=0.9, 50 steps: 99.9% of the
+#: block at exactly 0 with 4-bit. Stochastic rounding keeps those coordinates alive in
+#: expectation, at the price of variance. Whether that trade wins on a real run is what the
+#: A/B in ``benchmarks/control`` decides; until then it is a switch, not a default.
+#:
+#: Scope and limits (why it is a module toggle and not a ``momentum_dtype`` / kwarg): it is an
+#: A/B arm, read once per requant, and flipping it touches no optimizer signature or
+#: checkpoint format. It covers the codec's native per-param and foreach paths (every
+#: optimizer's ``_MomentumCodec`` call), NOT the fused Triton kernels (Adakaon / AdaPNM
+#: ``fused=True`` requantize in-kernel) — run the A/B with ``fused=False``. The noise comes
+#: from the module's per-device generator (reproducible under ``torch.manual_seed`` +
+#: ``kaon.reseed_stochastic_rounding()``), whose position NO checkpoint saves: a resumed run
+#: with this on is statistically, not bit-for-bit, the continuous one.
+STOCHASTIC_MOMENTUM_REQUANT = False
+
+
+def _momentum_gen(device: torch.device) -> torch.Generator | None:
+    """The momentum requant's generator: ``None`` (round-to-nearest) unless opted in."""
+    return _device_generator(device) if STOCHASTIC_MOMENTUM_REQUANT else None
 
 
 def _round_(x: Tensor, gen: torch.Generator | None) -> Tensor:
@@ -632,7 +660,7 @@ class _Int8Codec(_MomentumCodec):
         dims = tuple(range(1, m.ndim)) if m.ndim >= 2 else ()
         absmax = _absmax(m, dims)
         scale = absmax / _INT8_ABSMAX
-        state["m"].copy_((m / scale).round_().clamp_(-_INT8_CLAMP, _INT8_CLAMP))
+        state["m"].copy_(_round_(m / scale, _momentum_gen(m.device)).clamp_(-_INT8_CLAMP, _INT8_CLAMP))
         state["m_scale"].copy_(scale.reshape_as(state["m_scale"]))
         return m
 
@@ -675,7 +703,7 @@ class _Int8Codec(_MomentumCodec):
         m = torch.stack(ms).float().mul_(scale)                      # dequant
         m.lerp_(update, 1.0 - beta1)
         # No clone: ``_quant_int8_stacked`` does not mutate ``m``.
-        q, new_scale = _quant_int8_stacked(m)                        # requant
+        q, new_scale = _quant_int8_stacked(m, _momentum_gen(m.device))  # requant
         # ``_quant_int8_stacked`` reduces the trailing axis of ``[N, *eff]``, so
         # ``new_scale`` is already ``[N, *rowshape]`` — the cached scale views' shape.
         torch._foreach_copy_(ms, list(q.unbind(0)))
@@ -687,7 +715,7 @@ class _Int8Codec(_MomentumCodec):
         return m
 
     def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
-        q, scale = _quant_int8(m_fp32.reshape(state["m"].shape))
+        q, scale = _quant_int8(m_fp32.reshape(state["m"].shape), _momentum_gen(m_fp32.device))
         state["m"].copy_(q)
         state["m_scale"].copy_(scale.reshape_as(state["m_scale"]))
 
@@ -698,7 +726,8 @@ class _Int8Codec(_MomentumCodec):
         n = m_fp32.shape[0]
         shape = tuple(m_fp32.shape[1:])
         row, rest = _row_rest(shape)
-        q, new_scale = _quant_int8_stacked(m_fp32.reshape(n, row, rest))
+        q, new_scale = _quant_int8_stacked(m_fp32.reshape(n, row, rest),
+                                           _momentum_gen(m_fp32.device))
         qs = list(q.unbind(0))
         if views is not None and views.eff == shape:
             rowshape = (row, 1) if len(shape) >= 2 else (1,)
@@ -769,7 +798,7 @@ class _FourBitCodec(_MomentumCodec):
         m = m.view_as(update)                                        # dequant -> update shape
         m.lerp_(update, 1.0 - beta1)
         # No clone: ``_quant_4bit`` does not mutate ``m``.
-        packed, scale, _ = _quant_4bit(m, bs)                        # requant
+        packed, scale, _ = _quant_4bit(m, bs, _momentum_gen(m.device))  # requant
         state["m"].copy_(packed)
         state["m_scale"].copy_(scale)
         return m
@@ -810,7 +839,8 @@ class _FourBitCodec(_MomentumCodec):
         # the delta is elementwise, so the strided view is fine.
         m = _dequant_4bit_stacked(packed, sc, per, bs).view_as(update)
         m.lerp_(update, 1.0 - beta1)
-        new_packed, new_scale = _quant_4bit_stacked(m.reshape(n, per), bs)  # requant
+        new_packed, new_scale = _quant_4bit_stacked(
+            m.reshape(n, per), bs, _momentum_gen(m.device))           # requant
         torch._foreach_copy_(ms, list(new_packed.unbind(0)))
         if cached:
             torch._foreach_copy_(views.scale, list(new_scale.unbind(0)))
@@ -820,7 +850,7 @@ class _FourBitCodec(_MomentumCodec):
         return m
 
     def store_one(self, state: dict[str, Any], m_fp32: Tensor) -> None:
-        packed, scale, _ = _quant_4bit(m_fp32, state["m_block"])
+        packed, scale, _ = _quant_4bit(m_fp32, state["m_block"], _momentum_gen(m_fp32.device))
         state["m"].copy_(packed)
         state["m_scale"].copy_(scale)
 
@@ -832,7 +862,8 @@ class _FourBitCodec(_MomentumCodec):
         shape = tuple(m_fp32.shape[1:])
         per = math.prod(shape) if m_fp32.ndim > 1 else 1
         bs = states[0]["m_block"]
-        new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs)
+        new_packed, new_scale = _quant_4bit_stacked(m_fp32.reshape(n, per), bs,
+                                                    _momentum_gen(m_fp32.device))
         packs = list(new_packed.unbind(0))
         if views is not None and views.eff == shape:
             torch._foreach_copy_(views.store, packs)
