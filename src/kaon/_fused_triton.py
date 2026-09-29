@@ -453,6 +453,18 @@ if _HAS_TRITON:
         return tl.where(finite, rounded, ibits).to(tl.float32, bitcast=True)
 
     @triton.jit
+    def grad_ptr(base, LOWP: tl.constexpr, GF32: tl.constexpr):
+        """Type a pointer-array GRAD entry: bf16 when the weight is (``LOWP``) unless the bucket's
+        grads are fp32 (``GF32``: an fp32 gradient on a bf16 weight — ``p.grad_dtype = None``, or
+        a trainer that keeps fp32 grads). Every consumer upcasts the loaded grad to fp32 at once,
+        so the fp32 grad goes through exactly the arithmetic the bf16 one does — the native
+        path's ``grad.float()``. Default ``GF32=False`` is the pre-0.7.18 typing, unchanged."""
+        if LOWP and not GF32:
+            return base.to(tl.pointer_type(tl.bfloat16))
+        else:
+            return base.to(tl.pointer_type(tl.float32))
+
+    @triton.jit
     def ck_ptr(c_addr, t, BITS: tl.constexpr):
         """The residual pointer of tensor ``t`` in a compact-Kahan pointer array: ``uint8``
         for ``kahan8``, ``int16`` (the uint16 pattern in signed storage) for ``kahan16``."""
@@ -771,6 +783,7 @@ if _HAS_TRITON:
         GC: tl.constexpr, SR: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
         EXACT: tl.constexpr = False, FBLK: tl.constexpr = 0,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """One program == one tensor. Whole factored Adakaon step, in place via pointer-array.
 
@@ -801,12 +814,8 @@ if _HAS_TRITON:
         mi = tl.load(m_addr + t)
         rowp = tl.load(row_addr + t).to(tl.pointer_type(tl.float32))
         colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
-        if LOWP:
-            gp = gi.to(tl.pointer_type(tl.bfloat16))
-            pp = pi.to(tl.pointer_type(tl.bfloat16))
-        else:
-            gp = gi.to(tl.pointer_type(tl.float32))
-            pp = pi.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gi, LOWP, GF32)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
 
         ri = tl.arange(0, BR)[:, None]
         ci = tl.arange(0, BC)[None, :]
@@ -1105,6 +1114,7 @@ if _HAS_TRITON:
     def _reduce_rowcol(
         g_addr, rowmean_ptr, rowsum_ptr, colsum_ptr, R, C, RB,
         LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GF32: tl.constexpr = False,
     ):
         """Per (tensor, row-block): GC (per-row mean over C) -> rowmean[N,R], rowsum_gsq[N,R] (direct),
         colsum_gsq[N,C] (atomic). Padded cols load 0 so the per-row mean over the real C is exact."""
@@ -1117,7 +1127,7 @@ if _HAS_TRITON:
         cmask = ci < C
         m2 = rmask[:, None] & cmask[None, :]
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
         if GC:
             # ``C * 1.0``, never ``C.to(tl.float32)``: Triton SPECIALIZES an int argument whose
@@ -1134,6 +1144,7 @@ if _HAS_TRITON:
     def _reduce_rms(
         g_addr, rowmean_ptr, rfac_ptr, cfac_ptr, rms_ptr, R, C, RB,
         LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GF32: tl.constexpr = False,
     ):
         """Per (tensor, row-block): accumulate sum( (g' * r_factor * c_factor)^2 ) into rms_ptr[t]
         (atomic), re-reading grad via the pointer array and GC via the precomputed rowmean."""
@@ -1146,7 +1157,7 @@ if _HAS_TRITON:
         cmask = ci < C
         m2 = rmask[:, None] & cmask[None, :]
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
         if GC:
             rmean = tl.load(rowmean_ptr + t * R + ri, mask=rmask, other=0.0)
@@ -1181,6 +1192,7 @@ if _HAS_TRITON:
     def _reduce_rowcol_det(
         g_addr, rowmean_ptr, rowsum_ptr, colpart_ptr, R, C, RB,
         LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GF32: tl.constexpr = False,
     ):
         """``_reduce_rowcol`` with the colsum atomic replaced by a per-row-block PARTIAL store."""
         pid = tl.program_id(0)
@@ -1192,7 +1204,7 @@ if _HAS_TRITON:
         cmask = ci < C
         m2 = rmask[:, None] & cmask[None, :]
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
         if GC:
             rmean = tl.sum(g, axis=1) / (C * 1.0)          # see _reduce_rowcol on the `* 1.0`
@@ -1207,6 +1219,7 @@ if _HAS_TRITON:
     def _reduce_rms_det(
         g_addr, rowmean_ptr, rfac_ptr, cfac_ptr, rmspart_ptr, R, C, RB,
         LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GF32: tl.constexpr = False,
     ):
         """``_reduce_rms`` with the rms atomic replaced by a per-row-block PARTIAL store."""
         pid = tl.program_id(0)
@@ -1218,7 +1231,7 @@ if _HAS_TRITON:
         cmask = ci < C
         m2 = rmask[:, None] & cmask[None, :]
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
         if GC:
             rmean = tl.load(rowmean_ptr + t * R + ri, mask=rmask, other=0.0)
@@ -1307,6 +1320,7 @@ if _HAS_TRITON:
         clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """As ``_chunked_mom_batched`` but grad comes from the pointer array (GC via rowmean[t, row])."""
         pid = tl.program_id(0)
@@ -1317,7 +1331,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -1350,6 +1364,7 @@ if _HAS_TRITON:
         g_addr, rowmean_ptr, m_addr, p_addr, c_addr, inv_mean_ptr, lr, wd, seed, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """As ``_chunked_apply_batched`` but grad (for cautious) comes from the pointer array + GC."""
         pid = tl.program_id(0)
@@ -1375,7 +1390,7 @@ if _HAS_TRITON:
         if CAUTIOUS:
             i = offs // C
             gbase = tl.load(g_addr + t)
-            gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+            gp = grad_ptr(gbase, LOWP, GF32)
             g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
             if GC:
                 g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -1409,6 +1424,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr, FBLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """One program == one 1-D tensor. Whole non-factored Adam step, in place via pointer-array."""
         t = tl.program_id(0)
@@ -1417,12 +1433,8 @@ if _HAS_TRITON:
         gi = tl.load(g_addr + t)
         pi = tl.load(p_addr + t)
         vp = tl.load(v_addr + t).to(tl.pointer_type(tl.float32))
-        if LOWP:
-            gp = gi.to(tl.pointer_type(tl.bfloat16))
-            pp = pi.to(tl.pointer_type(tl.bfloat16))
-        else:
-            gp = gi.to(tl.pointer_type(tl.float32))
-            pp = pi.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gi, LOWP, GF32)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         offs = tl.arange(0, BL)
         mask = offs < L
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
@@ -1992,6 +2004,7 @@ if _HAS_TRITON:
         rms_ptr, clip, wd, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
         BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Count cautious survivors for a no-momentum chunked update."""
         pid = tl.program_id(0)
@@ -2002,7 +2015,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2023,6 +2036,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Apply a chunked factored update without materializing momentum."""
         pid = tl.program_id(0)
@@ -2033,7 +2047,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2072,6 +2086,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
         FBLOCK: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
         CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Count cautious survivors from the exact pre-requantized 4-bit EMA.
 
@@ -2088,7 +2103,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2116,6 +2131,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, FBLOCK: tl.constexpr, BLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Exact update plus in-kernel 4-bit requantization for a chunked tensor.
 
@@ -2131,7 +2147,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2229,6 +2245,7 @@ if _HAS_TRITON:
         keep_ptr, rms_ptr, clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Count cautious survivors from the exact pre-requantized int8 EMA.
 
@@ -2244,7 +2261,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2270,6 +2287,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         SR: tl.constexpr, CSEG: tl.constexpr, RPC: tl.constexpr, BLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Exact update plus in-kernel per-row int8 requantization for a chunked tensor.
 
@@ -2284,7 +2302,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
