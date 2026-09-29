@@ -314,6 +314,45 @@ def _lag_key(state: dict[str, Any], group: dict[str, Any]) -> int:
     return group["step"] - state["step"]
 
 
+#: Per-tensor element count from which a bf16 bucket's grads are stacked straight into
+#: fp32 (see :func:`_grad_stack_fp32`). Measured on CUDA: ``torch.stack(out=)`` across a
+#: dtype change is NOT one kernel but one copy per tensor, so on a 400-tensor LoRA bag it
+#: added ~376 launches and +25% step time (-18% peak there too, but the bag's peak is
+#: small); on DiT-sized matrices (>=1.3M elements each) the extra launches are free and the
+#: peak drops 167 -> 137 MB. 1M elements separates the two regimes.
+_FP32_STACK_MIN_NUMEL = 1 << 20
+
+
+def _grad_stack_fp32(chunk: ForeachChunk) -> Tensor:
+    """This step's stacked fp32 gradient ``[N, *eff]``.
+
+    :meth:`~kaon._foreach_plan.ForeachChunk.grad_stack` is ``torch.stack(grads).float()``,
+    which for bf16 grads materializes the bf16 stack AND its fp32 copy (+2 B/elem of
+    transient peak and an extra pass over the bucket). For big tensors
+    (:data:`_FP32_STACK_MIN_NUMEL`) the grads are instead stacked with ``out=`` an fp32
+    buffer, converting on the way in — the same values element for element (the bf16 ->
+    fp32 widening is exact). fp32 grads, and small bf16 tensors (launch-bound: the
+    cross-dtype ``out=`` is one copy kernel per tensor), keep the plain stack. Same layout
+    rules as ``grad_stack``: a bucket whose grads share an ndim stacks the raw grads and
+    reshapes the STACK once; only a 0-D + shape-``(1,)`` mix builds per-param views. Never
+    cached (it would pin the previous step's gradients — see ``ForeachChunk``).
+    """
+    if chunk.grad_uniform:
+        grads = [p.grad for p in chunk.plist]
+        reshape = chunk.grad_reshape
+    else:
+        view = chunk.view
+        grads = [view(p.grad) for p in chunk.plist]
+        reshape = None
+    g0 = grads[0]
+    if g0.dtype == torch.float32 or g0.numel() < _FP32_STACK_MIN_NUMEL:
+        out = torch.stack(grads).float()
+    else:
+        out = torch.empty((chunk.n, *g0.shape), dtype=torch.float32, device=g0.device)
+        torch.stack(grads, out=out)
+    return out if reshape is None else out.view(reshape)
+
+
 _CODECS: dict[str, _MomentumCodec] = {}
 
 
@@ -1540,7 +1579,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         rows, cols = chunk.state_views
 
-        grad = chunk.grad_stack()                                         # [N, R, C]
+        grad = _grad_stack_fp32(chunk)                                    # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
@@ -1555,6 +1594,9 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
             grad_sq = grad_sq.add_(eps1)
         row.lerp_(grad_sq.mean(dim=-1), omb2)
         col.lerp_(grad_sq.mean(dim=-2), omb2)
+        # ``grad_sq`` is a whole [N, R, C] fp32 buffer that nothing below reads: drop it
+        # now rather than at return, so it is not live under the momentum / cautious peak.
+        del grad_sq
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
@@ -1565,7 +1607,9 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         # Positive-negative momentum mixing (read both, EMA only the positive).
         pn = self._pn_stacked(memo, chunk, codec, pos, neg, (R, C), grad, c)       # [N, R, C]
 
-        update = _rms_clip_batched_(pn.mul_(inv_denom), group["clip_threshold"])   # rms(u)<=clip
+        pn.mul_(inv_denom)
+        del inv_denom                                  # same reason as grad_sq above
+        update = _rms_clip_batched_(pn, group["clip_threshold"])                   # rms(u)<=clip
         delta = update.mul_(c["step_size"])                                        # full step
 
         if cautious:
@@ -1599,7 +1643,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         length = chunk.length
         (vs,) = chunk.state_views
 
-        grad = chunk.grad_stack()                                         # [N, L]
+        grad = _grad_stack_fp32(chunk)                                    # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
         if wd != 0:
@@ -1624,7 +1668,9 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         de_nom.div_(c["bc2_sq"]).add_(eps1)                               # sqrt(v_hat) + eps
 
         pn = self._pn_stacked(memo, chunk, codec, pos, neg, (length,), grad, c)   # [N, L]
-        update = _rms_clip_batched_(pn.div_(de_nom), group["clip_threshold"])
+        pn.div_(de_nom)
+        del de_nom                                     # not live under the cautious peak
+        update = _rms_clip_batched_(pn, group["clip_threshold"])
         delta = update.mul_(c["step_size"])
 
         if cautious:

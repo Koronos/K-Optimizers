@@ -749,3 +749,29 @@ def test_one_dim_eps_is_not_scaled_by_the_bias_correction(foreach, ams_bound):
     want = -(lr / (1 - b1)) * pn / (g.abs() + eps)
     for p in ps:
         torch.testing.assert_close(p.detach(), want, rtol=1e-5, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("min_numel", [0, 1 << 20])
+def test_foreach_grad_stack_is_the_fp32_stack_of_the_grads(dtype, min_numel, monkeypatch):
+    """Big bf16 grads are stacked straight into an fp32 buffer (``torch.stack(out=fp32)``)
+    instead of ``stack(...).float()``; either way the values must be the exact widening, on
+    every bucket layout (2-D, conv, 1-D, a 0-D + ``(1,)`` mix). ``min_numel=0`` forces the
+    ``out=`` path onto these small tensors."""
+    import kaon.adapnm as adapnm_mod
+    from kaon.adapnm import _grad_stack_fp32
+
+    monkeypatch.setattr(adapnm_mod, "_FP32_STACK_MIN_NUMEL", min_numel)
+
+    shapes = [(6, 5), (6, 5), (4, 2, 3, 3), (4, 2, 3, 3), (7,), (7,), (), (1,)]
+    ps = [torch.nn.Parameter(torch.randn(s).to(dtype)) for s in shapes]
+    opt = AdaPNM(ps, lr=1e-3)
+    for p in ps:
+        p.grad = torch.randn(p.shape).to(dtype)
+    opt.step()
+    chunks = opt._foreach_chunks(ps, opt.param_groups[0], 1 << 20)
+    assert len(chunks) == 4
+    for chunk in chunks:
+        got = _grad_stack_fp32(chunk)
+        assert got.dtype == torch.float32
+        assert torch.equal(got, chunk.grad_stack())
