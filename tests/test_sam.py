@@ -440,6 +440,7 @@ def test_add_param_group_after_construction():
     assert "old_p" not in opt.state[c]
 
 
+@pytest.mark.filterwarnings("ignore:Detected call of `lr_scheduler.step\(\)`")
 def test_torch_lr_scheduler_drives_the_inner_lr():
     """A torch LR scheduler built on the SAM wrapper must change the lr the BASE optimizer
     actually steps with (shared ``param_groups``)."""
@@ -460,3 +461,19 @@ def test_torch_lr_scheduler_drives_the_inner_lr():
         deltas.append(float((w.detach() - before).abs().max()))
     assert opt.base_optimizer.param_groups[0]["lr"] == pytest.approx(1e-4)
     assert deltas[1] < 0.5 * deltas[0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_zero_element_params_climb_and_restore(dtype):
+    """Buckets of zero-element params divided the stack budget by ``numel == 0``."""
+    ps = [torch.randn(s).to(dtype).requires_grad_(True) for s in [(4, 3), (0, 3), (0, 3)]]
+    opt = SAM(ps, Adakaon, lr=1e-3, rho=0.05)
+    w0 = [p.detach().clone() for p in ps]
+    for p in ps:
+        p.grad = torch.randn(p.shape).to(dtype)
+    opt.first_step()
+    for p in ps:
+        p.grad = None
+    opt.second_step()
+    for a, p in zip(w0, ps, strict=True):
+        assert torch.equal(a, p.detach())

@@ -287,7 +287,8 @@ class Lookahead(WrapsInnerOptimizer, TrainEvalWeights, Optimizer):
         for p in params:
             buckets.setdefault((tuple(p.shape), p.dtype), []).append(p)
         for (shape, _dtype), plist in buckets.items():
-            n_per = max(1, chunk_budget // max(p.numel() for p in plist))
+            # max(1, ...): a bucket of zero-element params would divide by zero
+            n_per = max(1, chunk_budget // max(1, max(p.numel() for p in plist)))
             for i in range(0, len(plist), n_per):
                 chunk = plist[i:i + n_per]
                 states = [self.state[p] for p in chunk]

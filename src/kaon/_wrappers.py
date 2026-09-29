@@ -52,6 +52,7 @@ from kaon._momentum_codec import (
     _quant_4bit_stacked,
     _quant_int8,
     _quant_int8_stacked,
+    int8_scale_shape,
 )
 
 __all__ = ["CodecBuffer", "TrainEvalWeights", "WrapsInnerOptimizer"]
@@ -91,6 +92,17 @@ def _onto_device(value: Any, device: torch.device) -> Any:
     return value
 
 
+def _quant_int8_any(t: Tensor) -> tuple[Tensor, Tensor]:
+    """:func:`kaon._momentum_codec._quant_int8`, also for a ZERO-ELEMENT tensor (a (5, 0)
+    projection, a (0,) bias): the absmax reduction has nothing to reduce there and raises.
+    An empty buffer has no values to scale, so its codes are an empty int8 tensor and its
+    scale a placeholder of the layout ``_quant_int8`` would give (ones)."""
+    if t.numel() == 0:
+        return (torch.empty(t.shape, dtype=torch.int8, device=t.device),
+                torch.ones(int8_scale_shape(t), dtype=torch.float32, device=t.device))
+    return _quant_int8(t)
+
+
 class CodecBuffer:
     """Per-parameter full-size buffer stored through the shared momentum codec.
 
@@ -104,6 +116,10 @@ class CodecBuffer:
     The companion scale / block metadata live under ``f"{key}_scale"``, ``f"{key}_numel"``,
     ``f"{key}_block"`` — exactly the layout :func:`kaon._momentum_codec.load_state_dict_preserving_dtypes`
     already preserves on resume.
+
+    Zero-element buffers (a param with a 0-sized dim) are supported at every dtype: there
+    is nothing to quantize, read or write, so those paths short-circuit instead of hitting
+    the codec's absmax reductions or the ``per // row`` matrixization.
     """
 
     @staticmethod
@@ -120,7 +136,7 @@ class CodecBuffer:
             d = torch.bfloat16 if dtype == "bfloat16" else torch.float32
             state[key] = s.to(d).clone()
         elif dtype == "int8":
-            state[key], state[f"{key}_scale"] = _quant_int8(s.float())
+            state[key], state[f"{key}_scale"] = _quant_int8_any(s.float())
         else:  # 4bit
             bs = CodecBuffer.block_size(src, block)
             packed, scale, _ = _quant_4bit(s.float(), bs)
@@ -142,6 +158,8 @@ class CodecBuffer:
             if out is t:  # fp32 buffer -> .float() is a no-op alias; clone to stay safe
                 out = out.clone()
             return out.reshape_as(like)
+        if like.numel() == 0:  # nothing stored; any codec layout reads back as empty fp32
+            return torch.zeros(like.shape, dtype=torch.float32, device=state[key].device)
         if dtype == "int8":
             codes = state[key]
             row = codes.shape[0] if codes.ndim >= 2 else 1
@@ -153,6 +171,8 @@ class CodecBuffer:
     @staticmethod
     def write(state: dict[str, Any], key: str, dtype: str, value_fp32: Tensor) -> None:
         """Write an updated fp32 buffer back into the configured storage."""
+        if value_fp32.numel() == 0:
+            return
         if dtype in ("bfloat16", "float32"):
             state[key].copy_(value_fp32.reshape(state[key].shape))
         elif dtype == "int8":
@@ -172,6 +192,8 @@ class CodecBuffer:
         """Stacked fp32 buffer ``[N, *shape]`` from per-param storage (always a fresh tensor)."""
         n = len(states)
         per = math.prod(shape)
+        if per == 0:
+            return torch.zeros((n, *shape), dtype=torch.float32, device=states[0][key].device)
         if dtype in ("bfloat16", "float32"):
             return torch.stack([s[key].reshape(shape) for s in states]).float()
         if dtype == "int8":
@@ -193,6 +215,8 @@ class CodecBuffer:
         n = value_fp32.shape[0]
         shape = tuple(value_fp32.shape[1:])
         per = math.prod(shape)
+        if per == 0:
+            return
         if dtype in ("bfloat16", "float32"):
             torch._foreach_copy_([s[key].reshape(shape) for s in states], list(value_fp32.unbind(0)))
         elif dtype == "int8":

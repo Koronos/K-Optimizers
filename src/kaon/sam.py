@@ -291,7 +291,8 @@ class SAM(WrapsInnerOptimizer, Optimizer):
             with_grad = [p for p in group["params"] if p.grad is not None]
             for plist in self._bucket_params(with_grad).values():
                 budget = self._chunk_budget(plist)
-                n_per = max(1, budget // max(p.numel() for p in plist))
+                # max(1, ...): a bucket of zero-element params would divide by zero
+                n_per = max(1, budget // max(1, max(p.numel() for p in plist)))
                 for i in range(0, len(plist), n_per):
                     self._climb_chunk(plist[i:i + n_per], scale=scale, adaptive=adaptive)
         self._climbed = True
