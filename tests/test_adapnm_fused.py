@@ -1390,3 +1390,33 @@ def test_bf16_weight_decay_moves_the_weight_on_every_route(shapes, fused):
     for p in ps:
         mean = p.detach().float().mean().item()
         assert abs(mean - ideal) < 4e-5, (mean, ideal)
+
+
+def test_one_dim_visible_eps_matches_native():
+    """1-D fused route with an eps that MATTERS (1e-3 against grads ~1e-3): the kernel's
+    ``(sqrt(v+1e-15) + eps) / bc2_sq`` only equals native's ``sqrt(v_hat) + eps`` because the
+    host hands it ``eps * bc2_sq``. Every other parity test here runs eps=1e-30, where the two
+    forms coincide; without the host scaling eps is ~31.6x too big at step 1 and this fails."""
+    dtype = torch.float32   # fp32 weights: bf16 SR noise would swamp the displacement
+    cfg = dict(lr=1e-3, betas=(0.8, 0.999), beta0=0.5, eps=1e-3, cautious=False,
+               momentum_dtype="float32")
+    pv = _bag([(1024,)] * 3, dtype, seed=3)
+    pn = _clone(pv)
+    ov, on = AdaPNM(pv, fused=True, **cfg), AdaPNM(pn, **cfg)
+    gen = torch.Generator(device=DEV).manual_seed(9)
+    for _ in range(4):
+        gs = [torch.randn(*p.shape, generator=gen, device=DEV) * 1e-3 for p in pv]
+        for p, g in zip(pv, gs, strict=True):
+            p.grad = g.to(dtype)
+        for p, g in zip(pn, gs, strict=True):
+            p.grad = g.to(dtype)
+        ov.step()
+        on.step()
+    torch.cuda.synchronize()
+    assert len(_parts(ov)[2]) == 3, "the params did not take the 1-D fused route"
+    # Compare the DISPLACEMENT (the weights themselves are O(1) and would hide it).
+    p0 = _bag([(1024,)] * 3, dtype, seed=3)
+    for a, b, z in zip(pv, pn, p0, strict=True):
+        da, db = (a.detach().float() - z.float()), (b.detach().float() - z.float())
+        rel = (da - db).abs().max().item() / db.abs().max().item()
+        assert rel < 5e-3, f"rel={rel:.2e}"   # fp32 ulps of O(1) weights ~1e-4; no scaling -> O(1)
