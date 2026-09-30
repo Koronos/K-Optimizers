@@ -37,7 +37,10 @@ def _ref_adabelief_1d(
     * first moment ``m = beta1*m + (1-beta1)*g`` (decay and bias correction both beta1).
     * residual second moment ``s = beta2*s + (1-beta2)*(g-m)^2 + eps``.
     * denom ``= (sqrt(s) + eps) / sqrt(1 - beta2^t)``.
-    * decoupled weight decay ``p *= 1 - lr*wd`` BEFORE the moment updates.
+    * decoupled weight decay ``p *= 1 - lr*wd`` on the pre-step weight. The reference
+      applies it as a separate multiply; kaon folds the same term into the fp32 step
+      (``p -= step + lr*wd*p_old``, see ``kaon._decoupled_wd``), which is algebraically
+      identical and differs only in rounding (hence the ``rtol`` of the comparison).
     * ``p -= (lr / (1 - beta1^t)) * m / denom``.
     """
     p = p.copy()
