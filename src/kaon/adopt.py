@@ -316,7 +316,9 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             with torch.enable_grad():
                 loss = closure()
         for group in self.param_groups:
-            params = [p for p in group["params"] if p.grad is not None]
+            # A zero-element weight ((5, 0), (0, 5), (0,)) has nothing to update and broke the
+            # int8 / 4bit codecs (and AdamP's projection): left out like a grad-less param.
+            params = [p for p in group["params"] if p.grad is not None and p.numel()]
             for p in params:
                 if p.grad.is_sparse:
                     raise RuntimeError("ADOPT does not support sparse gradients")
