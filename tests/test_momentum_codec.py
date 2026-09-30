@@ -15,6 +15,7 @@ gone. These tests pin behaviour including bf16/fp32-EMA agreement.
 from __future__ import annotations
 
 import copy
+import math
 import warnings
 
 import pytest
@@ -378,3 +379,148 @@ def test_warn_if_4bit_high_beta1():
     msgs = [str(x.message) for x in w if issubclass(x.category, UserWarning)]
     assert len(msgs) == 1
     assert "1/sqrt" in msgs[0] or "amplif" in msgs[0].lower()
+
+
+# ------------------------------------------------------------- empty tensors (int8)
+# ``(0,)`` / ``(5, 0)`` / ``(3, 0, 2)`` used to raise out of ``amax`` ("reduction over a
+# zero-size dimension") on every int8 entry point; 4-bit already survived (its blocks view
+# reduces over a size-1 block). A zero-element param is legal (a pruned / zero-width layer)
+# and every other codec steps it as a no-op.
+EMPTY_SHAPES = [(0,), (5, 0), (3, 0, 2), (0, 4)]
+
+
+@pytest.mark.parametrize("shape", EMPTY_SHAPES)
+def test_int8_quant_of_an_empty_tensor(shape):
+    m = torch.zeros(shape)
+    q, scale = _quant_int8(m)
+    assert q.shape == m.shape and q.dtype == torch.int8
+    dims = tuple(range(1, m.ndim)) if m.ndim >= 2 else ()
+    expect = torch.zeros(shape).amax(dim=dims, keepdim=True).shape if m.numel() else None
+    if expect is not None:
+        assert scale.shape == expect
+    # stacked, in the effective row layout the foreach buckets use
+    row = shape[0] if len(shape) >= 2 else 1
+    stack = torch.zeros((3, row, math.prod(shape[1:]) if len(shape) >= 2 else 0))
+    qs, ss = _quant_int8_stacked(stack)
+    assert qs.shape == stack.shape and ss.shape == (*stack.shape[:-1], 1)
+
+
+@pytest.mark.parametrize("md", DTYPES)
+@pytest.mark.parametrize("shape", EMPTY_SHAPES)
+def test_every_codec_steps_an_empty_tensor(md, shape):
+    codec = _make_codec(md)
+    like = torch.zeros(shape)
+    eff = ((shape[0], math.prod(shape[1:])) if len(shape) >= 2 else (math.prod(shape),))
+
+    def mat(t):
+        return t.reshape(eff)
+
+    s1, s2 = _ema_state(codec, shape), _ema_state(codec, shape)
+    d = codec.ema_one(s1, like.clone(), 0.9)
+    assert d.numel() == 0
+    codec.store_one(s1, like.clone())
+    assert codec.dequant_one(s1, like).shape == like.shape
+    upd = torch.zeros((2, *eff))
+    states = [s2, _ema_state(codec, shape)]
+    codec.ema_stacked(states, upd.clone(), mat, eff, 0.9)
+    codec.store_stacked(states, upd.clone())
+    assert codec.dequant_stacked(states, mat, eff).shape == upd.shape
+
+
+# ---------------------------------------- opt-in stochastic requant of the momentum
+# ``STOCHASTIC_MOMENTUM_REQUANT`` (default OFF, bit-identical to 0.7.17). Under
+# ``m = beta*m_q + (1-beta)*g`` a round-to-nearest requant flattens every coordinate below
+# half its block's quant step for good; the stochastic one keeps them in expectation.
+def _outlier_block_run(md, stochastic, monkeypatch, steps=200, beta=0.9):
+    """Returns ``(sum_t m_q(t), sum_t m_fp32(t), m_q(T))`` on a 128-block with one outlier.
+
+    The SUM over steps is what the weights integrate (every step applies ``m``), so it is
+    the quantity a biased requant loses and an unbiased one keeps, even though a single
+    stochastic snapshot is noisier than the round-to-nearest one.
+    """
+    import kaon._momentum_codec as mc
+
+    monkeypatch.setattr(mc, "STOCHASTIC_MOMENTUM_REQUANT", stochastic)
+    torch.manual_seed(0)
+    codec = _make_codec(md)
+    shape = (1, 128)
+    state = _ema_state(codec, shape)
+    ref = torch.zeros(shape)
+    acc_q, acc_ref = torch.zeros(shape), torch.zeros(shape)
+    g = torch.Generator().manual_seed(1)
+    bias = torch.randn(shape, generator=g) * 0.05          # a persistent per-coordinate signal
+    for _ in range(steps):
+        grad = bias + torch.randn(shape, generator=g) * 0.1
+        grad[0, 0] = 5.0
+        ref.lerp_(grad, 1 - beta)
+        codec.ema_one(state, grad, beta)
+        acc_ref += ref
+        acc_q += codec.dequant_one(state, torch.zeros(shape))
+    return acc_q, acc_ref, codec.dequant_one(state, torch.zeros(shape))
+
+
+@pytest.mark.parametrize("md", ["int8", "4bit"])
+def test_stochastic_momentum_requant_is_off_by_default(md):
+    import kaon._momentum_codec as mc
+
+    assert mc.STOCHASTIC_MOMENTUM_REQUANT is False
+    assert mc._momentum_gen(torch.device("cpu")) is None
+
+
+@pytest.mark.parametrize("md", ["int8", "4bit"])
+def test_stochastic_momentum_requant_keeps_the_small_coordinates_alive(md, monkeypatch):
+    acc_rne, acc_ref, m_rne = _outlier_block_run(md, False, monkeypatch)
+    acc_sr, _, _ = _outlier_block_run(md, True, monkeypatch)
+    rest = slice(1, None)
+    cos = torch.nn.functional.cosine_similarity
+    c_rne = cos(acc_rne[0, rest], acc_ref[0, rest], dim=0).item()
+    c_sr = cos(acc_sr[0, rest], acc_ref[0, rest], dim=0).item()
+    msg = f"{md}: stochastic requant integrates cos {c_sr:.3f} (round-to-nearest {c_rne:.3f})"
+    if md == "4bit":       # the reported defect: the whole block flattened to 0 for good
+        assert (m_rne[0, rest] == 0).float().mean().item() > 0.95
+        assert c_rne < 0.1, f"4-bit round-to-nearest kept {c_rne:.3f} of the signal"
+        assert c_sr > 0.5, msg                      # measured 0.565 vs 0.000
+    else:                  # int8's step is 18x finer: RNE already keeps it (0.978 vs 0.977)
+        assert c_sr > 0.9, msg
+
+
+@pytest.mark.parametrize("md", ["int8", "4bit"])
+def test_stochastic_momentum_requant_stacked_and_per_param_stay_in_range(md, monkeypatch):
+    """With the toggle ON every entry point still produces valid codes and scales."""
+    import kaon._momentum_codec as mc
+
+    monkeypatch.setattr(mc, "STOCHASTIC_MOMENTUM_REQUANT", True)
+    shape = (8, 16)
+    codec = _make_codec(md)
+    states = [_ema_state(codec, shape) for _ in range(3)]
+    upd = torch.randn(3, *shape)
+    d = codec.ema_stacked(states, upd, lambda t: t, shape, 0.9)
+    assert torch.isfinite(d).all()
+    codec.store_stacked(states, upd)
+    codec.store_one(states[0], upd[0])
+    codec.ema_one(states[1], upd[1], 0.9)
+    for s in states:
+        back = codec.dequant_one(s, torch.zeros(shape))
+        assert torch.isfinite(back).all()
+        assert (back - upd[0]).abs().max() < 10
+
+
+def test_stochastic_momentum_noise_is_not_the_weight_sr_stream(monkeypatch):
+    """The toggle's generator must not replay SR stream 0's words (same global seed)."""
+    import kaon._momentum_codec as mc
+    from kaon import reseed_stochastic_rounding
+    from kaon._stochastic_rounding import SRStream
+
+    monkeypatch.setattr(mc, "STOCHASTIC_MOMENTUM_REQUANT", True)
+    torch.manual_seed(123)
+    reseed_stochastic_rounding()
+    dev = torch.device("cpu")
+    a = torch.rand(100_000, generator=mc._momentum_gen(dev))
+    b = torch.rand(100_000, generator=SRStream().generator(dev))     # stream 0 after reseed
+    assert not torch.equal(a, b)
+    corr = torch.corrcoef(torch.stack([a, b]))[0, 1].abs().item()
+    assert corr < 0.02, f"momentum requant noise correlates with the weight SR noise ({corr})"
+    # ... and it is reproducible under the protocol.
+    torch.manual_seed(123)
+    reseed_stochastic_rounding()
+    assert torch.equal(a, torch.rand(100_000, generator=mc._momentum_gen(dev)))

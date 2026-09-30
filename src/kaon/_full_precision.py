@@ -17,6 +17,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from kaon._backend import decode_value
 from kaon._compact_kahan import RESIDUAL_KEY, decode, is_compact_kahan, residual_bits_of
 
 __all__ = ["decode_weights", "full_precision_state_dict"]
@@ -66,12 +67,42 @@ def _check_view(chain: list[Any]) -> None:
             )
 
 
+#: Elements per CPU decode chunk (1 Mi). The torch reference :func:`decode` holds ~4.25x its
+#: input in int32/bool scratch at peak (``w``, ``q``, the carry mask and product); decoding
+#: chunk by chunk into ONE preallocated fp32 output bounds that scratch to ~17 MB whatever
+#: the tensor. Measured process peak over the call (output included): 4608x1152 (5.3 M)
+#: 66.5 -> 13.9 MiB, 21 M elements 425.9 -> 102.9 MiB. 4 Mi chunks were WORSE than no
+#: chunking on the 5.3 M DiT MLP (78.8 vs 66.5 MiB): the chunk must be well below the tensor.
+_DECODE_CHUNK = 1 << 20
+
+
+def _decode_lowmem(p: Tensor, lo: Tensor, bits: int) -> Tensor:
+    """:func:`decode` with bounded scratch; bit-identical (the decode is elementwise).
+
+    CUDA: :func:`kaon._backend.decode_value` — the single-launch Triton kernel the foreach
+    path already uses, writing straight into its fp32 output with NO scratch (the torch
+    reference it falls back to, e.g. without Triton, is the old peak). CPU: the torch
+    reference, chunk by chunk, into a preallocated output.
+    """
+    if p.is_cuda:
+        return decode_value(p, lo, bits)
+    n = p.numel()
+    if n <= _DECODE_CHUNK or not (p.is_contiguous() and lo.is_contiguous()):
+        return decode(p, lo, bits)
+    out = torch.empty(p.shape, dtype=torch.float32, device=p.device)
+    of, pf, lf = out.view(-1), p.view(-1), lo.view(-1)
+    for i in range(0, n, _DECODE_CHUNK):
+        j = min(i + _DECODE_CHUNK, n)
+        of[i:j] = decode(pf[i:j], lf[i:j], bits)
+    return out
+
+
 def _decoded(p: Tensor, lo: Tensor | None, method: str) -> Tensor:
     """fp32 full value of one param, on ``p``'s device (a fresh tensor)."""
     # A residual is only maintained while the group's method is compact Kahan: after a
     # switch back to SR / none it is stale and must not be added.
     if lo is not None and is_compact_kahan(method):
-        return decode(p.detach(), lo, residual_bits_of(lo))
+        return _decode_lowmem(p.detach(), lo, residual_bits_of(lo))
     return p.detach().float().clone()
 
 

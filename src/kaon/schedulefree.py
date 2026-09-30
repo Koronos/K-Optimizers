@@ -168,6 +168,8 @@ from kaon._momentum_codec import (
     _quant_int8,
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
+    store_stochastic_,
+    store_stochastic_stacked_,
 )
 from kaon._stochastic_rounding import SRStream
 from kaon._wrappers import CodecBuffer, TrainEvalWeights
@@ -475,6 +477,9 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
         temporaries per bucket — measured 0.73x the step and +98 MiB of transient on the
         UNet/DiT bag before this went through the shared primitive.
         """
+        if md in ("int8", "4bit"):
+            store_stochastic_(state, "z", md, z_fp32, sr)
+            return
         if md != "bfloat16":
             CodecBuffer.write(state, "z", md, z_fp32)
             return
@@ -495,9 +500,12 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
         ``_foreach_copy_`` into the per-param storages — the same shape of work
         :func:`kaon._backend.subtract_batched_` does for bf16 weights, and through the
         same :func:`kaon._backend._sr_write_` entry point (one Triton launch, no
-        temporary, on CUDA). Since the draws differ from the per-param path's, a bf16
-        ``z`` makes the two paths agree in expectation instead of bit-for-bit (the
-        quantized and fp32 codecs stay exact).
+        temporary, on CUDA). Since the draws differ from the per-param path's, a bf16,
+        int8 or 4-bit ``z`` (all stochastically rounded since 0.7.18) makes the two paths
+        agree in expectation, not bit-for-bit; only an fp32 ``z`` stays exact. The one
+        bit-exact exception is the CPU torch reference path with nothing else drawing in
+        between and the same draw order on both paths (see
+        :func:`kaon._momentum_codec.store_stochastic_stacked_`).
 
         ``N == 1`` — every bucket of a big-unique-shape model (UNet/DiT) — skips the
         stack entirely and rounds straight into the parameter's own ``z``: a one-tensor
@@ -505,6 +513,9 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
         transfers per bucket for nothing. The arithmetic and the number of drawn
         elements are unchanged.
         """
+        if md in ("int8", "4bit"):
+            store_stochastic_stacked_(states, "z", md, z_fp32, sr)
+            return
         if md != "bfloat16":
             CodecBuffer.write_stacked(states, "z", md, z_fp32)
             return

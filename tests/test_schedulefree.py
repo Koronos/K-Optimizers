@@ -308,7 +308,10 @@ def test_foreach_chunking_is_exact():
             p.grad = g.clone()
         for p, g in zip(pb, gs, strict=True):
             p.grad = g.clone()
+        # The int8 z requant is stochastic (0.7.18): replay the same draws on both paths.
+        reseed_stochastic_rounding()
         oa.step()
+        reseed_stochastic_rounding()
         ob.step()
     for a, b in zip(pa, pb, strict=True):
         assert torch.equal(a, b)
@@ -803,6 +806,7 @@ def test_group_without_grads_does_not_advance_its_step():
 def _plan_run_schedulefree(cache: bool) -> list[torch.Tensor]:
     """Five steps over a 0-D / 1-D / 2-D / conv bag, with a ``p.data`` rebind at step 3."""
     torch.manual_seed(0x5EED)
+    reseed_stochastic_rounding()      # the int8 z requant draws SR noise (0.7.18)
     shapes = [(), (), (1,), (5,), (5,), (4, 3), (4, 3), (2, 2, 3, 3), (2, 2, 3, 3)]
     g = torch.Generator().manual_seed(7)
     params = [torch.nn.Parameter(torch.randn(s, generator=g)) for s in shapes]

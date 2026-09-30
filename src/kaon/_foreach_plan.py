@@ -136,6 +136,7 @@ WATCHED_STATE_KEYS = frozenset({
     "m_pos", "m_neg", "m_pos_scale", "m_neg_scale",  # AdaPNM's two momenta
     "row", "col",                                    # factored second moment
     "v", "max_v",                                    # non-factored second moment (+ AMSGrad)
+    "s",                                             # AdaBelief's belief (flat_state)
     "shift",                                         # Kahan compensation (bf16, legacy)
     "kahan_lo",                                      # compact Kahan residual (kahan8/kahan16)
 })
@@ -320,6 +321,25 @@ class WatchedState(defaultdict):
     __copy__ = copy
 
 
+def plain_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """``state_dict`` with every per-param entry of ``state_dict["state"]`` as a PLAIN dict.
+
+    ``Optimizer.state_dict`` hands the per-param state dicts out BY REFERENCE, i.e. as
+    :class:`WatchedParamState`. Pickled, those reduce to ``builtins.dict`` via a ``GLOBAL``
+    opcode, which ``torch.load``'s default ``weights_only=True`` unpickler refuses
+    ("Unsupported global: GLOBAL dict") — a checkpoint that loads only with
+    ``weights_only=False``. A shallow copy is a real ``dict`` (pickled with the plain dict
+    opcodes) and keeps the very same tensor references, so it costs one small dict per
+    param and no tensor memory.
+    """
+    state = state_dict.get("state")
+    if isinstance(state, dict) and any(type(v) is WatchedParamState for v in state.values()):
+        state_dict["state"] = {
+            k: (dict(v) if type(v) is WatchedParamState else v) for k, v in state.items()
+        }
+    return state_dict
+
+
 def _plain_state(items: list[tuple[Any, Any]]) -> defaultdict:
     """Unpickle/deepcopy target for :class:`WatchedState` — a plain ``defaultdict(dict)``.
 
@@ -406,6 +426,11 @@ class WatchedStateMixin:
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)                         # type: ignore[misc]
         self._install_state_watch()
+
+    def state_dict(self) -> dict[str, Any]:
+        """Plain per-param dicts, loadable with ``torch.load(weights_only=True)`` (see
+        :func:`plain_state_dict`)."""
+        return plain_state_dict(super().state_dict())       # type: ignore[misc]
 
 
 class ForeachSpec:
@@ -776,6 +801,33 @@ class ForeachPlanMixin:
 
     _FOREACH_SPEC: ForeachSpec = ForeachSpec()
     _foreach_cache_enabled: bool = True
+
+    # STATE WATCH. The chunks' ``state_views`` alias the buffers the spec names, so this
+    # plan is only as safe as the state-identity generation it keys on — and until 0.7.18
+    # only Adakaon / AdaPNM (via :class:`WatchedStateMixin`) ever had a :class:`WatchedState`.
+    # Every other optimizer on this plan kept a plain ``defaultdict``, whose generation is
+    # the constant :data:`_NO_GENERATION`, so ``opt.state[p]["row"] = ...`` left the plan
+    # stepping the RETIRED tensor (measured 3/3 ``row`` and 2/2 ``s`` on AdaBelief, 2/2
+    # ``v`` on AdamP). The watch is installed HERE, by the plan that depends on it, so no
+    # optimizer can adopt the plan and forget it. Same two hooks as
+    # :class:`WatchedStateMixin` (which cannot simply be a base class: Adakaon lists it
+    # BEFORE this mixin, and a base appearing before its subclass has no consistent MRO);
+    # both are idempotent, so an optimizer carrying both mixins wraps exactly once.
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "state":
+            value = _as_watched(value)
+        super().__setattr__(name, value)
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)                         # type: ignore[misc]
+        current = self.__dict__.get("state")
+        if current is not None and type(current) is not WatchedState:
+            self.state = _as_watched(current)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Plain per-param dicts, loadable with ``torch.load(weights_only=True)`` (see
+        :func:`plain_state_dict`; idempotent next to :class:`WatchedStateMixin`'s)."""
+        return plain_state_dict(super().state_dict())       # type: ignore[misc]
 
     def _foreach_spec(self, group: dict[str, Any]) -> ForeachSpec:
         """The spec that governs ``group``'s bucketing. Normally the class attribute.

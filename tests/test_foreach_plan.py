@@ -1021,3 +1021,107 @@ def test_pinned_bf16_sr_vector_matches_the_pre_plan_tree(name, md, cache):
     bucketing induces is very much visible here.
     """
     assert _pinned_sr_run(name, md, cache=cache) == _PINNED_SR_BITS[(name, md)]
+
+
+# ---------------------------------------------------------- state-identity watch
+# The plan's ``state_views`` alias the buffers a spec names, so a REBINDING of one of those
+# keys has to invalidate it. That is what ``WatchedState`` + ``WATCHED_STATE_KEYS`` do — but
+# only if (a) every key a spec bakes is in the watched set and (b) the optimizer's ``state``
+# is actually a ``WatchedState``. Until 0.7.18 (a) missed AdaBelief's ``"s"`` and (b) held
+# for Adakaon / AdaPNM only: every other foreach optimizer kept a plain ``defaultdict``, so
+# ``opt.state[p]["row"] = ...`` (or ``["s"]``, ``["v"]``, ``["m"]``) left the plan stepping
+# the RETIRED tensor. Measured 2/2 ``s``, 3/3 ``row`` on AdaBelief and 2/2 ``v`` on AdamP.
+def _foreach_specs():
+    """Every ``ForeachSpec`` any kaon optimizer class declares, by ``(class, attr)``."""
+    import inspect
+
+    import kaon
+    from kaon._foreach_plan import ForeachSpec
+
+    found = {}
+    for _, cls in inspect.getmembers(kaon, inspect.isclass):
+        if not issubclass(cls, ForeachPlanMixin):
+            continue
+        for klass in cls.__mro__:
+            for attr, value in vars(klass).items():
+                if isinstance(value, ForeachSpec):
+                    found[(klass.__name__, attr)] = value
+    return found
+
+
+def test_every_spec_state_key_is_watched():
+    """STRUCTURAL: a key a spec bakes into cached views must be one a rebinding of is seen."""
+    from kaon._foreach_plan import WATCHED_STATE_KEYS
+
+    specs = _foreach_specs()
+    # Sanity: the scan found the real specs (a silent empty scan would pass vacuously).
+    assert ("AdaBelief", "_FOREACH_SPEC") in specs
+    assert ("KProdigy", "_FOREACH_SPEC_FACTORED") in specs
+    missing = {
+        where: sorted(set(spec.factored_state + spec.flat_state) - WATCHED_STATE_KEYS)
+        for where, spec in specs.items()
+    }
+    missing = {k: v for k, v in missing.items() if v}
+    assert not missing, f"spec state keys missing from WATCHED_STATE_KEYS: {missing}"
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_foreach_optimizer_state_is_watched(name):
+    from kaon._foreach_plan import WatchedState
+
+    _bag, opt = run(name, steps=1)
+    assert type(opt.state) is WatchedState, (
+        f"{name}.state is a {type(opt.state).__name__}: a state rebinding is invisible "
+        "to its cached foreach plan"
+    )
+
+
+def _spec_keys(name, opt, p):
+    spec = opt._foreach_spec(opt.param_groups[0])
+    st = opt.state[p]
+    keys = spec.factored_state if p.ndim >= 2 else spec.flat_state
+    return [k for k in (*keys, "m", "m_scale") if k in st and torch.is_tensor(st[k])]
+
+
+@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("md", ["float32", "int8"])
+def test_rebinding_a_baked_state_key_drops_the_plan(name, md):
+    """Swap every baked buffer for an equal-valued CLONE mid-run: the trajectory must be
+    bit-identical to the uninterrupted run and the retired buffers must stay untouched."""
+    ref = snapshot(*run(name, momentum_dtype=md))
+
+    torch.manual_seed(11)
+    reseed_stochastic_rounding()
+    bag = make_bag()
+    opt = build(name, bag, momentum_dtype=md)
+    retired = []
+    for step in range(1, 5):
+        set_grads(bag, step)
+        if step == 3:
+            for p in bag:
+                st = opt.state[p]
+                for k in _spec_keys(name, opt, p):
+                    old = st[k]
+                    st[k] = old.clone()
+                    retired.append((k, old, old.clone()))
+        opt.step()
+    assert retired, "nothing was rebound"
+    dirty = sorted({k for k, live, snap in retired if not torch.equal(live, snap)})
+    assert not dirty, f"{name}: the step wrote RETIRED state buffers {dirty}"
+    assert_same(snapshot(bag, opt), ref)
+
+
+@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("md", ["float32", "bfloat16", "int8", "4bit"])
+def test_steady_state_steps_do_not_move_the_state_generation(name, md):
+    """Nothing in a steady-state step may rebind a watched key: that would turn every step
+    into a full plan rebuild (the watch is only free because the counter never moves)."""
+    _bag, opt = run(name, steps=2, momentum_dtype=md)
+    gen = opt.state.gen[0]
+    plan = only_plan(opt)
+    bag = _bag
+    for step in (3, 4, 5):
+        set_grads(bag, step)
+        opt.step()
+    assert opt.state.gen[0] == gen, f"{name}/{md}: a steady-state step rebinds a watched key"
+    assert only_plan(opt) is plan

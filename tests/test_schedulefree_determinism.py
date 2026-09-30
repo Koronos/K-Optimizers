@@ -26,8 +26,8 @@ Everything below is the evidence, in the order it settles the question:
 * under the documented protocol (`torch.manual_seed` + `kaon.reseed_stochastic_rounding()`)
   ScheduleFree IS bit-identical against itself, on every device, both paths, every
   parameter and momentum dtype;
-* a `z` that is not bf16 (`float32`/`int8`/`4bit`) draws no noise at all, claims no stream
-  and needs no reseed;
+* an fp32 `z` draws no noise at all, claims no stream and needs no reseed (an `int8` /
+  `4bit` `z` did too until 0.7.18; its requant is now stochastic, like a bf16 `z`'s write);
 * with a bf16 `z` the two runs claim *different* stream identities and diverge at the
   second step, and giving both runs the SAME (pinned) identity makes them bit-identical
   again with no reseed — the identity is the only variable;
@@ -52,8 +52,12 @@ STEPS = 4
 SEED = 1234
 
 MOMENTUM_DTYPES = ["bfloat16", "float32", "int8", "4bit"]
-# The three that store `z` through the codec's round-to-nearest write, i.e. no SR draw.
-NO_SR_MOMENTUM = ["float32", "int8", "4bit"]
+# The one that stores `z` with no SR draw at all. `int8` / `4bit` used to be here too (their
+# codec write was round-to-nearest) until 0.7.18 made their requant stochastic: an RNE
+# requant froze `z` exactly like an RNE bf16 write did (see `ScheduleFree._store_z`), so
+# they now draw from the same stream as a bf16 `z` and follow its reseed protocol.
+NO_SR_MOMENTUM = ["float32"]
+QUANTIZED_Z = ["int8", "4bit"]
 
 
 def _seed_torch() -> None:
@@ -195,6 +199,20 @@ def test_a_non_bf16_z_needs_no_reseed_and_claims_no_stream(device, foreach, mome
             "a ScheduleFree that never rounds must not claim a stream identity"
         )
         assert "_sr_meta" not in opt.state_dict(), "no draws -> nothing to checkpoint"
+
+
+@pytest.mark.parametrize("momentum_dtype", QUANTIZED_Z)
+@pytest.mark.parametrize("foreach", [True, False], ids=["foreach", "per_param"])
+def test_a_quantized_z_draws_from_the_optimizers_own_stream(foreach, momentum_dtype):
+    """The stochastic requant of an int8 / 4-bit ``z`` is CHECKPOINTED noise: it claims the
+    optimizer's stream (so ``_sr_meta`` carries it) and is reproducible under the protocol."""
+    reseed_stochastic_rounding()
+    a, oa = _run(device="cpu", momentum_dtype=momentum_dtype, foreach=foreach, reseed=True)
+    # Read before the second run: its reseed releases this stream's identity (a new run).
+    assert oa.sr_stream.stream_id is not None
+    assert "_sr_meta" in oa.state_dict()
+    b, _ob = _run(device="cpu", momentum_dtype=momentum_dtype, foreach=foreach, reseed=True)
+    assert _first_difference(a, b) is None
 
 
 # ==================================================== the cause: the bf16 z's SR identity
