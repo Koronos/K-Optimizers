@@ -810,3 +810,26 @@ def test_eps_zero_with_a_zero_second_moment_stays_finite(foreach, zero_column):
             p.grad = torch.randn(p.shape, generator=g)
         opt.step()
     assert all(torch.isfinite(p).all() for p in params)
+
+
+@pytest.mark.parametrize("foreach", [True, False])
+@pytest.mark.parametrize("shape", [(7,), ()])
+def test_eps_zero_nonfactored_zero_grad_stays_finite(foreach, shape):
+    """The non-factored (1-D / 0-D) path had the same ``eps1 = 0`` hole: ``v == 0`` after
+    an all-zero gradient made ``grad * rsqrt(v)`` a ``0 * inf`` NaN. The update must be
+    exactly zero there."""
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.randn(shape)) for _ in range(3)]
+    opt = AdaMuon(params, lr=1e-2, eps=(0.0, 1e-3), cautious=False, foreach=foreach)
+    before = [p.detach().clone() for p in params]
+    for p in params:
+        p.grad = torch.zeros_like(p)
+    opt.step()
+    for p, b in zip(params, before, strict=True):
+        assert torch.equal(p.detach(), b)
+    g = torch.Generator().manual_seed(3)
+    for _ in range(3):
+        for p in params:
+            p.grad = torch.randn(p.shape, generator=g)
+        opt.step()
+    assert all(torch.isfinite(p).all() for p in params)

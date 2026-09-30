@@ -303,7 +303,10 @@ def _nonfactored_pre_math(
         grad_sq = grad_sq.add_(eps1)
     v.lerp_(grad_sq, omb)
 
-    update = grad.mul(v.rsqrt())                                      # [N, L], RMS≈1
+    # eps1 == 0: an all-zero grad history leaves v == 0 and ``0 * rsqrt(0)`` is NaN;
+    # the same _MIN_NORMAL floor as the factored path makes that update exactly zero.
+    inv_sqrt_v = v.rsqrt() if eps1 > 0 else v.clamp_min(_MIN_NORMAL).rsqrt_()
+    update = grad.mul(inv_sqrt_v)                                     # [N, L], RMS≈1
     if bc_scale is not None:
         update.mul_(bc_scale)
     rms_ = update.norm(2, dim=1) / math.sqrt(length)
@@ -381,7 +384,8 @@ def _nonfactored_one_pre_math(
     if eps1 > 0:
         grad_sq.add_(eps1)
     v.lerp_(grad_sq, 1.0 - beta2)
-    update = grad.mul(v.rsqrt())
+    # eps1 == 0 floor, see _nonfactored_pre_math.
+    update = grad.mul(v.rsqrt() if eps1 > 0 else v.clamp_min(_MIN_NORMAL).rsqrt_())
     if bc_scale is not None:
         update.mul_(bc_scale)
     if clip > 0:
