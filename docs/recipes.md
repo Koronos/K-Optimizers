@@ -36,16 +36,19 @@ without the schedule. Its sweet spot is a **high** constant LR. → [docs/adapnm
 ```python
 from kaon import Lion
 
-opt = Lion(model.parameters(), lr=2e-4, betas=(0.95, 0.98), momentum_dtype="4bit")
+opt = Lion(model.parameters(), lr=2e-4, betas=(0.95, 0.98), momentum_dtype="int8")
 ```
 
 One momentum buffer, no second moment; the sign update's implicit regularization. `lr` is
 Lion-scale (~AdamW/5); `betas` are a loss↔gap dial (`(0.95,0.98)` for loss, higher β2 for a
 lower gap).
 
-**Evidence:** lightest state in the family — **~0.5 B/param at 4bit**. On the proxy at the
-larger C=128/2500 setting, tuned Lion reached **AdaMuon's loss at ~half its train–val gap** and
-beat the no-momentum Adakaon baseline on both axes. → [docs/lion.md](lion.md).
+**Evidence:** one momentum buffer — **~1 B/param at int8**, near loss-equivalent to bf16. Avoid
+`"4bit"` on Lion (0.5 B/param): its update is the momentum's *sign*, ~12–13% of coordinates
+flip under 4bit noise and the final loss measured ~32× worse (caveat in
+[docs/lion.md](lion.md)). On the proxy at the larger C=128/2500 setting, tuned Lion reached
+**AdaMuon's loss at ~half its train–val gap** and beat the no-momentum Adakaon baseline on
+both axes. → [docs/lion.md](lion.md).
 
 ### Minimum VRAM, regularizing (no momentum)
 
