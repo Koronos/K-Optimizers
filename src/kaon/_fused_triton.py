@@ -631,6 +631,51 @@ if _HAS_TRITON:
         mask = offs < n
         tl.store(out_ptr + offs, ck_decode(p_ptr, c_ptr, offs, mask, BITS), mask=mask)
 
+    # ---- the same two writes over a foreach bucket's param VIEWS, in place (pointer array) ----
+    # The foreach path's bf16 write (``kaon._backend.subtract_batched_``) used to stack the
+    # bucket's weights (+ residuals), run ``_sr_axpy_kernel`` / ``_ck_axpy_kernel`` on the stack
+    # and ``_foreach_copy_`` it back: two extra full passes over the weights (three bytes more
+    # per element under kahan8) plus a bucket-sized allocation, per chunk per step. These write
+    # each view where it lives. The NOISE is the stacked kernel's, bit for bit: one seed per
+    # launch and the stacked flat index ``t * n + j`` as the ``tl.rand`` counter — only the
+    # ADDRESS is per view — so a switch between the two is invisible in the trajectory.
+    @triton.jit
+    def _sr_axpy_views_kernel(p_addr, d_ptr, alpha, n, K, seed, BLOCK: tl.constexpr):
+        """``view_t += alpha * d[t]`` (bf16 SR) for every view ``t`` of a pointer array."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        local = k * BLOCK + tl.arange(0, BLOCK)
+        mask = local < n
+        gidx = t * n + local                      # the stacked kernel's element index
+        pp = tl.load(p_addr + t).to(tl.pointer_type(tl.bfloat16))
+        p = tl.load(pp + local, mask=mask, other=0.0).to(tl.float32)
+        d = tl.load(d_ptr + gidx, mask=mask, other=0.0).to(tl.float32)
+        tl.store(pp + local, sr_round(p + alpha * d, seed, gidx).to(tl.bfloat16), mask=mask)
+
+    @triton.jit
+    def _ck_axpy_views_kernel(p_addr, c_addr, d_ptr, alpha, n, K, seed, BITS: tl.constexpr,
+                              BLOCK: tl.constexpr):
+        """``(view_t, lo_t) += alpha * d[t]`` (compact Kahan) for every view of a pointer array;
+        :func:`ck_store`'s draw on the stacked index, as ``_ck_axpy_kernel`` makes it."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        local = k * BLOCK + tl.arange(0, BLOCK)
+        mask = local < n
+        gidx = t * n + local
+        pp = tl.load(p_addr + t).to(tl.pointer_type(tl.bfloat16))
+        cp = ck_ptr(c_addr, t, BITS)
+        z = ck_decode(pp, cp, local, mask, BITS)
+        d = tl.load(d_ptr + gidx, mask=mask, other=0.0).to(tl.float32)
+        res = z + alpha * d
+        if BITS == 16:
+            ck_store_noise(pp, cp, local, mask, res, 0, BITS)
+        else:
+            UNIT: tl.constexpr = 1 << (16 - BITS)
+            noise = tl.minimum((tl.rand(seed, gidx) * UNIT).to(tl.int32), UNIT - 1)
+            ck_store_noise(pp, cp, local, mask, res, noise, BITS)
+
     @triton.jit
     def dequant_int8(code_ptr, idx, mask, scale_ptr, rr, R):
         """Per-row int8 momentum codes -> fp32. REUSABLE by any factored-family fused optimizer.
@@ -2805,6 +2850,92 @@ def int8_route(C: int) -> str:  # noqa: N803
     if C <= BIG_BLOCK and BIG_BLOCK % C == 0:
         return "aligned"
     return "rows" if C >= INT8_ROWS_MIN_C else "codec"
+
+
+# Device pointer arrays for :func:`sr_add_views_` / :func:`ck_add_views_`, CONTENT-addressed:
+# the key IS the tuple of addresses the array holds, so a hit can never be stale (a rebound or
+# reallocated view simply has a different key). The foreach plan hands over the same views
+# every step, so in steady state this is one tuple build + one dict hit per chunk instead of a
+# host->device copy. Bounded: cleared whole when it outgrows the working set of one run.
+_VIEW_PTRS: dict[tuple, torch.Tensor] = {}
+_VIEW_PTRS_MAX = 1024
+
+
+def _view_ptr_array(tensors, device) -> torch.Tensor:
+    key = (device, *map(_DATA_PTR, tensors))
+    arr = _VIEW_PTRS.get(key)
+    if arr is None:
+        if len(_VIEW_PTRS) >= _VIEW_PTRS_MAX:
+            _VIEW_PTRS.clear()
+        arr = _VIEW_PTRS[key] = torch.tensor(key[1:], dtype=torch.int64, device=device)
+    return arr
+
+
+def _views_ok(views, source, want) -> bool:
+    """``views`` are N bf16 CUDA tensors laid out contiguously, each ``source[i]``'s size,
+    all on ``source``'s device, with residual dtype ``want`` (``None``: the weights)."""
+    n = source[0].numel() if source.dim() else 0
+    dev = source.device
+    return all(v.dtype == want and v.is_contiguous() and v.numel() == n and v.device == dev
+               for v in views)
+
+
+def sr_add_views_supported(views, source) -> bool:
+    """Can :func:`sr_add_views_` take this bucket? bf16 CUDA contiguous views, one per row of
+    a contiguous fp32 ``source`` of matching per-row size, on one device."""
+    return (
+        _HAS_TRITON
+        and source.is_cuda
+        and source.dtype == torch.float32
+        and source.is_contiguous()
+        and source.dim() >= 1
+        and source.shape[0] == len(views)
+        and len(views) > 0
+        and _views_ok(views, source, torch.bfloat16)
+    )
+
+
+@torch.no_grad()
+def sr_add_views_(views, source, alpha: float = 1.0, sr: SRStream | None = None) -> None:
+    """``views[i] += alpha * source[i]`` with bf16 SR, IN PLACE, one launch for the bucket.
+
+    Bit-identical to ``stack -> sr_add_ -> _foreach_copy_`` (same seed, same per-element noise
+    counter), minus the stack, the copy-back and the bucket-sized temporary. The caller must
+    have checked :func:`sr_add_views_supported`."""
+    n = source[0].numel()
+    stream = _PROCESS_SR_STREAM if sr is None else sr
+    seed = stream.next_seed(source.device)           # drawn where sr_add_ draws it
+    K = (n + 1023) // 1024  # noqa: N806
+    with torch.cuda.device(source.device):
+        _sr_axpy_views_kernel[(len(views) * K,)](
+            _view_ptr_array(views, source.device), source, alpha, n, K, seed, BLOCK=1024,
+        )
+
+
+def ck_add_views_supported(views, lows, source, bits: int = 8) -> bool:
+    """Can :func:`ck_add_views_` take this bucket (see :func:`sr_add_views_supported`; plus
+    one residual per view in the ``bits``-wide codec's dtype)?"""
+    return (
+        sr_add_views_supported(views, source)
+        and len(lows) == len(views)
+        and _views_ok(lows, source, torch.int16 if bits == 16 else torch.uint8)
+    )
+
+
+@torch.no_grad()
+def ck_add_views_(views, lows, source, alpha: float = 1.0, bits: int = 8,
+                  sr: SRStream | None = None) -> None:
+    """``(views[i], lows[i]) += alpha * source[i]`` with the compact-Kahan codec, in place:
+    bit-identical to ``stack -> ck_add_ -> _foreach_copy_`` (see :func:`sr_add_views_`)."""
+    n = source[0].numel()
+    stream = _PROCESS_SR_STREAM if sr is None else sr
+    seed = stream.next_seed(source.device)
+    K = (n + 1023) // 1024  # noqa: N806
+    with torch.cuda.device(source.device):
+        _ck_axpy_views_kernel[(len(views) * K,)](
+            _view_ptr_array(views, source.device), _view_ptr_array(lows, source.device),
+            source, alpha, n, K, seed, BITS=bits, BLOCK=1024,
+        )
 
 
 def fourbit_kernel_blocks(numel: int, block: int = 0) -> int:

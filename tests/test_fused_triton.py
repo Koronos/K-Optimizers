@@ -1815,21 +1815,32 @@ def test_sr_write_falls_back_to_torch_when_triton_is_off(monkeypatch):
 
 
 def test_sr_write_reaches_both_weight_writers(monkeypatch):
-    """Both public writers route bf16+SR through ``_sr_write_`` (per-param and batched)."""
+    """Both public writers route bf16+SR through a Triton SR write: the per-param one through
+    ``_sr_write_``, the batched one IN PLACE over its views (``sr_add_views_``, 0.7.18) — and
+    through ``_sr_write_`` on the stack when the views cannot take it (a strided view)."""
+    import kaon._fused_triton as ft
     from kaon import _backend as bk
     seen = []
-    real = bk._sr_write_
+    real, real_views = bk._sr_write_, ft.sr_add_views_
 
     def spy(*a, **k):
-        seen.append(1)
+        seen.append("stack")
         return real(*a, **k)
 
+    def spy_views(*a, **k):
+        seen.append("views")
+        return real_views(*a, **k)
+
     monkeypatch.setattr(bk, "_sr_write_", spy)
+    monkeypatch.setattr(ft, "sr_add_views_", spy_views)
     p = torch.zeros(8, 8, device=DEV, dtype=torch.bfloat16)
     bk.subtract_one_(p, torch.ones(8, 8, device=DEV), {}, "stochastic_rounding", alpha=1e-3)
     bk.subtract_batched_([p, p.clone()], torch.ones(2, 8, 8, device=DEV),
                          "stochastic_rounding", alpha=1e-3)
-    assert len(seen) == 2
+    q = torch.zeros(8, 8, device=DEV, dtype=torch.bfloat16)
+    bk.subtract_batched_([p.t(), q], torch.ones(2, 8, 8, device=DEV),
+                         "stochastic_rounding", alpha=1e-3)
+    assert seen == ["stack", "views", "stack"]
 
 
 # ---------------------------------------------- 4-bit requant: single-axis reduction (item 9a)
@@ -2124,3 +2135,77 @@ def test_big_int8_row_split_shapes_still_match_native(shape):
     d, scale, ov = _run_parity([shape] * 2, torch.float32, "int8", wd=0.05)
     assert len(_parts(ov)[1]) == 2
     assert d / scale < 5e-4, f"{shape} rel={d / scale:.2e}"
+
+
+# ------------------------------------------------------------------- in-place foreach bf16 write
+def _views_bucket(n_views, shape, seed, bits=0):
+    """``n_views`` bf16 params (views of separate storages, like a foreach plan's pviews), their
+    residuals under compact Kahan, and a stacked fp32 delta."""
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    views = [torch.randn(shape, generator=g, device=DEV).bfloat16() for _ in range(n_views)]
+    lows = []
+    if bits:
+        dt = torch.int16 if bits == 16 else torch.uint8
+        hi = 2 ** 15 if bits == 16 else 256
+        lo = -hi if bits == 16 else 0
+        lows = [torch.randint(lo, hi, shape, generator=g, device=DEV).to(dt) for _ in views]
+    delta = torch.randn((n_views, *shape), generator=g, device=DEV) * 1e-2
+    return views, lows, delta
+
+
+@pytest.mark.parametrize("bits", [0, 8, 16], ids=["sr", "kahan8", "kahan16"])
+@pytest.mark.parametrize("shape", [(64, 48), (3000,), (7, 1030)])
+def test_in_place_views_write_is_bit_identical_to_the_stacked_write(bits, shape):
+    """``sr_add_views_`` / ``ck_add_views_`` write each view in place and must reproduce
+    ``stack -> sr_add_/ck_add_ -> _foreach_copy_`` bit for bit: same seed from the stream,
+    same per-element noise counter (the stacked index), weights AND residuals."""
+    import kaon._fused_triton as ft
+    from kaon._stochastic_rounding import SRStream
+    views, lows, delta = _views_bucket(5, shape, seed=90, bits=bits)
+    ref_v = [v.clone() for v in views]
+    ref_l = [c.clone() for c in lows]
+    sa, sb = SRStream(11), SRStream(11)
+    stacked = torch.stack(ref_v)
+    if bits:
+        slo = torch.stack(ref_l)
+        ft.ck_add_(stacked, slo, delta, -0.7, bits, sa)
+        torch._foreach_copy_(ref_l, list(slo.unbind(0)))
+        assert ft.ck_add_views_supported(views, lows, delta, bits)
+        ft.ck_add_views_(views, lows, delta, -0.7, bits, sb)
+    else:
+        ft.sr_add_(stacked, delta, -0.7, sa)
+        assert ft.sr_add_views_supported(views, delta)
+        ft.sr_add_views_(views, delta, -0.7, sb)
+    torch._foreach_copy_(ref_v, list(stacked.unbind(0)))
+    torch.cuda.synchronize()
+    assert sa.draws == sb.draws == 1
+    for a, b in zip(views, ref_v, strict=True):
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+    for a, b in zip(lows, ref_l, strict=True):
+        assert torch.equal(a, b)
+
+
+def test_in_place_views_write_refuses_what_it_cannot_index():
+    import kaon._fused_triton as ft
+    views, lows, delta = _views_bucket(3, (8, 8), seed=91, bits=8)
+    assert ft.sr_add_views_supported(views, delta)
+    assert not ft.sr_add_views_supported([views[0].t()] + views[1:], delta)      # strided
+    assert not ft.sr_add_views_supported(views[:2], delta)                        # count
+    assert not ft.sr_add_views_supported([v.float() for v in views], delta)       # dtype
+    assert not ft.sr_add_views_supported(views, delta.bfloat16())
+    assert not ft.ck_add_views_supported(views, [c.to(torch.int16) for c in lows], delta, 8)
+    assert not ft.ck_add_views_supported(views, lows[:2], delta, 8)
+
+
+def test_in_place_views_pointer_array_follows_a_rebind():
+    """The pointer array is content-addressed: a view list whose storage moved gets a new
+    array, never the old one."""
+    import kaon._fused_triton as ft
+    views, _, delta = _views_bucket(2, (16,), seed=92)
+    ft.sr_add_views_(views, delta, 1.0)
+    moved = [v.clone() for v in views]
+    before = [v.clone() for v in views]
+    ft.sr_add_views_(moved, delta, 1.0)
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(views, before, strict=True))
+    assert not all(torch.equal(a, b) for a, b in zip(moved, before, strict=True))
