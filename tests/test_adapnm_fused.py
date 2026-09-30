@@ -1010,6 +1010,42 @@ def test_pnm_big_cache_owns_its_accumulators_and_row_col_arrays(fused_red):
     assert _maxdiff(pv, pn) / scale < 1e-5
 
 
+# ----------------------------------------------------------------- 5b. very wide rows / huge tensors
+@pytest.mark.parametrize("gc", [False, True], ids=["nogc", "gc"])
+@pytest.mark.parametrize("shapes", [[(4, 1 << 20)] * 2, [(3, 40000)] * 2], ids=["1M", "40000"])
+def test_pnm_very_wide_rows_take_the_column_tiled_reductions(shapes, gc):
+    """``reduction_tile`` handed AdaPNM's batched-big reduction ``next_pow2(C)`` columns per
+    program with no ceiling: a (4, 1048576) bucket compiled a 1M-lane tile for >100 s. Above
+    ``REDUCTION_C_CAP`` it now launches the column-tiled kernels Adakaon uses (every narrower
+    width is untouched); same outputs as native."""
+    import time
+
+    assert ft.wide_rows(shapes[0][1])
+    cfg = dict(_SAFE_CFG, gradient_centralization=gc)
+    pv, pn, ov, on = _safe_pair(shapes, cfg, seed=91)
+    t0 = time.perf_counter()
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(93))
+    assert time.perf_counter() - t0 < 90, "compiling the wide-row reductions took too long"
+    _assert_safe_route(ov, "big")
+    scale = max(p.detach().abs().max().item() for p in pn)
+    assert _maxdiff(pv, pn) / scale < 1e-5
+
+
+def test_pnm_huge_tensor_is_not_routed_to_the_int32_chunked_kernels(monkeypatch):
+    """The chunked kernels index one tensor in int32, so a weight of >= 2**31 elements must
+    stay native (Adakaon's partition already guarded it; AdaPNM's did not). Pinned with a
+    lowered threshold — a real 2**31-element weight does not fit this GPU's tests."""
+    monkeypatch.setattr(ft, "I64_THRESHOLD", 300_000)
+    shapes = [(512, 1024)] * 2 + [(512, 512)] * 2
+    pv, pn, ov, on = _safe_pair(shapes, _SAFE_CFG, seed=95)
+    _drive([(pv, ov), (pn, on)], 2, torch.Generator(device=DEV).manual_seed(97))
+    ob, big, od, nat = _parts(ov)
+    assert [tuple(p.shape) for p in nat] == [(512, 1024)] * 2
+    assert [tuple(p.shape) for p in big] == [(512, 512)] * 2
+    scale = max(p.detach().abs().max().item() for p in pn)
+    assert _maxdiff(pv, pn) / scale < 1e-5
+
+
 # ----------------------------------------------------------------- 6. equal_to_1 specialization
 @pytest.mark.parametrize("shapes", [[(20000, 1)] * 2, [(1, 20000)] * 2, [(20000, 1)], [(1, 20000)]])
 def test_pnm_extreme_aspect_shapes_compile_and_match_native(shapes):

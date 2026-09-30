@@ -331,8 +331,8 @@ def bucket_gc_ok(plist: list) -> bool:
     return flags.pop()
 
 
-#: Widest padded row (``next_pow2(C)``) a reduction program owns whole; above it Adakaon
-#: switches to the column-tiled ``*_ct`` kernels, which walk the row in ``REDUCTION_C_TILE``
+#: Widest padded row (``next_pow2(C)``) a reduction program owns whole; above it Adakaon and
+#: AdaPNM switch to the column-tiled ``*_ct`` kernels, which walk the row in ``REDUCTION_C_TILE``
 #: columns (see :func:`reduction_tile`'s ``cap``). Every width up to the threshold keeps the
 #: exact pre-0.7.18 kernels.
 REDUCTION_C_CAP = 1 << 15
@@ -357,8 +357,8 @@ def reduction_tile(R: int, C: int, work: int = 16384,  # noqa: N803
     atomic, and ``RB`` below is derived from the PADDED ``BR`` so the row blocks still tile
     ``R`` exactly once.
 
-    ``cap`` (Adakaon only; AdaPNM passes none and keeps the unbounded tile): bound ``BC`` for a
-    caller that launches the column-tiled ``*_ct`` kernels when ``next_pow2(C)`` exceeds it.
+    ``cap``: bound ``BC`` for a caller that launches the column-tiled ``*_ct`` kernels when
+    ``next_pow2(C)`` exceeds :data:`REDUCTION_C_CAP` (:func:`wide_rows`; Adakaon and AdaPNM).
     """
     BC = triton.next_power_of_2(C)  # noqa: N806
     if cap is not None:            # the column-tiled kernels walk C in ``cap``-wide tiles
@@ -1390,8 +1390,8 @@ if _HAS_TRITON:
     # ---- column-TILED twins of the reductions, for rows too wide for one program ----
     # ``reduction_tile`` gives a program ``BC = next_pow2(C)`` columns, unbounded: a
     # (4, 1048576) weight asked Triton for a 1M-lane tile and took >100 s to compile (and ran as
-    # one fat program per row). Above :data:`REDUCTION_C_CAP` padded columns Adakaon launches
-    # these instead: same grid, same outputs, the row walked in ``BC``-column tiles (two walks
+    # one fat program per row). Above :data:`REDUCTION_C_CAP` padded columns Adakaon and AdaPNM
+    # launch these instead: same grid, same outputs, the row walked in ``BC``-column tiles (two walks
     # under GC: the row mean first, then the centralized squares). Separate kernels rather than
     # a branch in the originals, so every normal shape compiles exactly as before.
     @triton.jit
@@ -3035,6 +3035,36 @@ I64_THRESHOLD = 2**31 - 2 * 1024
 def needs_i64(total: int) -> bool:
     """``I64`` for a launch whose largest flat index (grid extent x BLOCK) may reach ``total``."""
     return total >= I64_THRESHOLD
+
+
+def wide_rows(C: int) -> bool:  # noqa: N803
+    """Whether a big bucket's rows are too wide for one reduction program (``next_pow2(C) >
+    REDUCTION_C_CAP``): the caller then launches the column-tiled ``*_ct`` kernels."""
+    return triton.next_power_of_2(C) > REDUCTION_C_CAP
+
+
+def factor_rowcol_(row_addr, col_addr, rowsum, colsum, rfac, cfac, N, R, C, beta2, eps1):  # noqa: N803
+    """Launch the factored-EMA update + inverse-sqrt factors for a big bucket of ``N`` tensors.
+
+    One launch (``grid=(N,)``) over :func:`_factor_rowcol_batched`, or its column-tiled twin
+    :func:`_factor_rowcol_batched_ct` when the rows are wider than :data:`REDUCTION_C_CAP`
+    padded lanes (every narrower width compiles exactly the kernel it always did). Shared by
+    Adakaon's and AdaPNM's batched-big reductions. ``rfac``/``cfac`` may alias
+    ``rowsum``/``colsum`` (program ``t`` reads and writes the same indices; see
+    :class:`BigPointerCache`).
+    """
+    FR = triton.next_power_of_2(R)  # noqa: N806
+    FC = triton.next_power_of_2(C)  # noqa: N806
+    if FC > REDUCTION_C_CAP:
+        _factor_rowcol_batched_ct[(N,)](
+            row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, beta2, eps1,
+            BR=FR, BC=REDUCTION_C_TILE, num_warps=warps_for(max(FR, REDUCTION_C_TILE)),
+        )
+    else:
+        _factor_rowcol_batched[(N,)](
+            row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, beta2, eps1,
+            BR=FR, BC=FC, num_warps=warps_for(max(FR, FC)),
+        )
 
 
 # Device pointer arrays for :func:`sr_add_views_` / :func:`ck_add_views_`, CONTENT-addressed:

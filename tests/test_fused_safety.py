@@ -1315,6 +1315,6 @@ def test_very_wide_rows_take_the_column_tiled_reductions(shapes, det):
 
 def test_reduction_tile_caps_the_column_tile_only_when_asked():
     import kaon._fused_triton as ft
-    assert reduction_tile(4, 1 << 20)[1] == 1 << 20                  # AdaPNM: unchanged
+    assert reduction_tile(4, 1 << 20)[1] == 1 << 20                  # no cap: unchanged
     br, bc, rb = reduction_tile(4, 1 << 20, cap=ft.REDUCTION_C_TILE)
     assert bc == ft.REDUCTION_C_TILE and br * rb >= 4

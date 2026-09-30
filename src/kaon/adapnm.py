@@ -957,8 +957,12 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                     # ``m_pos_block``. Making the block a constexpr would multiply the JIT
                     # variants; the 1-D route needs no guard (quant 1-D is native anyway).
                     ok = False
+            # The chunked kernels index one tensor in int32 (``k * BLOCK + arange``), so a
+            # single weight of >= 2**31 elements stays native instead of wrapping its offsets
+            # (the same guard as Adakaon's partition).
             big_ok = (bf_ok and conv_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous()
                       and p.dtype in (torch.float32, torch.bfloat16)
+                      and p.numel() < ft.I64_THRESHOLD
                       and ft.next_pow2_tile(*ft.eff_2d(p))[0] * ft.next_pow2_tile(*ft.eff_2d(p))[1] > cap)
             if ok:
                 one_block.append(p)
@@ -1376,20 +1380,26 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         N = len(plist)  # noqa: N806
         row_addr, col_addr, colsum = cache.row_addr, cache.col_addr, cache.colsum
         g_addr = cache.g_addr
-        BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806
+        # Rows wider than REDUCTION_C_CAP padded lanes take the column-tiled kernels (as in
+        # Adakaon): ``reduction_tile`` gave one program ``next_pow2(C)`` columns with no
+        # ceiling, and a (4, 1048576) bucket compiled a 1M-lane tile for >100 s. Every
+        # narrower width launches exactly the kernels it always did.
+        ct = ft.wide_rows(C)
+        BR, BC, RB = ft.reduction_tile(R, C, cap=ft.REDUCTION_C_TILE if ct else None)  # noqa: N806
         rowmean = cache.rowmean
         rowsum = cache.rowsum
         cache.zero_accumulators()  # colsum (atomic target) + keep + rms_acc, one launch
-        ft._reduce_rowcol[(N * RB,)](
-            g_addr, rowmean, rowsum, colsum, R, C, RB,
-            LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
-        )
-        FR = ft.triton.next_power_of_2(R)  # noqa: N806
-        FC = ft.triton.next_power_of_2(C)  # noqa: N806
-        ft._factor_rowcol_batched[(N,)](
-            row_addr, col_addr, rowsum, colsum, rowsum, colsum, R, C, b2, eps1,
-            BR=FR, BC=FC, num_warps=ft.warps_for(max(FR, FC)),
-        )
+        if ct:
+            ft._reduce_rowcol_ct[(N * RB,)](
+                g_addr, rowmean, rowsum, colsum, colsum, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, DET=False, num_warps=ft.warps_for(BR * BC),
+            )
+        else:
+            ft._reduce_rowcol[(N * RB,)](
+                g_addr, rowmean, rowsum, colsum, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+            )
+        ft.factor_rowcol_(row_addr, col_addr, rowsum, colsum, rowsum, colsum, N, R, C, b2, eps1)
         return g_addr, rowmean, rowsum, colsum
 
     def state_dict(self) -> dict[str, Any]:

@@ -1547,7 +1547,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         b2, eps1 = group["betas"][1], group["eps"][0]
         N = len(plist)  # noqa: N806
         g_addr = cache.g_addr
-        ct = ft.triton.next_power_of_2(C) > ft.REDUCTION_C_CAP   # rows too wide: tiled kernels
+        ct = ft.wide_rows(C)               # rows too wide for one program: column-tiled kernels
         BR, BC, RB = ft.reduction_tile(R, C, cap=ft.REDUCTION_C_TILE if ct else None)  # noqa: N806
         rowmean = cache.rowmean
         rowsum = cache.rowsum
@@ -1583,21 +1583,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         # factor overwrites the sum it came from (see BigPointerCache).
         r = cache.rfac
         c = cache.cfac
-        row_addr = cache.row_addr
-        col_addr = cache.col_addr
-        FR = ft.triton.next_power_of_2(R)  # noqa: N806
-        FC = ft.triton.next_power_of_2(C)  # noqa: N806
-        if ct:
-            ft._factor_rowcol_batched_ct[(N,)](
-                row_addr, col_addr, rowsum, colsum, r, c, R, C, b2, eps1,
-                BR=FR, BC=ft.REDUCTION_C_TILE,
-                num_warps=ft.warps_for(max(FR, ft.REDUCTION_C_TILE)),
-            )
-        else:
-            ft._factor_rowcol_batched[(N,)](
-                row_addr, col_addr, rowsum, colsum, r, c, R, C, b2, eps1,
-                BR=FR, BC=FC, num_warps=ft.warps_for(max(FR, FC)),
-            )
+        ft.factor_rowcol_(cache.row_addr, cache.col_addr, rowsum, colsum, r, c, N, R, C, b2, eps1)
         rms = cache.rms
         if ct:
             ft._reduce_rms_ct[(N * RB,)](
