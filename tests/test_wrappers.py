@@ -8,6 +8,7 @@ footgun), and per-param == stacked equivalence.
 """
 from __future__ import annotations
 
+import pytest
 import torch
 
 from kaon._wrappers import CodecBuffer
@@ -96,3 +97,74 @@ def test_1d_buffer_roundtrip():
         st = _alloc(dtype, src)
         out = CodecBuffer.read(st, "b", dtype, src)
         assert out.shape == src.shape and torch.isfinite(out).all()
+
+
+# --------------------------------------------- 0.7.18 audit: zero-element buffers
+_EMPTY_SHAPES = [(5, 0), (0, 5), (0,), (3, 0, 2)]
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16", "int8", "4bit"])
+@pytest.mark.parametrize("shape", _EMPTY_SHAPES)
+def test_empty_buffer_per_param_roundtrip(dtype, shape):
+    """A zero-element weight (e.g. a (5, 0) projection) must alloc/read/write through
+    every codec dtype: the int8 absmax reduction and the ``per // row`` reshape both
+    broke on it."""
+    src = torch.randn(shape)
+    st = _alloc(dtype, src)
+    out = CodecBuffer.read(st, "b", dtype, src)
+    assert out.shape == src.shape and out.dtype == torch.float32
+    CodecBuffer.write(st, "b", dtype, out)
+    assert CodecBuffer.read(st, "b", dtype, src).shape == src.shape
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16", "int8", "4bit"])
+@pytest.mark.parametrize("shape", _EMPTY_SHAPES)
+def test_empty_buffer_stacked_roundtrip(dtype, shape):
+    srcs = [torch.randn(shape) for _ in range(3)]
+    states = [_alloc(dtype, s) for s in srcs]
+    out = CodecBuffer.read_stacked(states, "b", dtype, shape)
+    assert out.shape == (3, *shape) and out.dtype == torch.float32
+    CodecBuffer.write_stacked(states, "b", dtype, out)
+    assert CodecBuffer.read_stacked(states, "b", dtype, shape).shape == (3, *shape)
+
+
+@pytest.mark.parametrize("shape", [
+    (0, 5),
+    # (5, 0) first dies in ScheduleFree's own z allocation (``_momentum_codec._quant_int8``
+    # on an empty tensor), outside kaon._wrappers; passes once that is fixed too.
+    pytest.param((5, 0), marks=pytest.mark.xfail(
+        raises=IndexError, strict=False,
+        reason="ScheduleFree._alloc_full -> _quant_int8 on a zero-element tensor")),
+])
+def test_schedulefree_int8_foreach_with_an_empty_param(shape):
+    """ScheduleFree foreach + int8 ``z`` with a zero-element param next to a normal one."""
+    from kaon import ScheduleFree
+
+    a = torch.nn.Parameter(torch.randn(4, 3))
+    e = torch.nn.Parameter(torch.randn(shape))
+    b = torch.nn.Parameter(torch.randn(4, 3))
+    opt = ScheduleFree([a, e, b], lr=1e-3, momentum_dtype="int8", foreach=True)
+    opt.train()
+    a0 = a.detach().clone()
+    for _ in range(3):
+        for p in (a, e, b):
+            p.grad = torch.randn(p.shape)
+        opt.step()
+    opt.eval()
+    opt.train()
+    assert not torch.equal(a.detach(), a0) and torch.isfinite(a).all()
+
+
+@pytest.mark.parametrize("slow_dtype", ["int8", "4bit", "bfloat16"])
+def test_lookahead_foreach_sync_with_an_empty_param(slow_dtype):
+    from kaon import Lookahead
+
+    ps = [torch.nn.Parameter(torch.randn(s)) for s in [(4, 3), (0, 3), (4, 3)]]
+    opt = Lookahead(ps, lr=1e-2, k=2, slow_dtype=slow_dtype, foreach=True)
+    for _ in range(4):
+        for p in ps:
+            p.grad = torch.randn(p.shape)
+        opt.step()
+    opt.eval()
+    opt.train()
+    assert torch.isfinite(ps[0]).all()

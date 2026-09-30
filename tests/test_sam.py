@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from kaon import SAM, Adakaon
@@ -277,3 +278,237 @@ def test_first_step_chunking_matches_per_param(monkeypatch):
 
     for p, rp in zip(params, ref, strict=True):
         torch.testing.assert_close(p.data, rp.data, rtol=1e-6, atol=1e-6)
+
+
+# ------------------------------------------------------- 0.7.18 audit: norm precision
+def test_grad_norm_of_bf16_grads_is_fp32_accurate():
+    """The per-tensor norms are reduced in fp32: ``_foreach_norm`` of bf16 grads used to
+    return bf16 scalars (rounded to 8 mantissa bits) BEFORE the ``.float()``, so the
+    global norm carried up to ~2e-3 relative error."""
+    g = torch.Generator().manual_seed(5)
+    params = []
+    for n in (50_000, 3_001, 777):
+        p = torch.randn(n, generator=g).to(torch.bfloat16).requires_grad_(True)
+        p.grad = torch.randn(n, generator=g).to(torch.bfloat16)
+        params.append(p)
+    opt = SAM(params, Adakaon, lr=1e-3)
+    got = opt._grad_norm()
+    assert got.dtype == torch.float32
+    ref = math.sqrt(sum(float(p.grad.double().pow(2).sum()) for p in params))
+    assert abs(float(got) - ref) / ref < 1e-5
+
+
+def test_grad_norm_adaptive_is_chunked_and_exact(monkeypatch):
+    """ASAM's ``|w|*g`` is materialized per chunk, never for all params at once — and the
+    chunked norm equals the reference."""
+    from kaon import sam as sam_mod
+
+    g = torch.Generator().manual_seed(9)
+    params = [torch.randn(4, 3, generator=g).requires_grad_(True) for _ in range(7)]
+    params.append(torch.randn(5, generator=g).requires_grad_(True))
+    _attach_grads(params, seed=10)
+    ref = _global_grad_norm(params, adaptive=True)
+    opt = SAM(params, Adakaon, adaptive=True, lr=1e-3)
+    full = float(opt._grad_norm())
+
+    def tiny_budget(_stack_budget, _cutoff, _bytes_per, _device):
+        return 2 * 4 * 3
+
+    monkeypatch.setattr(sam_mod, "foreach_budget", tiny_budget)
+    chunked = float(opt._grad_norm())
+    assert abs(chunked - ref) / ref < 1e-6
+    assert abs(chunked - full) / ref < 1e-6
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_grad_norm_adaptive_peak_is_one_chunk():
+    """ASAM's norm held ``|w|*g`` for EVERY param at once (+1x the weights); with a
+    one-tensor chunk budget the transient must stay around one tensor."""
+    n, k = 1 << 20, 8
+    params = [torch.randn(n, device="cuda").requires_grad_(True) for _ in range(k)]
+    for p in params:
+        p.grad = torch.randn(n, device="cuda")
+    opt = SAM(params, Adakaon, adaptive=True, lr=1e-3, foreach_stack_budget=n)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    opt._grad_norm()
+    torch.cuda.synchronize()
+    extra = torch.cuda.max_memory_allocated() - base
+    assert extra < 2.5 * 4 * n, f"adaptive norm transient {extra / (4 * n):.2f}x one tensor"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_grad_norm_params_on_different_devices():
+    """``torch.stack`` of per-tensor norms living on different devices raised; the norms
+    are brought to one device first."""
+    a = torch.randn(6, 4).requires_grad_(True)
+    b = torch.randn(6, 4, device="cuda").requires_grad_(True)
+    a.grad = torch.randn(6, 4)
+    b.grad = torch.randn(6, 4, device="cuda")
+    opt = SAM([a, b], Adakaon, lr=1e-3, rho=0.05)
+    ref = math.sqrt(float(a.grad.double().pow(2).sum()) + float(b.grad.double().pow(2).sum()))
+    assert abs(float(opt._grad_norm()) - ref) / ref < 1e-6
+    a0, b0 = a.detach().clone(), b.detach().clone()
+    opt.first_step()
+    assert not torch.equal(a.detach(), a0) and not torch.equal(b.detach(), b0)
+
+
+# ------------------------------------------------ 0.7.18 audit: groups / double climb
+def test_groups_without_grads_are_skipped():
+    a = torch.randn(4, 3).requires_grad_(True)
+    b = torch.randn(4, 3).requires_grad_(True)
+    opt = SAM([{"params": [a]}, {"params": [b]}], Adakaon, lr=1e-2, rho=0.05)
+    b0 = b.detach().clone()
+    a.grad = torch.randn(4, 3)
+    opt.first_step()
+    a.grad = torch.randn(4, 3)
+    opt.second_step()
+    assert torch.equal(b.detach(), b0)
+
+
+def test_first_step_without_any_grad_and_empty_first_group():
+    b = torch.randn(3, 3).requires_grad_(True)
+    opt = SAM([{"params": []}, {"params": [b]}], Adakaon, lr=1e-3)
+    b0 = b.detach().clone()
+    opt.first_step()     # no grad anywhere; the first group has no params at all
+    opt.second_step()
+    assert torch.equal(b.detach(), b0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_repeated_first_step_restores_before_climbing(dtype):
+    """An aborted SAM step (``first_step`` with no ``second_step`` — e.g. the perturbed
+    forward was skipped) followed by another ``first_step`` must not snapshot the
+    PERTURBED weights as ``old_p``: that baked the first climb into the weights for good
+    (1.9e-2 max drift in fp32). The second ``first_step`` restores first, so the restore
+    after it lands on the original weights exactly."""
+    g = torch.Generator().manual_seed(3)
+    w = torch.randn(16, 16, generator=g).to(dtype).requires_grad_(True)
+    w0 = w.detach().clone()
+    opt = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    w.grad = torch.randn(16, 16, generator=g).to(dtype)
+    opt.first_step()                  # climb 1, never completed
+    w.grad = torch.randn(16, 16, generator=g).to(dtype)
+    g2 = w.grad.clone()
+    opt.first_step()                  # climb 2 must start from w0
+    if dtype == torch.float32:
+        scale = torch.tensor(0.1 / (float(g2.double().norm()) + 1e-12), dtype=torch.float32)
+        torch.testing.assert_close(w.detach(), w0 + g2 * scale, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(opt.state[w]["old_p"], w0, rtol=0, atol=0)
+    w.grad = None                     # base step is a no-op without a grad
+    opt.second_step()
+    assert torch.equal(w.detach(), w0)
+
+
+def test_pending_climb_survives_a_checkpoint():
+    """A checkpoint taken between first_step and second_step carries old_p; a resumed
+    SAM whose next call is first_step must restore it before climbing again."""
+    import copy
+
+    w = torch.randn(6, 5).requires_grad_(True)
+    w0 = w.detach().clone()
+    opt = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    w.grad = torch.randn(6, 5)
+    opt.first_step()
+    sd = copy.deepcopy(opt.state_dict())
+    opt2 = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    opt2.load_state_dict(sd)
+    w.grad = torch.randn(6, 5)
+    opt2.first_step()
+    torch.testing.assert_close(opt2.state[w]["old_p"], w0, rtol=0, atol=0)
+    w.grad = None
+    opt2.second_step()
+    assert torch.equal(w.detach(), w0)
+
+
+def test_add_param_group_after_construction():
+    a = torch.randn(4, 3).requires_grad_(True)
+    c = torch.randn(5).requires_grad_(True)
+    opt = SAM([a], Adakaon, lr=1e-3, rho=0.07)
+    opt.add_param_group({"params": [c], "lr": 5e-3})
+    assert opt.param_groups[-1]["rho"] == 0.07 and opt.param_groups[-1]["adaptive"] is False
+    assert opt.base_optimizer.param_groups is opt.param_groups
+    c0 = c.detach().clone()
+    for p in (a, c):
+        p.grad = torch.randn_like(p)
+    opt.first_step(zero_grad=True)
+    for p in (a, c):
+        p.grad = torch.randn_like(p)
+    opt.second_step()
+    assert not torch.equal(c.detach(), c0)
+    assert "old_p" not in opt.state[c]
+
+
+@pytest.mark.filterwarnings("ignore:Detected call of `lr_scheduler.step")
+def test_torch_lr_scheduler_drives_the_inner_lr():
+    """A torch LR scheduler built on the SAM wrapper must change the lr the BASE optimizer
+    actually steps with (shared ``param_groups``)."""
+    torch.manual_seed(0)
+    deltas = []
+    w = torch.randn(8, 8).requires_grad_(True)
+    opt = SAM([w], Adakaon, lr=1e-2, rho=0.0, betas=(0.0, 0.999), cautious=False,
+              gradient_centralization=False)
+    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.1)
+    g = torch.randn(8, 8)
+    for _ in range(2):
+        before = w.detach().clone()
+        w.grad = g.clone()
+        opt.first_step()
+        w.grad = g.clone()
+        opt.second_step()
+        sched.step()
+        deltas.append(float((w.detach() - before).abs().max()))
+    assert opt.base_optimizer.param_groups[0]["lr"] == pytest.approx(1e-4)
+    assert deltas[1] < 0.5 * deltas[0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_zero_element_params_climb_and_restore(dtype):
+    """Buckets of zero-element params divided the stack budget by ``numel == 0``."""
+    ps = [torch.randn(s).to(dtype).requires_grad_(True) for s in [(4, 3), (0, 3), (0, 3)]]
+    opt = SAM(ps, Adakaon, lr=1e-3, rho=0.05)
+    w0 = [p.detach().clone() for p in ps]
+    for p in ps:
+        p.grad = torch.randn(p.shape).to(dtype)
+    opt.first_step()
+    for p in ps:
+        p.grad = None
+    opt.second_step()
+    for a, p in zip(w0, ps, strict=True):
+        assert torch.equal(a, p.detach())
+
+
+def test_reload_after_aborted_first_step_keeps_the_reloaded_weights():
+    """An aborted first_step, then the trainer reloads the weights (in place, e.g.
+    ``load_state_dict``): the next first_step must NOT clobber them with the stale
+    pre-climb snapshot."""
+    w = torch.randn(6, 5).requires_grad_(True)
+    opt = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    w.grad = torch.randn(6, 5)
+    opt.first_step()                                   # aborted
+    reloaded = torch.randn(6, 5)
+    with torch.no_grad():
+        w.copy_(reloaded)                              # what load_state_dict does
+    w.grad = torch.randn(6, 5)
+    with pytest.warns(UserWarning, match="modified in place"):
+        opt.first_step()
+    torch.testing.assert_close(opt.state[w]["old_p"], reloaded, rtol=0, atol=0)
+    w.grad = None
+    opt.second_step()
+    assert torch.equal(w.detach(), reloaded)
+
+
+def test_normal_cycle_does_not_warn_about_reloads(recwarn):
+    w = torch.randn(6, 5).requires_grad_(True)
+    opt = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    for _ in range(3):
+        w.grad = torch.randn(6, 5)
+        opt.first_step(zero_grad=True)
+        w.grad = torch.randn(6, 5)
+        opt.second_step()
+    w.grad = torch.randn(6, 5)
+    opt.first_step()
+    w.grad = torch.randn(6, 5)
+    opt.first_step()                                   # aborted + retry, no reload
+    assert not [r for r in recwarn if "modified in place" in str(r.message)]

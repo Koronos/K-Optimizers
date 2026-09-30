@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 
+import pytest
 import torch
 
 from kaon._wrappers import CodecBuffer
@@ -456,3 +457,99 @@ def test_kahan_resume_is_bit_exact():
         for a, b in zip(cont, resumed, strict=True):
             torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0,
                                        msg=f"slow_dtype={slow_dtype}")
+
+
+# ------------------------------------------- 0.7.18 audit: eval-mode checkpoints & more
+def _train(opt, params, grads):
+    for gs in grads:
+        for p, g in zip(params, gs, strict=True):
+            p.grad = g.to(p.dtype)
+        opt.step()
+
+
+def test_state_dict_backup_only_in_eval_mode():
+    """The eval-mode checkpoint carries the fast weights ``theta`` (the ``backup``) — the
+    ONLY copy of them, since the live weights then hold ``phi`` — and a train-mode one
+    does not (the live weights ARE theta)."""
+    params = _make_params([(4, 5), (6,)])
+    opt = Lookahead(params, lr=1e-2, k=3, foreach=False)
+    _train(opt, params, _grad_seq(params, 4))
+    assert all("backup" not in st for st in opt.state_dict()["lookahead"].values())
+    opt.eval()
+    sd = opt.state_dict()
+    assert all("backup" in st for st in sd["lookahead"].values())
+    opt.train()
+    assert all("backup" not in st for st in opt.state.values())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_eval_mode_checkpoint_resumes_exactly(dtype):
+    """Save model + optimizer in eval mode (the documented checkpoint point), resume into
+    fresh objects, ``train()``: the fast weights come back byte-exact and the continued
+    run matches the uninterrupted one bit for bit."""
+    shapes = [(8, 6), (6,)]
+    grads = _grad_seq(_make_params(shapes), 9, seed=3)
+    params = _make_params(shapes, dtype=dtype)
+    opt = Lookahead(params, lr=1e-2, k=3, foreach=False)
+    _train(opt, params, grads[:4])            # mid-cycle: theta != phi
+    opt.eval()
+    model_sd = [p.detach().clone() for p in params]   # what model.state_dict() would hold
+    opt_sd = copy.deepcopy(opt.state_dict())
+    opt.train()
+    _train(opt, params, grads[4:])            # uninterrupted reference
+
+    params2 = [torch.nn.Parameter(w.clone()) for w in model_sd]
+    opt2 = Lookahead(params2, lr=1e-2, k=3, foreach=False)
+    opt2.load_state_dict(opt_sd)
+    with pytest.raises(RuntimeError, match="train mode"):
+        params2[0].grad = grads[4][0].to(dtype)
+        opt2.step()
+    opt2.train()
+    _train(opt2, params2, grads[4:])
+    for a, b in zip(params, params2, strict=True):
+        assert torch.equal(a.detach(), b.detach())
+
+
+def test_groups_without_grads_are_skipped():
+    a, b = _make_params([(4, 4), (4, 4)])
+    opt = Lookahead([{"params": [a]}, {"params": [b]}], lr=1e-2, k=2)
+    b0 = b.detach().clone()
+    for _ in range(4):
+        a.grad = torch.randn(4, 4)
+        opt.step()
+    assert torch.equal(b.detach(), b0)
+    assert "phi" not in opt.state.get(b, {})
+
+
+def test_add_param_group_after_construction():
+    a, c = _make_params([(4, 4), (5,)])
+    opt = Lookahead([a], lr=1e-2, k=2, alpha=0.3)
+    opt.add_param_group({"params": [c]})
+    g = opt.param_groups[-1]
+    assert (g["k"], g["alpha"], g["la_step"], g["train_mode"]) == (2, 0.3, 0, True)
+    assert opt.inner.param_groups is opt.param_groups
+    c0 = c.detach().clone()
+    for _ in range(2):
+        for p in (a, c):
+            p.grad = torch.randn_like(p)
+        opt.step()
+    assert "phi" in opt.state[c]
+    assert not torch.equal(c.detach(), c0)
+
+
+def test_torch_lr_scheduler_drives_the_inner_lr():
+    torch.manual_seed(0)
+    (w,) = _make_params([(8, 8)])
+    opt = Lookahead([w], lr=1e-2, k=100, betas=(0.0, 0.999), cautious=False,
+                    gradient_centralization=False)
+    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.1)
+    g = torch.randn(8, 8)
+    deltas = []
+    for _ in range(2):
+        before = w.detach().clone()
+        w.grad = g.clone()
+        opt.step()
+        sched.step()
+        deltas.append(float((w.detach() - before).abs().max()))
+    assert opt.inner.param_groups[0]["lr"] == pytest.approx(1e-4)
+    assert deltas[1] < 0.5 * deltas[0]

@@ -61,6 +61,7 @@ not retained.)
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -152,27 +153,50 @@ class SAM(WrapsInnerOptimizer, Optimizer):
     def _grad_norm(self) -> Tensor:
         """Global L2 norm of the gradient over all params, ``sqrt(sum_i ||g_i||^2)``.
 
-        Batched via ``torch._foreach_norm``; per-tensor norms are stacked and reduced
-        in **fp32** (a bf16 norm stack would change the global value). The returned
-        ``scale = rho / (norm + eps)`` is therefore fp32 even when weights/grads are
-        bf16 — slightly more accurate than the pre-0.7.12 per-param bf16 accumulation.
-        With ``adaptive=True`` each gradient is scaled by ``|w|`` first (ASAM).
+        Batched via ``torch._foreach_norm(..., dtype=torch.float32)``: every per-tensor
+        norm is ACCUMULATED and returned in fp32 even for bf16 grads (without the
+        ``dtype`` the per-tensor norms came back as bf16 scalars — 8 mantissa bits, up to
+        ~2e-3 relative error — before any ``.float()`` could help), then stacked on one
+        device and reduced in fp32. The returned norm, and so ``scale = rho / (norm +
+        eps)``, is fp32 whatever the weight/grad dtype. With ``adaptive=True`` each
+        gradient is scaled by ``|w|`` first (ASAM); that product is materialized one
+        stack-budget chunk at a time, never for every param at once (+1x the weights).
+        Params may live on different devices: the per-tensor norms are moved to the
+        first one's device before the final reduction.
         """
         norms: list[Tensor] = []
+        plain: list[Tensor] = []
         for group in self.param_groups:
-            adaptive = group["adaptive"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g = p.grad
-                if adaptive:
-                    g = p.abs() * g
-                norms.append(g)
+            with_grad = [p for p in group["params"] if p.grad is not None]
+            if not with_grad:
+                continue
+            if not group["adaptive"]:
+                plain.extend(p.grad for p in with_grad)
+                continue
+            budget = self._chunk_budget(with_grad)
+            chunk: list[Tensor] = []
+            size = 0
+            for p in with_grad:
+                if chunk and size + p.numel() > budget:
+                    norms.extend(self._adaptive_norms(chunk))
+                    chunk, size = [], 0
+                chunk.append(p)
+                size += p.numel()
+            norms.extend(self._adaptive_norms(chunk))
+        if plain:
+            norms = list(torch._foreach_norm(plain, 2, dtype=torch.float32)) + norms  # type: ignore[attr-defined]
         if not norms:
-            dev = self.param_groups[0]["params"][0].device
-            return torch.zeros((), device=dev)
-        per = torch._foreach_norm(norms)  # type: ignore[attr-defined]
-        return torch.linalg.vector_norm(torch.stack(per).float())
+            # No grad anywhere: nothing will climb, so the device is immaterial (and the
+            # first group's param list may itself be empty).
+            return torch.zeros(())
+        dev = norms[0].device
+        return torch.linalg.vector_norm(torch.stack([n.to(dev) for n in norms]))
+
+    @staticmethod
+    def _adaptive_norms(chunk: list[Tensor]) -> list[Tensor]:
+        """fp32 per-tensor norms of ASAM's ``|w| * g`` for one bounded chunk."""
+        return list(torch._foreach_norm([p.abs() * p.grad for p in chunk], 2,  # type: ignore[attr-defined]
+                                        dtype=torch.float32))
 
     @staticmethod
     def _bucket_params(params: list[Tensor]) -> dict[tuple[Any, ...], list[Tensor]]:
@@ -197,20 +221,56 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         scale: Tensor,
         adaptive: bool,
     ) -> None:
-        weights = torch.stack([p.data for p in plist])
-        old_stack = weights.clone()
-        grads = torch.stack([p.grad for p in plist])
-        if adaptive:
-            e_w = grads * scale.to(weights.device) * (weights * weights)
+        """Climb one same-(shape, dtype, device) chunk: ``w += e`` and snapshot ``old_p``.
+
+        Every route computes ``e = (g * scale) [* (w * w)]`` with the same ops in the same
+        order and writes it with the same primitive, so all three are bit-identical to the
+        historical stack -> clone -> add -> copy-back (including the stochastic-rounding
+        stream: the torch SR draw depends only on the element count and logical order).
+        What differs is the transient: the historical route held a weight stack, its
+        clone, a grad stack and ``e`` (~4-5x the chunk) and paid a copy-back.
+
+        * fp32 weights + fp32 grads: no stack at all — ``_foreach`` ops in place on the
+          live weights; only the ``old_p`` snapshot and ``e`` are allocated.
+        * a single contiguous low-precision weight (a unique shape, or one above the stack
+          budget — e.g. a 3072x3072 DiT MLP): stacking one tensor is pure overhead, so it
+          climbs in place.
+        * otherwise (bf16 buckets of N >= 2) one stacked SR write, with ``e`` computed in
+          place in the grad stack.
+        """
+        s = scale.to(plist[0].device)
+        pdata = [p.data for p in plist]
+        grads = [p.grad for p in plist]
+        if plist[0].dtype == torch.float32 and all(g.dtype == torch.float32 for g in grads):
+            olds = [pdata[0].clone()] if len(pdata) == 1 else list(torch.stack(pdata).unbind(0))
+            e = torch._foreach_mul(grads, s)  # type: ignore[attr-defined]
+            if adaptive:
+                torch._foreach_mul_(e, torch._foreach_mul(pdata, pdata))  # type: ignore[attr-defined]
+            torch._foreach_add_(pdata, e)  # type: ignore[attr-defined]
+        elif len(pdata) == 1 and pdata[0].is_contiguous():
+            w = pdata[0]
+            olds = [w.clone()]
+            e1 = grads[0] * s
+            if adaptive:
+                e1 = e1 * (w * w)
+            add_stochastic_(w, e1, alpha=1.0, sr=self.sr_stream)
         else:
-            e_w = grads * scale.to(weights.device)
-        if weights.dtype == torch.float32:
-            weights.add_(e_w)
-        else:
+            weights = torch.stack(pdata)
+            olds = list(weights.clone().unbind(0))
+            e_w = torch.stack(grads).mul_(s)
+            if adaptive:
+                ww = weights * weights
+                # in place only when it cannot narrow (bf16 grads on fp32 weights promote)
+                e_w = e_w.mul_(ww) if e_w.dtype == ww.dtype else e_w * ww
             add_stochastic_(weights, e_w, alpha=1.0, sr=self.sr_stream)
-        for p, old in zip(plist, old_stack.unbind(0), strict=True):
+            torch._foreach_copy_(pdata, list(weights.unbind(0)))  # type: ignore[attr-defined]
+        versions = self._climb_versions
+        for p, old in zip(plist, olds, strict=True):
             self.state[p]["old_p"] = old
-        torch._foreach_copy_([p.data for p in plist], list(weights.unbind(0)))  # type: ignore[attr-defined]
+            # The climb writes through ``p.data``, which does not bump ``p._version``; any
+            # later in-place write to ``p`` itself (``load_state_dict``, ``p.copy_`` under
+            # no_grad) does — see _restore_climb.
+            versions[p] = p._version
 
     # ------------------------------------------------------------------ pass 1
     @torch.no_grad()
@@ -220,7 +280,26 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         Requires ``p.grad`` already populated (the loop did the first backward). For each
         param: ``e = scale * (w^2 if adaptive else 1) * g`` with
         ``scale = rho / (global_grad_norm + eps)``; the climb ``w += e`` is bf16-correct.
+
+        A previous ``first_step`` whose ``second_step`` never ran (an aborted step: the
+        perturbed forward was skipped, raised, or produced a non-finite loss) is undone
+        FIRST — its ``old_p`` snapshot is copied back — so this climb starts from, and
+        snapshots, the true weights. Without that the new ``old_p`` was the perturbed
+        weight and the first climb stayed in the model for good (measured 1.9e-2 max
+        drift in fp32). Restoring rather than raising keeps the "skip this batch and
+        carry on" loop pattern working; the true weights can never be lost.
+
+        **Reloading weights in between.** If the trainer reloads the model weights after
+        an aborted ``first_step`` (``model.load_state_dict``, a rollback, ``p.copy_``),
+        the pending ``old_p`` is stale. That is detected per param, for free, through
+        ``p._version`` (bumped by any in-place write to ``p`` — the climb itself writes
+        through ``p.data`` and does not bump it): such a param keeps the reloaded weights,
+        its stale snapshot is dropped, and a warning says so. A reload that writes through
+        ``p.data`` directly bypasses the version counter and is NOT detected — in that case
+        call :meth:`second_step` (or :meth:`zero_grad` + ``opt.state.clear()``) before
+        reloading, so no snapshot is pending.
         """
+        self._restore_climb()
         grad_norm = self._grad_norm()
         for group in self.param_groups:
             adaptive = group["adaptive"]
@@ -228,9 +307,11 @@ class SAM(WrapsInnerOptimizer, Optimizer):
             with_grad = [p for p in group["params"] if p.grad is not None]
             for plist in self._bucket_params(with_grad).values():
                 budget = self._chunk_budget(plist)
-                n_per = max(1, budget // max(p.numel() for p in plist))
+                # max(1, ...): a bucket of zero-element params would divide by zero
+                n_per = max(1, budget // max(1, max(p.numel() for p in plist)))
                 for i in range(0, len(plist), n_per):
                     self._climb_chunk(plist[i:i + n_per], scale=scale, adaptive=adaptive)
+        self._climbed = True
         if zero_grad:
             self.zero_grad()
 
@@ -244,14 +325,52 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         ``w``. The restore is an exact ``copy_`` of the pre-climb snapshot, so no climb
         rounding leaks into the final weights.
         """
-        for group in self.param_groups:
-            for p in group["params"]:
-                old_p = self.state[p].pop("old_p", None)
-                if old_p is not None:
-                    p.data.copy_(old_p)
+        self._restore_climb(force=True)
         self.base_optimizer.step()
         if zero_grad:
             self.zero_grad()
+
+    @torch.no_grad()
+    def _restore_climb(self, force: bool = False) -> None:
+        """Copy every pending ``old_p`` snapshot back into its weight (exact) and drop it.
+
+        ``first_step`` only walks the params when a climb is known to be pending (the
+        flag, which ``load_state_dict`` re-derives from the restored state), so the
+        normal ``first_step``/``second_step`` cycle pays nothing extra; ``second_step``
+        always walks them, as it always has."""
+        if not (force or getattr(self, "_climbed", False)):
+            return
+        state = self.state
+        versions = self._climb_versions
+        stale = 0
+        for group in self.param_groups:
+            for p in group["params"]:
+                st = state.get(p)
+                old_p = st.pop("old_p", None) if st else None
+                v = versions.pop(p, None)
+                if old_p is None:
+                    continue
+                if v is not None and p._version != v:
+                    stale += 1           # p was rewritten in place since the climb: keep it
+                    continue
+                p.data.copy_(old_p)
+        self._climbed = False
+        if stale:
+            warnings.warn(
+                f"SAM: {stale} parameter(s) were modified in place (e.g. reloaded) after "
+                "first_step and before the climb was undone; they keep their current values "
+                "and the stale pre-climb snapshot is discarded.",
+                stacklevel=3,
+            )
+
+    @property
+    def _climb_versions(self) -> dict[Tensor, int]:
+        """``p._version`` right after each param's climb (see _restore_climb). Not
+        checkpointed: after a resume a pending snapshot is restored unconditionally."""
+        d = self.__dict__.get("_climb_versions_d")
+        if d is None:
+            d = self.__dict__["_climb_versions_d"] = {}
+        return d
 
     # ------------------------------------------------------------------ combined
     @torch.no_grad()
@@ -289,6 +408,9 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         """
         self._load_wrapped(state_dict, lambda inner, sd: inner.load_state_dict(sd))
         self.base_optimizer = self.inner
+        # A checkpoint taken between first_step and second_step carries old_p snapshots.
+        self._climbed = any("old_p" in st for st in self.state.values())
+        self._climb_versions.clear()   # versions of a pre-load climb say nothing now
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)

@@ -29,8 +29,9 @@ commodity GPUs, where optimizer state is precious and weights are bf16.
   `torch.compile`, AdaMuon-only). → [docs/adamuon.md](docs/adamuon.md)
 - **`Lion`** — **Lion's sign-momentum** (one buffer, no second moment) on
   Adakaon's backend (codec, stochastic-rounding bf16, cautious, foreach). Lightest
-  state in the family — **~1 B (int8) / 0.5 B (4bit) per param** — with Lion's implicit
-  regularization. `betas` are a loss↔generalization dial. → [docs/lion.md](docs/lion.md)
+  state in the family — **~1 B/param with `int8` momentum** (the recommended cheap option;
+  `4bit` saves another 0.5 B/param but flips update signs and measured ~32× worse final loss
+  on Lion) — with Lion's implicit regularization. `betas` are a loss↔generalization dial. → [docs/lion.md](docs/lion.md)
 - **`AdaPNM`** — **Adam + Positive-Negative Momentum** (Xie et al. 2021) on the kaon
   backend. PNM's negative-momentum term injects anti-correlated noise — a built-in
   *implicit regularizer* (flat-minima seeking) **without** SAM's extra forward/backward.
@@ -95,7 +96,9 @@ from kaon import Lion
 
 # Lion sign-momentum, lightest state (no second moment). lr is Lion-scale (~AdamW/5).
 # betas are a loss<->generalization dial: (0.95,0.98) for loss, higher beta2 for less overfit.
-opt = Lion(model.parameters(), lr=2e-4, betas=(0.95, 0.98), momentum_dtype="4bit")
+# int8 momentum (~1 B/param) is near loss-equivalent to bf16; avoid "4bit" on Lion (sign
+# flips, ~32x worse final loss measured — see docs/lion.md).
+opt = Lion(model.parameters(), lr=2e-4, betas=(0.95, 0.98), momentum_dtype="int8")
 ```
 
 ```python
@@ -120,8 +123,9 @@ from kaon import AdaPNM, Lion, Adakaon
 # Best generalization; the only one happy on a constant (resumable) LR:
 AdaPNM(model.parameters(), lr=2e-3, betas=(0.8, 0.999), beta0=0.5)
 
-# Lightest state (no 2nd moment), regularizing sign-momentum — ~0.5 B/param:
-Lion(model.parameters(), lr=2e-4, betas=(0.95, 0.98), momentum_dtype="4bit")
+# Lightest state (no 2nd moment), regularizing sign-momentum — ~1 B/param (int8; "4bit"
+# is not recommended on Lion, see docs/lion.md):
+Lion(model.parameters(), lr=2e-4, betas=(0.95, 0.98), momentum_dtype="int8")
 
 # Minimum VRAM, regularizing (no momentum) — near-zero optimizer state:
 Adakaon(model.parameters(), lr=1e-4, betas=(0.0, 0.999), bf16_method="stochastic_rounding")

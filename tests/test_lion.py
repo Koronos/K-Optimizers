@@ -649,3 +649,158 @@ def test_transposed_2d_weight_actually_gets_its_update():
     )
     for p, r in zip(params, ref, strict=True):
         torch.testing.assert_close(p.detach(), r.detach(), rtol=0, atol=0)
+
+
+# ------------------------------------------------ 0.7.18 audit: empty group / cautious_wd
+@pytest.mark.parametrize("foreach", [True, False])
+def test_group_without_any_grad_is_skipped(foreach):
+    """A param group where NO param has a grad this step (frozen block, gradient release,
+    a second group that did not participate) must be skipped, not crash: the foreach path
+    read ``params[0].device`` off an empty list (IndexError)."""
+    a = torch.nn.Parameter(torch.randn(4, 4))
+    b = torch.nn.Parameter(torch.randn(4, 4))
+    b0 = b.detach().clone()
+    opt = Lion([{"params": [a]}, {"params": [b]}], lr=1e-3, foreach=foreach)
+    a0 = a.detach().clone()
+    a.grad = torch.randn(4, 4)
+    opt.step()
+    assert not torch.equal(a.detach(), a0)
+    assert torch.equal(b.detach(), b0)
+    assert b not in opt.state or not opt.state[b]
+
+
+def _ref_lion_full_wd(p, g, m, lr, beta1, beta2, wd):
+    """numpy Lion with ``cautious_wd="full"``: the mask filters only the sign update;
+    ``lr*wd*p`` is applied to every coordinate outside it (Adakaon's "full")."""
+    c = beta1 * m + (1.0 - beta1) * g
+    update = np.sign(c)
+    new_m = beta2 * m + (1.0 - beta2) * g
+    mask = (update * g > 0).astype(update.dtype)
+    update = update * mask / max(mask.mean(), 1e-8)
+    return p - lr * (update + wd * p), new_m
+
+
+def test_cautious_wd_full_matches_numpy_reference():
+    lr, b1, b2, wd = 0.01, 0.9, 0.99, 0.1
+    p = torch.nn.Parameter(torch.randn(16, 7, dtype=torch.float64).float())
+    opt = Lion([p], lr=lr, betas=(b1, b2), weight_decay=wd, momentum_dtype="float32",
+               cautious=True, cautious_wd="full", foreach=False,
+               gradient_centralization=False)
+    pr = p.detach().numpy().copy().astype(np.float64)
+    mr = np.zeros_like(pr)
+    gg = torch.Generator().manual_seed(3)
+    for _ in range(12):
+        g = torch.randn(16, 7, generator=gg)
+        p.grad = g.clone()
+        opt.step()
+        pr, mr = _ref_lion_full_wd(pr, g.numpy().astype(np.float64), mr, lr, b1, b2, wd)
+    torch.testing.assert_close(p.detach().double(), torch.from_numpy(pr), rtol=1e-5, atol=1e-6)
+
+
+def test_cautious_wd_full_decays_every_coordinate():
+    """Under "full" a coordinate the mask rejects still gets exactly ``lr*wd*p``; under
+    "masked" (default, historical) it gets none."""
+    lr, wd = 0.01, 0.5
+    p0 = torch.tensor([[1.0, 2.0, -3.0, 4.0]])
+    g = torch.tensor([[1.0, -1.0, 1.0, -1.0]])
+    m = torch.tensor([[-5.0, -5.0, -5.0, -5.0]])  # c = sign(0.9*m + 0.1*g) = -1 everywhere
+
+    def run(mode):
+        p = torch.nn.Parameter(p0.clone())
+        opt = Lion([p], lr=lr, betas=(0.9, 0.99), weight_decay=wd, momentum_dtype="float32",
+                   cautious=True, cautious_wd=mode, foreach=False,
+                   gradient_centralization=False)
+        p.grad = g.clone()
+        opt.step()                       # allocate state
+        with torch.no_grad():
+            p.copy_(p0)
+            opt.state[p]["m"].copy_(m)
+        p.grad = g.clone()
+        opt.step()
+        return p.detach()
+
+    full = run("full")
+    masked = run("masked")
+    # sign update = -1; agrees with g (-1) only on coords 1 and 3 -> keep = 0.5
+    # "full": rejected coords 0, 2 move by -lr*wd*p exactly
+    torch.testing.assert_close(full[0, [0, 2]], p0[0, [0, 2]] * (1 - lr * wd))
+    # "masked": delta = -1 + wd*p; coord 0: -1+0.5 = -0.5 disagrees with g=+1 -> untouched
+    assert masked[0, 0] == p0[0, 0]
+
+
+@pytest.mark.parametrize("cautious", [False, True])
+@pytest.mark.parametrize("cautious_wd", ["masked", "full"])
+@pytest.mark.parametrize("momentum_dtype", ["float32", "int8"])
+def test_cautious_wd_foreach_matches_per_param(cautious, cautious_wd, momentum_dtype):
+    cfg = dict(lr=1e-3, betas=(0.9, 0.99), momentum_dtype=momentum_dtype,
+               weight_decay=0.05, cautious=cautious, cautious_wd=cautious_wd)
+    pa = _parity_params()
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
+    oa = Lion(pa, foreach=True, **cfg)
+    ob = Lion(pb, foreach=False, **cfg)
+    gg = torch.Generator().manual_seed(7)
+    for _ in range(6):
+        for a, b in zip(pa, pb, strict=True):
+            grad = torch.randn(*a.shape, generator=gg) * 0.02
+            a.grad, b.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+    for a, b in zip(pa, pb, strict=True):
+        torch.testing.assert_close(a.detach(), b.detach(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("foreach", [True, False])
+def test_cautious_wd_modes_coincide_without_cautious(foreach):
+    """With ``cautious=False`` the mask is a no-op, so the two placements are the same add."""
+    out = []
+    for mode in ("masked", "full"):
+        ps = _parity_params()
+        opt = Lion(ps, lr=1e-3, weight_decay=0.05, cautious=False, cautious_wd=mode,
+                   foreach=foreach)
+        gg = torch.Generator().manual_seed(7)
+        for _ in range(4):
+            for p in ps:
+                p.grad = torch.randn(*p.shape, generator=gg) * 0.02
+            opt.step()
+        out.append([p.detach().clone() for p in ps])
+    for a, b in zip(*out, strict=True):
+        assert torch.equal(a, b)
+
+
+def test_cautious_wd_default_is_masked_and_validated():
+    p = torch.nn.Parameter(torch.randn(3))
+    assert Lion([p]).defaults["cautious_wd"] == "masked"
+    with pytest.raises(ValueError, match="cautious_wd"):
+        Lion([p], cautious_wd="bogus")
+
+
+def test_cautious_wd_backfilled_on_old_checkpoint():
+    p = torch.nn.Parameter(torch.randn(4, 4))
+    opt = Lion([p], lr=1e-3)
+    p.grad = torch.randn(4, 4)
+    opt.step()
+    sd = opt.state_dict()
+    for g in sd["param_groups"]:
+        g.pop("cautious_wd")
+    opt2 = Lion([p], lr=1e-3)
+    opt2.load_state_dict(sd)
+    assert opt2.param_groups[0]["cautious_wd"] == "masked"
+    p.grad = torch.randn(4, 4)
+    opt2.step()
+
+
+@pytest.mark.parametrize("cautious_wd", ["masked", "full"])
+@pytest.mark.parametrize("foreach", [True, False])
+def test_kahan16_with_weight_decay_is_bit_exact_to_an_fp32_master(foreach, cautious_wd):
+    """Decoupled WD reads the weight's full VALUE (decoded under kahan8/kahan16), as in
+    Adakaon: reading the bare bf16 ``p`` rounded it to the bf16 grid inside the update and
+    split a kahan16 run from its fp32 twin as soon as ``weight_decay > 0``."""
+    from .test_kahan16 import _assert_fp32_master, _bag, _drive
+
+    p32, p16 = _bag(torch.float32), _bag()
+    kw = dict(lr=1e-3, weight_decay=0.1, foreach=foreach, gradient_centralization=False,
+              momentum_dtype="float32", cautious_wd=cautious_wd)
+    o32 = Lion(p32, **kw)
+    o16 = Lion(p16, bf16_method="kahan16", **kw)
+    _drive([o32, o16], [p32, p16])
+    _assert_fp32_master(p16, o16, p32)
