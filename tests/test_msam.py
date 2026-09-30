@@ -448,3 +448,18 @@ def test_plan_witness_beats_genexpr_on_the_clock():
         f"the plan witness costs {shipped * 1e6:.1f} us per call vs {ref * 1e6:.1f} us for "
         "a plain generator expression — the C-level map scan has been lost"
     )
+
+
+# ------------------------------------------------ 0.7.18 audit: global norm edge case
+def test_global_zero_momentum_with_zero_eps_is_a_noop():
+    """A zero global momentum norm with ``eps=0`` must not climb (no 0/0 into the weights)."""
+    params = _params()
+    w0 = [p.detach().clone() for p in params]
+    opt = MSAM(params, Adakaon, rho=0.3, norm="global", eps=0.0, lr=1e-2,
+               weight_decay=0.0)
+    for p in params:
+        p.grad = torch.zeros_like(p)
+    opt.step()
+    for a, p in zip(w0, params):
+        assert torch.isfinite(p).all()
+        torch.testing.assert_close(p.detach(), a, rtol=0, atol=0)
