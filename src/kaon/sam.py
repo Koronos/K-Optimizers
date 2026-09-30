@@ -298,19 +298,38 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         ``p.data`` directly bypasses the version counter and is NOT detected — in that case
         call :meth:`second_step` (or :meth:`zero_grad` + ``opt.state.clear()``) before
         reloading, so no snapshot is pending.
+
+        **No gradient at all.** If no parameter has a ``.grad`` (``step(closure)`` called
+        without the first ``loss.backward()``, or after a ``zero_grad(set_to_none=True)``),
+        there is nothing to climb along: the step silently degrades to the base optimizer
+        at ``w``. That is warned about ONCE per optimizer (a ``RuntimeWarning``), since it is
+        almost always a loop bug rather than intent.
         """
         self._restore_climb()
         grad_norm = self._grad_norm()
+        any_grad = False
         for group in self.param_groups:
             adaptive = group["adaptive"]
             scale = group["rho"] / (grad_norm + self.eps)
             with_grad = [p for p in group["params"] if p.grad is not None]
+            any_grad = any_grad or bool(with_grad)
             for plist in self._bucket_params(with_grad).values():
                 budget = self._chunk_budget(plist)
                 # max(1, ...): a bucket of zero-element params would divide by zero
                 n_per = max(1, budget // max(1, max(p.numel() for p in plist)))
                 for i in range(0, len(plist), n_per):
                     self._climb_chunk(plist[i:i + n_per], scale=scale, adaptive=adaptive)
+        if not any_grad and not getattr(self, "_warned_no_grad", False):
+            self._warned_no_grad = True
+            warnings.warn(
+                "SAM.first_step: no parameter has a .grad, so there is no ascent direction and "
+                "the weights are NOT perturbed (the step reduces to the base optimizer at w). "
+                "SAM needs the first-pass gradient BEFORE first_step()/step(closure): call "
+                "loss.backward() first; the closure only recomputes the perturbed pass. "
+                "(Warned once per optimizer.)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self._climbed = True
         if zero_grad:
             self.zero_grad()

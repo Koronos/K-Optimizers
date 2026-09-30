@@ -371,9 +371,40 @@ def test_first_step_without_any_grad_and_empty_first_group():
     b = torch.randn(3, 3).requires_grad_(True)
     opt = SAM([{"params": []}, {"params": [b]}], Adakaon, lr=1e-3)
     b0 = b.detach().clone()
-    opt.first_step()     # no grad anywhere; the first group has no params at all
+    with pytest.warns(RuntimeWarning, match="no parameter has a .grad"):
+        opt.first_step()     # no grad anywhere; the first group has no params at all
     opt.second_step()
     assert torch.equal(b.detach(), b0)
+
+
+def test_step_closure_without_first_backward_warns_once(recwarn):
+    """``step(closure)`` needs the first-pass gradient already on the params; without the
+    first ``loss.backward()`` the climb had nothing to follow and SAM silently degraded to
+    its base optimizer. It now says so, once per optimizer — and a normal cycle is silent."""
+    w = torch.randn(6, 5).requires_grad_(True)
+    x = torch.randn(8, 6)
+    opt = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+
+    def closure():
+        loss = (x @ w).square().mean()
+        loss.backward()
+        return loss
+
+    for _ in range(3):
+        opt.zero_grad(set_to_none=True)
+        opt.step(closure)                              # BUG in the loop: no first backward
+    hits = [r for r in recwarn if issubclass(r.category, RuntimeWarning)
+            and "no parameter has a .grad" in str(r.message)]
+    assert len(hits) == 1, [str(r.message) for r in recwarn]
+    assert "loss.backward()" in str(hits[0].message)
+
+    recwarn.clear()
+    fresh = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    for _ in range(3):
+        fresh.zero_grad(set_to_none=True)
+        closure()                                      # the first backward, as documented
+        fresh.step(closure)
+    assert not [r for r in recwarn if "no parameter has a .grad" in str(r.message)]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
