@@ -2326,3 +2326,27 @@ def test_grad_pointer_refresh_tracks_every_step():
         # with the pre-0.7.18 refresh); a stale pointer reads NaN/garbage (poisoned buffers).
         assert torch.allclose(a, b, atol=5e-5), "a fused route read a stale grad pointer"
 
+
+def test_in_place_views_write_refuses_duplicate_or_overlapping_views():
+    """The same param twice in a bucket (or overlapping views of one storage) would make the
+    in-place write a race between programs; those buckets keep the stacked path (where the
+    last copy-back wins, as before). Disjoint views of ONE storage are fine."""
+    import kaon._fused_triton as ft
+    from kaon import _backend as bk
+    x = torch.randn(128, device=DEV).bfloat16()
+    d2 = torch.randn(2, 64, device=DEV)
+    assert ft.sr_add_views_supported([x[:64], x[64:]], d2)
+    assert not ft.sr_add_views_supported([x[:64], x[:64]], d2)
+    assert not ft.sr_add_views_supported([x[:64], x[32:96]], d2)
+    lo = torch.zeros(128, device=DEV, dtype=torch.uint8)
+    assert not ft.ck_add_views_supported([x[:64], x[64:]], [lo[:64], lo[:64]], d2, 8)
+    # end to end: a duplicated view goes through the stack, so every element of the param
+    # is one of the two stacked rows (the copy-back of two rows into one param has no
+    # defined order — the pre-0.7.18 behaviour, kept), never a torn in-place mixture
+    from kaon._stochastic_rounding import SRStream
+    p = torch.randn(64, device=DEV).bfloat16()
+    stack = torch.stack([p, p])
+    ft.sr_add_(stack, d2, -1e-2, SRStream(3))
+    bk.subtract_batched_([p, p], d2, "stochastic_rounding", alpha=1e-2, sr=SRStream(3))
+    torch.cuda.synchronize()
+    assert ((p == stack[0]) | (p == stack[1])).all()

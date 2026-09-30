@@ -3056,13 +3056,33 @@ def _view_ptr_array(tensors, device) -> torch.Tensor:
     return arr
 
 
+_VIEW_DISJOINT: dict[tuple, bool] = {}
+
+
+def _views_disjoint(views) -> bool:
+    """No two views share a byte. The same parameter listed twice in a group (or two params
+    that are overlapping views of one storage) would make the in-place write a RACE between
+    programs; the stacked path it replaces let the last copy-back win. Such a bucket keeps the
+    stacked path. Memoized by the address tuple (content-addressed like the pointer arrays),
+    so the steady state pays one dict hit."""
+    key = tuple(map(_DATA_PTR, views))
+    ok = _VIEW_DISJOINT.get(key)
+    if ok is None:
+        if len(_VIEW_DISJOINT) >= _VIEW_PTRS_MAX:
+            _VIEW_DISJOINT.clear()
+        spans = sorted((p, p + v.numel() * v.element_size()) for p, v in zip(key, views, strict=True))
+        ok = _VIEW_DISJOINT[key] = all(a[1] <= b[0] for a, b in zip(spans, spans[1:], strict=False))
+    return ok
+
+
 def _views_ok(views, source, want) -> bool:
     """``views`` are N bf16 CUDA tensors laid out contiguously, each ``source[i]``'s size,
-    all on ``source``'s device, with residual dtype ``want`` (``None``: the weights)."""
+    all on ``source``'s device, with residual dtype ``want`` (``None``: the weights), and no
+    two of them overlap (:func:`_views_disjoint`)."""
     n = source[0].numel() if source.dim() else 0
     dev = source.device
     return all(v.dtype == want and v.is_contiguous() and v.numel() == n and v.device == dev
-               for v in views)
+               for v in views) and _views_disjoint(views)
 
 
 def sr_add_views_supported(views, source) -> bool:
