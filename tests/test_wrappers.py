@@ -128,14 +128,7 @@ def test_empty_buffer_stacked_roundtrip(dtype, shape):
     assert CodecBuffer.read_stacked(states, "b", dtype, shape).shape == (3, *shape)
 
 
-@pytest.mark.parametrize("shape", [
-    (0, 5),
-    # (5, 0) first dies in ScheduleFree's own z allocation (``_momentum_codec._quant_int8``
-    # on an empty tensor), outside kaon._wrappers; passes once that is fixed too.
-    pytest.param((5, 0), marks=pytest.mark.xfail(
-        raises=IndexError, strict=False,
-        reason="ScheduleFree._alloc_full -> _quant_int8 on a zero-element tensor")),
-])
+@pytest.mark.parametrize("shape", [(0, 5), (5, 0)])
 def test_schedulefree_int8_foreach_with_an_empty_param(shape):
     """ScheduleFree foreach + int8 ``z`` with a zero-element param next to a normal one."""
     from kaon import ScheduleFree
