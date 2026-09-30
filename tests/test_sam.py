@@ -477,3 +477,38 @@ def test_zero_element_params_climb_and_restore(dtype):
     opt.second_step()
     for a, p in zip(w0, ps, strict=True):
         assert torch.equal(a, p.detach())
+
+
+def test_reload_after_aborted_first_step_keeps_the_reloaded_weights():
+    """An aborted first_step, then the trainer reloads the weights (in place, e.g.
+    ``load_state_dict``): the next first_step must NOT clobber them with the stale
+    pre-climb snapshot."""
+    w = torch.randn(6, 5).requires_grad_(True)
+    opt = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    w.grad = torch.randn(6, 5)
+    opt.first_step()                                   # aborted
+    reloaded = torch.randn(6, 5)
+    with torch.no_grad():
+        w.copy_(reloaded)                              # what load_state_dict does
+    w.grad = torch.randn(6, 5)
+    with pytest.warns(UserWarning, match="modified in place"):
+        opt.first_step()
+    torch.testing.assert_close(opt.state[w]["old_p"], reloaded, rtol=0, atol=0)
+    w.grad = None
+    opt.second_step()
+    assert torch.equal(w.detach(), reloaded)
+
+
+def test_normal_cycle_does_not_warn_about_reloads(recwarn):
+    w = torch.randn(6, 5).requires_grad_(True)
+    opt = SAM([w], Adakaon, lr=1e-3, rho=0.1)
+    for _ in range(3):
+        w.grad = torch.randn(6, 5)
+        opt.first_step(zero_grad=True)
+        w.grad = torch.randn(6, 5)
+        opt.second_step()
+    w.grad = torch.randn(6, 5)
+    opt.first_step()
+    w.grad = torch.randn(6, 5)
+    opt.first_step()                                   # aborted + retry, no reload
+    assert not [r for r in recwarn if "modified in place" in str(r.message)]

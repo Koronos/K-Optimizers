@@ -61,6 +61,7 @@ not retained.)
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -263,8 +264,13 @@ class SAM(WrapsInnerOptimizer, Optimizer):
                 e_w = e_w.mul_(ww) if e_w.dtype == ww.dtype else e_w * ww
             add_stochastic_(weights, e_w, alpha=1.0, sr=self.sr_stream)
             torch._foreach_copy_(pdata, list(weights.unbind(0)))  # type: ignore[attr-defined]
+        versions = self._climb_versions
         for p, old in zip(plist, olds, strict=True):
             self.state[p]["old_p"] = old
+            # The climb writes through ``p.data``, which does not bump ``p._version``; any
+            # later in-place write to ``p`` itself (``load_state_dict``, ``p.copy_`` under
+            # no_grad) does — see _restore_climb.
+            versions[p] = p._version
 
     # ------------------------------------------------------------------ pass 1
     @torch.no_grad()
@@ -282,6 +288,16 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         weight and the first climb stayed in the model for good (measured 1.9e-2 max
         drift in fp32). Restoring rather than raising keeps the "skip this batch and
         carry on" loop pattern working; the true weights can never be lost.
+
+        **Reloading weights in between.** If the trainer reloads the model weights after
+        an aborted ``first_step`` (``model.load_state_dict``, a rollback, ``p.copy_``),
+        the pending ``old_p`` is stale. That is detected per param, for free, through
+        ``p._version`` (bumped by any in-place write to ``p`` — the climb itself writes
+        through ``p.data`` and does not bump it): such a param keeps the reloaded weights,
+        its stale snapshot is dropped, and a warning says so. A reload that writes through
+        ``p.data`` directly bypasses the version counter and is NOT detected — in that case
+        call :meth:`second_step` (or :meth:`zero_grad` + ``opt.state.clear()``) before
+        reloading, so no snapshot is pending.
         """
         self._restore_climb()
         grad_norm = self._grad_norm()
@@ -325,13 +341,36 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         if not (force or getattr(self, "_climbed", False)):
             return
         state = self.state
+        versions = self._climb_versions
+        stale = 0
         for group in self.param_groups:
             for p in group["params"]:
                 st = state.get(p)
                 old_p = st.pop("old_p", None) if st else None
-                if old_p is not None:
-                    p.data.copy_(old_p)
+                v = versions.pop(p, None)
+                if old_p is None:
+                    continue
+                if v is not None and p._version != v:
+                    stale += 1           # p was rewritten in place since the climb: keep it
+                    continue
+                p.data.copy_(old_p)
         self._climbed = False
+        if stale:
+            warnings.warn(
+                f"SAM: {stale} parameter(s) were modified in place (e.g. reloaded) after "
+                "first_step and before the climb was undone; they keep their current values "
+                "and the stale pre-climb snapshot is discarded.",
+                stacklevel=3,
+            )
+
+    @property
+    def _climb_versions(self) -> dict[Tensor, int]:
+        """``p._version`` right after each param's climb (see _restore_climb). Not
+        checkpointed: after a resume a pending snapshot is restored unconditionally."""
+        d = self.__dict__.get("_climb_versions_d")
+        if d is None:
+            d = self.__dict__["_climb_versions_d"] = {}
+        return d
 
     # ------------------------------------------------------------------ combined
     @torch.no_grad()
@@ -371,6 +410,7 @@ class SAM(WrapsInnerOptimizer, Optimizer):
         self.base_optimizer = self.inner
         # A checkpoint taken between first_step and second_step carries old_p snapshots.
         self._climbed = any("old_p" in st for st in self.state.values())
+        self._climb_versions.clear()   # versions of a pre-load climb say nothing now
         for group in self.param_groups:
             for key, value in self.defaults.items():
                 group.setdefault(key, value)
