@@ -500,9 +500,12 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
         ``_foreach_copy_`` into the per-param storages — the same shape of work
         :func:`kaon._backend.subtract_batched_` does for bf16 weights, and through the
         same :func:`kaon._backend._sr_write_` entry point (one Triton launch, no
-        temporary, on CUDA). Since the draws differ from the per-param path's, a bf16
-        ``z`` makes the two paths agree in expectation instead of bit-for-bit (the
-        quantized and fp32 codecs stay exact).
+        temporary, on CUDA). Since the draws differ from the per-param path's, a bf16,
+        int8 or 4-bit ``z`` (all stochastically rounded since 0.7.18) makes the two paths
+        agree in expectation, not bit-for-bit; only an fp32 ``z`` stays exact. The one
+        bit-exact exception is the CPU torch reference path with nothing else drawing in
+        between and the same draw order on both paths (see
+        :func:`kaon._momentum_codec.store_stochastic_stacked_`).
 
         ``N == 1`` — every bucket of a big-unique-shape model (UNet/DiT) — skips the
         stack entirely and rounds straight into the parameter's own ``z``: a one-tensor

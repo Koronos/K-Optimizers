@@ -315,12 +315,15 @@ def fourbit_block_size(grad: Tensor, group: dict[str, Any]) -> int:
 # ``f"{key}_scale"``, ``f"{key}_block"``), requantized with UNBIASED stochastic rounding
 # (:func:`_round_`) and noise from the owner's checkpointed :class:`SRStream` — its
 # reference-path generator (:meth:`SRStream.generator`), the one a bf16 ``z`` written through
-# ``add_stochastic_`` already draws from. That keeps both of the bf16 ``z``'s properties: the
-# position is checkpointed (``_sr_meta["gen"]``), so a resume continues the exact noise; and a
-# stacked draw of ``N * M`` numbers consumes the same sequence as ``N`` per-param draws of
-# ``M`` (the requant noise is laid out param-major in both), so foreach == per-param bit for
-# bit whenever nothing else draws in between (fp32 weights / ``bf16_method != "stochastic_
-# rounding"``), and in expectation otherwise — exactly the contract of a bf16 ``z``. Used
+# ``add_stochastic_`` already draws from. The position is checkpointed (``_sr_meta["gen"]``),
+# so a resume continues the exact noise. foreach vs per-param agree IN EXPECTATION — the
+# contract of a bf16 ``z``. They coincide bit for bit only in a narrow case: on the CPU
+# generator (mt19937), where a stacked draw of ``N * M`` numbers consumes the same sequence as
+# ``N`` per-param draws of ``M`` (the requant noise is param-major in both), AND nothing else
+# draws in between (fp32 weights / ``bf16_method != "stochastic_rounding"``) AND both paths
+# visit the params in the same order (bucket order vs parameter order can differ). On CUDA
+# never: the Philox offset advances per launch, so one stacked draw is not ``N`` small ones.
+# Used
 # for Schedule-Free's ``z`` at ``momentum_dtype="int8"``/``"4bit"``: its per-step move
 # ``lr_t * d`` sits far below half a quant step (``absmax/254`` int8, ``absmax/14`` 4-bit),
 # so the codec's round-to-nearest wrote the old code back and ``z`` froze — measured at
@@ -353,7 +356,8 @@ def store_stochastic_stacked_(
 ) -> None:
     """Stacked :func:`store_stochastic_` over ``[N, *shape]``: ONE noise draw per bucket.
 
-    Same draws as ``N`` per-param calls on the reference generator (see the section note).
+    Agrees with ``N`` per-param calls in expectation (bit-exact only in the CPU case the
+    section note spells out).
     """
     n = value_fp32.shape[0]
     shape = tuple(value_fp32.shape[1:])
