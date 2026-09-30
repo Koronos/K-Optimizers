@@ -301,9 +301,9 @@ def test_adapnm_fp32_grad_not_representable_in_bf16_is_read_exactly(route):
         for key in keys:
             x, y = ow.state[a][key], on.state[b][key]
             rel = ((x - y).abs().max() / y.abs().max()).item()
-            # 1.29e-5 today: the kernels form ``1 - beta2`` in fp32 from an fp32 beta2
-            # (native: fp64 -> fp32), a -1.3e-5 relative error on the EMA weight.
-            assert rel < 5e-5, f"AdaPNM/{route}: state {key} rel {rel:.2e} vs native"
+            # Was 1.29e-5 on every route while the kernels formed ``1 - beta2`` from an fp32
+            # beta2 (native: fp64 -> fp32).
+            assert rel < 2e-6, f"AdaPNM/{route}: state {key} rel {rel:.2e} vs native"
 
 
 @pytest.mark.parametrize("route", list(_ROUTES))

@@ -1093,7 +1093,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                 ft._adapnm_tile_kernel[(len(bk["plist"]),)](
                     bk["g_addr"], bk["p_addr"], kpos, kneg, kposc, knegc, bk["row_addr"],
                     bk["col_addr"], bk["Rs"], bk["Cs"], bk["mscale_n"],
-                    c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], sc, lr * wd, eps1,
+                    c["beta1_sq"], c["beta0"], inv_noise, 1.0 - c["beta2"], sc, lr * wd, eps1,
                     clip_eff, group["step"], LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious,
                     # GC is PER BUCKET: a tile of fan-in-1 tensors (BC == 1) has no fan-in mean
                     # to subtract and centralizing it would zero the gradient. Resolved at cache
@@ -1142,7 +1142,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
             with torch.cuda.device(bk["dev"]):         # see _fused_one_block on the device scope
                 ft._adapnm_1d_kernel[(len(bk["plist"]),)](
                     bk["g_addr"], bk["p_addr"], kpos, kneg, bk["v_addr"], bk["Ls"],
-                    c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], c["step_size"], c["bc2_sq"],
+                    c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], 1.0 - c["beta2"],
+                    c["step_size"], c["bc2_sq"],
                     eps_k, lr * wd, clip, group["step"], LOWP=bk["lowp"], MOM=bk["mom"],
                     CAUTIOUS=cautious, WD=wd != 0, CLIP=clip > 0.0, SR=_fused_sr(group, bk["lowp"]),
                     BL=bk["BL"],

@@ -99,7 +99,7 @@ if HAS_TRITON:
     @triton.jit
     def _factored_rc_probe(
         g_ptr, row_ptr, col_ptr, row_factor_ptr, col_factor_ptr,
-        R, C, beta2, eps1, BR: tl.constexpr, BC: tl.constexpr,
+        R, C, omb, eps1, BR: tl.constexpr, BC: tl.constexpr,
     ):
         ri = tl.arange(0, BR)[:, None]
         ci = tl.arange(0, BC)[None, :]
@@ -110,7 +110,7 @@ if HAS_TRITON:
         grad = tl.load(g_ptr + idx, mask=mask, other=0.0)
         row_factor, col_factor = factored_rc(
             grad, row_ptr, col_ptr, rows, cols, R, C,
-            R.to(tl.float32), C.to(tl.float32), beta2, eps1,
+            R.to(tl.float32), C.to(tl.float32), omb, eps1,
         )
         tl.store(row_factor_ptr + rows, row_factor, mask=rows < R)
         tl.store(col_factor_ptr + cols, col_factor, mask=cols < C)
@@ -1471,7 +1471,7 @@ def test_factored_rc_primitive():
     col = torch.zeros(C, device=DEV)
     rfac = torch.zeros(R, device=DEV)
     cfac = torch.zeros(C, device=DEV)
-    _factored_rc_probe[(1,)](g, row, col, rfac, cfac, R, C, 0.999, 1e-30, BR=BR, BC=BC)
+    _factored_rc_probe[(1,)](g, row, col, rfac, cfac, R, C, 1.0 - 0.999, 1e-30, BR=BR, BC=BC)
     torch.cuda.synchronize()
     row_r = torch.zeros(R, device=DEV)
     col_r = torch.zeros(C, device=DEV)
@@ -1481,6 +1481,10 @@ def test_factored_rc_primitive():
     assert torch.allclose(cfac, cf_r.view(-1), atol=1e-4)
     assert torch.allclose(row, row_r, atol=1e-5)            # row EMA updated in place
     assert torch.allclose(col, col_r, atol=1e-5)
+    # ...with the torch path's EMA weight: ``1 - beta2`` comes from the host in fp64. Formed in
+    # the kernel from an fp32 beta2 it was off by -1.3e-5 relative on every update.
+    torch.testing.assert_close(row, row_r, rtol=2e-6, atol=0.0)
+    torch.testing.assert_close(col, col_r, rtol=2e-6, atol=0.0)
 
 
 # ----------------------------------------------------------------- fused/native unification

@@ -844,16 +844,19 @@ if _HAS_TRITON:
         return tl.where(m2, g - gmean[:, None], 0.0)
 
     @triton.jit
-    def factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, beta2, eps1):
+    def factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, omb, eps1):
         """Factored second-moment EMA (row/col) -> the rsqrt reconstruction factors (r, c).
 
         REUSABLE by Adakaon / AdaPNM / KProdigy (every factored-Adam optimizer). Updates the row/col
         EMA state in place (HF eps placement) and returns ``(r_factor [BR], c_factor [BC])`` such that
-        1/sqrt(v_hat)[i,j] == r_factor[i] * c_factor[j]. Mirrors ``kaon._factored``."""
+        1/sqrt(v_hat)[i,j] == r_factor[i] * c_factor[j]. Mirrors ``kaon._factored``.
+
+        ``omb`` is ``1 - beta2`` computed by the HOST in fp64 (rounded once to fp32 at the launch,
+        like the torch path's ``lerp_(x, 1.0 - beta2)``); forming it here from an fp32 ``beta2``
+        was ``fp32(1 - fp32(0.999))``, a -1.3e-5 relative error on every EMA update."""
         gsq = g * g
         row_mean = tl.sum(gsq, axis=1) / Cf + eps1
         col_mean = tl.sum(gsq, axis=0) / Rf + eps1
-        omb = 1.0 - beta2
         row_new = tl.load(rowp + rr, mask=rr < R, other=0.0)
         row_new = row_new + omb * (row_mean - row_new)
         col_new = tl.load(colp + cc, mask=cc < C, other=0.0)
@@ -866,7 +869,7 @@ if _HAS_TRITON:
     @triton.jit
     def _adakaon_tile_kernel(
         g_addr, p_addr, c_addr, m_addr, mscale_addr, row_addr, col_addr, Rs_ptr, Cs_ptr, Ns_ptr,
-        lr, beta1, beta2, eps1, clip, wd, seed, m_blk,
+        lr, beta1, omb2, eps1, clip, wd, seed, m_blk,
         LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr,
         CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         GC: tl.constexpr, SR: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
@@ -929,7 +932,7 @@ if _HAS_TRITON:
         # --- REUSABLE (factored family): GC + row/col second moment -> r/c factors ---
         if GC:
             g = gradient_centralize(g, m2, Cf)
-        r_factor, c_factor = factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, beta2, eps1)
+        r_factor, c_factor = factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, omb2, eps1)
 
         # --- Adakaon-specific: reconstructed update, RMS-clip (lr scales the final delta) ---
         upd = tl.where(m2, g * r_factor[:, None] * c_factor[None, :], 0.0)  # 0*inf corners -> 0
@@ -1667,7 +1670,7 @@ if _HAS_TRITON:
     @triton.jit
     def _adam_1d_kernel(
         g_addr, p_addr, c_addr, m_addr, mscale_addr, v_addr, Ls_ptr,
-        lr, beta1, beta2, eps1, clip, wd, seed,
+        lr, beta1, omb2, eps1, clip, wd, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr, FBLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
@@ -1688,7 +1691,9 @@ if _HAS_TRITON:
 
         # full per-coordinate second moment (HF eps placement: eps1 into grad^2)
         v = tl.load(vp + offs, mask=mask, other=0.0)
-        v = beta2 * v + (1.0 - beta2) * (g * g + eps1)
+        # ``lerp`` with a host-side ``omb2 = 1 - beta2``: the native ``v.lerp_(g*g + eps1,
+        # 1.0 - beta2)`` (see factored_rc on why ``1 - beta2`` is not formed here).
+        v = v + omb2 * ((g * g + eps1) - v)
         tl.store(vp + offs, v, mask=mask)
         update = tl.where(mask, g * tl.rsqrt(v), 0.0)
 
@@ -1781,7 +1786,7 @@ if _HAS_TRITON:
     def _adapnm_tile_kernel(
         g_addr, p_addr, pos_addr, neg_addr, posc_addr, negc_addr, row_addr, col_addr,
         Rs_ptr, Cs_ptr, Ns_ptr,
-        beta1_sq, beta0, inv_noise, beta2, sc, lrwd, eps1, clip_eff, seed,
+        beta1_sq, beta0, inv_noise, omb2, sc, lrwd, eps1, clip_eff, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         GC: tl.constexpr, SR: tl.constexpr, CLIP: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
         GF32: tl.constexpr = False,
@@ -1808,7 +1813,7 @@ if _HAS_TRITON:
         g = tl.load(gp + idx, mask=m2, other=0.0).to(tl.float32)
         if GC:
             g = gradient_centralize(g, m2, Cf)
-        r_factor, c_factor = factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, beta2, eps1)
+        r_factor, c_factor = factored_rc(g, rowp, colp, rr, cc, R, C, Rf, Cf, omb2, eps1)
 
         # dequant both momenta (codec-level, reusable); EMA only the positive
         Chalf = C // 2
@@ -2139,7 +2144,7 @@ if _HAS_TRITON:
     @triton.jit
     def _adapnm_1d_kernel(
         g_addr, p_addr, pos_addr, neg_addr, v_addr, Ls_ptr,
-        beta1_sq, beta0, inv_noise, beta2, step_size, bc2_sq, eps, lrwd, clip, seed,
+        beta1_sq, beta0, inv_noise, beta2, omb2, step_size, bc2_sq, eps, lrwd, clip, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         CLIP: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr, GF32: tl.constexpr = False,
     ):
@@ -2158,7 +2163,7 @@ if _HAS_TRITON:
 
         # full per-coordinate second moment (no eps1 in grad^2 for AdaPNM; eps goes on the denom)
         v = tl.load(vp + offs, mask=mask, other=0.0)
-        v = beta2 * v + (1.0 - beta2) * (g * g)
+        v = beta2 * v + omb2 * (g * g)        # omb2 = host-side 1 - beta2, see factored_rc
         tl.store(vp + offs, v, mask=mask)
 
         posi = tl.load(pos_addr + t)

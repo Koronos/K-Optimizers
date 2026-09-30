@@ -1117,7 +1117,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     self._c_addr_arg(bk["c_addr"], bk["p_addr"], ck if bk["lowp"] else 0),
                     bk["m_addr"], bk["mscale_addr"], bk["row_addr"],
                     bk["col_addr"], bk["Rs"], bk["Cs"], bk["mscale_n"],
-                    lr, b1, b2, eps1, clip, wd, self._t, bk["blk"],
+                    lr, b1, 1.0 - b2, eps1, clip, wd, self._t, bk["blk"],
                     # GC is PER BUCKET: a tile of fan-in-1 tensors (BC == 1) has no fan-in
                     # mean to subtract, and centralizing it would zero the gradient. The
                     # predicate is resolved at cache build (``bucket_gc_ok``), so this is a
@@ -1160,7 +1160,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     bk["g_addr"], bk["p_addr"],
                     self._c_addr_arg(bk["c_addr"], bk["p_addr"], ck if bk["lowp"] else 0),
                     bk["m_addr"], bk["mscale_addr"],
-                    bk["v_addr"], bk["Ls"], lr, b1, b2, eps1, clip, wd, self._t,
+                    bk["v_addr"], bk["Ls"], lr, b1, 1.0 - b2, eps1, clip, wd, self._t,
                     LOWP=bk["lowp"], MOM=bk["mom"], MOMENTUM=bk["momentum"], CAUTIOUS=cautious,
                     WD=wd != 0, SR=self._fused_sr(group, bk["lowp"]), CK=ck if bk["lowp"] else 0,
                     BL=bk["BL"], FBLOCK=bk["block"], WDFULL=wd_full, GF32=_gf32(bk["plist"]),
