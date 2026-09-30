@@ -130,13 +130,20 @@ def _zero_safe_inv_sqrt_factors(row: Tensor, col: Tensor) -> tuple[Tensor, Tenso
 def zeropower_via_newtonschulz5(grad: Tensor, steps: int) -> Tensor:
     """Newton-Schulz quintic iteration: approximate the orthogonal factor of ``grad``.
 
-    Returns ``U`` (≈ ``U @ V.T`` of ``grad = U S V.T``) in bf16 — for a tall ``grad``
-    (``R > C``) as a transposed view, so widen it with ``memory_format`` if the layout
-    matters. Runs in bf16 for
-    speed/memory — the iteration is robust to it. ``grad`` must be 2-D. (Muon's
-    orthogonalization, Jordan et al.; the per-parameter path uses it directly, the
-    foreach path the batched ``_stacked`` variant below.)
+    Returns ``U`` (≈ ``U @ V.T`` of ``grad = U S V.T``) as a contiguous bf16 tensor.
+    Runs in bf16 for speed/memory — the iteration is robust to it. ``grad`` must be
+    2-D. (Muon's orthogonalization, Jordan et al.; the foreach path uses the batched
+    ``_stacked`` variant below. The optimizer itself calls the private
+    :func:`_newtonschulz5_view`, which skips the final layout copy.)
     """
+    return _newtonschulz5_view(grad, steps).contiguous()
+
+
+def _newtonschulz5_view(grad: Tensor, steps: int) -> Tensor:
+    """:func:`zeropower_via_newtonschulz5` without the final copy: for a tall ``grad``
+    (``R > C``) the result is a transposed VIEW (the GEMM epilogues write the
+    inner-dimension layout). The caller widens it to fp32 with
+    ``memory_format=torch.contiguous_format``, one kernel for both."""
     assert grad.ndim == 2, "Newton-Schulz expects a 2-D matrix"
     a, b, c = 3.4445, -4.7750, 2.0315
     x = grad.bfloat16()
@@ -159,7 +166,7 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
     """Batched Newton-Schulz quintic iteration over a stack of 2-D matrices.
 
     ``grad`` is ``[N, R, C]`` (all slices share ``R, C``). Returns ``[N, R, C]``
-    bf16 orthogonal factors, one per slice — element-for-element the per-slice
+    contiguous bf16 orthogonal factors, one per slice — element-for-element the per-slice
     :func:`zeropower_via_newtonschulz5` but with a single ``bmm`` per
     iteration instead of ``N`` matmuls (the LoRA throughput win). Each slice is
     normalized by its own Frobenius norm and transposed to its smaller inner
@@ -168,6 +175,12 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
     bf16 matmul reduction order differs between ``bmm`` and per-slice ``@``, so this
     matches the per-slice helper closely but not bit-for-bit; both are unbiased.
     """
+    return _newtonschulz5_stacked_view(grad, steps).contiguous()
+
+
+def _newtonschulz5_stacked_view(grad: Tensor, steps: int) -> Tensor:
+    """:func:`zeropower_via_newtonschulz5_stacked` without the final copy (a transposed
+    view for tall slices; see :func:`_newtonschulz5_view`)."""
     assert grad.ndim == 3, "stacked Newton-Schulz expects [N, R, C]"
     a, b, c = 3.4445, -4.7750, 2.0315
     x = grad.bfloat16()
@@ -246,7 +259,7 @@ def _factored_math(
     N, R, C = m.shape  # noqa: N806 — matrix dims
     # Contiguous widening: on a tall matrix the Newton-Schulz result is a transposed view,
     # and every elementwise op below plus the weight write want the weight's own layout.
-    ortho = zeropower_via_newtonschulz5_stacked(m, ns_steps).to(
+    ortho = _newtonschulz5_stacked_view(m, ns_steps).to(
         torch.float32, memory_format=torch.contiguous_format)          # [N, R, C]
 
     # Factored second moment OF the orthogonalized signal (HF eps placement).
@@ -347,7 +360,7 @@ def _factored_one_math(
 ) -> Tensor:
     """Per-parameter 2-D core. Tensors are ``[R, C]``; ``row`` / ``col`` are the state
     tensors themselves (updated in place). Returns the ``[R, C]`` delta."""
-    ortho = zeropower_via_newtonschulz5(m, ns_steps).to(
+    ortho = _newtonschulz5_view(m, ns_steps).to(
         torch.float32, memory_format=torch.contiguous_format)          # [R, C], see above
     update_factored_state(ortho, row, col, beta2, eps1)
     if eps1 > 0:

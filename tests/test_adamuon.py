@@ -833,3 +833,11 @@ def test_eps_zero_nonfactored_zero_grad_stays_finite(foreach, shape):
             p.grad = torch.randn(p.shape, generator=g)
         opt.step()
     assert all(torch.isfinite(p).all() for p in params)
+
+
+@pytest.mark.parametrize("shape", [(64, 16), (16, 64)])
+def test_public_newton_schulz_returns_contiguous(shape):
+    """The public helpers keep their contract of a contiguous result also for tall
+    matrices (the optimizer uses private view-returning variants internally)."""
+    assert zeropower_via_newtonschulz5(torch.randn(shape), 2).is_contiguous()
+    assert zeropower_via_newtonschulz5_stacked(torch.randn(3, *shape), 2).is_contiguous()
