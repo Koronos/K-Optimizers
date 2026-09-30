@@ -732,6 +732,10 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
 
         # Official 1-D denom: sqrt(v)/sqrt(bc2) + eps.
         de_nom = v.sqrt().div_(c["bc2_sq"]).add_(eps)
+        # eps == 0: a coordinate with v == 0 (its gradient was always exactly zero, so m is 0
+        # too) would be 0/0 -> NaN; its update is 0 (m / inf). Skipped otherwise: bit-identical.
+        if eps == 0:
+            de_nom.masked_fill_(de_nom == 0, math.inf)
 
         codec = self._codec(md)
         views = chunk.momentum_views(codec)
@@ -797,6 +801,10 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             v = state["v"]
             v.mul_(c["beta2"]).addcmul_(grad, grad, value=1.0 - c["beta2"])
             de_nom = v.sqrt().div_(c["bc2_sq"]).add_(eps)                # official 1-D placement
+            # eps == 0: a coordinate with v == 0 (its gradient was always exactly zero, so m is 0
+            # too) would be 0/0 -> NaN; its update is 0 (m / inf). Skipped otherwise: bit-identical.
+            if eps == 0:
+                de_nom.masked_fill_(de_nom == 0, math.inf)
             m = self._dequant_one(state, md, grad)
             m.mul_(c["beta1"]).add_(grad, alpha=1.0 - c["beta1"])
             self._store_one(state, md, m)

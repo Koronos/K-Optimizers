@@ -609,6 +609,10 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         torch._foreach_copy_(ss, list(s.unbind(0)))
 
         de_nom = s.sqrt().add_(eps).div_(c["bc2_sq"])
+        # eps == 0: a coordinate with s == 0 (its residual was always exactly zero, so m is 0
+        # too) would be 0/0 -> NaN; its update is 0 (m / inf). Skipped otherwise: bit-identical.
+        if eps == 0:
+            de_nom.masked_fill_(de_nom == 0, math.inf)
         delta = m.div_(de_nom).mul_(c["step_size"])
 
         if cautious:
@@ -667,6 +671,10 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             residual = grad - m
             s.mul_(c["beta2"]).addcmul_(residual, residual, value=1.0 - c["beta2"]).add_(eps)
             de_nom = s.sqrt().add_(eps).div_(c["bc2_sq"])
+            # eps == 0: a coordinate with s == 0 (its residual was always exactly zero, so m is 0
+            # too) would be 0/0 -> NaN; its update is 0 (m / inf). Skipped otherwise: bit-identical.
+            if eps == 0:
+                de_nom.masked_fill_(de_nom == 0, math.inf)
             delta = m.div_(de_nom).mul_(c["step_size"])
 
         if cautious:

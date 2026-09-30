@@ -118,11 +118,13 @@ def test_kahan16_with_decay_is_the_fp32_run(cls, extra, route, md, cautious):
 @pytest.mark.parametrize("route", ROUTES)
 def test_eps_zero_all_zero_grad_stays_finite(cls, route):
     """eps=0 (no eps1 inside the factored square) + an all-zero gradient: the row mean is 0
-    and the reconstruction used to be 0/0 -> NaN weights. A zero second moment with a zero
-    first moment is a zero update."""
+    and the reconstruction used to be 0/0 -> NaN weights; the non-factored 1-D / 0-D path was
+    ``m / (sqrt(0) + 0) = 0/0``. A zero second moment with a zero first moment is a zero
+    update."""
     dev = _dev(route)
     torch.manual_seed(0)
-    ps = [torch.nn.Parameter(torch.randn(s, device=dev)) for s in [(8, 6), (8, 6), (4, 3, 3)]]
+    shapes = [(8, 6), (8, 6), (4, 3, 3), (6,), (6,), (5,), ()]  # factored, 1-D, 0-D
+    ps = [torch.nn.Parameter(torch.randn(s, device=dev)) for s in shapes]
     p0 = [p.detach().clone() for p in ps]
     eps = 1e-6 if cls is ADOPT else 0.0  # ADOPT's eps is a cap (> 0); its eps1 is always 0
     opt = cls(ps, lr=1e-3, eps=eps, foreach=route != "per_param")
@@ -139,15 +141,16 @@ def test_eps_zero_all_zero_grad_stays_finite(cls, route):
 @pytest.mark.parametrize("route", ROUTES)
 def test_eps_zero_dead_row_stays_finite(cls, route):
     """eps=0 and ONE output row whose gradient is always zero (a dead unit): its row
-    statistic is exactly 0, so ``rsqrt`` of it is inf and ``0 * inf`` NaN'd the row."""
+    statistic is exactly 0, so ``rsqrt`` of it is inf and ``0 * inf`` NaN'd the row. The 1-D
+    twin: a coordinate with ``v == 0`` was ``0 / (sqrt(0) + 0)``."""
     dev = _dev(route)
     torch.manual_seed(0)
-    ps = [torch.nn.Parameter(torch.randn(8, 6, device=dev)) for _ in range(2)]
+    ps = [torch.nn.Parameter(torch.randn(s, device=dev)) for s in [(8, 6), (8, 6), (6,), (6,)]]
     opt = cls(ps, lr=1e-3, eps=0.0, gradient_centralization=False, foreach=route != "per_param")
     for _ in range(3):
         for p in ps:
             g = torch.randn_like(p)
-            g[2] = 0.0
+            g[2] = 0.0  # a dead output row / a dead 1-D coordinate
             p.grad = g
         opt.step()
     for p in ps:
