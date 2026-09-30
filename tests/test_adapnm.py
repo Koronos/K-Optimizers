@@ -832,3 +832,26 @@ def test_foreach_grad_stack_is_the_fp32_stack_of_the_grads(dtype, min_numel, mon
         got = _grad_stack_fp32(chunk)
         assert got.dtype == torch.float32
         assert torch.equal(got, chunk.grad_stack())
+
+
+def test_fp64_weight_decay_foreach_matches_per_param():
+    """fp64 weights: foreach and per-param must pick the SAME decay form (the in-place
+    multiply, ``is_low_precision`` is False) — the foreach used to fold it as if low-precision.
+    Non-factored shapes only: those are bit-exact between the two paths on fp64 (the factored
+    bucket's fp64 weights already differ by ~1 fp32 ulp at wd=0, independently of the decay),
+    so the fold-vs-multiply rounding difference is what this catches."""
+    shapes = [(7,), (7,), (), (1,)]
+    torch.manual_seed(3)
+    pa = [torch.nn.Parameter(torch.randn(s, dtype=torch.float64)) for s in shapes]
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
+    cfg = dict(lr=1e-2, weight_decay=0.05, momentum_dtype="float32")
+    oa, ob = AdaPNM(pa, foreach=True, **cfg), AdaPNM(pb, foreach=False, **cfg)
+    gg = torch.Generator().manual_seed(4)
+    for _ in range(5):
+        for a, b in zip(pa, pb, strict=True):
+            g = torch.randn(a.shape, generator=gg, dtype=torch.float64) * 0.1
+            a.grad, b.grad = g.clone(), g.clone()
+        oa.step()
+        ob.step()
+    for a, b in zip(pa, pb, strict=True):
+        assert torch.equal(a, b)

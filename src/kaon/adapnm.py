@@ -1603,10 +1603,10 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
-        # Decoupled weight decay (kozistr order: it reads the PRE-step weight). fp32 weights
-        # keep the in-place ``p *= 1 - lr*wd``; low-precision ones fold it into the delta
-        # below — see _step_one_param.
-        fold_wd = wd != 0 and chunk.pviews[0].dtype != torch.float32
+        # Decoupled weight decay (kozistr order: it reads the PRE-step weight). fp32/fp64
+        # weights keep the in-place ``p *= 1 - lr*wd``; low-precision ones fold it into the
+        # delta below — same ``is_low_precision`` predicate as _step_one_param.
+        fold_wd = wd != 0 and is_low_precision(chunk.pviews[0])
         if wd != 0 and not fold_wd:
             torch._foreach_mul_(chunk.pviews, 1.0 - group["lr"] * wd)
 
@@ -1674,7 +1674,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         grad = _grad_stack_fp32(chunk)                                    # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
-        fold_wd = wd != 0 and chunk.pviews[0].dtype != torch.float32   # see _factored_bucket
+        fold_wd = wd != 0 and is_low_precision(chunk.pviews[0])   # see _factored_bucket
         if wd != 0 and not fold_wd:
             torch._foreach_mul_(chunk.pviews, 1.0 - group["lr"] * wd)
 
