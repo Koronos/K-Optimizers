@@ -1355,9 +1355,10 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         grid = (N * K,)
         direct_4bit = md == "4bit" and states[0]["m_block"] <= 1024 \
             and 1024 % states[0]["m_block"] == 0
-        # int8's scale is per ROW, so a chunk may requantize a row only if it owns the whole
-        # row: C <= BLOCK and BLOCK % C == 0 (see _chunked_int8_apply_batched_g). Otherwise the
-        # per-row absmax would need a cross-program reduction and the codec fallback stands.
+        # int8's scale is per ROW, so a chunk may requantize a row in ONE pass only if it owns
+        # the whole row: C <= BLOCK and BLOCK % C == 0 (``ft.int8_route`` == "aligned", see
+        # _chunked_int8_apply_batched_g). Rows that span chunks take the two-pass cross-program
+        # row absmax ("rows", C >= 128); only narrower misaligned rows keep the codec fallback.
         int8_route = ft.int8_route(C) if md == "int8" and self._direct_int8 else "codec"
         direct_int8 = int8_route == "aligned"
         if direct_int8 and fused_red:

@@ -238,6 +238,40 @@ def test_fp32_grad_on_bf16_param_stays_fused(name, method, route):
 
 
 @pytest.mark.parametrize("route", list(_ROUTES))
+@pytest.mark.parametrize("name", ["Adakaon", "Nekaon"])
+def test_fp32_grad_not_representable_in_bf16_is_read_exactly(name, route):
+    """GF32 with fp32 grads that a bf16 grad could NOT hold (plain ``randn``): the kernel must
+    read the full fp32 value, not a truncated one. ``kahan16`` carries the fp32 master exactly,
+    so fused and native agree to fp32 rounding / reduction order — measured 1e-10..1.2e-8 relative on
+    the one-block and 1-D routes, ~1.1e-6 on the big ones (their row/col reductions sum in a
+    different order). A bf16 truncation of the grad would show up at ~1e-3."""
+    shapes = _ROUTES[route]
+    pw = _bag(shapes, seed=71)
+    pn = _clone(pw)
+    ow = _make(name, pw, True, "kahan16")
+    on = _make(name, pn, False, "kahan16")
+    gen = torch.Generator(device=DEV).manual_seed(73)
+    for _ in range(3):
+        raw = [torch.randn(tuple(p.shape), generator=gen, device=DEV) for p in pw]
+        for plist in (pw, pn):
+            for p, g in zip(plist, raw, strict=True):
+                p.grad = g.clone()
+        ow.step()
+        on.step()
+    torch.cuda.synchronize()
+    expected = "big" if route.startswith("big") else route
+    assert all(_route_of(ow, p) == expected for p in pw) and _demoted_ids(ow) == set()
+    for o in (ow, on):
+        if hasattr(o, "eval"):
+            o.eval()
+    dw, dn = decode_weights(ow), decode_weights(on)
+    tol = 5e-6 if route.startswith("big") else 1e-7
+    for a, b in zip(pw, pn, strict=True):
+        rel = ((dw[a] - dn[b]).abs().max() / dn[b].abs().max()).item()
+        assert rel < tol, f"{name}/{route}: rel {rel:.2e} vs native with unrepresentable grads"
+
+
+@pytest.mark.parametrize("route", list(_ROUTES))
 @pytest.mark.parametrize("name", list(_OPTS))
 def test_bf16_grad_on_fp32_param_matches_native(name, route):
     """The mirror case: a bf16 grad on an fp32 weight would be read as fp32 words spanning two
