@@ -98,6 +98,11 @@ __all__ = ["AdaMuon"]
 
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
+#: ``dict.__setitem__``, i.e. a per-param state write that SKIPS the state-identity
+#: hook (:class:`kaon._foreach_plan.WatchedParamState`), as in :mod:`kaon.adapnm`. Legal
+#: for scalar bookkeeping keys ONLY (the per-param ``step``) — never for a tensor buffer.
+_set_unwatched = dict.__setitem__
+
 # Shape-independent applied-update RMS target (before lr). The factored
 # inv_sqrt(v) already brings ``u`` to RMS≈1, so this is the only magnitude scale
 # applied — equal to Muon's per-element RMS (``0.2``). See the module docstring on
@@ -845,8 +850,10 @@ class AdaMuon(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         unused.
         """
         t = 0
+        set_raw = _set_unwatched            # scalar key: skip the state-identity hook
         for s in states:
-            t = s["step"] = s.get("step", 0) + 1
+            t = s.get("step", 0) + 1
+            set_raw(s, "step", t)
         return t
 
     @torch.no_grad()

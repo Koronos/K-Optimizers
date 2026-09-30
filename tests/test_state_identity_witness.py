@@ -808,3 +808,40 @@ def test_state_dict_carries_plain_dicts(cls, cfg):
     back = pickle.loads(blob)
     for entry in back["state"].values():
         assert type(entry) is dict
+
+
+# ------------------------------------------------ steady state: no hooked per-param writes
+_EVERY_WATCHED = ["AdaBelief", "AdamP", "AdaMuon", "ADOPT", "KProdigy", "Lion", "ScheduleFree",
+                  "Adakaon", "AdaPNM"]
+
+
+@pytest.mark.parametrize("foreach", [True, False], ids=["foreach", "per_param"])
+@pytest.mark.parametrize("name", _EVERY_WATCHED)
+def test_steady_state_step_makes_no_hooked_state_writes(name, foreach, monkeypatch):
+    """Every optimizer on the foreach plan has a watched ``self.state``, so a per-param
+    scalar write through ``state["step"] = ...`` runs the Python-level hook once per
+    parameter per step. The per-param ``step`` counter goes through ``dict.__setitem__``
+    (``_set_unwatched``) instead; AdaMuon and KProdigy were the two still paying the hook
+    (one call per parameter per step). A steady-state step must make ZERO hooked writes."""
+    import kaon
+
+    calls: list[str] = []
+    hooked = WatchedParamState.__setitem__
+
+    def counting(self, key, value):
+        calls.append(key)
+        hooked(self, key, value)
+
+    monkeypatch.setattr(WatchedParamState, "__setitem__", counting)
+    torch.manual_seed(0)
+    ps = [torch.nn.Parameter(torch.randn(s)) for s in [(16, 8)] * 3 + [(12,)] * 2 + [(4, 2, 3, 3)]]
+    opt = getattr(kaon, name)(ps, lr=1e-3, foreach=foreach)
+    for _ in range(3):
+        for p in ps:
+            p.grad = torch.randn_like(p)
+        opt.step()
+    calls.clear()
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt.step()
+    assert calls == [], f"{name}: hooked per-param state writes in a steady step: {calls}"

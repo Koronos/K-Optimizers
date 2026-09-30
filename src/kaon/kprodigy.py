@@ -91,6 +91,11 @@ from kaon._momentum_codec import (
 
 __all__ = ["KProdigy"]
 
+#: ``dict.__setitem__``, i.e. a per-param state write that SKIPS the state-identity
+#: hook (:class:`kaon._foreach_plan.WatchedParamState`), as in :mod:`kaon.adapnm`. Legal
+#: for scalar bookkeeping keys ONLY (the per-param ``step``) — never for a tensor buffer.
+_set_unwatched = dict.__setitem__
+
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 SecondMoment = Literal["full", "factored"]
 
@@ -455,8 +460,11 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         # ---- pass 2: apply updates (Adakaon engine) -----------------------
         for group in groups:
             params = [p for p in group["params"] if p.grad is not None]
+            state = self.state
+            set_raw = _set_unwatched        # scalar key: skip the state-identity hook
             for p in params:
-                self.state[p]["step"] += 1
+                st = state[p]
+                set_raw(st, "step", st["step"] + 1)
             self._apply_updates(params, group, d, dlr)
             group["k"] = group["k"] + 1
 
