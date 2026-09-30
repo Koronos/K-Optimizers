@@ -315,9 +315,9 @@ def test_bf16_momentum_ema_is_invariant_to_bucket_size(second_moment):
     Two conditions have to hold at once for the in-bf16 EMA to be caught, and
     the shared fixture only meets the first: ``numel % 16 != 0`` (CPU
     low-precision elementwise kernels take a vectorized body plus a scalar tail,
-    which round differently) AND at least two params per shape, since
-    ``_pass1_momentum_foreach`` buckets by ``(momentum_dtype, shape)`` and a
-    bucket of one stacks to the same numel as the lone tensor.
+    which round differently) AND at least two params per shape, since the
+    batched pass 1 buckets by ``(group, shape)`` (``_pass1_momentum_chunk``) and
+    a bucket of one stacks to the same numel as the lone tensor.
     """
     shapes = [(3, 7), (3, 7), (5, 11), (5, 11), (127,), (127,)]
     g = torch.Generator().manual_seed(7)

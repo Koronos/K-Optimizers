@@ -768,7 +768,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
             r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
         inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])                        # 1/sqrt(v_hat)
 
-        # ``inv_denom`` is consumed (it becomes ``d`` on the no-inner-momentum path).
+        # ``d`` is a fresh tensor; drop the full-size ``inv_denom`` before the y/z update.
         d = self._normalized_d_stacked(states, md, grad, inv_denom, (R, C), c)     # [N, R, C]
         del inv_denom
 
