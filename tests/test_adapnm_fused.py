@@ -984,6 +984,32 @@ def test_pnm_big_pointer_cache_is_reused_across_steps():
         "a p.data rebind must rebuild the big pointer cache"
 
 
+@pytest.mark.parametrize("fused_red", [True, False], ids=["fused_reductions", "stacked"])
+def test_pnm_big_cache_owns_its_accumulators_and_row_col_arrays(fused_red):
+    """``BigPnmCache`` carries the row/col EMA pointer arrays and ONE zeroed accumulator block
+    (``colsum`` | ``rms_acc`` | ``keep``), like Adakaon's ``BigPointerCache``. AdaPNM used to
+    keep a per-cache sidecar with a SECOND copy of the three accumulators and of the row/col
+    arrays (``N*C + 2N`` fp32 of duplicate scratch per bucket); both routes now read the
+    cache's own, and still match native."""
+    shapes = [(512, 512)] * 3
+    pv, pn, ov, on = _safe_pair(shapes, _SAFE_CFG, seed=81)
+    ov._fused_reductions = fused_red
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(83))
+    _assert_safe_route(ov, "big")
+    assert not hasattr(ov, "_fused_big_sidecars")
+    (cache,) = ov._fused_big_caches.values()
+    n, c = cache.N, cache.C
+    assert cache._zeros.numel() == n * c + 2 * n
+    base = cache._zeros.data_ptr()
+    assert cache.colsum.data_ptr() == base
+    assert cache.rms_acc.data_ptr() == base + 4 * n * c
+    assert cache.keep.data_ptr() == base + 4 * (n * c + n) and cache.keep.dtype == torch.int32
+    assert cache.row_addr.tolist() == [ov.state[p]["row"].data_ptr() for p in cache.plist]
+    assert cache.col_addr.tolist() == [ov.state[p]["col"].data_ptr() for p in cache.plist]
+    scale = max(p.detach().abs().max().item() for p in pn)
+    assert _maxdiff(pv, pn) / scale < 1e-5
+
+
 # ----------------------------------------------------------------- 6. equal_to_1 specialization
 @pytest.mark.parametrize("shapes", [[(20000, 1)] * 2, [(1, 20000)] * 2, [(20000, 1)], [(1, 20000)]])
 def test_pnm_extreme_aspect_shapes_compile_and_match_native(shapes):

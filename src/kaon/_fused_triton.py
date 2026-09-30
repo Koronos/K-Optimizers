@@ -3555,6 +3555,14 @@ class BigPnmCache(_WitnessedCache):
     optimizer swaps them into (positive, negative) order by step parity, exactly as
     :class:`AdaPnmCache` does. Quantized momenta step on host-side fp32 temps and therefore keep
     building their own per-step arrays — only ``p``/``grad``/the scratch are reused there.
+
+    Like :class:`BigPointerCache` it also carries the ``row``/``col`` EMA pointer arrays
+    (:func:`_factor_rowcol_batched` updates that state in place through them) and keeps the
+    three per-step atomic accumulators — ``colsum``, ``rms_acc`` and ``keep`` (an int32 view of
+    its fp32 slice; all-zero bits are 0 in both) — as adjacent slices of ONE ``_zeros`` buffer,
+    so :meth:`zero_accumulators` clears them in a single launch. (Until 0.7.18 AdaPNM kept a
+    per-cache "sidecar" holding a second copy of the three accumulators and of the row/col
+    arrays: ``N*C + 2N`` fp32 of duplicate scratch per bucket.)
     """
 
     def __init__(self, plist, state_of, R, C, gen: int = 0):  # noqa: N803
@@ -3574,11 +3582,26 @@ class BigPnmCache(_WitnessedCache):
         # always allocates ``rowmean`` for real (no aliasing trick), so unlike Adakaon's it does
         # not need the effective flag as part of its validity.
         self.gc_ok = bucket_gc_ok(plist)
+        self.row_addr = ptr_array([s["row"] for s in states], dev)
+        self.col_addr = ptr_array([s["col"] for s in states], dev)
         self.rowmean = torch.empty(self.N * R, dtype=torch.float32, device=dev)
         self.rowsum = torch.empty(self.N * R, dtype=torch.float32, device=dev)
-        self.colsum = torch.empty(self.N * C, dtype=torch.float32, device=dev)
-        self.keep = torch.empty(self.N, dtype=torch.int32, device=dev)
-        self.rms_acc = torch.empty(self.N, dtype=torch.float32, device=dev)
+        # The per-step-zeroed accumulators, contiguous so one zero_() clears them (the same
+        # layout BigPointerCache uses): colsum [N*C] | rms_acc [N] | keep [N] (int32 view).
+        n_c = self.N * C
+        self._zeros = torch.zeros(n_c + 2 * self.N, dtype=torch.float32, device=dev)
+        self.colsum = self._zeros[:n_c]
+        self.rms_acc = self._zeros[n_c:n_c + self.N]
+        self.keep = self._zeros[n_c + self.N:].view(torch.int32)
+
+    def zero_accumulators(self) -> None:
+        """Clear ``colsum`` + ``rms_acc`` + ``keep`` for this step in ONE launch."""
+        self._zeros.zero_()
+
+    def zero_rms_keep(self) -> None:
+        """Clear only ``rms_acc`` + ``keep`` (one launch): the stacked-reductions route
+        (``AdaPNM._fused_reductions = False``) never touches ``colsum``."""
+        self._zeros[self.N * self.C:].zero_()
 
     def momenta(self, pos_first: bool):
         """The (positive, negative) pointer arrays for this step's parity."""
