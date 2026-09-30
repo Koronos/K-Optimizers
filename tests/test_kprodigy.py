@@ -769,3 +769,26 @@ def test_pass1_peak_is_bounded_by_the_stack_budget(second_moment):
     # below this (measured 600 MiB here vs 40 MiB chunked, on an 80 MiB bound).
     all_fp32_grads = n * math.prod(shape) * 4
     assert transient < all_fp32_grads, (transient / 2**20, all_fp32_grads / 2**20)
+
+
+@pytest.mark.parametrize("foreach", [True, False])
+@pytest.mark.parametrize("slice_p", [1, 3])
+def test_p0_is_scalar_for_zero_weights_and_a_slice_copy_otherwise(foreach, slice_p):
+    """The first-step state init checks ``norm > 0`` for all params in one batched
+    host sync (it used to sync per parameter); the outcome must be what the per-param
+    check gave: a 0-D ``p0`` for an all-zero weight (no fp32 copy of a zero-init layer),
+    the sliced fp32 weight otherwise."""
+    torch.manual_seed(0)
+    zero = torch.nn.Parameter(torch.zeros(6, 5))
+    live = torch.nn.Parameter(torch.randn(6, 5))
+    bias = torch.nn.Parameter(torch.randn(5))
+    opt = KProdigy([zero, live, bias], slice_p=slice_p, foreach=foreach)
+    for p in (zero, live, bias):
+        p.grad = torch.randn_like(p)
+    before = {id(p): p.detach().clone() for p in (live, bias)}
+    opt.step()
+    assert opt.state[zero]["p0"].ndim == 0 and float(opt.state[zero]["p0"]) == 0.0
+    for p in (live, bias):
+        torch.testing.assert_close(
+            opt.state[p]["p0"], before[id(p)].flatten()[::slice_p], rtol=0, atol=0,
+        )

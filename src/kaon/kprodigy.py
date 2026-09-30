@@ -279,15 +279,41 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
     # -- state -------------------------------------------------------------
 
     @torch.no_grad()
-    def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
+    def _init_new_states(self, groups: list[dict[str, Any]]) -> None:
+        """Initialize every gradient-bearing param of ``groups`` that has no state yet,
+        with ONE host sync for all of them.
+
+        :meth:`_init_state` branches on ``sliced.norm() > 0`` (a zero weight keeps a 0-D
+        ``p0`` instead of a full fp32 copy), a device->host sync per parameter: measured
+        ~190 ms of a 400-parameter first step (678 vs 485 ms). The norms are computed
+        here in one ``_foreach_norm`` and moved together. Cloning ``p0`` unconditionally
+        would drop the sync too, but at +4 B/param for every zero-initialized weight
+        (adaLN-zero, LoRA ``B``) with the default ``slice_p=1``.
+        """
+        todo = [
+            (p, g) for g in groups for p in g["params"]
+            if p.grad is not None and not p.grad.is_sparse and "step" not in self.state[p]
+        ]
+        if not todo:
+            return
+        norms = torch._foreach_norm([p.detach().flatten()[::g["slice_p"]] for p, g in todo])
+        nonzero = (torch.stack([n.float() for n in norms]) > 0).tolist()
+        for (p, g), nz in zip(todo, nonzero, strict=True):
+            self._init_state(p, self.state[p], g, nonzero=nz)
+
+    @torch.no_grad()
+    def _init_state(
+        self, p: Tensor, state: dict[str, Any], group: dict[str, Any], nonzero: bool | None = None,
+    ) -> None:
         beta1 = group["betas"][0]
         slice_p = group["slice_p"]
         sliced = p.flatten()[::slice_p]
 
         state["step"] = 0
         state["s"] = torch.zeros_like(sliced, dtype=torch.float32)
-        # p0: reference point for the D estimate. fp32 (sliced -> small).
-        if sliced.norm() > 0:
+        # p0: reference point for the D estimate. fp32 (sliced -> small). ``nonzero``
+        # comes from the batched check of _init_new_states; standalone calls sync here.
+        if nonzero if nonzero is not None else bool(sliced.norm() > 0):
             state["p0"] = sliced.detach().float().clone()
         else:
             state["p0"] = torch.zeros((), device=p.device, dtype=torch.float32)
@@ -444,6 +470,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         self, groups: list[dict[str, Any]], ctx: dict[str, Any]
     ) -> tuple[float, float, torch.device | None]:
         """Reference (per-parameter) pass 1. Bit-exact original behaviour."""
+        self._init_new_states(groups)
         beta1, beta2, beta3 = ctx["beta1"], ctx["beta2"], ctx["beta3"]
         d, dlr, d_over_d0 = ctx["d"], ctx["dlr"], ctx["d_over_d0"]
         slice_p = ctx["slice_p"]
@@ -534,6 +561,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         safeguard_warmup = ctx["safeguard_warmup"]
         should_update_d = ctx["should_update_d"]
         lr = ctx["lr"]
+        self._init_new_states(groups)
 
         # -- collection (original order) ----------------------------------
         # records[i] = (p, state, group, do_d) in iteration order. No gradient is
