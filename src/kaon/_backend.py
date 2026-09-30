@@ -550,6 +550,13 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
                 f"other width ({sorted({str(c.dtype) for c in comp})}, want {want}); convert "
                 "them first with kaon._backend.ensure_residuals"
             )
+        # In place over the views when Triton takes it: no stack, no copy-back (bit-identical
+        # to the stacked kernel — see kaon._fused_triton.ck_add_views_).
+        if SR_TRITON if triton is None else triton:
+            from kaon import _fused_triton as ft
+            if ft.ck_add_views_supported(pviews, comp, delta, bits):
+                ft.ck_add_views_(pviews, comp, delta, -alpha, bits, sr)
+                return
         # ``stacked``: the (weights, residuals) stack the caller already built this step for
         # the decoded decay read (ForeachChunk.value_and_stacks) — same views, unwritten since.
         weights, lows = stacked if stacked is not None else (torch.stack(pviews), torch.stack(comp))
@@ -557,6 +564,11 @@ def subtract_batched_(pviews: list[Tensor], delta: Tensor, bf16_method: str,
         torch._foreach_copy_(pviews, list(weights.unbind(0)))
         torch._foreach_copy_(comp, list(lows.unbind(0)))
     elif p0.dtype == torch.bfloat16 and bf16_method == "stochastic_rounding":
+        if SR_TRITON if triton is None else triton:
+            from kaon import _fused_triton as ft
+            if ft.sr_add_views_supported(pviews, delta):   # in place, see sr_add_views_
+                ft.sr_add_views_(pviews, delta, -alpha, sr)
+                return
         weights = torch.stack(pviews)
         _sr_write_(weights, delta, -alpha, triton, sr)
         torch._foreach_copy_(pviews, list(weights.unbind(0)))

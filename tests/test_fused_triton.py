@@ -13,6 +13,8 @@ Skips cleanly when CUDA or Triton is unavailable (the kernel is GPU-only).
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -1567,17 +1569,9 @@ def test_big_int8_direct_path_never_dequantizes_to_stacked_temp(monkeypatch):
     opt.step()
 
 
-def test_big_int8_direct_path_declines_when_a_row_spans_chunks(monkeypatch):
-    """C=1152 (a matrixized 3x3 conv) does NOT divide 1024, so a row has several writers.
-
-    The per-row absmax would then need a cross-program reduction; the routing must fall back
-    to the codec rather than requantize a partial row. This asserts the guard is REACHED -
-    without it the kernel would silently write a wrong scale for every split row.
-    """
-    ps = _bag([(256, 128, 3, 3)] * 2, torch.float32, seed=82)
-    for p in ps:
-        p.grad = torch.randn_like(p)
-    opt = _fused(ps, lr=1e-3, momentum_dtype="int8")
+def _spy_codec_fallback(monkeypatch, opt):
+    """Record every ``dequant_stacked`` call — i.e. every big bucket that took the codec
+    fallback (dequant -> fp32 temp -> requant) instead of an in-kernel int8 route."""
     codec = opt._codec(opt.param_groups[0])
     seen = []
     real = codec.dequant_stacked
@@ -1587,8 +1581,137 @@ def test_big_int8_direct_path_declines_when_a_row_spans_chunks(monkeypatch):
         return real(*a, **k)
 
     monkeypatch.setattr(codec, "dequant_stacked", spy)
+    return seen
+
+
+def test_big_int8_direct_path_declines_when_rows_are_too_narrow(monkeypatch):
+    """C=100 neither divides the 1024-element chunk nor reaches ``INT8_ROWS_MIN_C``: a chunk
+    would touch ~12 rows, one segmented max each. The routing must keep the codec fallback;
+    this asserts the guard is REACHED."""
+    import kaon._fused_triton as ft
+    assert ft.int8_route(100) == "codec"
+    ps = _bag([(256, 100)] * 2, torch.float32, seed=82)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, momentum_dtype="int8")
+    seen = _spy_codec_fallback(monkeypatch, opt)
     opt.step()
-    assert seen, "a bucket whose rows span chunks must keep the codec fallback"
+    assert len(_parts(opt)[1]) == 2
+    assert seen, "a bucket whose rows are too narrow for the row route must keep the codec"
+
+
+_INT8_ROWS = [
+    [(256, 128, 3, 3)] * 2,          # matrixized 3x3 conv, C = 1152 (a row spans two chunks)
+    [(64, 4608)] * 2,                # DiT fc2, C = 4608
+    [(96, 1280), (96, 1280)],        # C = 1280, R not a power of two
+    [(40, 1536)],                    # a LONE big tensor (N == 1)
+    [(300, 320)] * 2,                # C = 320 < BLOCK, 1024 % 320 != 0: rows straddle chunks
+]
+
+
+@pytest.mark.parametrize("shapes", _INT8_ROWS, ids=lambda s: "x".join(map(str, s[0])))
+def test_big_int8_rows_route_skips_the_codec_fallback(monkeypatch, shapes):
+    """Rows that SPAN chunks (C > 1024, or 1024 % C != 0) take the two-pass in-kernel route:
+    no ``dequant_stacked`` (no fp32 [N,R,C] temp) on any step."""
+    import kaon._fused_triton as ft
+    R, C = shapes[0][0], math.prod(shapes[0][1:])  # noqa: N806
+    assert ft.int8_route(C) == "rows"
+    ps = _bag(shapes, torch.float32, seed=86)
+    opt = _fused(ps, lr=1e-3, momentum_dtype="int8")
+    seen = _spy_codec_fallback(monkeypatch, opt)
+    for _ in range(2):
+        for p in ps:
+            p.grad = torch.randn_like(p)
+        opt.step()
+    assert len(_parts(opt)[1]) == len(shapes)
+    assert not seen, "a row-spanning int8 bucket fell back to the codec"
+    cache = next(iter(opt._fused_big_caches.values()))
+    assert cache.rowmax is not None and cache.rowmax.numel() == len(shapes) * R
+    zs = cache._zeros.untyped_storage().data_ptr()
+    assert cache.rowmax.untyped_storage().data_ptr() == zs, "rowmax must share the one zero_()"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cautious", [True, False])
+@pytest.mark.parametrize("shapes", _INT8_ROWS, ids=lambda s: "x".join(map(str, s[0])))
+def test_big_int8_rows_route_equals_codec_fallback(shapes, cautious, dtype):
+    """The row route and the codec fallback are two implementations of one codec. Measured
+    (deterministic reductions on both, so only the codec differs): the FIRST step is
+    bit-identical in the weights, and over 30 steps the drift stays at fp32-ulp level —
+    max 6.7e-5 relative in fp32, and in bf16 0 except where an ulp-level momentum difference
+    flips one SR draw (7.9e-4, one bf16 ulp of a small weight); row scales identical, codes
+    within one rounding tie."""
+    cfg = dict(lr=2e-3, weight_decay=0.05, cautious=cautious, gradient_centralization=True,
+               momentum_dtype="int8", deterministic_reductions=True)
+    pd = _bag(shapes, dtype, seed=87)
+    pc = _clone(pd)
+    od = _fused(pd, **cfg)
+    oc = _fused(pc, **cfg)
+    oc._direct_int8 = False
+    gen = torch.Generator(device=DEV).manual_seed(19)
+    for step in range(30):
+        gs = [torch.randn(tuple(p.shape), generator=gen, device=DEV, dtype=dtype) for p in pd]
+        for ps in (pd, pc):
+            for p, g in zip(ps, gs, strict=True):
+                p.grad = g.clone()
+        od.step()
+        oc.step()
+        if step == 0:
+            assert all(torch.equal(a, b) for a, b in zip(pd, pc, strict=True)), \
+                "first step must be bit-identical to the codec fallback"
+    torch.cuda.synchronize()
+    for a, b in zip(pd, pc, strict=True):
+        sa, sb = od.state[a], oc.state[b]
+        assert sa["m"].dtype == torch.int8 and sa["m"].shape == sb["m"].shape
+        assert sa["m_scale"].shape == sb["m_scale"].shape
+        rs = ((sa["m_scale"] - sb["m_scale"]).abs() / sb["m_scale"].abs()).max().item()
+        assert rs < 1e-6, f"row scales rel {rs:.2e}"
+        dq = (sa["m"].int() - sb["m"].int()).abs()
+        assert dq.max().item() <= 1 and dq.float().mean().item() < 1e-3
+    d = max((a.float() - b.float()).abs().max().item() for a, b in zip(pd, pc, strict=True))
+    scale = max(b.float().abs().max().item() for b in pc)
+    tol = 2e-4 if dtype == torch.float32 else 2e-3
+    assert d / scale < tol, f"rows route vs codec rel={d / scale:.2e} after 30 steps"
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf"])
+@pytest.mark.parametrize("shape", [(96, 1152), (128, 512)], ids=["rows", "aligned"])
+def test_big_int8_in_kernel_routes_propagate_non_finite_like_the_codec(shape, bad):
+    """NaN policy (0.7.12): a non-finite grad poisons the step identically on every path. The
+    codec's ``amax`` of a NaN row is NaN (scale NaN) and ``NaN.to(int8)`` is 0; ``tl.max`` /
+    ``tl.atomic_max`` drop NaN and Triton's clamp picks a bound, so both in-kernel int8 routes
+    (row-spanning and aligned) used to leave finite scales and different codes."""
+    import kaon._fused_triton as ft
+    assert ft.int8_route(shape[1]) == ("rows" if shape[1] == 1152 else "aligned")
+    out = []
+    for direct in (True, False):
+        ps = _bag([shape] * 2, torch.float32, seed=99)
+        opt = _fused(ps, lr=1e-3, momentum_dtype="int8", deterministic_reductions=True)
+        opt._direct_int8 = direct
+        gen = torch.Generator(device=DEV).manual_seed(5)
+        for step in range(2):
+            for p in ps:
+                g = torch.randn(tuple(p.shape), generator=gen, device=DEV)
+                if step == 1:
+                    g[3, 5] = float(bad)
+                p.grad = g
+            opt.step()
+        torch.cuda.synchronize()
+        out.append([(opt.state[p]["m_scale"].clone(), opt.state[p]["m"].clone(), p.detach().clone())
+                    for p in ps])
+    for (sd, md, pd), (sc, mc, pc) in zip(*out, strict=True):
+        assert sc.isnan().any(), "the codec reference no longer makes NaN scales"
+        assert torch.equal(sd.isnan(), sc.isnan()), "NaN scale rows differ from the codec"
+        assert torch.equal(sd[~sd.isnan()], sc[~sc.isnan()])
+        assert torch.equal(md, mc), "codes differ from the codec under a non-finite grad"
+        assert torch.equal(pd.isnan(), pc.isnan())
+
+
+def test_big_int8_rows_route_matches_native():
+    """End to end against the native per-row int8 codec, on a DiT-width bucket."""
+    d, scale, ov = _run_parity([(128, 1152)] * 2, torch.float32, "int8", wd=0.05)
+    assert len(_parts(ov)[1]) == 2
+    assert d / scale < 5e-4, f"rel={d / scale:.2e}"
 
 
 @pytest.mark.parametrize("shape", [(512, 512), (1024, 512), (2048, 64), (300, 1024)])
@@ -1729,21 +1852,32 @@ def test_sr_write_falls_back_to_torch_when_triton_is_off(monkeypatch):
 
 
 def test_sr_write_reaches_both_weight_writers(monkeypatch):
-    """Both public writers route bf16+SR through ``_sr_write_`` (per-param and batched)."""
+    """Both public writers route bf16+SR through a Triton SR write: the per-param one through
+    ``_sr_write_``, the batched one IN PLACE over its views (``sr_add_views_``, 0.7.18) — and
+    through ``_sr_write_`` on the stack when the views cannot take it (a strided view)."""
+    import kaon._fused_triton as ft
     from kaon import _backend as bk
     seen = []
-    real = bk._sr_write_
+    real, real_views = bk._sr_write_, ft.sr_add_views_
 
     def spy(*a, **k):
-        seen.append(1)
+        seen.append("stack")
         return real(*a, **k)
 
+    def spy_views(*a, **k):
+        seen.append("views")
+        return real_views(*a, **k)
+
     monkeypatch.setattr(bk, "_sr_write_", spy)
+    monkeypatch.setattr(ft, "sr_add_views_", spy_views)
     p = torch.zeros(8, 8, device=DEV, dtype=torch.bfloat16)
     bk.subtract_one_(p, torch.ones(8, 8, device=DEV), {}, "stochastic_rounding", alpha=1e-3)
     bk.subtract_batched_([p, p.clone()], torch.ones(2, 8, 8, device=DEV),
                          "stochastic_rounding", alpha=1e-3)
-    assert len(seen) == 2
+    q = torch.zeros(8, 8, device=DEV, dtype=torch.bfloat16)
+    bk.subtract_batched_([p.t(), q], torch.ones(2, 8, 8, device=DEV),
+                         "stochastic_rounding", alpha=1e-3)
+    assert seen == ["stack", "views", "stack"]
 
 
 # ---------------------------------------------- 4-bit requant: single-axis reduction (item 9a)
@@ -1993,19 +2127,24 @@ def test_big_cache_records_gc_and_rebuilds_on_a_flip():
 
 
 # ------------------------------------------------- int8 direct-path guard: BOTH halves matter
-@pytest.mark.parametrize(("shape", "direct"), [
-    ((512, 512), True),      # C=512 divides 1024
-    ((300, 1024), True),     # C=1024 divides 1024 (one row per chunk)
-    ((256, 513), False),     # C=513 <= 1024 but does NOT divide it -> rows span chunks
-    ((64, 4096), False),     # C=4096 > 1024 -> a row spans four chunks
+@pytest.mark.parametrize(("shape", "route"), [
+    ((512, 512), "aligned"),   # C=512 divides 1024
+    ((300, 1024), "aligned"),  # C=1024 divides 1024 (one row per chunk)
+    ((256, 513), "rows"),      # C=513 <= 1024 but does NOT divide it -> rows span chunks
+    ((64, 4096), "rows"),      # C=4096 > 1024 -> a row spans four chunks
+    ((256, 100), "codec"),     # rows span chunks AND are too narrow for the row route
 ])
-def test_big_int8_guard_routes_on_row_alignment(shape, direct, monkeypatch):
+def test_big_int8_guard_routes_on_row_alignment(shape, route, monkeypatch):
     """``C <= 1024 and 1024 % C == 0`` — the second half is load-bearing on its own.
 
-    ``(256, 513)`` is under the block size and still splits rows, so the per-row absmax would
-    have several writing programs and the kernel would store a scale computed from part of a
-    row. It must fall back to the codec.
+    ``(256, 513)`` is under the block size and still splits rows, so the ALIGNED kernel's
+    per-row absmax would have several writing programs and store a scale computed from part of
+    a row. It must take the cross-program row route (0.7.18; the codec fallback before), which
+    is the one whose cache carries the ``rowmax`` accumulator; too-narrow rows keep the codec.
     """
+    import kaon._fused_triton as ft
+    assert ft.int8_route(shape[1]) == route
+    direct = route != "codec"
     ps = _bag([shape] * 2, torch.float32, seed=98)
     for p in ps:
         p.grad = torch.randn_like(p)
@@ -2023,6 +2162,8 @@ def test_big_int8_guard_routes_on_row_alignment(shape, direct, monkeypatch):
     assert bool(seen) is (not direct), (
         f"{shape}: expected {'the in-kernel path' if direct else 'the codec fallback'}"
     )
+    cache = next(iter(opt._fused_big_caches.values()))
+    assert (cache.rowmax is not None) is (route == "rows")
 
 
 @pytest.mark.parametrize("shape", [(256, 513), (64, 4096)])
@@ -2031,3 +2172,181 @@ def test_big_int8_row_split_shapes_still_match_native(shape):
     d, scale, ov = _run_parity([shape] * 2, torch.float32, "int8", wd=0.05)
     assert len(_parts(ov)[1]) == 2
     assert d / scale < 5e-4, f"{shape} rel={d / scale:.2e}"
+
+
+# ------------------------------------------------------------------- in-place foreach bf16 write
+def _views_bucket(n_views, shape, seed, bits=0):
+    """``n_views`` bf16 params (views of separate storages, like a foreach plan's pviews), their
+    residuals under compact Kahan, and a stacked fp32 delta."""
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    views = [torch.randn(shape, generator=g, device=DEV).bfloat16() for _ in range(n_views)]
+    lows = []
+    if bits:
+        dt = torch.int16 if bits == 16 else torch.uint8
+        hi = 2 ** 15 if bits == 16 else 256
+        lo = -hi if bits == 16 else 0
+        lows = [torch.randint(lo, hi, shape, generator=g, device=DEV).to(dt) for _ in views]
+    delta = torch.randn((n_views, *shape), generator=g, device=DEV) * 1e-2
+    return views, lows, delta
+
+
+@pytest.mark.parametrize("bits", [0, 8, 16], ids=["sr", "kahan8", "kahan16"])
+@pytest.mark.parametrize("shape", [(64, 48), (3000,), (7, 1030)])
+def test_in_place_views_write_is_bit_identical_to_the_stacked_write(bits, shape):
+    """``sr_add_views_`` / ``ck_add_views_`` write each view in place and must reproduce
+    ``stack -> sr_add_/ck_add_ -> _foreach_copy_`` bit for bit: same seed from the stream,
+    same per-element noise counter (the stacked index), weights AND residuals."""
+    import kaon._fused_triton as ft
+    from kaon._stochastic_rounding import SRStream
+    views, lows, delta = _views_bucket(5, shape, seed=90, bits=bits)
+    ref_v = [v.clone() for v in views]
+    ref_l = [c.clone() for c in lows]
+    sa, sb = SRStream(11), SRStream(11)
+    stacked = torch.stack(ref_v)
+    if bits:
+        slo = torch.stack(ref_l)
+        ft.ck_add_(stacked, slo, delta, -0.7, bits, sa)
+        torch._foreach_copy_(ref_l, list(slo.unbind(0)))
+        assert ft.ck_add_views_supported(views, lows, delta, bits)
+        ft.ck_add_views_(views, lows, delta, -0.7, bits, sb)
+    else:
+        ft.sr_add_(stacked, delta, -0.7, sa)
+        assert ft.sr_add_views_supported(views, delta)
+        ft.sr_add_views_(views, delta, -0.7, sb)
+    torch._foreach_copy_(ref_v, list(stacked.unbind(0)))
+    torch.cuda.synchronize()
+    assert sa.draws == sb.draws == 1
+    for a, b in zip(views, ref_v, strict=True):
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+    for a, b in zip(lows, ref_l, strict=True):
+        assert torch.equal(a, b)
+
+
+def test_in_place_views_write_refuses_what_it_cannot_index():
+    import kaon._fused_triton as ft
+    views, lows, delta = _views_bucket(3, (8, 8), seed=91, bits=8)
+    assert ft.sr_add_views_supported(views, delta)
+    assert not ft.sr_add_views_supported([views[0].t()] + views[1:], delta)      # strided
+    assert not ft.sr_add_views_supported(views[:2], delta)                        # count
+    assert not ft.sr_add_views_supported([v.float() for v in views], delta)       # dtype
+    assert not ft.sr_add_views_supported(views, delta.bfloat16())
+    assert not ft.ck_add_views_supported(views, [c.to(torch.int16) for c in lows], delta, 8)
+    assert not ft.ck_add_views_supported(views, lows[:2], delta, 8)
+
+
+def test_in_place_views_pointer_array_follows_a_rebind():
+    """The pointer array is content-addressed: a view list whose storage moved gets a new
+    array, never the old one."""
+    import kaon._fused_triton as ft
+    views, _, delta = _views_bucket(2, (16,), seed=92)
+    ft.sr_add_views_(views, delta, 1.0)
+    moved = [v.clone() for v in views]
+    before = [v.clone() for v in views]
+    ft.sr_add_views_(moved, delta, 1.0)
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(views, before, strict=True))
+    assert not all(torch.equal(a, b) for a, b in zip(moved, before, strict=True))
+
+
+@pytest.mark.parametrize("kernel", ["sr", "ck8", "ck16", "decode", "sr_views", "ck_views"])
+def test_int64_indexing_is_bit_identical_below_the_threshold(kernel):
+    """The ``I64`` variant (taken for >= 2**31-element index spaces, whose int32 offsets used to
+    wrap negative and slip past the ``offs < n`` mask) must compute exactly what the int32
+    variant computes wherever int32 did not wrap — same Philox noise included (an int64
+    counter below 2**32 draws the int32 stream). Allocating 2**31 elements is not possible on
+    a test GPU, so the variant is forced on a small buffer."""
+    import kaon._fused_triton as ft
+    n = 5000
+    g = torch.Generator(device=DEV).manual_seed(93)
+    p0 = torch.randn(n, generator=g, device=DEV).bfloat16()
+    d = torch.randn(n, generator=g, device=DEV) * 1e-2
+    bits = 16 if kernel == "ck16" else 8
+    lo0 = torch.randint(0, 256, (n,), generator=g, device=DEV).to(torch.uint8)
+    if bits == 16:
+        lo0 = torch.randint(-2**15, 2**15, (n,), generator=g, device=DEV).to(torch.int16)
+    outs = []
+    for i64 in (False, True):
+        p, lo = p0.clone(), lo0.clone()
+        grid = ((n + 1023) // 1024,)
+        if kernel == "sr":
+            ft._sr_axpy_kernel[grid](p, d, -0.5, n, 123, BLOCK=1024, I64=i64)
+            res = (p,)
+        elif kernel in ("ck8", "ck16"):
+            ft._ck_axpy_kernel[grid](p, lo, d, -0.5, n, 123, BITS=bits, BLOCK=1024, I64=i64)
+            res = (p, lo)
+        elif kernel == "decode":
+            out = torch.empty(n, device=DEV)
+            ft._ck_decode_kernel[grid](p, lo, out, n, BITS=8, BLOCK=1024, I64=i64)
+            res = (out,)
+        else:
+            views = list(p.view(5, 1000).unbind(0))
+            lows = list(lo.view(5, 1000).unbind(0))
+            K = 1  # noqa: N806
+            parr = ft._view_ptr_array(views, p.device)
+            if kernel == "sr_views":
+                ft._sr_axpy_views_kernel[(5,)](parr, d, -0.5, 1000, K, 123, BLOCK=1024, I64=i64)
+            else:
+                ft._ck_axpy_views_kernel[(5,)](parr, ft._view_ptr_array(lows, p.device), d, -0.5,
+                                               1000, K, 123, BITS=8, BLOCK=1024, I64=i64)
+            res = (p, lo)
+        torch.cuda.synchronize()
+        outs.append(res)
+    for a, b in zip(*outs, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    assert not ft.needs_i64(2**31 - 4096) and ft.needs_i64(2**31)
+
+
+def test_grad_pointer_refresh_tracks_every_step():
+    """Grads reallocated on EVERY step (the varying-sequence-length pattern), old buffers
+    poisoned right after the step that read them: every route must read this step's grads —
+    parity with native over 8 steps."""
+    shapes = [(64, 48)] * 3 + [(512, 512)] * 2 + [(96,)] * 3
+
+    def run(fused):
+        torch.manual_seed(0)
+        ps = [(torch.randn(s, device=DEV) * 0.01).requires_grad_(True) for s in shapes]
+        opt = Adakaon(ps, lr=1e-3, fused=fused, deterministic_reductions=True)
+        g = torch.Generator(device=DEV).manual_seed(3)
+        keep = []
+        for _ in range(8):
+            gs = [torch.randn(s, generator=g, device=DEV) for s in shapes]
+            for p, gr in zip(ps, gs, strict=True):
+                p.grad = gr
+            opt.step()
+            for old in keep:
+                old.fill_(float("nan"))          # a freed buffer the allocator handed back
+            keep = gs
+        torch.cuda.synchronize()
+        return [p.detach().clone() for p in ps]
+
+    wf, wn = run(True), run(False)
+    for a, b in zip(wf, wn, strict=True):
+        assert torch.isfinite(a).all()
+        # 1.05e-5 is the big route's ordinary fused-vs-native drift over 8 steps (the same
+        # with the pre-0.7.18 refresh); a stale pointer reads NaN/garbage (poisoned buffers).
+        assert torch.allclose(a, b, atol=5e-5), "a fused route read a stale grad pointer"
+
+
+def test_in_place_views_write_refuses_duplicate_or_overlapping_views():
+    """The same param twice in a bucket (or overlapping views of one storage) would make the
+    in-place write a race between programs; those buckets keep the stacked path (where the
+    last copy-back wins, as before). Disjoint views of ONE storage are fine."""
+    import kaon._fused_triton as ft
+    from kaon import _backend as bk
+    x = torch.randn(128, device=DEV).bfloat16()
+    d2 = torch.randn(2, 64, device=DEV)
+    assert ft.sr_add_views_supported([x[:64], x[64:]], d2)
+    assert not ft.sr_add_views_supported([x[:64], x[:64]], d2)
+    assert not ft.sr_add_views_supported([x[:64], x[32:96]], d2)
+    lo = torch.zeros(128, device=DEV, dtype=torch.uint8)
+    assert not ft.ck_add_views_supported([x[:64], x[64:]], [lo[:64], lo[:64]], d2, 8)
+    # end to end: a duplicated view goes through the stack, so every element of the param
+    # is one of the two stacked rows (the copy-back of two rows into one param has no
+    # defined order — the pre-0.7.18 behaviour, kept), never a torn in-place mixture
+    from kaon._stochastic_rounding import SRStream
+    p = torch.randn(64, device=DEV).bfloat16()
+    stack = torch.stack([p, p])
+    ft.sr_add_(stack, d2, -1e-2, SRStream(3))
+    bk.subtract_batched_([p, p], d2, "stochastic_rounding", alpha=1e-2, sr=SRStream(3))
+    torch.cuda.synchronize()
+    assert ((p == stack[0]) | (p == stack[1])).all()

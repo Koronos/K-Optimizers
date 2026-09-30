@@ -1235,3 +1235,86 @@ def test_persistent_strided_grad_does_not_rebuild_the_big_buckets():
         "the big pointer caches were rebuilt on a stable demoted set"
     )
     assert spy.counts["fused"] == 3, spy.counts       # the partition's only, 3 steps
+
+
+# --------------------------------------------- 17. zero-element params next to normal weights
+# A 2-D param with ``shape[0] == 0`` made ``eff_2d`` divide by zero (``numel // shape[0]``)
+# inside the partition, BEFORE any numel guard — so one empty tensor took the WHOLE fused
+# step down with ``ZeroDivisionError``, Adakaon (fp32 and bf16) and AdaPNM alike. ``(5, 0)``
+# (fan-in 0) instead reached the one-block kernel and failed to compile. A zero-element
+# tensor has nothing to step: it is never fused-eligible and rides the native path, and its
+# neighbours keep their fused routes.
+
+_EMPTY_BAGS = {
+    "rows0": [(0, 5), (8, 8), (8, 8)],
+    "fanin0": [(5, 0), (8, 8), (8, 8)],
+    "rows0_wide": [(0, 20000), (512, 512)],
+    "one_dim0": [(0,), (8, 8), (32,)],
+}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("bag", sorted(_EMPTY_BAGS))
+@pytest.mark.parametrize("cls_name", ["Adakaon", "AdaPNM"])
+def test_zero_element_param_does_not_break_the_fused_step(cls_name, bag, dtype):
+    import kaon
+    cls = getattr(kaon, cls_name)
+    shapes = _EMPTY_BAGS[bag]
+    cfg = dict(lr=2e-3, weight_decay=0.02, gradient_centralization=True)
+    pv = _bag(shapes, dtype, seed=181)
+    pn = _clone(pv)
+    ov, on = cls(pv, fused=True, **cfg), cls(pn, **cfg)
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(191))
+    ob, big, od, nat = _parts(ov)
+    empty = [p for p in pv if p.numel() == 0]
+    assert all(any(p is q for q in nat + od) for p in empty)
+    assert not any(p is q for p in empty for q in ob + big), "an empty tensor was fused 2-D"
+    assert ob or big, "the healthy 2-D neighbours must keep a fused route"
+    d = _maxdiff([p for p in pv if p.numel()], [p for p in pn if p.numel()])
+    # fp32: the chunked (512, 512) differs from native by reduction order only; bf16: the
+    # fused and native SR noise streams differ, so a few bf16 ulps of |p| ~ 4.
+    tol = 1e-4 if dtype == torch.float32 else 1e-1
+    assert d < tol, f"{bag}: max|Delta p| vs native = {d:.2e}"
+
+
+@pytest.mark.parametrize("cls_name", ["Adakaon", "AdaPNM"])
+def test_fused_group_without_any_grad_is_a_no_op(cls_name):
+    import kaon
+    cls = getattr(kaon, cls_name)
+    ps = _bag([(8, 8), (512, 512), (32,)], seed=193)
+    before = [p.detach().clone() for p in ps]
+    opt = cls(ps, fused=True, lr=1e-2)
+    opt.step()
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(before, ps, strict=True))
+
+
+# --------------------------------------------- 18. rows too wide for one reduction program
+# ``reduction_tile`` handed a program ``next_pow2(C)`` columns with no ceiling: (4, 1048576)
+# asked Triton for a 1M-lane tile and took >100 s to compile. Above ``REDUCTION_C_CAP`` the
+# column-tiled ``*_ct`` kernels walk the row instead; everything narrower is untouched.
+@pytest.mark.parametrize("det", [False, True], ids=["atomic", "deterministic"])
+@pytest.mark.parametrize("shapes", [[(4, 1 << 20)], [(3, 40000)] * 2], ids=["1M", "40000"])
+def test_very_wide_rows_take_the_column_tiled_reductions(shapes, det):
+    import time
+
+    import kaon._fused_triton as ft
+    assert triton.next_power_of_2(shapes[0][1]) > ft.REDUCTION_C_CAP
+    cfg = dict(_FP32_CFG, deterministic_reductions=det)
+    pv = _bag(shapes, seed=197)
+    pn = _clone(pv)
+    ov, on = Adakaon(pv, fused=True, **cfg), Adakaon(pn, **cfg)
+    t0 = time.perf_counter()
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(199))
+    assert time.perf_counter() - t0 < 90, "compiling the wide-row reductions took too long"
+    ob, big, od, nat = _parts(ov)
+    assert big and not nat
+    d = _maxdiff(pv, pn)
+    assert d < 1e-5, f"{shapes[0]}: max|Delta p| vs native = {d:.2e}"
+
+
+def test_reduction_tile_caps_the_column_tile_only_when_asked():
+    import kaon._fused_triton as ft
+    assert reduction_tile(4, 1 << 20)[1] == 1 << 20                  # AdaPNM: unchanged
+    br, bc, rb = reduction_tile(4, 1 << 20, cap=ft.REDUCTION_C_TILE)
+    assert bc == ft.REDUCTION_C_TILE and br * rb >= 4

@@ -196,6 +196,59 @@ def _demote_unfusable_grads(
     return kept[0], kept[1], kept[2], native + demoted
 
 
+def _widened_grad(p: Tensor) -> bool:
+    """An fp32 gradient on a bf16 weight — the one grad/param dtype mismatch Adakaon's fused
+    kernels read directly (their ``GF32`` constexpr types the grad pointer fp32 while the weight
+    stays bf16; the grad is upcast to fp32 on load either way, as native's ``grad.float()``)."""
+    return p.dtype == torch.bfloat16 and p.grad.dtype == torch.float32
+
+
+def _adakaon_demoted(parts: tuple) -> tuple:
+    """Ids of the fused-routed params Adakaon must step natively THIS step.
+
+    :func:`_grad_unfusable` minus the widened case: a non-contiguous grad, or a grad whose dtype
+    is neither the param's nor the widened fp32-on-bf16 (fp16 grads, a bf16 grad on an fp32
+    weight, ...). A WIDENED grad stays fused — ``GF32`` is one constexpr per launch, resolved from
+    the bucket's first grad, so every bf16 weight of a route must agree on its grad dtype: when a
+    route mixes bf16-grad and fp32-grad bf16 weights, the fp32-grad ones are demoted as before
+    (the rare case; the common ones — every grad fp32, or every grad bf16 — keep the whole route).
+    AdaPNM keeps :func:`_grad_unfusable` (its kernels type the grad by the weight)."""
+    out: list[int] = []
+    for sub in parts[:3]:
+        wide: list[int] = []
+        narrow = False
+        for p in sub:
+            g = p.grad
+            if not g.is_contiguous():
+                out.append(id(p))
+            elif g.dtype == p.dtype:
+                narrow = narrow or p.dtype == torch.bfloat16
+            elif _widened_grad(p):
+                wide.append(id(p))
+            else:
+                out.append(id(p))
+        if narrow:
+            out += wide
+    return tuple(out)
+
+
+def _demote_by_id(parts: tuple, demoted: tuple) -> tuple:
+    """``parts`` with the params whose ids are in ``demoted`` moved onto the native subset."""
+    ids = set(demoted)
+    kept: tuple[list[Tensor], ...] = ([], [], [])
+    moved: list[Tensor] = []
+    for keep, sub in zip(kept, parts[:3], strict=True):
+        for p in sub:
+            (moved if id(p) in ids else keep).append(p)
+    return kept[0], kept[1], kept[2], parts[3] + moved
+
+
+def _gf32(plist: list[Tensor]) -> bool:
+    """The ``GF32`` constexpr of a launch over ``plist`` (a bucket of one param dtype): True for a
+    bf16 bucket whose grads are fp32. Uniform across the bucket by :func:`_adakaon_demoted`."""
+    return _widened_grad(plist[0])
+
+
 class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     """Conv-aware factored optimizer with optional bf16 momentum.
 
@@ -670,8 +723,13 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             # skip its own sweep; True for a param routed native anyway is harmless (the sweep
             # then moves nothing). Every grad is checked, never one per bucket: a bucket can mix
             # grad dtypes.
+            #
+            # An fp32 grad on a bf16 weight (``wide``) is READ by the fused kernels (``GF32``), so
+            # it only needs the sweep when the group also has a bf16 weight with a bf16 grad —
+            # checked lazily, so the default all-bf16 steady state pays nothing new here.
             params: list[Tensor] = []
             unfusable = False
+            wide = False
             for p in group["params"]:
                 g = p.grad
                 if g is None:
@@ -679,8 +737,16 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                 if g.is_sparse:
                     raise RuntimeError("Adakaon does not support sparse gradients")
                 params.append(p)
-                if g.dtype != p.dtype or not g.is_contiguous():
+                if g.dtype != p.dtype:
+                    if g.dtype == torch.float32 and p.dtype == torch.bfloat16:
+                        wide = True
+                    else:
+                        unfusable = True
+                if not g.is_contiguous():
                     unfusable = True
+            if wide and not unfusable:
+                unfusable = any(p.dtype == torch.bfloat16 and p.grad.dtype == torch.bfloat16
+                                for p in params)
             parts = self._fused_partition(group, params, ft)
             # Routing is cached; grad CONTIGUITY is not cacheable (fresh tensor every backward).
             one_block, big, one_dim, native = self._fused_demote(id(group), parts,
@@ -874,8 +940,11 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             # compatible with that view (int8 scales dim-0, 4-bit blocks the same flat storage).
             # The matrixized write-back needs a contiguous GRAD — enforced per step by
             # _demote_unfusable_grads, not here, because the grad changes every backward.
+            # The chunked kernels index one tensor in int32 (``k * BLOCK + arange``), so a
+            # single weight of >= 2**31 elements stays native instead of wrapping its offsets.
             two_d = bf_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous() \
-                and p.dtype in (torch.float32, torch.bfloat16)
+                and p.dtype in (torch.float32, torch.bfloat16) \
+                and p.numel() < ft.I64_THRESHOLD
             ok = bf_ok and ft.fused_eligible(p, cap)
             if ok and momentum and md == "4bit" and ft.eff_2d(p)[1] % 2 != 0:
                 ok = False                                  # one-block 4bit needs even C
@@ -939,8 +1008,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         """
         # ``unfusable`` is the caller's verdict from the grad pass it already makes (False: no
         # grad in the group is unfusable, so there is nothing to sweep for).
-        demoted = () if not unfusable else tuple(
-            id(p) for sub in parts[:3] for p in sub if _grad_unfusable(p))
+        demoted = () if not unfusable else _adakaon_demoted(parts)
         if not demoted:
             self._fused_demoted.pop(gid, None)
             return parts
@@ -948,7 +1016,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if (cached is not None and cached[0] == demoted
                 and all(a is b for a, b in zip(cached[1], parts, strict=True))):
             return cached[2]
-        out = _demote_unfusable_grads(*parts)
+        out = _demote_by_id(parts, demoted)
         self._fused_demoted[gid] = (demoted, parts, out)
         return out
 
@@ -1057,7 +1125,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     LOWP=bk["lowp"], MOM=bk["mom"], CAUTIOUS=cautious, WD=wd != 0,
                     GC=gc and bk["gc_ok"],
                     SR=self._fused_sr(group, bk["lowp"]), CK=ck if bk["lowp"] else 0,
-                    MOMENTUM=bk["momentum"], WDFULL=wd_full,
+                    MOMENTUM=bk["momentum"], WDFULL=wd_full, GF32=_gf32(bk["plist"]),
                     BR=bk["BR"], BC=bk["BC"], EXACT=bk["exact4"], FBLK=bk["fblk"],
                     num_warps=ft.warps_for(lanes),
                 )
@@ -1095,7 +1163,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     bk["v_addr"], bk["Ls"], lr, b1, b2, eps1, clip, wd, self._t,
                     LOWP=bk["lowp"], MOM=bk["mom"], MOMENTUM=bk["momentum"], CAUTIOUS=cautious,
                     WD=wd != 0, SR=self._fused_sr(group, bk["lowp"]), CK=ck if bk["lowp"] else 0,
-                    BL=bk["BL"], FBLOCK=bk["block"], WDFULL=wd_full,
+                    BL=bk["BL"], FBLOCK=bk["block"], WDFULL=wd_full, GF32=_gf32(bk["plist"]),
                     num_warps=ft.warps_for(bk["BL"]),
                 )
 
@@ -1258,6 +1326,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             self._fused_big_caches[cache_key] = cache
         cache.refresh_grads()
         gc = cache.gc          # the per-bucket constexpr every launch below is given
+        gf32 = _gf32(plist)    # fp32 grads on bf16 weights, read in place (GF32)
 
         if b1 == 0.0:
             self._chunked_step_batched_nomom(
@@ -1286,23 +1355,42 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         grid = (N * K,)
         direct_4bit = md == "4bit" and states[0]["m_block"] <= 1024 \
             and 1024 % states[0]["m_block"] == 0
-        # int8's scale is per ROW, so a chunk may requantize a row only if it owns the whole
-        # row: C <= BLOCK and BLOCK % C == 0 (see _chunked_int8_apply_batched_g). Otherwise the
-        # per-row absmax would need a cross-program reduction and the codec fallback stands.
-        direct_int8 = (md == "int8" and self._direct_int8
-                       and C <= 1024 and 1024 % C == 0)
+        # int8's scale is per ROW, so a chunk may requantize a row in ONE pass only if it owns
+        # the whole row: C <= BLOCK and BLOCK % C == 0 (``ft.int8_route`` == "aligned", see
+        # _chunked_int8_apply_batched_g). Rows that span chunks take the two-pass cross-program
+        # row absmax ("rows", C >= 128); only narrower misaligned rows keep the codec fallback.
+        int8_route = ft.int8_route(C) if md == "int8" and self._direct_int8 else "codec"
+        direct_int8 = int8_route == "aligned"
         if direct_int8 and fused_red:
             if cautious:
                 ft._chunked_int8_keep_batched_g[grid](
                     g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
                     keep, rms, clip, wd, b1, R, C, n, K,
-                    LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full, CK=ck,
+                    LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full, CK=ck, GF32=gf32,
                 )
             ft._chunked_int8_apply_batched_g[grid](
                 g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
                 keep, rms, clip, lr, wd, b1, self._t, R, C, n, K,
                 LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
-                CSEG=C, RPC=1024 // C, BLOCK=1024, WDFULL=wd_full,
+                CSEG=C, RPC=1024 // C, BLOCK=1024, WDFULL=wd_full, GF32=gf32,
+            )
+            return
+        if int8_route == "rows" and fused_red and cache.rowmax is not None:
+            # Rows span chunks: the two-pass cross-program row absmax (see
+            # ``ft._chunked_int8_rowmax_batched_g``). Pass 1 also counts the cautious keep,
+            # so this route costs the aligned one's two launches, with or without cautious.
+            ft._chunked_int8_rowmax_batched_g[grid](
+                g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
+                keep, rms, cache.rowmax, cache.oldscale, clip, wd, b1, R, C, n, K,
+                LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024,
+                WDFULL=wd_full, CK=ck, GF32=gf32,
+            )
+            ft._chunked_int8_apply_rows_batched_g[grid](
+                g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
+                keep, rms, cache.rowmax, cache.oldscale, clip, lr, wd, b1, self._t,
+                R, C, n, K,
+                LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
+                BLOCK=1024, WDFULL=wd_full, GF32=gf32,
             )
             return
         if direct_4bit and fused_red:
@@ -1312,13 +1400,13 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                     g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
                     keep, rms, clip, wd, b1, R, C, n, K,
                     LOWP=lowp, GC=gc, WD=wd != 0, FBLOCK=block, BLOCK=1024, WDFULL=wd_full,
-                    CK=ck,
+                    CK=ck, GF32=gf32,
                 )
             ft._chunked_4bit_apply_batched_g[grid](
                 g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
                 keep, rms, clip, lr, wd, b1, self._t, R, C, n, K,
                 LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
-                FBLOCK=block, BLOCK=1024, WDFULL=wd_full,
+                FBLOCK=block, BLOCK=1024, WDFULL=wd_full, GF32=gf32,
             )
             return
 
@@ -1352,13 +1440,13 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             ft._chunked_mom_batched_g[grid](
                 g_addr, rowmean, m_addr, p_addr, c_addr, r, c, keep, rms, clip, wd, b1, R, C, n, K,
                 LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
-                CK=ck,
+                CK=ck, GF32=gf32,
             )
         else:
             ft._chunked_mom_batched[grid](
                 g, m_addr, p_addr, c_addr, r, c, keep, inv_rms, wd, b1, R, C, n, K,
                 LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
-                CK=ck,
+                CK=ck, I64=ft.needs_i64(N * K * 1024),
             )
         if quant:  # requant the updated fp32 temp back into per-tensor storage (apply reads the temp)
             # Batched requant (same write pattern as ema_stacked: in-place copies keep the
@@ -1380,7 +1468,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             ft._chunked_apply_batched_g[grid](
                 g_addr, rowmean, m_addr, p_addr, c_addr, keep, lr, wd, self._t, R, C, n, K,
                 LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
-                BLOCK=1024, WDFULL=wd_full,
+                BLOCK=1024, WDFULL=wd_full, GF32=gf32,
             )
         else:
             inv_mean = (
@@ -1390,7 +1478,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             ft._chunked_apply_batched[grid](
                 g, m_addr, p_addr, c_addr, inv_mean, lr, wd, self._t, n, K,
                 LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
-                BLOCK=1024, WDFULL=wd_full,
+                BLOCK=1024, WDFULL=wd_full, I64=ft.needs_i64(N * K * 1024),
             )
 
     def _chunked_step_batched_nomom(
@@ -1413,6 +1501,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             plist, group, ft, R, C, n, lowp, cache, gc
         )
         p_addr = cache.p_addr
+        gf32 = _gf32(plist)
         ck = self._ck_bits(group) if lowp else 0
         c_addr = self._c_addr_arg(cache.c_addr, p_addr, ck)
         K = (n + 1023) // 1024  # noqa: N806
@@ -1422,12 +1511,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             ft._chunked_nomom_keep_batched_g[grid](
                 g_addr, rowmean, p_addr, c_addr, r, c, keep, rms, clip,
                 wd, R, C, n, K, LOWP=lowp, GC=gc, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
-                CK=ck,
+                CK=ck, GF32=gf32,
             )
         ft._chunked_nomom_apply_batched_g[grid](
             g_addr, rowmean, p_addr, c_addr, r, c, rms, clip, keep,
             lr, wd, self._t, R, C, n, K, LOWP=lowp, GC=gc,
-            CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck, BLOCK=1024, WDFULL=wd_full,
+            CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck, BLOCK=1024, WDFULL=wd_full, GF32=gf32,
         )
 
     @torch.no_grad()
@@ -1458,24 +1547,35 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         b2, eps1 = group["betas"][1], group["eps"][0]
         N = len(plist)  # noqa: N806
         g_addr = cache.g_addr
-        BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806
+        ct = ft.triton.next_power_of_2(C) > ft.REDUCTION_C_CAP   # rows too wide: tiled kernels
+        BR, BC, RB = ft.reduction_tile(R, C, cap=ft.REDUCTION_C_TILE if ct else None)  # noqa: N806
         rowmean = cache.rowmean
         rowsum = cache.rowsum
         colsum = cache.colsum
         det = self._deterministic_reductions
         cache.zero_accumulators()          # colsum + rms + keep, one launch
+        gf32 = _gf32(plist)
+        nw = ft.warps_for(BR * BC)
         if det:
             colpart, rmspart = cache.partials(RB)
             CB = (C + 255) // 256  # noqa: N806
+        if ct:
+            ft._reduce_rowcol_ct[(N * RB,)](
+                g_addr, rowmean, rowsum, colsum, colpart if det else colsum, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, DET=det, num_warps=nw, GF32=gf32,
+            )
+            if det:
+                ft._reduce_colpart[(N * CB,)](colpart, colsum, C, RB, CB, BCT=256)
+        elif det:
             ft._reduce_rowcol_det[(N * RB,)](
                 g_addr, rowmean, rowsum, colpart, R, C, RB,
-                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=nw, GF32=gf32,
             )
             ft._reduce_colpart[(N * CB,)](colpart, colsum, C, RB, CB, BCT=256)
         else:
             ft._reduce_rowcol[(N * RB,)](
                 g_addr, rowmean, rowsum, colsum, R, C, RB,
-                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=nw, GF32=gf32,
             )
         # Update persistent row/col state directly via pointer arrays and emit
         # factors in one launch (no stack/scatter or eager elementwise chain). ``r``/``c``
@@ -1487,21 +1587,35 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         col_addr = cache.col_addr
         FR = ft.triton.next_power_of_2(R)  # noqa: N806
         FC = ft.triton.next_power_of_2(C)  # noqa: N806
-        ft._factor_rowcol_batched[(N,)](
-            row_addr, col_addr, rowsum, colsum, r, c, R, C, b2, eps1,
-            BR=FR, BC=FC, num_warps=ft.warps_for(max(FR, FC)),
-        )
+        if ct:
+            ft._factor_rowcol_batched_ct[(N,)](
+                row_addr, col_addr, rowsum, colsum, r, c, R, C, b2, eps1,
+                BR=FR, BC=ft.REDUCTION_C_TILE,
+                num_warps=ft.warps_for(max(FR, ft.REDUCTION_C_TILE)),
+            )
+        else:
+            ft._factor_rowcol_batched[(N,)](
+                row_addr, col_addr, rowsum, colsum, r, c, R, C, b2, eps1,
+                BR=FR, BC=FC, num_warps=ft.warps_for(max(FR, FC)),
+            )
         rms = cache.rms
-        if det:
+        if ct:
+            ft._reduce_rms_ct[(N * RB,)](
+                g_addr, rowmean, r, c, rmspart if det else rms, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, DET=det, num_warps=nw, GF32=gf32,
+            )
+            if det:
+                ft._reduce_rmspart[(N,)](rmspart, rms, RB)
+        elif det:
             ft._reduce_rms_det[(N * RB,)](
                 g_addr, rowmean, r, c, rmspart, R, C, RB,
-                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=nw, GF32=gf32,
             )
             ft._reduce_rmspart[(N,)](rmspart, rms, RB)
         else:
             ft._reduce_rms[(N * RB,)](
                 g_addr, rowmean, r, c, rms, R, C, RB,
-                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=nw, GF32=gf32,
             )
         return g_addr, rowmean, r, c, rms
 
@@ -1717,6 +1831,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             gsq_eps = (grad_sq + eps1) if (eps1 > 0 and matvec) else (
                 grad_sq.add_(eps1) if eps1 > 0 else grad_sq)
             row_mean, col_mean = gsq_eps.mean(dim=-1), gsq_eps.mean(dim=-2)
+            del gsq_eps
+        if not matvec:
+            # Dead from here on: dropping it lets the allocator hand its [N,R,C] block to
+            # ``update`` instead of holding both through the EMA/decay/cautious tail (one
+            # bucket-sized fp32 buffer off the foreach step's peak).
+            del grad_sq
         row.lerp_(row_mean, omb)
         col.lerp_(col_mean, omb)
         torch._foreach_copy_(rows, list(row.unbind(0)))
@@ -1743,6 +1863,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             rms = (r * r).mul_(
                 torch.bmm(grad_sq, (c * c).unsqueeze(-1)).squeeze(-1)
             ).sum(-1).div_(R * C).sqrt_()                                          # [N]
+            del grad_sq                                  # dead: see the non-matvec branch
             r = r.mul_(rms.div_(clip).clamp_(min=1.0).reciprocal_().unsqueeze(-1))
             update = grad.mul(r.unsqueeze(-1)).mul_(c.unsqueeze(-2))               # [N, R, C]
         else:  # A/B baseline: build the update, then norm it and divide it down.
@@ -1830,9 +1951,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if eps1 > 0:
             grad_sq = grad_sq.add_(eps1)
         v.lerp_(grad_sq, omb)
+        del grad_sq                    # dead: frees its [N, L] block for ``update``
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
-        update = grad.mul(v.rsqrt())                                      # [N, L]
+        # rsqrt(v) * grad, in the rsqrt's own buffer: one [N, L] temp instead of two
+        # (the product is commutative, so this is bit-identical to ``grad.mul(v.rsqrt())``).
+        update = v.rsqrt().mul_(grad)                                     # [N, L]
         rms = update.norm(2, dim=1) / math.sqrt(length)                   # per-slice RMS
         update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1))
 

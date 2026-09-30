@@ -50,6 +50,8 @@ What is already optimizer-AGNOSTIC vs Adakaon-SPECIFIC here:
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
 from kaon._backend import gc_applies
@@ -329,7 +331,16 @@ def bucket_gc_ok(plist: list) -> bool:
     return flags.pop()
 
 
-def reduction_tile(R: int, C: int, work: int = 16384) -> tuple[int, int, int]:
+#: Widest padded row (``next_pow2(C)``) a reduction program owns whole; above it Adakaon
+#: switches to the column-tiled ``*_ct`` kernels, which walk the row in ``REDUCTION_C_TILE``
+#: columns (see :func:`reduction_tile`'s ``cap``). Every width up to the threshold keeps the
+#: exact pre-0.7.18 kernels.
+REDUCTION_C_CAP = 1 << 15
+REDUCTION_C_TILE = 1 << 13
+
+
+def reduction_tile(R: int, C: int, work: int = 16384,  # noqa: N803
+                   cap: int | None = None) -> tuple[int, int, int]:
     """Row-block sizing for the fused reduction kernels: ``(BR, BC, RB)`` — one program owns ``BR``
     rows × ``BC = next_pow2(C)`` cols (≈ ``work`` lanes) and ``RB = ceil(R/BR)`` blocks tile the rows.
 
@@ -345,8 +356,13 @@ def reduction_tile(R: int, C: int, work: int = 16384) -> tuple[int, int, int]:
     ``_chunked_reductions_fused``) masks its rows with ``ri < R`` on every load, store and
     atomic, and ``RB`` below is derived from the PADDED ``BR`` so the row blocks still tile
     ``R`` exactly once.
+
+    ``cap`` (Adakaon only; AdaPNM passes none and keeps the unbounded tile): bound ``BC`` for a
+    caller that launches the column-tiled ``*_ct`` kernels when ``next_pow2(C)`` exceeds it.
     """
     BC = triton.next_power_of_2(C)  # noqa: N806
+    if cap is not None:            # the column-tiled kernels walk C in ``cap``-wide tiles
+        BC = min(BC, cap)  # noqa: N806
     BR = triton.next_power_of_2(max(1, min(R, max(1, work // BC))))  # noqa: N806
     RB = (R + BR - 1) // BR  # noqa: N806
     return BR, BC, RB
@@ -360,8 +376,15 @@ def eff_2d(p: torch.Tensor) -> tuple[int, int]:
     CONTIGUOUS tensor's row-major storage is identical under that reshape, the fused kernels (which
     index the flat buffer as ``ri*C + ci``) operate on a conv exactly as on the 2-D view, with no
     copy. The row/col second-moment state is already allocated in this matrixized shape (see each
-    optimizer's ``_init_state``)."""
-    return p.shape[0], p.numel() // p.shape[0]
+    optimizer's ``_init_state``).
+
+    A zero-row tensor (``shape[0] == 0``) has ``C`` = the product of the inner dims: the
+    ``numel // shape[0]`` shortcut divided by zero there, inside the partition, before any
+    eligibility guard ran — taking the WHOLE fused step down for one empty tensor."""
+    r = p.shape[0]
+    if r == 0:
+        return 0, math.prod(p.shape[1:])
+    return r, p.numel() // r
 
 
 def warps_for(lanes: int) -> int:
@@ -383,9 +406,11 @@ def fused_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP) -> bool:
     Optimizer-agnostic: any single-block fused kernel shares this predicate. ``ndim>2`` conv kernels
     are matrixized to ``(out, in*kh*kw)`` via :func:`eff_2d` (valid because they're contiguous); the
     caller must also confirm the GRAD is contiguous (the matrixized write-back needs it). Everything
-    that returns False is routed to the native fallback.
+    that returns False is routed to the native fallback. So is a ZERO-ELEMENT tensor: there is
+    nothing to step, and a zero tile extent is not a valid ``tl.arange`` (fan-in 0 failed to
+    compile, zero rows divided by zero in :func:`eff_2d`).
     """
-    if p.ndim < 2 or not p.is_cuda or not p.is_contiguous():
+    if p.ndim < 2 or not p.is_cuda or not p.is_contiguous() or p.numel() == 0:
         return False
     if p.dtype not in (torch.float32, torch.bfloat16):  # fp16 SR unsupported -> native
         return False
@@ -403,8 +428,9 @@ def fused_1d_eligible(p: torch.Tensor, tile_cap: int = TILE_CAP_1D) -> bool:
 
     Note the default is :data:`TILE_CAP_1D`, **not** the 2-D :data:`TILE_CAP`: falling off this
     cap means dropping to the native foreach path, not to the chunked kernel, so the two bounds
-    are unrelated. Callers pass no cap — ``fused_tile_cap=`` tunes the 2-D crossover only."""
-    if p.ndim != 1 or not p.is_cuda or not p.is_contiguous():
+    are unrelated. Callers pass no cap — ``fused_tile_cap=`` tunes the 2-D crossover only.
+    A zero-length tensor is never eligible (a zero-extent ``tl.arange`` does not compile)."""
+    if p.ndim != 1 or not p.is_cuda or not p.is_contiguous() or p.numel() == 0:
         return False
     if p.dtype not in (torch.float32, torch.bfloat16):
         return False
@@ -439,6 +465,34 @@ if _HAS_TRITON:
         # because a Triton kernel cannot read a module global.
         finite = tl.abs(res) <= 3.4028234663852886e+38
         return tl.where(finite, rounded, ibits).to(tl.float32, bitcast=True)
+
+    @triton.jit
+    def grad_ptr(base, LOWP: tl.constexpr, GF32: tl.constexpr):
+        """Type a pointer-array GRAD entry: bf16 when the weight is (``LOWP``) unless the bucket's
+        grads are fp32 (``GF32``: an fp32 gradient on a bf16 weight — ``p.grad_dtype = None``, or
+        a trainer that keeps fp32 grads). Every consumer upcasts the loaded grad to fp32 at once,
+        so the fp32 grad goes through exactly the arithmetic the bf16 one does — the native
+        path's ``grad.float()``. Default ``GF32=False`` is the pre-0.7.18 typing, unchanged."""
+        if LOWP and not GF32:
+            return base.to(tl.pointer_type(tl.bfloat16))
+        else:
+            return base.to(tl.pointer_type(tl.float32))
+
+    @triton.jit
+    def max_nan(a, b):
+        """``max`` that PROPAGATES NaN (``fmax.NaN``, same cost as a plain max) — the combine
+        function for row absmaxes that must match torch's ``amax`` on a NaN row."""
+        return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+    @triton.jit
+    def int8_codes(m, scale):
+        """``_quant_int8``'s codes for fp32 ``m`` against ``scale``, NaN included: torch's
+        ``round().clamp(-127, 127).to(int8)`` keeps a NaN through the clamp and casts it to 0,
+        while Triton's min/max do not propagate NaN (the clamp would pick a bound). A NaN
+        quotient — NaN momentum, a NaN scale, or ``inf / inf`` — is therefore coded 0
+        explicitly; finite quotients are clamped exactly as before."""
+        q = libdevice.rint(m / scale)
+        return tl.where(q == q, tl.minimum(tl.maximum(q, -127.0), 127.0), 0.0)
 
     @triton.jit
     def ck_ptr(c_addr, t, BITS: tl.constexpr):
@@ -558,7 +612,8 @@ if _HAS_TRITON:
             ck_store_noise(pp, cp, idx, mask, res, noise, BITS)
 
     @triton.jit
-    def _sr_axpy_kernel(p_ptr, d_ptr, alpha, n, seed, BLOCK: tl.constexpr):
+    def _sr_axpy_kernel(p_ptr, d_ptr, alpha, n, seed, BLOCK: tl.constexpr,
+                        I64: tl.constexpr = False):
         """``p += alpha * d`` for a bf16 ``p`` and an fp32 ``d``, stochastically rounded.
 
         ONE kernel and ZERO temporaries, against the torch path's chain inside
@@ -576,6 +631,8 @@ if _HAS_TRITON:
         nondeterminism, only a second place that uses it.
         """
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
         p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
@@ -583,13 +640,16 @@ if _HAS_TRITON:
         tl.store(p_ptr + offs, sr_round(p + alpha * d, seed, offs).to(tl.bfloat16), mask=mask)
 
     @triton.jit
-    def _ck_axpy_kernel(p_ptr, c_ptr, d_ptr, alpha, n, seed, BITS: tl.constexpr, BLOCK: tl.constexpr):
+    def _ck_axpy_kernel(p_ptr, c_ptr, d_ptr, alpha, n, seed, BITS: tl.constexpr, BLOCK: tl.constexpr,
+                        I64: tl.constexpr = False):
         """``(p, lo) += alpha * d`` for a compact-Kahan bf16 ``p`` + residual ``lo`` and an
         fp32 ``d``: ONE launch, ZERO temporaries — the ``kahan8`` twin of ``_sr_axpy_kernel``.
         The torch reference (``kaon._compact_kahan.compensated_add_``) is a dozen integer
         kernels with parameter-sized int32 scratch (measured ~23 B/elem transient on a
         stacked bucket); this reads 3 B/elem and writes 3 B/elem (4 and 4 for ``kahan16``)."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
         z = ck_decode(p_ptr, c_ptr, offs, mask, BITS)
@@ -597,15 +657,68 @@ if _HAS_TRITON:
         ck_store(p_ptr, c_ptr, offs, mask, z + alpha * d, seed, BITS)
 
     @triton.jit
-    def _ck_decode_kernel(p_ptr, c_ptr, out_ptr, n, BITS: tl.constexpr, BLOCK: tl.constexpr):
+    def _ck_decode_kernel(p_ptr, c_ptr, out_ptr, n, BITS: tl.constexpr, BLOCK: tl.constexpr,
+                          I64: tl.constexpr = False):
         """``out = decode(p, lo)`` as fp32, one launch (the torch reference,
         ``kaon._compact_kahan.decode``, is ~10 integer kernels with three int32 temporaries —
         measured +50-80% self-CUDA on a foreach Adakaon step when the weight-decay read went
         through it). Integer-identical: ``ck_decode`` is the same bit manipulation."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
         tl.store(out_ptr + offs, ck_decode(p_ptr, c_ptr, offs, mask, BITS), mask=mask)
+
+    # ---- the same two writes over a foreach bucket's param VIEWS, in place (pointer array) ----
+    # The foreach path's bf16 write (``kaon._backend.subtract_batched_``) used to stack the
+    # bucket's weights (+ residuals), run ``_sr_axpy_kernel`` / ``_ck_axpy_kernel`` on the stack
+    # and ``_foreach_copy_`` it back: two extra full passes over the weights (three bytes more
+    # per element under kahan8) plus a bucket-sized allocation, per chunk per step. These write
+    # each view where it lives. The NOISE is the stacked kernel's, bit for bit: one seed per
+    # launch and the stacked flat index ``t * n + j`` as the ``tl.rand`` counter — only the
+    # ADDRESS is per view — so a switch between the two is invisible in the trajectory.
+    @triton.jit
+    def _sr_axpy_views_kernel(p_addr, d_ptr, alpha, n, K, seed, BLOCK: tl.constexpr,
+                              I64: tl.constexpr = False):
+        """``view_t += alpha * d[t]`` (bf16 SR) for every view ``t`` of a pointer array."""
+        pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
+        t = pid // K
+        k = pid % K
+        local = k * BLOCK + tl.arange(0, BLOCK)
+        mask = local < n
+        gidx = t * n + local                      # the stacked kernel's element index
+        pp = tl.load(p_addr + t).to(tl.pointer_type(tl.bfloat16))
+        p = tl.load(pp + local, mask=mask, other=0.0).to(tl.float32)
+        d = tl.load(d_ptr + gidx, mask=mask, other=0.0).to(tl.float32)
+        tl.store(pp + local, sr_round(p + alpha * d, seed, gidx).to(tl.bfloat16), mask=mask)
+
+    @triton.jit
+    def _ck_axpy_views_kernel(p_addr, c_addr, d_ptr, alpha, n, K, seed, BITS: tl.constexpr,
+                              BLOCK: tl.constexpr, I64: tl.constexpr = False):
+        """``(view_t, lo_t) += alpha * d[t]`` (compact Kahan) for every view of a pointer array;
+        :func:`ck_store`'s draw on the stacked index, as ``_ck_axpy_kernel`` makes it."""
+        pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
+        t = pid // K
+        k = pid % K
+        local = k * BLOCK + tl.arange(0, BLOCK)
+        mask = local < n
+        gidx = t * n + local
+        pp = tl.load(p_addr + t).to(tl.pointer_type(tl.bfloat16))
+        cp = ck_ptr(c_addr, t, BITS)
+        z = ck_decode(pp, cp, local, mask, BITS)
+        d = tl.load(d_ptr + gidx, mask=mask, other=0.0).to(tl.float32)
+        res = z + alpha * d
+        if BITS == 16:
+            ck_store_noise(pp, cp, local, mask, res, 0, BITS)
+        else:
+            UNIT: tl.constexpr = 1 << (16 - BITS)
+            noise = tl.minimum((tl.rand(seed, gidx) * UNIT).to(tl.int32), UNIT - 1)
+            ck_store_noise(pp, cp, local, mask, res, noise, BITS)
 
     @triton.jit
     def dequant_int8(code_ptr, idx, mask, scale_ptr, rr, R):
@@ -759,6 +872,7 @@ if _HAS_TRITON:
         GC: tl.constexpr, SR: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
         EXACT: tl.constexpr = False, FBLK: tl.constexpr = 0,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """One program == one tensor. Whole factored Adakaon step, in place via pointer-array.
 
@@ -789,12 +903,8 @@ if _HAS_TRITON:
         mi = tl.load(m_addr + t)
         rowp = tl.load(row_addr + t).to(tl.pointer_type(tl.float32))
         colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
-        if LOWP:
-            gp = gi.to(tl.pointer_type(tl.bfloat16))
-            pp = pi.to(tl.pointer_type(tl.bfloat16))
-        else:
-            gp = gi.to(tl.pointer_type(tl.float32))
-            pp = pi.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gi, LOWP, GF32)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
 
         ri = tl.arange(0, BR)[:, None]
         ci = tl.arange(0, BC)[None, :]
@@ -996,11 +1106,14 @@ if _HAS_TRITON:
         wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        I64: tl.constexpr = False,
     ):
         """Batched pass 1: momentum EMA of the normalized update over a flat chunk of tensor ``t``;
         accumulates the cautious keep-count (on delta incl. WD unless ``WDFULL``, matching native)
         into ``keep_ptr[t]``."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         t = pid // K
         k = pid % K
         offs = k * BLOCK + tl.arange(0, BLOCK)
@@ -1041,10 +1154,13 @@ if _HAS_TRITON:
         g_ptr, m_addr, p_addr, c_addr, inv_mean_ptr, lr, wd, seed, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        I64: tl.constexpr = False,
     ):
         """Batched pass 2: delta = cautious(m + wd*p, g) ["masked"] or cautious(m, g) + wd*p
         ["full"]; p -= lr*delta (bf16 SR if LOWP+SR)."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         t = pid // K
         k = pid % K
         offs = k * BLOCK + tl.arange(0, BLOCK)
@@ -1093,6 +1209,7 @@ if _HAS_TRITON:
     def _reduce_rowcol(
         g_addr, rowmean_ptr, rowsum_ptr, colsum_ptr, R, C, RB,
         LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GF32: tl.constexpr = False,
     ):
         """Per (tensor, row-block): GC (per-row mean over C) -> rowmean[N,R], rowsum_gsq[N,R] (direct),
         colsum_gsq[N,C] (atomic). Padded cols load 0 so the per-row mean over the real C is exact."""
@@ -1105,7 +1222,7 @@ if _HAS_TRITON:
         cmask = ci < C
         m2 = rmask[:, None] & cmask[None, :]
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
         if GC:
             # ``C * 1.0``, never ``C.to(tl.float32)``: Triton SPECIALIZES an int argument whose
@@ -1122,6 +1239,7 @@ if _HAS_TRITON:
     def _reduce_rms(
         g_addr, rowmean_ptr, rfac_ptr, cfac_ptr, rms_ptr, R, C, RB,
         LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GF32: tl.constexpr = False,
     ):
         """Per (tensor, row-block): accumulate sum( (g' * r_factor * c_factor)^2 ) into rms_ptr[t]
         (atomic), re-reading grad via the pointer array and GC via the precomputed rowmean."""
@@ -1134,7 +1252,7 @@ if _HAS_TRITON:
         cmask = ci < C
         m2 = rmask[:, None] & cmask[None, :]
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
         if GC:
             rmean = tl.load(rowmean_ptr + t * R + ri, mask=rmask, other=0.0)
@@ -1169,6 +1287,7 @@ if _HAS_TRITON:
     def _reduce_rowcol_det(
         g_addr, rowmean_ptr, rowsum_ptr, colpart_ptr, R, C, RB,
         LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GF32: tl.constexpr = False,
     ):
         """``_reduce_rowcol`` with the colsum atomic replaced by a per-row-block PARTIAL store."""
         pid = tl.program_id(0)
@@ -1180,7 +1299,7 @@ if _HAS_TRITON:
         cmask = ci < C
         m2 = rmask[:, None] & cmask[None, :]
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
         if GC:
             rmean = tl.sum(g, axis=1) / (C * 1.0)          # see _reduce_rowcol on the `* 1.0`
@@ -1195,6 +1314,7 @@ if _HAS_TRITON:
     def _reduce_rms_det(
         g_addr, rowmean_ptr, rfac_ptr, cfac_ptr, rmspart_ptr, R, C, RB,
         LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GF32: tl.constexpr = False,
     ):
         """``_reduce_rms`` with the rms atomic replaced by a per-row-block PARTIAL store."""
         pid = tl.program_id(0)
@@ -1206,7 +1326,7 @@ if _HAS_TRITON:
         cmask = ci < C
         m2 = rmask[:, None] & cmask[None, :]
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
         if GC:
             rmean = tl.load(rowmean_ptr + t * R + ri, mask=rmask, other=0.0)
@@ -1267,6 +1387,115 @@ if _HAS_TRITON:
         tl.store(rfac_ptr + t * R + rr, tl.rsqrt(row_new / row_mean), mask=rmask)
         tl.store(cfac_ptr + t * C + cc, tl.rsqrt(col_new), mask=cmask)
 
+    # ---- column-TILED twins of the reductions, for rows too wide for one program ----
+    # ``reduction_tile`` gives a program ``BC = next_pow2(C)`` columns, unbounded: a
+    # (4, 1048576) weight asked Triton for a 1M-lane tile and took >100 s to compile (and ran as
+    # one fat program per row). Above :data:`REDUCTION_C_CAP` padded columns Adakaon launches
+    # these instead: same grid, same outputs, the row walked in ``BC``-column tiles (two walks
+    # under GC: the row mean first, then the centralized squares). Separate kernels rather than
+    # a branch in the originals, so every normal shape compiles exactly as before.
+    @triton.jit
+    def _reduce_rowcol_ct(
+        g_addr, rowmean_ptr, rowsum_ptr, colsum_ptr, colpart_ptr, R, C, RB,
+        LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        DET: tl.constexpr, GF32: tl.constexpr = False,
+    ):
+        """:func:`_reduce_rowcol` (``DET``: :func:`_reduce_rowcol_det`) over column tiles."""
+        pid = tl.program_id(0)
+        t = pid // RB
+        rb = pid % RB
+        ri = rb * BR + tl.arange(0, BR)
+        rmask = ri < R
+        gp = grad_ptr(tl.load(g_addr + t), LOWP, GF32)
+        if GC:
+            acc = tl.zeros((BR,), dtype=tl.float32)
+            for c0 in range(0, C, BC):
+                ci = c0 + tl.arange(0, BC)
+                m2 = rmask[:, None] & (ci < C)[None, :]
+                g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
+                acc += tl.sum(g, axis=1)
+            rmean = acc / (C * 1.0)
+            tl.store(rowmean_ptr + t * R + ri, rmean, mask=rmask)
+        rs = tl.zeros((BR,), dtype=tl.float32)
+        for c0 in range(0, C, BC):
+            ci = c0 + tl.arange(0, BC)
+            cmask = ci < C
+            m2 = rmask[:, None] & cmask[None, :]
+            g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
+            if GC:
+                g = tl.where(m2, g - rmean[:, None], 0.0)
+            gsq = g * g
+            rs += tl.sum(gsq, axis=1)
+            if DET:
+                tl.store(colpart_ptr + (t * RB + rb) * C + ci, tl.sum(gsq, axis=0), mask=cmask)
+            else:
+                tl.atomic_add(colsum_ptr + t * C + ci, tl.sum(gsq, axis=0), mask=cmask)
+        tl.store(rowsum_ptr + t * R + ri, rs, mask=rmask)
+
+    @triton.jit
+    def _reduce_rms_ct(
+        g_addr, rowmean_ptr, rfac_ptr, cfac_ptr, rms_ptr, R, C, RB,
+        LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        DET: tl.constexpr, GF32: tl.constexpr = False,
+    ):
+        """:func:`_reduce_rms` (``DET``: the partial store of :func:`_reduce_rms_det`, into
+        ``rms_ptr`` = ``rmspart``) over column tiles."""
+        pid = tl.program_id(0)
+        t = pid // RB
+        rb = pid % RB
+        ri = rb * BR + tl.arange(0, BR)
+        rmask = ri < R
+        gp = grad_ptr(tl.load(g_addr + t), LOWP, GF32)
+        if GC:
+            rmean = tl.load(rowmean_ptr + t * R + ri, mask=rmask, other=0.0)
+        rf = tl.load(rfac_ptr + t * R + ri, mask=rmask, other=0.0)
+        acc = tl.zeros((BR,), dtype=tl.float32)
+        for c0 in range(0, C, BC):
+            ci = c0 + tl.arange(0, BC)
+            cmask = ci < C
+            m2 = rmask[:, None] & cmask[None, :]
+            g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
+            if GC:
+                g = tl.where(m2, g - rmean[:, None], 0.0)
+            cf = tl.load(cfac_ptr + t * C + ci, mask=cmask, other=0.0)
+            u = g * rf[:, None] * cf[None, :]
+            acc += tl.sum(u * u, axis=1)
+        if DET:
+            tl.store(rms_ptr + t * RB + rb, tl.sum(acc))
+        else:
+            tl.atomic_add(rms_ptr + t, tl.sum(acc))
+
+    @triton.jit
+    def _factor_rowcol_batched_ct(
+        row_addr, col_addr, rowsum_ptr, colsum_ptr, rfac_ptr, cfac_ptr,
+        R, C, beta2, eps1,
+        BR: tl.constexpr, BC: tl.constexpr,
+    ):
+        """:func:`_factor_rowcol_batched` with the COLUMNS walked in ``BC`` tiles (the rows
+        stay one ``BR = next_pow2(R)`` tile, as in the original)."""
+        t = tl.program_id(0)
+        rr = tl.arange(0, BR)
+        rmask = rr < R
+        rowp = tl.load(row_addr + t).to(tl.pointer_type(tl.float32))
+        colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
+        omb = 1.0 - beta2
+        row_old = tl.load(rowp + rr, mask=rmask, other=0.0)
+        row_new = row_old + omb * (
+            tl.load(rowsum_ptr + t * R + rr, mask=rmask, other=0.0) / C + eps1 - row_old
+        )
+        tl.store(rowp + rr, row_new, mask=rmask)
+        row_mean = tl.sum(tl.where(rmask, row_new, 0.0)) / (R * 1.0)
+        tl.store(rfac_ptr + t * R + rr, tl.rsqrt(row_new / row_mean), mask=rmask)
+        for c0 in range(0, C, BC):
+            cc = c0 + tl.arange(0, BC)
+            cmask = cc < C
+            col_old = tl.load(colp + cc, mask=cmask, other=0.0)
+            col_new = col_old + omb * (
+                tl.load(colsum_ptr + t * C + cc, mask=cmask, other=0.0) / R + eps1 - col_old
+            )
+            tl.store(colp + cc, col_new, mask=cmask)
+            tl.store(cfac_ptr + t * C + cc, tl.rsqrt(col_new), mask=cmask)
+
     @triton.jit
     def _finish_rms(rms_ptr, inv_rms_ptr, n, clip, N, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
@@ -1295,6 +1524,7 @@ if _HAS_TRITON:
         clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """As ``_chunked_mom_batched`` but grad comes from the pointer array (GC via rowmean[t, row])."""
         pid = tl.program_id(0)
@@ -1305,7 +1535,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -1338,6 +1568,7 @@ if _HAS_TRITON:
         g_addr, rowmean_ptr, m_addr, p_addr, c_addr, inv_mean_ptr, lr, wd, seed, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """As ``_chunked_apply_batched`` but grad (for cautious) comes from the pointer array + GC."""
         pid = tl.program_id(0)
@@ -1363,7 +1594,7 @@ if _HAS_TRITON:
         if CAUTIOUS:
             i = offs // C
             gbase = tl.load(g_addr + t)
-            gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+            gp = grad_ptr(gbase, LOWP, GF32)
             g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
             if GC:
                 g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -1397,6 +1628,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, MOM: tl.constexpr, MOMENTUM: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr, FBLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """One program == one 1-D tensor. Whole non-factored Adam step, in place via pointer-array."""
         t = tl.program_id(0)
@@ -1405,12 +1637,8 @@ if _HAS_TRITON:
         gi = tl.load(g_addr + t)
         pi = tl.load(p_addr + t)
         vp = tl.load(v_addr + t).to(tl.pointer_type(tl.float32))
-        if LOWP:
-            gp = gi.to(tl.pointer_type(tl.bfloat16))
-            pp = pi.to(tl.pointer_type(tl.bfloat16))
-        else:
-            gp = gi.to(tl.pointer_type(tl.float32))
-            pp = pi.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gi, LOWP, GF32)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         offs = tl.arange(0, BL)
         mask = offs < L
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
@@ -1980,6 +2208,7 @@ if _HAS_TRITON:
         rms_ptr, clip, wd, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
         BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Count cautious survivors for a no-momentum chunked update."""
         pid = tl.program_id(0)
@@ -1990,7 +2219,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2011,6 +2240,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Apply a chunked factored update without materializing momentum."""
         pid = tl.program_id(0)
@@ -2021,7 +2251,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2060,6 +2290,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr,
         FBLOCK: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
         CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Count cautious survivors from the exact pre-requantized 4-bit EMA.
 
@@ -2076,7 +2307,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2104,6 +2335,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
         WD: tl.constexpr, SR: tl.constexpr, FBLOCK: tl.constexpr, BLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Exact update plus in-kernel 4-bit requantization for a chunked tensor.
 
@@ -2119,7 +2351,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2217,6 +2449,7 @@ if _HAS_TRITON:
         keep_ptr, rms_ptr, clip, wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, GC: tl.constexpr, WD: tl.constexpr, BLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Count cautious survivors from the exact pre-requantized int8 EMA.
 
@@ -2232,7 +2465,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2258,6 +2491,7 @@ if _HAS_TRITON:
         LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         SR: tl.constexpr, CSEG: tl.constexpr, RPC: tl.constexpr, BLOCK: tl.constexpr,
         WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
     ):
         """Exact update plus in-kernel per-row int8 requantization for a chunked tensor.
 
@@ -2272,7 +2506,7 @@ if _HAS_TRITON:
         i = offs // C
         j = offs % C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2318,14 +2552,157 @@ if _HAS_TRITON:
         # Per-row absmax / 127, round half-to-even, clamp — element-for-element
         # ``_quant_int8``. One reduce over the row axis of a (RPC, CSEG) reshape; padded lanes
         # of a final partial chunk carry 0.0 so they neither bias a row's absmax nor get stored.
+        #
+        # NaN PROPAGATES like the codec (policy since 0.7.12): torch's ``amax`` of a row with a
+        # NaN is NaN, and so is ``clamp_(min=1e-12)`` of it, so that row's scale is NaN.
+        # ``tl.max`` drops NaN and ``tl.maximum`` would floor it, hence the NaN-propagating
+        # reduction (``max_nan``) and clamp — the same instructions, so free on finite rows.
         mrows = tl.reshape(tl.where(mask, momentum, 0.0), (RPC, CSEG))
-        amax = tl.maximum(tl.max(tl.abs(mrows), axis=1), 1e-12)
+        amax = tl.maximum(tl.reduce(tl.abs(mrows), 1, max_nan), 1e-12,
+                          propagate_nan=tl.PropagateNan.ALL)          # [RPC]
         new_scale = amax / 127.0                                  # [RPC]
-        q = libdevice.rint(mrows / new_scale[:, None])
-        q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+        q = int8_codes(mrows, new_scale[:, None])
         tl.store(codes + offs, tl.reshape(q, (BLOCK,)).to(tl.int8), mask=mask)
         rows = (k * BLOCK) // CSEG + tl.arange(0, RPC)
         tl.store(scales + rows, new_scale, mask=rows < R)
+
+    # ---- in-kernel INT8 momentum when a row SPANS chunks (C > BLOCK, or BLOCK % C != 0) ----
+    # The DiT/UNet widths — 1152, 1280, 1536, 3072, 4096, 4608, and the matrixized 3x3 convs —
+    # fail the row-alignment condition above, and used to take the codec fallback on every step:
+    # a momentum-sized fp32 [N,R,C] temp (4 B/param transient), ~15 torch kernels and a
+    # host->device pointer copy. Here the per-row absmax is a CROSS-PROGRAM reduction instead:
+    #
+    #   pass 1 (``_chunked_int8_rowmax_batched_g``): the exact pre-requant EMA, its per-row
+    #     |m| max accumulated with ``tl.atomic_max`` into ``rowmax[N*R]`` (max is exact and
+    #     order-free, so the result is deterministic), the OLD per-row scales copied to
+    #     ``oldscale[N*R]``, and — under CAUTIOUS — the keep count the keep kernel makes;
+    #   pass 2 (``_chunked_int8_apply_rows_batched_g``): recompute the same EMA from the old
+    #     codes and ``oldscale`` (never the state's scale, which this pass rewrites while other
+    #     programs of the row still need the old value), update the weight, requantize every
+    #     lane against ``max(rowmax, 1e-12) / 127`` and store the new scale from the ONE program
+    #     that owns the row's first element.
+    #
+    # Codes are per element (one writer each), so the only shared datum is the row scale, and
+    # it is never read and written in the same pass. The codec format (int8 codes + fp32 scale
+    # per row, ``_momentum_codec._quant_int8``) is unchanged. A chunk touches at most
+    # ``BLOCK // C + 2`` rows; the host takes this route for ``C >= 128`` only (<= 10 per-row
+    # reductions per chunk), narrower misaligned rows keep the codec fallback.
+    @triton.jit
+    def _chunked_int8_rowmax_batched_g(
+        g_addr, rowmean_ptr, code_addr, scale_addr, p_addr, c_addr, rfac_ptr, cfac_ptr,
+        keep_ptr, rms_ptr, rowmax_ptr, oldscale_ptr, clip, wd, beta1, R, C, n, K,
+        LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
+        BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
+    ):
+        """Pass 1 of the row-spanning int8 route: row absmax of the new EMA (+ keep count)."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs - i * C
+        gbase = tl.load(g_addr + t)
+        gp = grad_ptr(gbase, LOWP, GF32)
+        g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+        if GC:
+            g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
+        upd = g * tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+        upd *= tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+        upd *= inv_rms_clip(rms_ptr, t, n, clip)
+        codes = tl.load(code_addr + t).to(tl.pointer_type(tl.int8))
+        scales = tl.load(scale_addr + t).to(tl.pointer_type(tl.float32))
+        sc = tl.load(scales + i, mask=mask, other=0.0)
+        old = tl.load(codes + offs, mask=mask, other=0).to(tl.float32)
+        old *= sc                                                  # per-row dequant
+        momentum = beta1 * old + (1.0 - beta1) * upd
+        # One writer per row for the old-scale copy: the lane holding the row's first element
+        # in this chunk (the chunk's first lane, or a lane where a row starts).
+        first = mask & ((j == 0) | (tl.arange(0, BLOCK) == 0))
+        tl.store(oldscale_ptr + t * R + i, sc, mask=first)
+        am = tl.where(mask, tl.abs(momentum), 0.0)
+        r0 = (k * BLOCK) // C
+        r1 = tl.minimum((k * BLOCK + BLOCK - 1) // C, R - 1)
+        # A NaN momentum must make its row's scale NaN, as the codec's ``amax`` does, but
+        # ``tl.max`` drops NaN: reduce with ``max_nan`` instead (same cost), so a row holding
+        # one accumulates a positive quiet NaN (the fp32 atomic max orders by the bit pattern,
+        # where it ranks above +inf, so it sticks against every later finite max).
+        for rr in range(r0, r1 + 1):
+            tl.atomic_max(rowmax_ptr + t * R + rr, tl.reduce(tl.where(i == rr, am, 0.0), 0, max_nan))
+        if CAUTIOUS:
+            delta = momentum
+            if WD and not WDFULL:
+                pbase = tl.load(p_addr + t)
+                pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
+                delta = wd_keep(delta, g, wd, pp, c_addr, t, offs, mask, CK)
+            keep = ((delta * g) > 0.0) & mask
+            tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
+
+    @triton.jit
+    def _chunked_int8_apply_rows_batched_g(
+        g_addr, rowmean_ptr, code_addr, scale_addr, p_addr, c_addr, rfac_ptr, cfac_ptr,
+        keep_ptr, rms_ptr, rowmax_ptr, oldscale_ptr, clip, lr, wd, beta1, seed, R, C, n, K,
+        LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
+        SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
+        CK: tl.constexpr = 0, GF32: tl.constexpr = False,
+    ):
+        """Pass 2 of the row-spanning int8 route: exact update + per-row requant (see above).
+        The weight arithmetic is ``_chunked_int8_apply_batched_g``'s, line for line."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs - i * C
+        gbase = tl.load(g_addr + t)
+        gp = grad_ptr(gbase, LOWP, GF32)
+        g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+        if GC:
+            g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
+        upd = g * tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+        upd *= tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+        upd *= inv_rms_clip(rms_ptr, t, n, clip)
+        codes = tl.load(code_addr + t).to(tl.pointer_type(tl.int8))
+        scales = tl.load(scale_addr + t).to(tl.pointer_type(tl.float32))
+        old = tl.load(codes + offs, mask=mask, other=0).to(tl.float32)
+        old *= tl.load(oldscale_ptr + t * R + i, mask=mask, other=0.0)
+        momentum = beta1 * old + (1.0 - beta1) * upd
+
+        pbase = tl.load(p_addr + t)
+        pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
+        p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if CK:
+            cp = ck_ptr(c_addr, t, CK)
+            zc = ck_decode(pp, cp, offs, mask, CK)
+            p = zc  # decay (WD) reads the full decoded value, never the bare bf16
+        delta = momentum
+        if WD and not WDFULL:
+            delta += wd * p
+        if CAUTIOUS:
+            count = tl.load(keep_ptr + t).to(tl.float32)
+            keep = (delta * g) > 0.0
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, n.to(tl.float32) / tl.maximum(count, 1.0), 0.0)
+        if WD and WDFULL:
+            delta = tl.fma(wd, p, delta)                 # see _chunked_int8_apply_batched_g
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
+        else:
+            res = p - lr * delta
+            if SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+
+        # Per-row absmax / 127, round half-to-even, clamp — element-for-element ``_quant_int8``.
+        # A NaN row max stays NaN (``clamp_(min=1e-12)`` of NaN is NaN in the codec).
+        amax = tl.maximum(tl.load(rowmax_ptr + t * R + i, mask=mask, other=1.0), 1e-12,
+                          propagate_nan=tl.PropagateNan.ALL)
+        new_scale = amax / 127.0
+        q = int8_codes(momentum, new_scale)
+        tl.store(codes + offs, q.to(tl.int8), mask=mask)
+        tl.store(scales + i, new_scale, mask=mask & (j == 0))    # the row's one owner
 
     @triton.jit
     def _axpy_momentum_batched(
@@ -2561,7 +2938,7 @@ def sr_add_(target, source, alpha: float = 1.0, sr: SRStream | None = None) -> N
     seed = stream.next_seed(target.device)
     with torch.cuda.device(target.device):   # a launch targets the CURRENT device
         _sr_axpy_kernel[((n + 1023) // 1024,)](
-            target, source, alpha, n, seed, BLOCK=1024,
+            target, source, alpha, n, seed, BLOCK=1024, I64=needs_i64(n),
         )
 
 
@@ -2606,7 +2983,8 @@ def ck_decode_fast(p, lo, bits: int):
     n = p.numel()
     if n:
         with torch.cuda.device(p.device):
-            _ck_decode_kernel[((n + 1023) // 1024,)](p, lo, out, n, BITS=bits, BLOCK=1024)
+            _ck_decode_kernel[((n + 1023) // 1024,)](p, lo, out, n, BITS=bits, BLOCK=1024,
+                                                     I64=needs_i64(n))
     return out
 
 
@@ -2623,7 +3001,147 @@ def ck_add_(target, lo, source, alpha: float = 1.0, bits: int = 8, sr: SRStream 
     seed = stream.next_seed(target.device)
     with torch.cuda.device(target.device):
         _ck_axpy_kernel[((n + 1023) // 1024,)](
-            target, lo, source, alpha, n, seed, BITS=bits, BLOCK=1024,
+            target, lo, source, alpha, n, seed, BITS=bits, BLOCK=1024, I64=needs_i64(n),
+        )
+
+
+#: The flat chunk of every batched big-route kernel (``BLOCK``), and the narrowest row the
+#: row-spanning int8 route takes (a chunk touches at most ``BLOCK // C + 2`` rows, one segmented
+#: max each; below this a misaligned int8 bucket keeps the codec fallback).
+BIG_BLOCK = 1024
+INT8_ROWS_MIN_C = 128
+
+
+def int8_route(C: int) -> str:  # noqa: N803
+    """Which in-kernel int8 momentum route a big bucket of row width ``C`` takes: ``"aligned"``
+    (a chunk owns whole rows: ``C <= BLOCK`` and ``BLOCK % C == 0`` — one pass), ``"rows"``
+    (rows span chunks: the two-pass cross-program row absmax, ``C >= INT8_ROWS_MIN_C``) or
+    ``"codec"`` (the dequant -> fp32 temp -> requant fallback)."""
+    if C <= BIG_BLOCK and BIG_BLOCK % C == 0:
+        return "aligned"
+    return "rows" if C >= INT8_ROWS_MIN_C else "codec"
+
+
+#: Element count from which a flat / stacked launch indexes in int64 (the kernels' ``I64``
+#: constexpr). ``pid * BLOCK + arange`` and ``t * n + j`` are int32 in Triton, so a stacked
+#: bucket (or a flat buffer) of >= 2**31 elements wrapped to negative offsets — which then
+#: PASSED the ``offs < n`` mask and addressed memory before the buffer. Below the threshold the
+#: kernels compile exactly as before (``I64=False``), so the common sizes pay nothing; above it
+#: the index is int64 end to end, and the ``tl.rand`` counter (int64 below 2**32 draws the
+#: same Philox stream as int32) keeps the SR noise of every index that did not wrap.
+I64_THRESHOLD = 2**31 - 2 * 1024
+
+
+def needs_i64(total: int) -> bool:
+    """``I64`` for a launch whose largest flat index (grid extent x BLOCK) may reach ``total``."""
+    return total >= I64_THRESHOLD
+
+
+# Device pointer arrays for :func:`sr_add_views_` / :func:`ck_add_views_`, CONTENT-addressed:
+# the key IS the tuple of addresses the array holds, so a hit can never be stale (a rebound or
+# reallocated view simply has a different key). The foreach plan hands over the same views
+# every step, so in steady state this is one tuple build + one dict hit per chunk instead of a
+# host->device copy. Bounded: cleared whole when it outgrows the working set of one run.
+_VIEW_PTRS: dict[tuple, torch.Tensor] = {}
+_VIEW_PTRS_MAX = 1024
+
+
+def _view_ptr_array(tensors, device) -> torch.Tensor:
+    key = (device, *map(_DATA_PTR, tensors))
+    arr = _VIEW_PTRS.get(key)
+    if arr is None:
+        if len(_VIEW_PTRS) >= _VIEW_PTRS_MAX:
+            _VIEW_PTRS.clear()
+        arr = _VIEW_PTRS[key] = torch.tensor(key[1:], dtype=torch.int64, device=device)
+    return arr
+
+
+_VIEW_DISJOINT: dict[tuple, bool] = {}
+
+
+def _views_disjoint(views) -> bool:
+    """No two views share a byte. The same parameter listed twice in a group (or two params
+    that are overlapping views of one storage) would make the in-place write a RACE between
+    programs; the stacked path it replaces let the last copy-back win. Such a bucket keeps the
+    stacked path. Memoized by the address tuple (content-addressed like the pointer arrays),
+    so the steady state pays one dict hit."""
+    key = tuple(map(_DATA_PTR, views))
+    ok = _VIEW_DISJOINT.get(key)
+    if ok is None:
+        if len(_VIEW_DISJOINT) >= _VIEW_PTRS_MAX:
+            _VIEW_DISJOINT.clear()
+        spans = sorted((p, p + v.numel() * v.element_size()) for p, v in zip(key, views, strict=True))
+        ok = _VIEW_DISJOINT[key] = all(a[1] <= b[0] for a, b in zip(spans, spans[1:], strict=False))
+    return ok
+
+
+def _views_ok(views, source, want) -> bool:
+    """``views`` are N bf16 CUDA tensors laid out contiguously, each ``source[i]``'s size,
+    all on ``source``'s device, with residual dtype ``want`` (``None``: the weights), and no
+    two of them overlap (:func:`_views_disjoint`)."""
+    n = source[0].numel() if source.dim() else 0
+    dev = source.device
+    return all(v.dtype == want and v.is_contiguous() and v.numel() == n and v.device == dev
+               for v in views) and _views_disjoint(views)
+
+
+def sr_add_views_supported(views, source) -> bool:
+    """Can :func:`sr_add_views_` take this bucket? bf16 CUDA contiguous views, one per row of
+    a contiguous fp32 ``source`` of matching per-row size, on one device."""
+    return (
+        _HAS_TRITON
+        and source.is_cuda
+        and source.dtype == torch.float32
+        and source.is_contiguous()
+        and source.dim() >= 1
+        and source.shape[0] == len(views)
+        and len(views) > 0
+        and _views_ok(views, source, torch.bfloat16)
+    )
+
+
+@torch.no_grad()
+def sr_add_views_(views, source, alpha: float = 1.0, sr: SRStream | None = None) -> None:
+    """``views[i] += alpha * source[i]`` with bf16 SR, IN PLACE, one launch for the bucket.
+
+    Bit-identical to ``stack -> sr_add_ -> _foreach_copy_`` (same seed, same per-element noise
+    counter), minus the stack, the copy-back and the bucket-sized temporary. The caller must
+    have checked :func:`sr_add_views_supported`."""
+    n = source[0].numel()
+    stream = _PROCESS_SR_STREAM if sr is None else sr
+    seed = stream.next_seed(source.device)           # drawn where sr_add_ draws it
+    K = (n + 1023) // 1024  # noqa: N806
+    with torch.cuda.device(source.device):
+        _sr_axpy_views_kernel[(len(views) * K,)](
+            _view_ptr_array(views, source.device), source, alpha, n, K, seed, BLOCK=1024,
+            I64=needs_i64(len(views) * K * 1024),
+        )
+
+
+def ck_add_views_supported(views, lows, source, bits: int = 8) -> bool:
+    """Can :func:`ck_add_views_` take this bucket (see :func:`sr_add_views_supported`; plus
+    one residual per view in the ``bits``-wide codec's dtype)?"""
+    return (
+        sr_add_views_supported(views, source)
+        and len(lows) == len(views)
+        and _views_ok(lows, source, torch.int16 if bits == 16 else torch.uint8)
+    )
+
+
+@torch.no_grad()
+def ck_add_views_(views, lows, source, alpha: float = 1.0, bits: int = 8,
+                  sr: SRStream | None = None) -> None:
+    """``(views[i], lows[i]) += alpha * source[i]`` with the compact-Kahan codec, in place:
+    bit-identical to ``stack -> ck_add_ -> _foreach_copy_`` (see :func:`sr_add_views_`)."""
+    n = source[0].numel()
+    stream = _PROCESS_SR_STREAM if sr is None else sr
+    seed = stream.next_seed(source.device)
+    K = (n + 1023) // 1024  # noqa: N806
+    with torch.cuda.device(source.device):
+        _ck_axpy_views_kernel[(len(views) * K,)](
+            _view_ptr_array(views, source.device), _view_ptr_array(lows, source.device),
+            source, alpha, n, K, seed, BITS=bits, BLOCK=1024,
+            I64=needs_i64(len(views) * K * 1024),
         )
 
 
@@ -2816,12 +3334,21 @@ class BigPointerCache(_WitnessedCache):
         self.g_addr = ptr_array([p.grad for p in plist], dev)
         self.grad_ptrs = tuple(p.grad.data_ptr() for p in plist)
         n_c = self.N * C
-        # The three per-step-zeroed accumulators, contiguous so one zero_() clears them.
-        self._zeros = torch.zeros(n_c + 2 * self.N, dtype=torch.float32, device=dev)
+        # The row-spanning int8 route's per-row |m| max is one more per-step-zeroed
+        # accumulator, so it joins the block (same single zero_()); ``oldscale`` is written
+        # in full by its pass 1 every step and needs no zeroing. Only an int8 bucket whose
+        # rows span chunks pays for either (see :func:`int8_route`).
+        m0 = states[0].get("m")
+        rows = self.N * R if (m0 is not None and m0.dtype == torch.int8
+                              and int8_route(C) == "rows") else 0
+        # The per-step-zeroed accumulators, contiguous so one zero_() clears them.
+        self._zeros = torch.zeros(n_c + 2 * self.N + rows, dtype=torch.float32, device=dev)
         self.colsum = self._zeros[:n_c]
         self.cfac = self.colsum                     # written in place (see the class docstring)
         self.rms = self._zeros[n_c:n_c + self.N]
-        self.keep = self._zeros[n_c + self.N:].view(torch.int32)
+        self.keep = self._zeros[n_c + self.N:n_c + 2 * self.N].view(torch.int32)
+        self.rowmax = self._zeros[n_c + 2 * self.N:] if rows else None
+        self.oldscale = torch.empty(rows, dtype=torch.float32, device=dev) if rows else None
         self.rowsum = torch.empty(self.N * R, dtype=torch.float32, device=dev)
         self.rfac = self.rowsum                     # written in place
         # Whether GC is DEFINED for this bucket's shape (fan-in >= 2), resolved once here —
