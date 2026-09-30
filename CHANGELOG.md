@@ -4,6 +4,131 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.18] - 2026-09-30
+
+Audit round (five read-only scanners over 0.7.17, fixes in six reviewed batches). Every perf
+claim below is an interleaved ABBA on the RTX 3000 Ada laptop (AC power, GPU idle at start);
+optimizations that did not measure a gain were reverted and are listed at the end.
+
+### Fixed
+- **Decoupled weight decay was a no-op on bf16 weights in ADOPT, AdaBelief, AdamP and AdaPNM**
+  (native and foreach): `p.mul_(1 - lr·wd)` ran in bf16 with round-to-nearest, so any
+  `lr·wd` below half a bf16 ulp (e.g. 1e-4 · 0.01) left the weight untouched; under
+  kahan8/kahan16 it also left the residual stale. The decay is now folded into the fp32 step
+  (`kaon._decoupled_wd`) and written through SR / compact Kahan, reading the decoded value.
+  Placement vs the cautious mask is unchanged (outside it). kahan16 now reproduces the fp32-weight
+  run bit for bit with wd>0; fp32 weights change only by rounding (≤1e-6 rel). AdamP under
+  kahan8/16 also projects with the decoded value. AdaPNM's fused kernels were already correct.
+  Lion under kahan8/16 now decays the decoded value too.
+- **State identity was only watched on Adakaon/AdaPNM**: rebinding `state[p][k]` ("row", "col",
+  "v", "s", "m", …) on AdaBelief, AdamP, ADOPT, Lion, AdaMuon, ScheduleFree or KProdigy left the
+  cached foreach plan writing the retired buffer. `ForeachPlanMixin` now installs the watch
+  itself; `"s"` joins `WATCHED_STATE_KEYS`; a structural test checks every spec's keys.
+  Per-step scalar writes (`step`) bypass the hook, so the steady-state cost is zero.
+- **`torch.load(path)` with torch's default `weights_only=True` rejected kaon optimizer
+  checkpoints** of Adakaon, AdaPNM, Nekaon, Lookahead, SAM and MSAM (and would have for every
+  optimizer with the watch above): `state_dict()` now emits plain per-param dicts (shallow, same
+  tensors).
+- **ScheduleFree `z` stored as int8/4bit froze at low LR** (round-to-nearest requant; int8 at
+  lr=1e-4 kept 41% of the fp32 drift). It is now requantized with stochastic rounding from the
+  checkpointed SR stream (capture 0.99), like the bf16 `z` already was; int8/4bit `z` therefore
+  follows the reseed protocol. The bf16 default is unchanged.
+- **Zero-element params**: the fused eligibility check divided by `shape[0]` (ZeroDivisionError /
+  CompilationError for `(0, C)`, `(5, 0)`, `(0,)`); the int8 codec, `CodecBuffer`, SAM,
+  Lookahead, ADOPT/AdaBelief/AdamP (projection and codecs) failed on them too. They are now
+  skipped / routed native.
+- **Lion** with a param group whose params have no grad raised IndexError; same for SAM's first
+  group.
+- **SAM**: the global grad norm was accumulated from bf16 per-tensor norms (~2e-3 rel error with
+  bf16 grads; now fp32); params on different devices are accepted; ASAM computes `|w|·g` in
+  chunks; a repeated `first_step` without `second_step` restores the pending climb instead of
+  baking it into the weights (1.9e-2 drift), and keeps weights reloaded in place in between
+  (detected via the param version counter, with a warning); `first_step` warns once when no
+  param has a grad.
+- **eps = 0** no longer produces NaN where a factored statistic (row/col) or a 1-D second moment
+  is exactly zero, in AdaBelief, AdamP, ScheduleFree, AdaMuon and KProdigy: one shared
+  `kaon._factored.zero_safe_inv_sqrt_factors` (zero statistic → zero update, no floor that could
+  explode subnormal statistics). Default eps are bit-identical. Note: with `cautious=True`, a
+  coordinate whose update becomes 0 this way counts as rejected by the mask.
+- **AdaPNM 1-D denominator** is `sqrt(v_hat) + eps` as documented (eps was scaled by
+  `1/sqrt(1-β2^t)`, ×31.6 at step 1) on the native, foreach and fused paths. **Changes the
+  trajectory of 1-D params with the defaults** (step 1 is 0.2-30% larger depending on the grad
+  scale; see the control battery A/B below). Also: fp64 weights decide the WD placement the same
+  way on foreach and per-param.
+- **KProdigy**: pass 1 on foreach used the first group's `eps_factored` for a bucket mixing groups
+  of the same shape; each group now uses its own.
+- **int8 fused rows propagate NaN/inf into the row scale** like the codec (the in-kernel absmax
+  ignored NaN), on the aligned and the new rows route.
+- Fused int32 index overflow for index spaces ≥2^31 elements (int64 offsets only when needed; a
+  single ≥2^31 tensor stays off the big route).
+- Fused: the in-place view writer falls back to the stacked path when a group holds the same (or
+  an overlapping) param twice.
+- `zeropower_via_newtonschulz5` keeps returning a contiguous tensor (the optimizer uses private
+  view-returning variants).
+
+### Changed
+- **Fused factored kernels receive `1 - beta2` from the host** (Adakaon, Nekaon, AdaPNM; big,
+  one-block, tile and 1-D routes). fp32(1 - fp32(0.999)) is off by -1.3e-5 relative, so fused
+  row/col/v sat 1.3e-5 from native; now 1.4e-7-1.8e-7 (1-D: bit-equal). ulp-level change of the
+  default fused trajectory, towards native; no bias.
+- **AdaMuon Newton-Schulz uses GEMM epilogues** (`addmm`/`baddbmm`): not bit-exact (~1 bf16 ulp,
+  same orthogonalization quality); −9-11% ms/step on DiT-XL/LoRA, up to −22% peak.
+- `kaon._momentum_codec.STOCHASTIC_MOMENTUM_REQUANT` (default `False`): experimental stochastic
+  requant of int8/4bit momenta, with its own generator. Left off: on real gradients it was worse
+  or equal to round-to-nearest (proxy U-Net: 4bit β=0.9 relL2 0.35 → 0.51).
+- Lion gains `cautious_wd="masked" | "full"` (Adakaon semantics); the default `"masked"` is
+  bit-identical.
+- Lookahead: documented that an eval-mode checkpoint keeps `theta` (`backup`) so resume is exact.
+
+### Performance / memory
+- **Fused Adakaon/Nekaon/AdaPNM read an fp32 grad on a bf16 weight in-kernel** (`GF32`) instead of
+  demoting the param to native every step: DiT-XL Adakaon 56.8 → 11.7 ms/step (711 → 33 kernels,
+  −204 MB transient); AdaPNM DiT 39.9 → 8.4 ms.
+- **Fused int8 momentum for rows that do not divide 1024** (C = 1152, 1280, 1536, 3072, 4096,
+  4608, 3×3 convs): new in-kernel two-pass "rows" route instead of the torch codec fallback:
+  3-4× faster, no fp32 transient (DiT int8 bf16 36.4 → 9.1 ms, −275 MB).
+- Foreach SR/Kahan writes go straight into the param views (no stack + copy-back): 3.5-17% faster,
+  bit-identical.
+- AdamP projection from per-row statistics instead of `cosine_similarity`: −33% self-CUDA on DiT
+  shapes, bit-identical; fewer live temporaries in ADOPT/AdaBelief/AdamP/ScheduleFree/Adakaon
+  foreach (step peak −14% to −41%).
+- AdaPNM foreach on the shared `ForeachPlanMixin` (−17-25% step time on a 400-tensor LoRA bag,
+  bit-identical); big-batched route reuses `_factor_rowcol_batched` (34 vs 64 kernels, −8-20%);
+  `BigPnmCache` owns its accumulators (no duplicate N·C+2N floats); fp32 grad stacks without the
+  bf16 intermediate for ≥1M-element buckets (peak −18%).
+- **KProdigy pass 1 in `foreach_budget` chunks**, without holding every param's fp32 grad: step
+  peak 9-12× lower on 40-block DiT bags (2324 → 200 MiB), −27% ms/step factored; first step
+  initializes state with one host sync per device (−43% with 400 params).
+- SAM climb without stacking in fp32 / for single-param buckets: `first_step` −38% (fp32 DiT),
+  −21% (3072² bf16), lower peak. Rakaon: fewer temporaries and kernels (dense peak 216 → 144 MB).
+- Reductions over rows wider than 32768 columns or taller than 32768 rows run in tiles: a
+  (4, 1M) or (1M, 4) tensor no longer takes ~100 s to compile.
+- `decode_weights` / `full_precision_state_dict` decode with the Triton kernel on CUDA (no scratch;
+  86 → 20 MiB for 5.3M elements) and in 2^20 chunks on CPU; torch SR path uses one int32
+  temporary less; CPU `encode_` skips the non-finite masks when everything is finite (−18-22%).
+
+### Quality A/B (control battery, `benchmarks/control`, 4 seeds, 0.7.17 vs 0.7.18)
+The default-trajectory changes (AdaPNM 1-D eps, fused `1 - beta2`, AdaMuon Newton-Schulz) were
+checked on AdaPNM, AdaPNM-fused, AdaMuon and Nekaon-fused (held-out loss, train-val gap, and both
+at constant LR): every paired difference is within seed noise (|t| ≤ 1.6), except AdaMuon
+constant-LR held-out loss (0.0815 → 0.0799, t = −2.6) and Nekaon-fused gap (+0.0100 → +0.0087,
+t = −2.5), both in 0.7.18's favour. No regression. (The proxy trains fp32 weights, so the bf16
+weight-decay fix is covered by the kahan16 = fp32 bit-exact tests instead.)
+
+### Rejected by measurement (do not retry without new evidence)
+- Pinned persistent pointer buffers for the fused grad-pointer upload: 6 → 0 host syncs per
+  iteration, wall time 0.993× (noise).
+- Fused kernel micro-opts: `j = offs - i*C`, skipping the second `p` load under CK, BLOCK 2048/4096
+  (±0.7%, BLOCK 4096 +3.4%).
+- MSAM `norm="global"` without the host sync: paired in-process A/B within ±0.5% (DiT) / −2.7%
+  with 24/40 pairs (LoRA int8).
+- Padded 4-bit momentum layout: gain only on irregular shapes DiT does not use, and it changes the
+  checkpoint layout.
+- Routing small foreach buckets to per-param for heterogeneous LoRA bags: foreach was 3-4× faster
+  even at N=3 per bucket; the slowness hypothesis did not hold.
+- Unconditional fp32 grad stack (`torch.stack(out=fp32)`) for every AdaPNM bucket: +376 kernels,
+  +25% on LoRA (per-tensor copies on CUDA); kept only for ≥1M-element buckets.
+
 ## [0.7.17] - 2026-09-26
 
 ### Fixed
