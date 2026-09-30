@@ -778,3 +778,66 @@ def test_foreach_plan_cache_is_numerically_invisible():
     off = _plan_run_adamuon(cache=False)
     for i, (a, b) in enumerate(zip(on, off, strict=True)):
         assert torch.equal(a, b), f"tensor {i} differs"
+
+
+@pytest.mark.parametrize("foreach", [True, False])
+@pytest.mark.parametrize("zero_column", [False, True])
+def test_eps_zero_with_a_zero_second_moment_stays_finite(foreach, zero_column):
+    """``eps1 = 0`` and a weight whose (orthogonalized) momentum is all zero — or has an
+    all-zero column, which Newton-Schulz preserves — left ``row == 0`` / ``col == 0``:
+    ``row / mean(row)`` was ``0/0``, ``rsqrt(col)`` was ``inf``, ``0 * inf`` NaN'd the
+    update and the per-slice RMS clip spread it over the whole weight. A zero second
+    moment means a zero orthogonalized signal there, so the update must be zero."""
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.randn(8, 6)) for _ in range(3)]
+    opt = AdaMuon(params, lr=1e-2, eps=(0.0, 1e-3), cautious=False, foreach=foreach)
+    before = [p.detach().clone() for p in params]
+    g = torch.Generator().manual_seed(11)
+    for p in params:
+        grad = torch.randn(p.shape, generator=g) if zero_column else torch.zeros_like(p)
+        if zero_column:
+            grad[:, 2] = 0.0
+        p.grad = grad
+    opt.step()
+    for p, b in zip(params, before, strict=True):
+        assert torch.isfinite(p).all()
+        if zero_column:
+            assert torch.equal(p.detach()[:, 2], b[:, 2])
+        else:
+            assert torch.equal(p.detach(), b)
+    for _ in range(3):
+        for p in params:
+            p.grad = torch.randn(p.shape, generator=g)
+        opt.step()
+    assert all(torch.isfinite(p).all() for p in params)
+
+
+@pytest.mark.parametrize("foreach", [True, False])
+@pytest.mark.parametrize("shape", [(7,), ()])
+def test_eps_zero_nonfactored_zero_grad_stays_finite(foreach, shape):
+    """The non-factored (1-D / 0-D) path had the same ``eps1 = 0`` hole: ``v == 0`` after
+    an all-zero gradient made ``grad * rsqrt(v)`` a ``0 * inf`` NaN. The update must be
+    exactly zero there."""
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.randn(shape)) for _ in range(3)]
+    opt = AdaMuon(params, lr=1e-2, eps=(0.0, 1e-3), cautious=False, foreach=foreach)
+    before = [p.detach().clone() for p in params]
+    for p in params:
+        p.grad = torch.zeros_like(p)
+    opt.step()
+    for p, b in zip(params, before, strict=True):
+        assert torch.equal(p.detach(), b)
+    g = torch.Generator().manual_seed(3)
+    for _ in range(3):
+        for p in params:
+            p.grad = torch.randn(p.shape, generator=g)
+        opt.step()
+    assert all(torch.isfinite(p).all() for p in params)
+
+
+@pytest.mark.parametrize("shape", [(64, 16), (16, 64)])
+def test_public_newton_schulz_returns_contiguous(shape):
+    """The public helpers keep their contract of a contiguous result also for tall
+    matrices (the optimizer uses private view-returning variants internally)."""
+    assert zeropower_via_newtonschulz5(torch.randn(shape), 2).is_contiguous()
+    assert zeropower_via_newtonschulz5_stacked(torch.randn(3, *shape), 2).is_contiguous()

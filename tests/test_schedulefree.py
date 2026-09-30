@@ -940,3 +940,48 @@ def test_bf16_z_store_reaches_the_triton_sr_kernel():
     finally:
         ft.sr_add_ = real
     assert launched, "the bf16 z store did not reach kaon._fused_triton.sr_add_"
+
+
+# --------------------------------------------------------------- eps == 0, zero second moment
+def _zero_stat_grads(params, *, zero_column: bool):
+    """All-zero grads (``zero_column=False``) or random grads with one all-zero column."""
+    g = torch.Generator().manual_seed(11)
+    for p in params:
+        if zero_column:
+            grad = torch.randn(p.shape, generator=g)
+            grad[:, 2] = 0.0
+        else:
+            grad = torch.zeros_like(p)
+        p.grad = grad
+
+
+@pytest.mark.parametrize("foreach", [True, False])
+@pytest.mark.parametrize("zero_column", [False, True])
+def test_eps_zero_with_a_zero_second_moment_stays_finite(foreach, zero_column):
+    """``eps=0`` folds into the factored ``eps1``, so a weight whose gradient history is
+    all zero (step 1 of a layer behind a zero-init gate, or of LoRA ``A`` behind a
+    zero-init ``B``) leaves ``row == 0``: ``row / mean(row)`` was ``0/0`` and an all-zero
+    column made ``rsqrt(col) = inf``, and ``0 * inf`` NaN'd the weight (``cautious`` hid
+    the column case only because its mask drops NaN coordinates). A zero second moment
+    means a zero gradient there, so the update must be exactly zero."""
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.randn(8, 6)) for _ in range(3)]
+    opt = ScheduleFree(params, lr=1e-2, eps=0.0, cautious=False, foreach=foreach,
+                       gradient_centralization=False,  # GC would refill the zero column
+                       momentum_dtype="float32")  # an exact z, so a zero d moves nothing
+    before = [p.detach().clone() for p in params]
+    _zero_stat_grads(params, zero_column=zero_column)
+    opt.step()
+    for p, b in zip(params, before, strict=True):
+        assert torch.isfinite(p).all()
+        if zero_column:
+            # the zero column's z moves by 0; y interpolates towards z == y at step 1
+            assert torch.equal(p.detach()[:, 2], b[:, 2])
+        else:
+            assert torch.equal(p.detach(), b)
+    g = torch.Generator().manual_seed(3)
+    for _ in range(3):
+        for p in params:
+            p.grad = torch.randn(p.shape, generator=g)
+        opt.step()
+    assert all(torch.isfinite(p).all() for p in params)

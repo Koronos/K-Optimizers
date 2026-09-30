@@ -79,7 +79,7 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
-from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -105,15 +105,45 @@ _UPDATE_RMS = 0.2
 _STACK_BYTES_PER_ELEM = 48
 
 
+def _zero_safe_inv_sqrt_factors(row: Tensor, col: Tensor) -> tuple[Tensor, Tensor]:
+    """``factored_inv_sqrt_factors`` for ``eps1 == 0``, where a stat can be exactly zero.
+
+    With no ``eps1`` an all-zero momentum (step 1 of a layer behind a zero-init gate,
+    LoRA ``A`` behind a zero-init ``B``) orthogonalizes to zero, so ``row == 0`` and
+    ``row / mean(row)`` is ``0/0``; an all-zero row or column (Newton-Schulz preserves
+    them) gives ``rsqrt(0) = inf`` and ``0 * inf = NaN``, which the per-slice RMS clip
+    then spreads over the whole weight. Nothing caps the reconstruction, so ADOPT's lone
+    divisor floor would only trade the NaN for an ``inf``: this floors the divisor AND
+    both rsqrt arguments at the smallest normal fp32, bounding each factor by
+    ``rsqrt(_MIN_NORMAL) = 2**63`` (the product stays finite), so a zero-stat coordinate
+    gets a zero update. Only zero/subnormal stats are touched; NaNs still propagate.
+    Only the ``eps1 == 0`` branch calls this, so ``eps1 > 0`` stays bit-identical.
+    (Same helper as ScheduleFree's; kept local so this module stays standalone.)
+    """
+    row_mean = row.mean(dim=-1, keepdim=True).clamp_min_(_MIN_NORMAL)
+    r_factor = row.div(row_mean).clamp_min_(_MIN_NORMAL).rsqrt_().unsqueeze(-1)
+    c_factor = col.clamp_min(_MIN_NORMAL).rsqrt_().unsqueeze(-2)
+    return r_factor, c_factor
+
+
 
 def zeropower_via_newtonschulz5(grad: Tensor, steps: int) -> Tensor:
     """Newton-Schulz quintic iteration: approximate the orthogonal factor of ``grad``.
 
-    Returns ``U`` (≈ ``U @ V.T`` of ``grad = U S V.T``) in bf16. Runs in bf16 for
-    speed/memory — the iteration is robust to it. ``grad`` must be 2-D. (Muon's
-    orthogonalization, Jordan et al.; the per-parameter path uses it directly, the
-    foreach path the batched ``_stacked`` variant below.)
+    Returns ``U`` (≈ ``U @ V.T`` of ``grad = U S V.T``) as a contiguous bf16 tensor.
+    Runs in bf16 for speed/memory — the iteration is robust to it. ``grad`` must be
+    2-D. (Muon's orthogonalization, Jordan et al.; the foreach path uses the batched
+    ``_stacked`` variant below. The optimizer itself calls the private
+    :func:`_newtonschulz5_view`, which skips the final layout copy.)
     """
+    return _newtonschulz5_view(grad, steps).contiguous()
+
+
+def _newtonschulz5_view(grad: Tensor, steps: int) -> Tensor:
+    """:func:`zeropower_via_newtonschulz5` without the final copy: for a tall ``grad``
+    (``R > C``) the result is a transposed VIEW (the GEMM epilogues write the
+    inner-dimension layout). The caller widens it to fp32 with
+    ``memory_format=torch.contiguous_format``, one kernel for both."""
     assert grad.ndim == 2, "Newton-Schulz expects a 2-D matrix"
     a, b, c = 3.4445, -4.7750, 2.0315
     x = grad.bfloat16()
@@ -123,10 +153,12 @@ def zeropower_via_newtonschulz5(grad: Tensor, steps: int) -> Tensor:
     x = x / (x.norm() + 1e-7)
     for _ in range(steps):
         aa = x @ x.mT
-        bb = b * aa + c * (aa @ aa)
-        x = a * x + bb @ x
+        # b*aa + c*(aa@aa) and a*x + bb@x as GEMM epilogues: one kernel each instead of
+        # a matmul + 2-3 elementwise launches and their bf16 temporaries.
+        bb = torch.addmm(aa, aa, aa, beta=b, alpha=c)
+        x = torch.addmm(x, bb, x, beta=a)
     if transposed:
-        x = x.mT
+        x = x.mT  # a transposed VIEW: the GEMM epilogues write the inner-dim layout
     return x
 
 
@@ -134,7 +166,7 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
     """Batched Newton-Schulz quintic iteration over a stack of 2-D matrices.
 
     ``grad`` is ``[N, R, C]`` (all slices share ``R, C``). Returns ``[N, R, C]``
-    bf16 orthogonal factors, one per slice — element-for-element the per-slice
+    contiguous bf16 orthogonal factors, one per slice — element-for-element the per-slice
     :func:`zeropower_via_newtonschulz5` but with a single ``bmm`` per
     iteration instead of ``N`` matmuls (the LoRA throughput win). Each slice is
     normalized by its own Frobenius norm and transposed to its smaller inner
@@ -143,6 +175,12 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
     bf16 matmul reduction order differs between ``bmm`` and per-slice ``@``, so this
     matches the per-slice helper closely but not bit-for-bit; both are unbiased.
     """
+    return _newtonschulz5_stacked_view(grad, steps).contiguous()
+
+
+def _newtonschulz5_stacked_view(grad: Tensor, steps: int) -> Tensor:
+    """:func:`zeropower_via_newtonschulz5_stacked` without the final copy (a transposed
+    view for tall slices; see :func:`_newtonschulz5_view`)."""
     assert grad.ndim == 3, "stacked Newton-Schulz expects [N, R, C]"
     a, b, c = 3.4445, -4.7750, 2.0315
     x = grad.bfloat16()
@@ -154,8 +192,9 @@ def zeropower_via_newtonschulz5_stacked(grad: Tensor, steps: int) -> Tensor:
     x = x / fro
     for _ in range(steps):
         aa = torch.bmm(x, x.mT)
-        bb = b * aa + c * torch.bmm(aa, aa)
-        x = a * x + torch.bmm(bb, x)
+        # Fused GEMM epilogues, as in the per-matrix helper above.
+        bb = torch.baddbmm(aa, aa, aa, beta=b, alpha=c)
+        x = torch.baddbmm(x, bb, x, beta=a)
     if transposed:
         x = x.mT
     return x
@@ -218,7 +257,10 @@ def _factored_math(
     written back by the caller). Returns ``(row, col, delta)``.
     """
     N, R, C = m.shape  # noqa: N806 — matrix dims
-    ortho = zeropower_via_newtonschulz5_stacked(m, ns_steps).float()   # [N, R, C]
+    # Contiguous widening: on a tall matrix the Newton-Schulz result is a transposed view,
+    # and every elementwise op below plus the weight write want the weight's own layout.
+    ortho = _newtonschulz5_stacked_view(m, ns_steps).to(
+        torch.float32, memory_format=torch.contiguous_format)          # [N, R, C]
 
     # Factored second moment OF the orthogonalized signal (HF eps placement).
     omb = 1.0 - beta2
@@ -227,10 +269,15 @@ def _factored_math(
         ortho_sq = ortho_sq.add_(eps1)
     row.lerp_(ortho_sq.mean(dim=-1), omb)
     col.lerp_(ortho_sq.mean(dim=-2), omb)
+    del ortho_sq  # a full [N, R, C] fp32: do not keep it alive next to ortho and update
 
-    r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
-    c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
-    update = ortho.mul(r_factor).mul_(c_factor)                               # [N, R, C], RMS≈1
+    if eps1 > 0:
+        r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
+        c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
+    else:
+        r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
+    # In place: ``ortho`` is the fresh fp32 widening of the bf16 Newton-Schulz output.
+    update = ortho.mul_(r_factor).mul_(c_factor)                              # [N, R, C], RMS≈1
     if bc_scale is not None:
         update.mul_(bc_scale)
 
@@ -269,7 +316,10 @@ def _nonfactored_pre_math(
         grad_sq = grad_sq.add_(eps1)
     v.lerp_(grad_sq, omb)
 
-    update = grad.mul(v.rsqrt())                                      # [N, L], RMS≈1
+    # eps1 == 0: an all-zero grad history leaves v == 0 and ``0 * rsqrt(0)`` is NaN;
+    # the same _MIN_NORMAL floor as the factored path makes that update exactly zero.
+    inv_sqrt_v = v.rsqrt() if eps1 > 0 else v.clamp_min(_MIN_NORMAL).rsqrt_()
+    update = grad.mul(inv_sqrt_v)                                     # [N, L], RMS≈1
     if bc_scale is not None:
         update.mul_(bc_scale)
     rms_ = update.norm(2, dim=1) / math.sqrt(length)
@@ -310,10 +360,15 @@ def _factored_one_math(
 ) -> Tensor:
     """Per-parameter 2-D core. Tensors are ``[R, C]``; ``row`` / ``col`` are the state
     tensors themselves (updated in place). Returns the ``[R, C]`` delta."""
-    ortho = zeropower_via_newtonschulz5(m, ns_steps).float()          # [R, C]
+    ortho = _newtonschulz5_view(m, ns_steps).to(
+        torch.float32, memory_format=torch.contiguous_format)          # [R, C], see above
     update_factored_state(ortho, row, col, beta2, eps1)
-    r_factor, c_factor = factored_inv_sqrt_factors(row, col)
-    update = ortho.mul(r_factor).mul_(c_factor)                       # [R, C], RMS≈1
+    if eps1 > 0:
+        r_factor, c_factor = factored_inv_sqrt_factors(row, col)
+    else:
+        r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
+    # In place: ``ortho`` is a fresh fp32 copy (see _factored_math).
+    update = ortho.mul_(r_factor).mul_(c_factor)                      # [R, C], RMS≈1
     if bc_scale is not None:
         update.mul_(bc_scale)
     if clip > 0:
@@ -342,7 +397,8 @@ def _nonfactored_one_pre_math(
     if eps1 > 0:
         grad_sq.add_(eps1)
     v.lerp_(grad_sq, 1.0 - beta2)
-    update = grad.mul(v.rsqrt())
+    # eps1 == 0 floor, see _nonfactored_pre_math.
+    update = grad.mul(v.rsqrt() if eps1 > 0 else v.clamp_min(_MIN_NORMAL).rsqrt_())
     if bc_scale is not None:
         update.mul_(bc_scale)
     if clip > 0:

@@ -79,7 +79,7 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
-from kaon._factored import factored_inv_sqrt_factors, update_factored_state
+from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors, update_factored_state
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -279,15 +279,48 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
     # -- state -------------------------------------------------------------
 
     @torch.no_grad()
-    def _init_state(self, p: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
+    def _init_new_states(self, groups: list[dict[str, Any]]) -> None:
+        """Initialize every gradient-bearing param of ``groups`` that has no state yet,
+        with ONE host sync per device.
+
+        :meth:`_init_state` branches on ``sliced.norm() > 0`` (a zero weight keeps a 0-D
+        ``p0`` instead of a full fp32 copy), a device->host sync per parameter: measured
+        ~190 ms of a 400-parameter first step (678 vs 485 ms). The norms are computed
+        here in one ``_foreach_norm`` and moved together. Cloning ``p0`` unconditionally
+        would drop the sync too, but at +4 B/param for every zero-initialized weight
+        (adaLN-zero, LoRA ``B``) with the default ``slice_p=1``.
+        """
+        todo = [
+            (p, g) for g in groups for p in g["params"]
+            if p.grad is not None and not p.grad.is_sparse and "step" not in self.state[p]
+        ]
+        if not todo:
+            return
+        # One stack + one transfer PER DEVICE: a D scope may mix CPU and CUDA params
+        # (one mixed group, or several groups with a shared D), and a cross-device
+        # ``stack`` would raise.
+        by_device: dict[torch.device, list[tuple[Tensor, dict[str, Any]]]] = {}
+        for p, g in todo:
+            by_device.setdefault(p.device, []).append((p, g))
+        for items in by_device.values():
+            norms = torch._foreach_norm([p.detach().flatten()[::g["slice_p"]] for p, g in items])
+            nonzero = (torch.stack([n.float() for n in norms]) > 0).tolist()
+            for (p, g), nz in zip(items, nonzero, strict=True):
+                self._init_state(p, self.state[p], g, nonzero=nz)
+
+    @torch.no_grad()
+    def _init_state(
+        self, p: Tensor, state: dict[str, Any], group: dict[str, Any], nonzero: bool | None = None,
+    ) -> None:
         beta1 = group["betas"][0]
         slice_p = group["slice_p"]
         sliced = p.flatten()[::slice_p]
 
         state["step"] = 0
         state["s"] = torch.zeros_like(sliced, dtype=torch.float32)
-        # p0: reference point for the D estimate. fp32 (sliced -> small).
-        if sliced.norm() > 0:
+        # p0: reference point for the D estimate. fp32 (sliced -> small). ``nonzero``
+        # comes from the batched check of _init_new_states; standalone calls sync here.
+        if nonzero if nonzero is not None else bool(sliced.norm() > 0):
             state["p0"] = sliced.detach().float().clone()
         else:
             state["p0"] = torch.zeros((), device=p.device, dtype=torch.float32)
@@ -444,6 +477,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         self, groups: list[dict[str, Any]], ctx: dict[str, Any]
     ) -> tuple[float, float, torch.device | None]:
         """Reference (per-parameter) pass 1. Bit-exact original behaviour."""
+        self._init_new_states(groups)
         beta1, beta2, beta3 = ctx["beta1"], ctx["beta2"], ctx["beta3"]
         d, dlr, d_over_d0 = ctx["d"], ctx["dlr"], ctx["d_over_d0"]
         slice_p = ctx["slice_p"]
@@ -468,9 +502,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
                     continue
                 if p.grad.is_sparse:
                     raise RuntimeError("KProdigy does not support sparse gradients")
-                state = self.state[p]
-                if "step" not in state:
-                    self._init_state(p, state, group)
+                state = self.state[p]  # initialized by _init_new_states above
                 device_seen = p.device
 
                 grad_fp32 = self._collect_grad(p, group)
@@ -513,8 +545,17 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
     ) -> tuple[float, float, torch.device | None]:
         """Batched pass 1: every elementwise op (the D-estimation inner products
         and ``s`` buffer, the d-scaled momentum EMA, and the full/factored
-        second-moment EMA) is computed with stacked / ``torch._foreach_*`` kernels,
-        bucketed by effective shape the same way pass 2 / Adakaon are.
+        second-moment EMA) is computed with stacked / ``torch._foreach_*`` kernels.
+
+        Params are bucketed by ``(group, shape)`` -- which fixes every per-param
+        property pass 1 branches on (momentum dtype, full vs factored second moment,
+        whether it feeds D) -- and each bucket is processed in chunks of at most the
+        pass-2 ``foreach_budget`` elements. The fp32 gradient is materialized once
+        per chunk and shared by the three sub-steps, so pass 1 never holds more than
+        one chunk's worth of widened gradient. (Until 0.7.17 the fp32 copy of EVERY
+        parameter's gradient stayed alive until the end of pass 1 -- +4 B/param of
+        peak on a bf16 model -- and whole shape buckets were stacked with no
+        chunking: 40 identical DiT blocks made one 40-deep stack per sub-step.)
 
         The scalar numerator/denominator partials cross to CPU together, then
         accumulate sequentially as numpy.float32 in original parameter order.
@@ -525,10 +566,13 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         safeguard_warmup = ctx["safeguard_warmup"]
         should_update_d = ctx["should_update_d"]
         lr = ctx["lr"]
+        self._init_new_states(groups)
 
         # -- collection (original order) ----------------------------------
-        # records[i] = (p, grad_fp32, state, group, do_d) in iteration order.
-        records: list[tuple[Tensor, Tensor, dict[str, Any], dict[str, Any], bool]] = []
+        # records[i] = (p, state, group, do_d) in iteration order. No gradient is
+        # widened here: that happens per chunk, below.
+        records: list[tuple[Tensor, dict[str, Any], dict[str, Any], bool]] = []
+        buckets: dict[tuple[int, tuple[int, ...]], list[int]] = {}
         device_seen = None
         for group in groups:
             group_lr = group["lr"]
@@ -537,64 +581,46 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
                     "KProdigy: groups sharing one D estimate must use the same lr "
                     "(or 0 for a frozen group). Use independent_d=True for per-group lr."
                 )
+            do_d = group_lr > 0.0 and should_update_d
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 if p.grad.is_sparse:
                     raise RuntimeError("KProdigy does not support sparse gradients")
-                state = self.state[p]
-                if "step" not in state:
-                    self._init_state(p, state, group)
+                state = self.state[p]  # initialized by _init_new_states above
                 device_seen = p.device
-                grad_fp32 = self._collect_grad(p, group)
-                do_d = group_lr > 0.0 and should_update_d
-                records.append((p, grad_fp32, state, group, do_d))
+                buckets.setdefault((id(group), tuple(p.shape)), []).append(len(records))
+                records.append((p, state, group, do_d))
 
         if not records:
             return 0.0, 0.0, device_seen
 
-        n = len(records)
-        # Per-param scalar partials, kept in record order for the ordered fold.
-        num_partials = torch.zeros(n, dtype=torch.float32, device=device_seen)
-        denom_partials = torch.zeros(n, dtype=torch.float32, device=device_seen)
-
-        # -- (a) batched D-estimation reduction + s buffer ----------------
-        # Bucket the D-stat params by sliced length. Each param contributes a
-        # numerator partial <g, p0-p> and a denom partial |s|.sum after the s EMA.
-        d_buckets: dict[int, list[int]] = {}
-        for i, (_p, _g, _state, _grp, do_d) in enumerate(records):
-            if do_d:
-                d_buckets.setdefault(records[i][2]["s"].numel(), []).append(i)
-
-        for _len, idxs in d_buckets.items():
-            # Stack the sliced grad and (p0 - p) for this bucket.
-            sliced_g = torch.stack([
-                records[i][1].flatten()[::slice_p] for i in idxs
-            ])                                                            # [B, L]
-            sliced_p = torch.stack([
-                records[i][0].detach().flatten()[::slice_p] for i in idxs
-            ]).float()                                                    # [B, L]
-            p0 = torch.stack([records[i][2]["p0"].expand_as(sliced_p[0]) for i in idxs])
-            # numerator partials: <g, p0 - p> per param. The [B, L] row reduction
-            # is not the same tree as a per-tensor .sum(): with slice_p=11 the two
-            # differ by ~3.3e-7 relative on D (CPU), inside the 1e-6 contract.
-            num = (sliced_g * (p0 - sliced_p)).sum(dim=-1)               # [B]
-            num_partials[idxs] = num.to(num_partials.dtype)
-            # s EMA: s <- beta3*s + alpha_s * g (stacked, bit-identical).
-            alpha_s = (d_over_d0 * d) if safeguard_warmup else (d_over_d0 * dlr)
-            s_stack = torch.stack([records[i][2]["s"] for i in idxs])    # [B, L]
-            s_stack.mul_(beta3).add_(sliced_g, alpha=alpha_s)
-            torch._foreach_copy_(
-                [records[i][2]["s"] for i in idxs], list(s_stack.unbind(0))
-            )
-            denom_partials[idxs] = s_stack.abs().sum(dim=-1).to(denom_partials.dtype)
-
-        # -- (b) batched first-moment (momentum) EMA ----------------------
-        if beta1 > 0:
-            self._pass1_momentum_foreach(records, beta1, d)
-
-        # -- (b) batched second-moment EMA --------------------------------
-        self._pass1_second_moment_foreach(records, beta2, d)
+        budget = foreach_budget(
+            self._foreach_stack_budget, self._foreach_batch_cutoff, _STACK_BYTES_PER_ELEM,
+            device_seen,
+        )
+        alpha_s = (d_over_d0 * d) if safeguard_warmup else (d_over_d0 * dlr)
+        # Per-chunk D partials, in chunk order; ``part_idx`` maps them back to records.
+        num_parts: list[Tensor] = []
+        den_parts: list[Tensor] = []
+        part_idx: list[int] = []
+        for idxs in buckets.values():
+            p_first, _state, group, do_d = records[idxs[0]]  # uniform per bucket
+            per_chunk = max(1, budget // max(p_first.numel(), 1))
+            for start in range(0, len(idxs), per_chunk):
+                chunk = idxs[start:start + per_chunk]
+                params = [records[i][0] for i in chunk]
+                states = [records[i][1] for i in chunk]
+                grads = self._pass1_grad_stack(params, group)             # [B, *shape] fp32
+                if do_d:
+                    num, den = self._pass1_d_chunk(params, states, grads, slice_p, beta3, alpha_s)
+                    num_parts.append(num)
+                    den_parts.append(den)
+                    part_idx.extend(chunk)
+                if beta1 > 0:
+                    self._pass1_momentum_chunk(states, group, p_first, grads, beta1, d)
+                self._pass1_second_moment_chunk(states, group, p_first, grads, beta2, d)
+                del grads
 
         # -- ordered scalar fold (one D2H synchronization) -----------------
         # Reconstruct the original per-param add sequence:
@@ -602,32 +628,72 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         #   d_denom         += |s_i|.sum
         # in record (group->params) order. Moving both rows together replaces
         # 2*N scalar GPU additions plus two later .item() synchronizations.
-        if not d_buckets:
+        if not part_idx:
             # Nothing contributed to D this step (lr == 0 everywhere, or a
             # d_update_freq skip): return without touching the host, the same
             # as the per-param path, which never syncs on a skipped step.
             return 0.0, 0.0, device_seen
         const = d_over_d0 * dlr
-        scaled_num = num_partials * const
-        host = torch.stack((scaled_num, denom_partials)).cpu().numpy()
+        host = torch.stack((torch.cat(num_parts) * const, torch.cat(den_parts))).cpu().numpy()
+        n = len(records)
+        scaled_num = np.zeros(n, dtype=np.float32)
+        denom_partials = np.zeros(n, dtype=np.float32)
+        scaled_num[part_idx] = host[0]
+        denom_partials[part_idx] = host[1]
         delta_numerator = np.float32(0.0)
         d_denom = np.float32(0.0)
         for i in range(n):
-            if records[i][4]:  # do_d
-                delta_numerator = np.float32(delta_numerator + host[0, i])
-                d_denom = np.float32(d_denom + host[1, i])
+            if records[i][3]:  # do_d
+                delta_numerator = np.float32(delta_numerator + scaled_num[i])
+                d_denom = np.float32(d_denom + denom_partials[i])
         return float(delta_numerator), float(d_denom), device_seen
 
-    @torch.no_grad()
-    def _pass1_momentum_foreach(
-        self, records: list[tuple[Tensor, Tensor, dict[str, Any], dict[str, Any], bool]],
-        beta1: float, d: float,
-    ) -> None:
-        """Batched d-scaled first-moment EMA, bucketed by (momentum_dtype, shape).
+    def _pass1_grad_stack(self, params: list[Tensor], group: dict[str, Any]) -> Tensor:
+        """``[B, *shape]`` fp32 pass-1 gradient of one chunk (read-only downstream).
 
-        Every dtype reproduces the arithmetic of :meth:`_update_momentum` — fp32
+        Widening is exact, so ``stack(...).float()`` equals stacking each param's
+        :meth:`_collect_grad`; the non-decoupled weight-decay fold keeps the per-param
+        op. A lone contiguous fp32 gradient is aliased (``unsqueeze``), not copied:
+        every sub-step only reads it.
+        """
+        if group["weight_decay"] != 0 and not group["decouple"]:
+            return torch.stack([self._collect_grad(p, group) for p in params])
+        grads = [p.grad for p in params]
+        if len(grads) == 1 and grads[0].dtype == torch.float32 and grads[0].is_contiguous():
+            return grads[0].unsqueeze(0)
+        return torch.stack(grads).float()
+
+    @staticmethod
+    def _pass1_d_chunk(
+        params: list[Tensor], states: list[dict[str, Any]], grads: Tensor,
+        slice_p: int, beta3: float, alpha_s: float,
+    ) -> tuple[Tensor, Tensor]:
+        """D statistics of one chunk: the ``[B]`` numerator ``<g, p0 - p>`` and
+        denominator ``|s|.sum`` partials, after the in-place ``s`` EMA."""
+        sliced_g = grads.reshape(grads.shape[0], -1)[:, ::slice_p]         # [B, L]
+        sliced_p = torch.stack([p.detach().flatten()[::slice_p] for p in params]).float()
+        p0 = torch.stack([s["p0"].expand_as(sliced_p[0]) for s in states])
+        # numerator partials: <g, p0 - p> per param. The [B, L] row reduction
+        # is not the same tree as a per-tensor .sum(): with slice_p=11 the two
+        # differ by ~3.3e-7 relative on D (CPU), inside the 1e-6 contract.
+        num = (sliced_g * (p0 - sliced_p)).sum(dim=-1)                    # [B]
+        del sliced_p, p0
+        # s EMA: s <- beta3*s + alpha_s * g (stacked, bit-identical).
+        ss = [s["s"] for s in states]
+        s_stack = torch.stack(ss)                                         # [B, L]
+        s_stack.mul_(beta3).add_(sliced_g, alpha=alpha_s)
+        torch._foreach_copy_(ss, list(s_stack.unbind(0)))
+        return num, s_stack.abs().sum(dim=-1)
+
+    def _pass1_momentum_chunk(
+        self, states: list[dict[str, Any]], group: dict[str, Any], like: Tensor,
+        grads: Tensor, beta1: float, d: float,
+    ) -> None:
+        """Batched d-scaled first-moment EMA of one chunk (one momentum dtype, one shape).
+
+        Every dtype reproduces the arithmetic of :meth:`_update_momentum` -- fp32
         EMA for float32/bf16/int8 (int8 with the native dim-0 row scale), the
-        shared codec's stacked lerp for 4bit — so agreement with the per-param
+        shared codec's stacked lerp for 4bit -- so agreement with the per-param
         path is bounded by the module's 1e-6 relative contract. Only the bf16
         momentum is bit-identical, and only because its EMA is now computed in
         fp32 and rounded once on write: an EMA that runs in the storage dtype
@@ -636,105 +702,86 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         carries that asymmetry (a pre-existing 1 fp32 ulp on CPU), which is
         inside the contract but not bit-for-bit.
         """
-        buckets: dict[tuple[str, tuple[int, ...]], list[int]] = {}
-        for i, (p, _g, _state, group, _do_d) in enumerate(records):
-            md = group["momentum_dtype"]
-            buckets.setdefault((md, tuple(p.shape)), []).append(i)
-
-        for (md, _shape), idxs in buckets.items():
-            grads = torch.stack([records[i][1] for i in idxs])          # [B, *shape]
-            states = [records[i][2] for i in idxs]
-            group = records[idxs[0]][3]
-            if md in ("bfloat16", "float32"):
-                # Widen once, EMA in fp32, round once on write — exactly what
-                # _update_momentum does per param. Running the EMA in the storage
-                # dtype would NOT be stack-invariant for bf16: CPU bf16 kernels
-                # round the vectorized body and the scalar tail differently, so a
-                # (3, 7) tensor drifts by an ulp when it is folded into a [B, 3, 7]
-                # stack (measured: 1.07e-4 relative on D, 3.4e-2 on the weights).
-                target = d * (1 - beta1)
-                ms = [s["m"] for s in states]
-                m_stack = torch.stack(ms).float()                       # [B, *shape]
-                m_stack.mul_(beta1).add_(grads, alpha=target)
-                torch._foreach_copy_(ms, list(m_stack.unbind(0)))
-            elif md == "int8":
-                # int8 EMA runs in fp32 (dequant -> EMA -> requant), which IS
-                # bit-identical stacked. The per-param scale follows _quant_int8:
-                # a per dim-0 row scale for ndim>=2 (reduce trailing dims), a single
-                # scalar for ndim<=1 (reduce the whole row). The stacked layout is
-                # [B, *shape]; reduce all dims after B except dim-0-row.
-                #
-                # 0-D params go through flat_view so the stack is [B, 1] and the
-                # ndim<=1 branch below applies verbatim: without it the stack would
-                # be [B] with NO axis to reduce and the [B, 1] scale would broadcast
-                # to [B, B] (a hard RuntimeError on any 0-D + int8 bag). flat_view is
-                # the identity for ndim>=1, so every other shape is untouched.
-                target = d * (1 - beta1)
-                ndim = max(records[idxs[0]][0].ndim, 1)
-                ms = [flat_view(s["m"]) for s in states]
-                m_stack = torch.stack(ms).float()                        # [B, *shape]
-                # Broadcast each per-param scale ([R,1...] or scalar) under the
-                # leading batch dim.
-                if ndim >= 2:
-                    scales = torch.stack([s["m_scale"] for s in states])  # [B, R, 1...]
-                else:
-                    scales = torch.stack(
-                        [s["m_scale"].reshape(1) for s in states]
-                    ).reshape(len(states), 1)                            # [B, 1]
-                m_stack.mul_(scales)
-                m_stack.mul_(beta1).add_(grads.reshape(m_stack.shape), alpha=target)
-                # Requant IN PLACE via the shared codec (MSAM caches m / m_scale ptrs).
-                self._codec(group).store_stacked(states, m_stack)
-            else:  # 4bit — shared codec stacked lerp (bit-identical to ema_one)
-                upd = grads if d == 1.0 else grads.mul(d)
-                self._codec(group).ema_stacked(states, upd, lambda t: t, tuple(records[idxs[0]][0].shape), beta1)
-
-    @torch.no_grad()
-    def _pass1_second_moment_foreach(
-        self, records: list[tuple[Tensor, Tensor, dict[str, Any], dict[str, Any], bool]],
-        beta2: float, d: float,
-    ) -> None:
-        """Batched second-moment EMA: full ``v`` bucketed by shape, factored
-        row/col bucketed by matrixized effective shape. Bit-identical to the
-        per-param addcmul / Adafactor reductions."""
-        full_buckets: dict[tuple[int, ...], list[int]] = {}
-        fac_buckets: dict[tuple[Any, ...], list[int]] = {}
-        for i, (p, _g, state, group, _do_d) in enumerate(records):
-            if "v" in state:
-                full_buckets.setdefault(tuple(p.shape), []).append(i)
+        md = group["momentum_dtype"]
+        if md in ("bfloat16", "float32"):
+            # Widen once, EMA in fp32, round once on write -- exactly what
+            # _update_momentum does per param. Running the EMA in the storage
+            # dtype would NOT be stack-invariant for bf16: CPU bf16 kernels
+            # round the vectorized body and the scalar tail differently, so a
+            # (3, 7) tensor drifts by an ulp when it is folded into a [B, 3, 7]
+            # stack (measured: 1.07e-4 relative on D, 3.4e-2 on the weights).
+            target = d * (1 - beta1)
+            ms = [s["m"] for s in states]
+            m_stack = torch.stack(ms).float()                           # [B, *shape]
+            m_stack.mul_(beta1).add_(grads, alpha=target)
+            torch._foreach_copy_(ms, list(m_stack.unbind(0)))
+        elif md == "int8":
+            # int8 EMA runs in fp32 (dequant -> EMA -> requant), which IS
+            # bit-identical stacked. The per-param scale follows _quant_int8:
+            # a per dim-0 row scale for ndim>=2 (reduce trailing dims), a single
+            # scalar for ndim<=1 (reduce the whole row). The stacked layout is
+            # [B, *shape]; reduce all dims after B except dim-0-row.
+            #
+            # 0-D params go through flat_view so the stack is [B, 1] and the
+            # ndim<=1 branch below applies verbatim: without it the stack would
+            # be [B] with NO axis to reduce and the [B, 1] scale would broadcast
+            # to [B, B] (a hard RuntimeError on any 0-D + int8 bag). flat_view is
+            # the identity for ndim>=1, so every other shape is untouched.
+            target = d * (1 - beta1)
+            ndim = max(like.ndim, 1)
+            ms = [flat_view(s["m"]) for s in states]
+            m_stack = torch.stack(ms).float()                            # [B, *shape]
+            # Broadcast each per-param scale ([R,1...] or scalar) under the
+            # leading batch dim.
+            if ndim >= 2:
+                scales = torch.stack([s["m_scale"] for s in states])      # [B, R, 1...]
             else:
-                matrixize = p.ndim > 2 and group["factor_conv_as_matrix"]
-                eff = (p.shape[0], p.numel() // p.shape[0]) if matrixize else tuple(p.shape)
-                fac_buckets.setdefault((eff, matrixize), []).append(i)
+                scales = torch.stack(
+                    [s["m_scale"].reshape(1) for s in states]
+                ).reshape(len(states), 1)                                # [B, 1]
+            m_stack.mul_(scales)
+            m_stack.mul_(beta1).add_(grads.reshape(m_stack.shape), alpha=target)
+            # Requant IN PLACE via the shared codec (MSAM caches m / m_scale ptrs).
+            self._codec(group).store_stacked(states, m_stack)
+        else:  # 4bit -- shared codec stacked lerp (bit-identical to ema_one)
+            upd = grads if d == 1.0 else grads.mul(d)
+            self._codec(group).ema_stacked(states, upd, lambda t: t, tuple(like.shape), beta1)
 
-        v_value = d * d * (1 - beta2)
-        for _shape, idxs in full_buckets.items():
-            grads = torch.stack([records[i][1] for i in idxs])
-            v_stack = torch.stack([records[i][2]["v"] for i in idxs])
-            v_stack.mul_(beta2).addcmul_(grads, grads, value=v_value)
-            torch._foreach_copy_([records[i][2]["v"] for i in idxs], list(v_stack.unbind(0)))
-
-        for (eff, matrixize), idxs in fac_buckets.items():
-            group = records[idxs[0]][3]
-            # ``eff`` is the matrixized ``(R, C)`` when the bucket matrixizes and the
-            # weight's raw shape otherwise, which under
-            # ``factor_conv_as_matrix=False`` is any rank at all: ``row``/``col`` are
-            # then N-D too and every reduction below is written on the last two axes, so
-            # it works unchanged. Unpacking ``R, C = eff`` here used to raise
-            # ``ValueError: too many values to unpack`` on exactly that configuration.
-            grads = torch.stack([
-                (records[i][1].reshape(eff) if matrixize else records[i][1]) for i in idxs
-            ])                                                          # [B, *eff]
-            rows = torch.stack([records[i][2]["row"] for i in idxs])    # [B, R]
-            cols = torch.stack([records[i][2]["col"] for i in idxs])    # [B, C]
-            eps1 = group["eps_factored"]
-            grad_sq = grads.pow(2)
-            if eps1 > 0:
-                grad_sq.add_(eps1)
-            rows.lerp_(grad_sq.mean(dim=-1), 1.0 - beta2)
-            cols.lerp_(grad_sq.mean(dim=-2), 1.0 - beta2)
-            torch._foreach_copy_([records[i][2]["row"] for i in idxs], list(rows.unbind(0)))
-            torch._foreach_copy_([records[i][2]["col"] for i in idxs], list(cols.unbind(0)))
+    @staticmethod
+    def _pass1_second_moment_chunk(
+        states: list[dict[str, Any]], group: dict[str, Any], like: Tensor,
+        grads: Tensor, beta2: float, d: float,
+    ) -> None:
+        """Batched second-moment EMA of one chunk: full ``v`` or factored row/col (the
+        family is fixed by ``(group, shape)``). Bit-identical to the per-param
+        addcmul / Adafactor reductions."""
+        if "v" in states[0]:
+            vs = [s["v"] for s in states]
+            v_stack = torch.stack(vs)
+            v_stack.mul_(beta2).addcmul_(grads, grads, value=d * d * (1 - beta2))
+            torch._foreach_copy_(vs, list(v_stack.unbind(0)))
+            return
+        # Matrixized ``[B, R, C]`` when the weight is a conv and
+        # ``factor_conv_as_matrix`` is on; otherwise the weight's raw shape, which under
+        # ``factor_conv_as_matrix=False`` is any rank at all: ``row``/``col`` are then
+        # N-D too and every reduction below is written on the last two axes, so it
+        # works unchanged. (Unpacking ``R, C`` here once raised ``ValueError: too many
+        # values to unpack`` on exactly that configuration.)
+        if like.ndim > 2 and group["factor_conv_as_matrix"]:
+            grads = grads.reshape(grads.shape[0], like.shape[0], -1)       # [B, R, C]
+        rs = [s["row"] for s in states]
+        cs = [s["col"] for s in states]
+        rows = torch.stack(rs)                                            # [B, R]
+        cols = torch.stack(cs)                                            # [B, C]
+        eps1 = group["eps_factored"]
+        grad_sq = grads.pow(2)
+        if eps1 > 0:
+            grad_sq.add_(eps1)
+        rows.lerp_(grad_sq.mean(dim=-1), 1.0 - beta2)
+        cols.lerp_(grad_sq.mean(dim=-2), 1.0 - beta2)
+        del grad_sq
+        torch._foreach_copy_(rs, list(rows.unbind(0)))
+        torch._foreach_copy_(cs, list(cols.unbind(0)))
 
     # -- pass-2 update backend (Adakaon engine) --------------------------
 
@@ -877,7 +924,10 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
             denom = state["v"].sqrt().clamp_(min=d * eps)
             delta = numer.div_(denom)
         else:
-            r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
+            # ``eps_factored == 0``: floor the row-mean divisor like ADOPT (0/0 -> inf,
+            # which the 1/(d*eps) cap below collapses). Off otherwise -> bit-identical.
+            floor = _MIN_NORMAL if not group["eps_factored"] > 0 else 0.0
+            r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"], floor=floor)
             inv_denom = r_factor.mul(c_factor).div_(d).clamp_(max=1.0 / (d * eps))
             inv_denom = self._unmatrixize(inv_denom, grad_fp32, group)
             delta = numer.mul_(inv_denom)
@@ -982,7 +1032,12 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         rows = torch.stack(row_views)                                        # [N, R]
         cols = torch.stack(col_views)                                        # [N, C]
 
-        r_factor = rows.div(rows.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
+        row_mean = rows.mean(dim=-1, keepdim=True)
+        if not group["eps_factored"] > 0:
+            # All-zero grad history + eps_factored == 0 -> 0/0 NaN that the cap below
+            # cannot remove. ADOPT's floor turns it into inf, which the cap collapses.
+            row_mean.clamp_min_(_MIN_NORMAL)
+        r_factor = rows.div(row_mean).rsqrt_().unsqueeze(-1)                         # [N, R, 1]
         c_factor = cols.rsqrt().unsqueeze(-2)                                        # [N, 1, C]
         inv_denom = (r_factor * c_factor).div_(d).clamp_(max=1.0 / (d * eps))        # [N, R, C]
 
