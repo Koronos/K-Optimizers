@@ -41,7 +41,7 @@ def _ref_adapnm_1d(
     * two momenta, alternating which receives the gradient each step.
     * ``noise_norm = sqrt((1+beta0)^2 + beta0^2)``.
     * decoupled weight decay ``p *= 1 - lr*wd`` BEFORE the moment updates.
-    * ``v_hat`` denom = ``(sqrt(max_v or v) + eps) / sqrt(1 - beta2^t)``.
+    * denom = ``sqrt(max_v or v) / sqrt(1 - beta2^t) + eps`` (``sqrt(v_hat) + eps``).
     """
     p = p.copy()
     m_pos = np.zeros_like(p)
@@ -60,12 +60,14 @@ def _ref_adapnm_1d(
             pos, neg = m_neg, m_pos
         pos[...] = beta1_sq * pos + (1.0 - beta1_sq) * g
         v[...] = beta2 * v + (1.0 - beta2) * g * g
+        # denom = sqrt(v_hat) + eps (the class docstring's formula): the bias correction
+        # scales sqrt(v) only, NOT eps. The 1e-15 floor under the sqrt is kept (it is what
+        # makes eps=0 safe on an all-zero-gradient coordinate).
         if ams_bound:
             max_v[...] = np.maximum(max_v, v)
-            de_nom = np.sqrt(max_v + 1e-15) + eps
+            de_nom = np.sqrt(max_v + 1e-15) / math.sqrt(1.0 - beta2 ** t) + eps
         else:
-            de_nom = np.sqrt(v + 1e-15) + eps
-        de_nom = de_nom / math.sqrt(1.0 - beta2 ** t)
+            de_nom = np.sqrt(v + 1e-15) / math.sqrt(1.0 - beta2 ** t) + eps
         bc1 = 1.0 - beta1 ** t
         pn = ((1.0 + beta0) * pos - beta0 * neg) / noise_norm
         p = p - (lr / bc1) * pn / de_nom
@@ -637,9 +639,9 @@ def test_foreach_scalar_and_vector_with_same_local_step_share_bucket(monkeypatch
     bucket_shapes = []
     original = AdaPNM._nonfactored_bucket
 
-    def spy(self, plist, *args, **kwargs):
-        bucket_shapes.append([tuple(p.shape) for p in plist])
-        return original(self, plist, *args, **kwargs)
+    def spy(self, chunk, *args, **kwargs):
+        bucket_shapes.append([tuple(p.shape) for p in chunk.plist])
+        return original(self, chunk, *args, **kwargs)
 
     monkeypatch.setattr(AdaPNM, "_nonfactored_bucket", spy)
     scalar = torch.nn.Parameter(torch.tensor(0.1))
@@ -724,3 +726,132 @@ def test_int8_stacked_store_keeps_per_param_scale_layout():
             p.grad = torch.randn(shape) * 0.02
         resume.step()
         assert all(torch.isfinite(p).all() for p in batched), shape
+
+
+# ============================================================ decoupled weight decay on bf16
+# The decay used to be a separate ``p.mul_(1 - lr*wd)`` (per-param) / ``_foreach_mul_``
+# (foreach) on the bf16 weight: round-to-nearest in bf16, no SR, no Kahan — so any
+# ``lr*wd`` below half a bf16 ulp (2^-9 near 1.0) was a literal no-op, and under
+# kahan8/kahan16 it also moved the weight without its residual. The decay now rides the
+# fp32 delta (``delta += lr*wd * value(p_old)``, after cautious, so it stays ungated —
+# kozistr's order: the decay reads the PRE-step weight) and goes through the SR/Kahan write.
+@pytest.mark.parametrize("foreach", [False, True])
+@pytest.mark.parametrize("shape", [(256, 256), (65536,)])
+def test_bf16_weight_decay_is_not_a_noop(foreach, shape):
+    """bf16 ones, lr=1e-4, wd=0.01, zero grads: the decay alone must shrink the weight to
+    ~(1 - 1e-6)^200 == 0.9998 (it used to stay at exactly 1.0). The mean of the SR-written
+    weights is unbiased; its noise over 2x65536 elements is ~5e-6."""
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.ones(shape, dtype=torch.bfloat16)) for _ in range(2)]
+    opt = AdaPNM(params, lr=1e-4, weight_decay=0.01, cautious=False, foreach=foreach)
+    for _ in range(200):
+        for p in params:
+            p.grad = torch.zeros_like(p)
+        opt.step()
+    ideal = (1.0 - 1e-6) ** 200
+    for p in params:
+        mean = p.float().mean().item()
+        assert abs(mean - ideal) < 3e-5, (mean, ideal)
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+@pytest.mark.parametrize("cautious", [False, True])
+def test_kahan16_weight_decay_tracks_the_fp32_run(foreach, cautious):
+    """kahan16 carries an exact fp32 master: with weight decay its decoded weight must
+    follow the fp32-weight run of the same gradients (the old separate bf16 ``mul_``
+    moved the bf16 half without the residual and broke that)."""
+    from kaon._compact_kahan import RESIDUAL_KEY, decode
+
+    shapes = [(16, 24), (40,), (4, 3, 3, 3)]
+    torch.manual_seed(5)
+    init = [torch.randn(s) for s in shapes]
+    p16 = [torch.nn.Parameter(t.to(torch.bfloat16)) for t in init]
+    p32 = [torch.nn.Parameter(t.to(torch.bfloat16).float()) for t in init]
+    # GC off: on a bf16 grad it centralizes in bf16 (rounding the grad) while the fp32 run
+    # centralizes in fp32 — a separate, pre-existing difference this test is not about.
+    cfg = dict(lr=1e-3, weight_decay=0.05, cautious=cautious, foreach=foreach,
+               momentum_dtype="float32", gradient_centralization=False)
+    o16 = AdaPNM(p16, bf16_method="kahan16", **cfg)
+    o32 = AdaPNM(p32, **cfg)
+    gg = torch.Generator().manual_seed(9)
+    for _ in range(12):
+        for a, b in zip(p16, p32, strict=True):
+            g = (torch.randn(a.shape, generator=gg) * 0.01).to(torch.bfloat16)
+            a.grad, b.grad = g.clone(), g.float()
+        o16.step()
+        o32.step()
+    for a, b in zip(p16, p32, strict=True):
+        z = decode(a.data, o16.state[a][RESIDUAL_KEY], 16)
+        torch.testing.assert_close(z, b.detach(), rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("foreach", [False, True])
+@pytest.mark.parametrize("ams_bound", [False, True])
+def test_one_dim_eps_is_not_scaled_by_the_bias_correction(foreach, ams_bound):
+    """1-D denom is ``sqrt(v_hat) + eps`` (class docstring), not ``(sqrt(v) + eps)/bc2``.
+
+    The old form is ``sqrt(v_hat) + eps/sqrt(1-beta2^t)``: at step 1 with beta2=0.999 it
+    inflated eps ~31.6x. With eps comparable to |g| the two are far apart, so the first
+    step pins it: v = (1-b2) g^2 -> sqrt(v_hat) = |g| -> update = pn / (|g| + eps)."""
+    b1, b2, b0, eps, lr = 0.8, 0.999, 0.5, 1e-3, 1e-2
+    g = torch.tensor([1e-3, -2e-3, 5e-4, 4e-3])
+    ps = [torch.nn.Parameter(torch.zeros(4)) for _ in range(2)]
+    opt = AdaPNM(ps, lr=lr, betas=(b1, b2), beta0=b0, eps=eps, cautious=False, clip_threshold=0.0,
+                 ams_bound=ams_bound, momentum_dtype="float32", foreach=foreach)
+    for p in ps:
+        p.grad = g.clone()
+    opt.step()
+    m_pos = (1 - b1 * b1) * g
+    pn = (1 + b0) * m_pos / math.sqrt((1 + b0) ** 2 + b0 ** 2)
+    want = -(lr / (1 - b1)) * pn / (g.abs() + eps)
+    for p in ps:
+        torch.testing.assert_close(p.detach(), want, rtol=1e-5, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("min_numel", [0, 1 << 20])
+def test_foreach_grad_stack_is_the_fp32_stack_of_the_grads(dtype, min_numel, monkeypatch):
+    """Big bf16 grads are stacked straight into an fp32 buffer (``torch.stack(out=fp32)``)
+    instead of ``stack(...).float()``; either way the values must be the exact widening, on
+    every bucket layout (2-D, conv, 1-D, a 0-D + ``(1,)`` mix). ``min_numel=0`` forces the
+    ``out=`` path onto these small tensors."""
+    import kaon.adapnm as adapnm_mod
+    from kaon.adapnm import _grad_stack_fp32
+
+    monkeypatch.setattr(adapnm_mod, "_FP32_STACK_MIN_NUMEL", min_numel)
+
+    shapes = [(6, 5), (6, 5), (4, 2, 3, 3), (4, 2, 3, 3), (7,), (7,), (), (1,)]
+    ps = [torch.nn.Parameter(torch.randn(s).to(dtype)) for s in shapes]
+    opt = AdaPNM(ps, lr=1e-3)
+    for p in ps:
+        p.grad = torch.randn(p.shape).to(dtype)
+    opt.step()
+    chunks = opt._foreach_chunks(ps, opt.param_groups[0], 1 << 20)
+    assert len(chunks) == 4
+    for chunk in chunks:
+        got = _grad_stack_fp32(chunk)
+        assert got.dtype == torch.float32
+        assert torch.equal(got, chunk.grad_stack())
+
+
+def test_fp64_weight_decay_foreach_matches_per_param():
+    """fp64 weights: foreach and per-param must pick the SAME decay form (the in-place
+    multiply, ``is_low_precision`` is False) — the foreach used to fold it as if low-precision.
+    Non-factored shapes only: those are bit-exact between the two paths on fp64 (the factored
+    bucket's fp64 weights already differ by ~1 fp32 ulp at wd=0, independently of the decay),
+    so the fold-vs-multiply rounding difference is what this catches."""
+    shapes = [(7,), (7,), (), (1,)]
+    torch.manual_seed(3)
+    pa = [torch.nn.Parameter(torch.randn(s, dtype=torch.float64)) for s in shapes]
+    pb = [torch.nn.Parameter(p.detach().clone()) for p in pa]
+    cfg = dict(lr=1e-2, weight_decay=0.05, momentum_dtype="float32")
+    oa, ob = AdaPNM(pa, foreach=True, **cfg), AdaPNM(pb, foreach=False, **cfg)
+    gg = torch.Generator().manual_seed(4)
+    for _ in range(5):
+        for a, b in zip(pa, pb, strict=True):
+            g = torch.randn(a.shape, generator=gg, dtype=torch.float64) * 0.1
+            a.grad, b.grad = g.clone(), g.clone()
+        oa.step()
+        ob.step()
+    for a, b in zip(pa, pb, strict=True):
+        assert torch.equal(a, b)

@@ -111,7 +111,8 @@ drops into per-parameter / gradient-release training loops unchanged.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections import ChainMap
+from collections.abc import Hashable, Iterable
 from typing import Any, Literal
 
 import torch
@@ -125,8 +126,6 @@ from kaon._backend import (
     cautious_batched_,
     cautious_one_,
     centralize_grads_,
-    ensure_residuals,
-    flat_view,
     foreach_budget,
     gc_applies,
     init_bf16_state,
@@ -136,13 +135,21 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
     validate_bf16_method,
+    weight_value,
 )
-from kaon._compact_kahan import RESIDUAL_KEY, is_compact_kahan, residual_bits
+from kaon._compact_kahan import is_compact_kahan
 from kaon._factored import factored_inv_sqrt_factors, update_factored_state
-from kaon._foreach_plan import WatchedStateMixin, state_generation
+from kaon._foreach_plan import (
+    ForeachChunk,
+    ForeachPlanMixin,
+    ForeachSpec,
+    WatchedStateMixin,
+    state_generation,
+)
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
     _make_codec,
+    _MomentumCodec,
     fourbit_block_size,
     load_state_dict_preserving_dtypes,
     warn_if_4bit_high_beta1,
@@ -302,22 +309,80 @@ def _probe_routing(opt: AdaPNM, group: dict[str, Any]) -> dict[int, str]:
 
 
 
-def _residual_views(plist: list[Tensor], states: list[dict[str, Any]], bf16_method: str,
-                    view: Any) -> list[Tensor] | None:
-    """The bucket's ``kahan_lo`` views for a bf16 ``kahan8`` / ``kahan16`` bucket, else ``None``.
+def _lag_key(state: dict[str, Any], group: dict[str, Any]) -> int:
+    """The foreach plan's extra bucket key: how many group steps this param is behind.
 
-    Missing residuals (a group switched to kahan8/kahan16 after its state existed) are
-    allocated here with :func:`kaon._backend.ensure_residuals` — one warning, zero
-    residuals — and residuals of the other width are converted, the same lazy contract as
-    the foreach plan and the per-param writer, instead of letting the batched writer refuse
-    the bucket.
+    Constant while a group's params advance in lockstep (the plan then survives every
+    step) and distinct per bias correction, which is what a bucket must share."""
+    return group["step"] - state["step"]
+
+
+#: Per-tensor element count from which a bf16 bucket's grads are stacked straight into
+#: fp32 (see :func:`_grad_stack_fp32`). Measured on CUDA: ``torch.stack(out=)`` across a
+#: dtype change is NOT one kernel but one copy per tensor, so on a 400-tensor LoRA bag it
+#: added ~376 launches and +25% step time (-18% peak there too, but the bag's peak is
+#: small); on DiT-sized matrices (>=1.3M elements each) the extra launches are free and the
+#: peak drops 167 -> 137 MB. 1M elements separates the two regimes.
+_FP32_STACK_MIN_NUMEL = 1 << 20
+
+
+def _grad_stack_fp32(chunk: ForeachChunk) -> Tensor:
+    """This step's stacked fp32 gradient ``[N, *eff]``.
+
+    :meth:`~kaon._foreach_plan.ForeachChunk.grad_stack` is ``torch.stack(grads).float()``,
+    which for bf16 grads materializes the bf16 stack AND its fp32 copy (+2 B/elem of
+    transient peak and an extra pass over the bucket). For big tensors
+    (:data:`_FP32_STACK_MIN_NUMEL`) the grads are instead stacked with ``out=`` an fp32
+    buffer, converting on the way in — the same values element for element (the bf16 ->
+    fp32 widening is exact). fp32 grads, and small bf16 tensors (launch-bound: the
+    cross-dtype ``out=`` is one copy kernel per tensor), keep the plain stack. Same layout
+    rules as ``grad_stack``: a bucket whose grads share an ndim stacks the raw grads and
+    reshapes the STACK once; only a 0-D + shape-``(1,)`` mix builds per-param views. Never
+    cached (it would pin the previous step's gradients — see ``ForeachChunk``).
     """
-    if not (plist and plist[0].dtype == torch.bfloat16 and is_compact_kahan(bf16_method)):
-        return None
-    ensure_residuals(plist, states, residual_bits(bf16_method))
-    return [view(s[RESIDUAL_KEY]) for s in states]
+    if chunk.grad_uniform:
+        grads = [p.grad for p in chunk.plist]
+        reshape = chunk.grad_reshape
+    else:
+        view = chunk.view
+        grads = [view(p.grad) for p in chunk.plist]
+        reshape = None
+    g0 = grads[0]
+    if g0.dtype == torch.float32 or g0.numel() < _FP32_STACK_MIN_NUMEL:
+        out = torch.stack(grads).float()
+    else:
+        out = torch.empty((chunk.n, *g0.shape), dtype=torch.float32, device=g0.device)
+        torch.stack(grads, out=out)
+    return out if reshape is None else out.view(reshape)
 
-class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
+
+def _decay_value_stacked(chunk: ForeachChunk, bf16_method: str) -> tuple[Tensor, Any]:
+    """The stacked VALUE of a low-precision bucket's weights for the folded weight decay,
+    plus the ``stacked=`` hand-off for the write (see :func:`kaon._backend.subtract_batched_`).
+
+    Under kahan8/kahan16 that is the decoded ``(bf16, residual)`` value
+    (:meth:`~kaon._foreach_plan.ForeachChunk.value_and_stacks`, whose stacks the write then
+    reuses). Otherwise it is the raw bf16/fp16 stack: ``delta.add_(bf16, alpha=)`` promotes
+    to fp32 inside the kernel, bit-identical to adding ``.float()`` of it, without the
+    [N, *eff] fp32 copy."""
+    if is_compact_kahan(bf16_method) and chunk.pviews[0].dtype == torch.bfloat16:
+        return chunk.value_and_stacks(bf16_method)
+    return torch.stack(chunk.pviews), None
+
+
+_CODECS: dict[str, _MomentumCodec] = {}
+
+
+def _codec_for(momentum_dtype: str) -> _MomentumCodec:
+    """One shared codec instance per ``momentum_dtype`` (stateless; the chunk memos key on
+    the instance, so a fresh one per step would rebuild them every step)."""
+    codec = _CODECS.get(momentum_dtype)
+    if codec is None:
+        codec = _CODECS[momentum_dtype] = _make_codec(momentum_dtype)
+    return codec
+
+
+class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Optimizer):
     """AdaPNM (Adam + Positive-Negative Momentum) on Adakaon's memory backend.
 
     Args:
@@ -340,9 +405,11 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             load-bearing); ``beta0=1`` is the canonical PNM ``(2*m_pos-m_neg)/sqrt(5)``.
             Default ``0.5`` (the measured sweet spot — best loss/gap on the proxy).
         eps: term added to the second-moment denominator for stability. On the
-            non-factored (1-D) path it is added to ``sqrt(v_hat)`` exactly as
-            kozistr does. On the factored path it is folded into the Adafactor
-            ``eps1`` (added to ``grad**2`` before the row/col reductions).
+            non-factored (1-D) path the denominator is ``sqrt(v_hat) + eps`` (the bias
+            correction scales ``sqrt(v)`` only — before 0.7.18 it also divided eps,
+            i.e. ``sqrt(v_hat) + eps/sqrt(1-beta2^t)``). On the factored path it is
+            folded into the Adafactor ``eps1`` (added to ``grad**2`` before the
+            row/col reductions).
         clip_threshold: Adafactor-style RMS clip on the (v_hat-normalized) update —
             ``rms(pn / sqrt(v_hat)) <= clip_threshold`` before the lr scale, exactly as
             Adakaon. **On by default (``1.0``).** This is the stability guard for the
@@ -353,10 +420,14 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             unclamped PNM update — diverges on real diffusion training, kept only for
             ablation). Set looser (e.g. ``> 1``) to recover more of the raw PNM step if
             a generalization measurement shows the clip costs gap.
-        weight_decay: decoupled (AdamW-style) weight decay. Applied multiplicatively
-            ``p *= (1 - lr*weight_decay)`` *before* the moment updates, matching
-            kozistr's ``weight_decouple=True`` default (not folded into the cautious
-            delta — so cautious does not gate weight decay, unlike Adakaon).
+        weight_decay: decoupled (AdamW-style) weight decay, kozistr's
+            ``weight_decouple=True`` semantics: ``p *= (1 - lr*weight_decay)`` from the
+            *pre-step* weight, i.e. ``p -= delta + lr*weight_decay*p_old``. Not gated by
+            cautious (unlike Adakaon's default). fp32 weights apply it as that in-place
+            multiply; bf16/fp16 weights fold the term into the fp32 delta so it goes
+            through the stochastic-rounding / Kahan write (a separate bf16 multiply
+            rounds any ``lr*wd`` below half an ulp away, and under kahan8/kahan16 it
+            would skip the residual) and read the full decoded value under kahan8/kahan16.
         cautious: cautious masking (Liang et al. 2024) on the final pos-neg step vs
             the gradient. **On by default.** See the class docstring: it interacts
             with — and partially damps — PNM's noise-manipulation mechanism; ablate
@@ -477,6 +548,9 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         self._fused_ob_caches: dict[tuple[int, int], Any] = {}
         self._fused_od_caches: dict[tuple[int, int], Any] = {}
         self._fused_big_caches: dict[tuple, Any] = {}
+        # Same keys as ``_fused_big_caches``: (cache it was built for, row/col pointer arrays,
+        # one-launch zeroed accumulators) — see _big_sidecar.
+        self._fused_big_sidecars: dict[tuple, tuple] = {}
         # (group id, lag) -> (the ``big`` list the buckets were split from, the buckets)
         self._fused_big_buckets: dict[tuple[int, int], tuple[list, list]] = {}
         self._fused_demoted: dict[int, tuple] = {}
@@ -496,8 +570,10 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         self._fused_ob_caches.clear()
         self._fused_od_caches.clear()
         self._fused_big_caches.clear()
+        self._fused_big_sidecars.clear()
         self._fused_big_buckets.clear()
         self._fused_demoted.clear()
+        self._clear_foreach_plans()
 
     def _autolr_reset_base_state(self) -> None:
         """Reset AdaPNM's base optimizer after an AutoLR rollback/contact."""
@@ -577,21 +653,6 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
     @staticmethod
     def _store_one(state: dict[str, Any], prefix: str, md: str, m_fp32: Tensor) -> None:
         _make_codec(md).store_one(AdaPNM._codec_state(state, prefix), m_fp32)
-
-    @staticmethod
-    def _dequant_stacked(
-        states: list[dict[str, Any]], prefix: str, md: str, shape: tuple[int, ...]
-    ) -> Tensor:
-        aliases = [AdaPNM._codec_state(state, prefix) for state in states]
-        mat = lambda tensor: tensor.reshape(shape)  # noqa: E731
-        return _make_codec(md).dequant_stacked(aliases, mat, shape)
-
-    @staticmethod
-    def _store_stacked(
-        states: list[dict[str, Any]], prefix: str, md: str, m_fp32: Tensor
-    ) -> None:
-        aliases = [AdaPNM._codec_state(state, prefix) for state in states]
-        _make_codec(md).store_stacked(aliases, m_fp32)
 
     def _prepare_param_steps(self, params: list[Tensor], group: dict[str, Any]) -> None:
         """Initialize state and advance each parameter's bias-correction counter.
@@ -685,12 +746,13 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
                 self._step_foreach(fast, group, chunk_budget)
                 for p in slow:
                     self._step_one_param(p, group)
-            else:
-                for p in params:
-                    self._step_one_param(p, group)
-        else:
-            for p in params:
-                self._step_one_param(p, group)
+                return
+        # Per-parameter fallback for the whole group: drop its cached foreach plan (and the
+        # momentum memos hanging off it), so a cached plan only ever describes a group the
+        # foreach path actually stepped — the same invariant as Adakaon._native_dispatch.
+        self._drop_foreach_plan(group)
+        for p in params:
+            self._step_one_param(p, group)
 
     # ----------------------------------------------------------- fused (Triton) step
     @torch.no_grad()
@@ -739,6 +801,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
                 self._fused_od_caches, gid, set(one_dim_buckets))
             self._fused_big_caches = self._prune_lag_caches(
                 self._fused_big_caches, gid, set(big_buckets))
+            self._fused_big_sidecars = self._prune_lag_caches(
+                self._fused_big_sidecars, gid, set(big_buckets))
             self._fused_big_buckets = self._prune_lag_caches(
                 self._fused_big_buckets, gid, set(big_buckets))
             for lag, plist in one_block_buckets.items():
@@ -1053,6 +1117,10 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
         cautious, clip = group["cautious"], group["clip_threshold"]
         inv_noise = 1.0 / c["noise_norm"]
+        # The kernel computes ``(sqrt(v + 1e-15) + eps) / bc2_sq``; handing it ``eps * bc2_sq``
+        # makes that ``sqrt(v_hat) + eps`` — the native denominator (see _step_one_param) —
+        # without touching the kernel.
+        eps_k = eps * c["bc2_sq"]
         for bk in cache.buckets:
             # which physical buffer plays positive this step (alternation): the m_pos slot if odd.
             kpos, kneg = (bk["pos_addr"], bk["neg_addr"]) if odd else (bk["neg_addr"], bk["pos_addr"])
@@ -1060,7 +1128,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
                 ft._adapnm_1d_kernel[(len(bk["plist"]),)](
                     bk["g_addr"], bk["p_addr"], kpos, kneg, bk["v_addr"], bk["Ls"],
                     c["beta1_sq"], c["beta0"], inv_noise, c["beta2"], c["step_size"], c["bc2_sq"],
-                    eps, lr * wd, clip, group["step"], LOWP=bk["lowp"], MOM=bk["mom"],
+                    eps_k, lr * wd, clip, group["step"], LOWP=bk["lowp"], MOM=bk["mom"],
                     CAUTIOUS=cautious, WD=wd != 0, CLIP=clip > 0.0, SR=_fused_sr(group, bk["lowp"]),
                     BL=bk["BL"],
                     num_warps=ft.warps_for(bk["BL"]),
@@ -1080,7 +1148,10 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         if len(big) >= 2 and not self._fused_big_batched:
             if group["gradient_centralization"]:
                 centralize_grads_(big)
-            self._native_dispatch(big, group)
+            # Its own plan key: the native subset of the same group goes through
+            # _native_dispatch too, and sharing ``id(group)`` made the two param lists evict
+            # each other's cached plan on every step.
+            self._native_dispatch(big, self._plan_group(group, ("big", lag)))
             return
         # Group by EXACT shape, dtype AND DEVICE: a bucket is launched as one grid against pointer
         # arrays built on ``plist[0].device``, so two CUDA devices sharing a shape would run the
@@ -1225,12 +1296,16 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         gc = gc_flag and cache.gc_ok
         fused_red = self._fused_reductions
         if fused_red:  # grad via pointer array, no [N,R,C] stack (candidate #4); rowmean carries GC
+            side = self._big_sidecar(cache_key, cache, ft)
             g_addr, rowmean, r, cfac = self._chunked_reductions_fused(
-                plist, group, ft, R, C, lowp, cache, gc
+                plist, group, ft, R, C, lowp, cache, gc, side
             )
+            keep, rms_acc = side[4], side[5]        # zeroed by the reductions' single launch
         else:
             g, r, cfac = self._chunked_reductions_batched(plist, group, gc)  # g [N,R,C], r, c
             gf = g.reshape(-1)
+            keep = cache.keep.zero_()
+            rms_acc = cache.rms_acc.zero_()
         sc, inv_noise = c["bc2_sq"] * c["step_size"], 1.0 / c["noise_norm"]
 
         quant = md in ("int8", "4bit")
@@ -1247,8 +1322,6 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             pos_addr, neg_addr = cache.momenta(pos_pref == "m_pos")
             mom = ft.MOM_BF16 if md == "bfloat16" else ft.MOM_FP32
         p_addr = cache.p_addr
-        keep = cache.keep.zero_()
-        rms_acc = cache.rms_acc.zero_()
         K = (n + 1023) // 1024  # noqa: N806
         grid = (N * K,)
         if fused_red:
@@ -1267,8 +1340,11 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
                 self._store_one(st, pos_pref, md, pos_temp[i])
         # Per-tensor Adafactor RMS-clip: rms_u = bc2_sq * sqrt(rms_acc / n); fold into sc_apply[N].
         if clip > 0.0:
-            rms_u = rms_acc.div_(n).sqrt_().mul_(c["bc2_sq"])             # [N]
-            sc_apply = (sc / rms_u.div_(clip).clamp_(min=1.0)).contiguous()
+            # max(rms_u / clip, 1) as ONE scaled sqrt, sqrt(acc * bc2^2 / (n * clip^2)): four
+            # launches where ``(sc / (sqrt(acc/n)*bc2/clip).clamp(1)).contiguous()`` took six.
+            # Same value up to fp32 rounding of the clip factor.
+            k = c["bc2_sq"] * c["bc2_sq"] / (n * clip * clip)
+            sc_apply = rms_acc.mul_(k).sqrt_().clamp_(min=1.0).reciprocal_().mul_(sc)   # [N]
         else:
             sc_apply = torch.full((N,), sc, dtype=torch.float32, device=dev)
         inv_mean = (1.0 / (keep.float() / n).clamp_(min=1e-8)) if cautious else torch.ones(N, device=dev)
@@ -1285,40 +1361,69 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
                 SR=sr, BLOCK=1024,
             )
 
+    def _big_sidecar(self, key: tuple, cache: Any, ft: Any) -> tuple:
+        """Per-``BigPnmCache`` extras the fused reductions need and the cache does not carry.
+
+        ``(cache, row_addr, col_addr, zeros, colsum, keep, rms_acc)``: pointer arrays to the
+        persistent ``row``/``col`` EMA state (so :func:`kaon._fused_triton._factor_rowcol_batched`
+        can update it in place — the kernel Adakaon's batched-big route uses), and the three
+        per-step atomic accumulators as adjacent slices of ONE buffer, so a single ``zero_()``
+        clears them (``keep`` is an int32 view of its fp32 slice; all-zero bits are 0 in both).
+        Rebuilt exactly when the cache is (identity), so it can never point at state the cache
+        itself no longer trusts. ``BigPointerCache`` (Adakaon) carries all of this itself; the
+        cache's own ``colsum``/``keep``/``rms_acc`` stay unused on this route.
+        """
+        side = self._fused_big_sidecars.get(key)
+        if side is not None and side[0] is cache:
+            return side[1:]
+        dev = cache.dev
+        states = [self.state[p] for p in cache.plist]
+        n_c = cache.N * cache.C
+        zeros = torch.zeros(n_c + 2 * cache.N, dtype=torch.float32, device=dev)
+        side = (cache, ft.ptr_array([s["row"] for s in states], dev),
+                ft.ptr_array([s["col"] for s in states], dev), zeros, zeros[:n_c],
+                zeros[n_c + cache.N:].view(torch.int32), zeros[n_c:n_c + cache.N])
+        self._fused_big_sidecars[key] = side
+        return side[1:]
+
     @torch.no_grad()
-    def _chunked_reductions_fused(self, plist, group, ft, R, C, lowp, cache, gc):  # noqa: N803
+    def _chunked_reductions_fused(self, plist, group, ft, R, C, lowp, cache, gc, side):  # noqa: N803
         """Candidate #4 for AdaPNM: row/col EMA factors via the Triton reduction kernel reading grad
         from a pointer array (no [N,R,C] stack; GC in-kernel). No rms here — AdaPNM's clip is computed
         in the mom kernel. Returns (g_addr, rowmean, r_factor[N,R], c_factor[N,C]).
 
-        ``cache`` supplies the grad pointer array and the three scratch buffers; they were
-        reallocated here on every step, which is exactly what the cache exists to avoid.
+        ``cache`` supplies the grad pointer array and the ``rowmean``/``rowsum`` scratch;
+        ``side`` (:meth:`_big_sidecar`) the row/col state pointers and the accumulators.
+        Three launches per bucket, the same set Adakaon's route runs: ONE ``zero_()`` for
+        ``colsum`` + ``keep`` + ``rms_acc``, the reduction, and ``_factor_rowcol_batched``,
+        which updates the ``row``/``col`` EMA IN PLACE through the pointer arrays and emits the
+        factors. That replaces a torch chain of two ``stack``s, ``div``/``add_``/``lerp_`` x2,
+        two ``_foreach_copy_`` write-backs, ``mean``/``div``/``rsqrt_``/``rsqrt`` and two
+        ``contiguous`` copies (plus the two separate accumulator ``zero_()``s) — a fixed
+        per-bucket launch cost. The factors are written over ``rowsum``/``colsum`` (program
+        ``t`` reads and writes the same indices; see ``BigPointerCache``).
 
         ``gc`` is the caller's effective per-bucket flag and MUST be the same one the mom/apply
         kernels get — they re-apply GC from the ``rowmean`` written here."""
         b2, eps1 = group["betas"][1], group["eps"]
         N = len(plist)  # noqa: N806
-        states = [self.state[p] for p in plist]
+        row_addr, col_addr, zeros, colsum = side[0], side[1], side[2], side[3]
         g_addr = cache.g_addr
         BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806
         rowmean = cache.rowmean
         rowsum = cache.rowsum
-        colsum = cache.colsum.zero_()  # atomic target
+        zeros.zero_()  # colsum (atomic target) + keep + rms_acc, one launch
         ft._reduce_rowcol[(N * RB,)](
             g_addr, rowmean, rowsum, colsum, R, C, RB,
             LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
         )
-        rowsum = rowsum.view(N, R)
-        colsum = colsum.view(N, C)
-        row = torch.stack([s["row"] for s in states])
-        col = torch.stack([s["col"] for s in states])
-        row.lerp_(rowsum.div(C).add_(eps1), 1.0 - b2)
-        col.lerp_(colsum.div(R).add_(eps1), 1.0 - b2)
-        torch._foreach_copy_([s["row"] for s in states], list(row.unbind(0)))
-        torch._foreach_copy_([s["col"] for s in states], list(col.unbind(0)))
-        r = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().contiguous()
-        cfac = col.rsqrt().contiguous()
-        return g_addr, rowmean, r, cfac
+        FR = ft.triton.next_power_of_2(R)  # noqa: N806
+        FC = ft.triton.next_power_of_2(C)  # noqa: N806
+        ft._factor_rowcol_batched[(N,)](
+            row_addr, col_addr, rowsum, colsum, rowsum, colsum, R, C, b2, eps1,
+            BR=FR, BC=FC, num_warps=ft.warps_for(max(FR, FC)),
+        )
+        return g_addr, rowmean, rowsum, colsum
 
     def state_dict(self) -> dict[str, Any]:
         """Base state + the auto_lr tuner blob (via AutoLRMixin) when auto_lr is on."""
@@ -1391,82 +1496,141 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             return p.data.is_contiguous() and p.grad.is_contiguous()
         return True
 
+    # Bucketing, chunking and the cached view plan live in kaon._foreach_plan, shared with
+    # Adakaon and the rest of the batched optimizers. The bucket key carries the param's
+    # LAG behind the group step (``extra_key``): every slice of a bucket must share one
+    # bias correction, and the lag — unlike the local step itself — is constant while the
+    # params advance in lockstep, so the plan survives every step that keeps the param set
+    # (only the coefficients, read off ``chunk.key``, change per step). ``row``/``col`` and
+    # ``v`` are the state buffers the bucket bodies stack and write back through.
+    # The two momenta go through the shared codec under per-chunk ALIAS dicts
+    # (``{"m": state["m_pos"], ...}``) plus the codec's cached stacked views, both built once
+    # per chunk in :meth:`_chunk_momentum` instead of on every step. The pos/neg role swap is
+    # only a choice of which alias list to read as positive, so it does not enter the key.
+    _FOREACH_SPEC = ForeachSpec(
+        factored_state=("row", "col"),
+        flat_state=("v",),
+        extra_key=_lag_key,
+    )
+
+    def _clear_foreach_plans(self) -> None:
+        """Drop every cached plan and, with them, the per-chunk momentum aliases."""
+        super()._clear_foreach_plans()
+        for name in ("_pnm_momentum_memo", "_pnm_plan_groups"):
+            memo = self.__dict__.get(name)
+            if memo:
+                memo.clear()
+
+    def _drop_foreach_plan(self, group: dict[str, Any]) -> None:
+        super()._drop_foreach_plan(group)
+        memo = self.__dict__.get("_pnm_momentum_memo")
+        if memo:
+            memo.pop(id(group), None)
+
+    def _plan_group(self, group: dict[str, Any], tag: Hashable) -> ChainMap:
+        """A stable, LIVE stand-in for ``group`` under which a second param subset of the same
+        group gets its own foreach plan (the plan cache is keyed by ``id(group)``).
+
+        A ``ChainMap`` over the group reads every hyperparameter (``lr``, ``step``, ...) live
+        and is never written to by the step. Cached per ``(id(group), tag)`` and checked by
+        identity of the wrapped group, so a recycled ``id`` can never hand back another
+        group's proxy."""
+        proxies = self.__dict__.get("_pnm_plan_groups")
+        if proxies is None:
+            proxies = self.__dict__["_pnm_plan_groups"] = {}
+        key = (id(group), tag)
+        proxy = proxies.get(key)
+        if proxy is None or proxy.maps[0] is not group:
+            proxy = proxies[key] = ChainMap(group)
+        return proxy
+
+    def _chunk_memos(self, group: dict[str, Any], chunks: list[ForeachChunk]) -> list[dict]:
+        """One momentum memo per chunk, valid for as long as the plan hands back ``chunks``.
+
+        :meth:`~kaon._foreach_plan.ForeachPlan.rechunk` returns the SAME list object while
+        neither the plan nor the split moved, and a fresh one otherwise (witness, state
+        generation, lag partition or budget split changed), so list identity is exactly the
+        plan's own validity and the memo can never outlive the chunks it describes.
+        """
+        memo = self.__dict__.get("_pnm_momentum_memo")
+        if memo is None:
+            memo = self.__dict__["_pnm_momentum_memo"] = {}
+        hit = memo.get(id(group))
+        if hit is None or hit[0] is not chunks:
+            hit = memo[id(group)] = (chunks, [{} for _ in chunks])
+        return hit[1]
+
+    @staticmethod
+    def _chunk_momentum(
+        memo: dict, chunk: ForeachChunk, prefix: str, codec: _MomentumCodec
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """``(codec alias dicts, codec stacked views)`` of one momentum buffer of ``chunk``.
+
+        Built once per chunk and prefix: the aliases only re-label buffers the state
+        already owns (the codec writes through them in place — its storage-identity
+        contract — so they never go stale while the plan stands), and the views are the
+        codec's own cached per-param view lists (``None`` when it declines the layout).
+        """
+        hit = memo.get(prefix)
+        if hit is None or hit[0] is not codec:
+            aliases = [AdaPNM._codec_state(s, prefix) for s in chunk.states]
+            eff = chunk.eff if chunk.eff is not None else (chunk.length,)
+            hit = memo[prefix] = (codec, aliases, codec.stacked_views(aliases, chunk.view, eff))
+        return hit[1], hit[2]
+
     @torch.no_grad()
     def _step_foreach(self, params: list[Tensor], group: dict[str, Any], budget: int) -> None:
         """Batched step. Factored (ndim>=2) and non-factored (ndim<=1) buckets, by shape.
 
         0-D scalars ride the non-factored bucket keyed by ``numel() == 1``, sharing it
-        with real shape-(1,) params."""
+        with real shape-(1,) params. The bucketing and every view it derives come from the
+        cached :class:`~kaon._foreach_plan.ForeachPlan`."""
         md = group["momentum_dtype"]
         pos, neg = self._pos_neg_prefixes(group["step"])
         group_step = group["step"]
         assert group_step >= 1, "AdaPNM foreach step requires an advanced group step"
-
-        factored_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        flat_buckets: dict[tuple[Any, ...], list[Tensor]] = {}
-        for p in params:
-            state = self.state[p]
-            assert state and state.get("step", 0) >= 1, (
-                "AdaPNM parameter state must be prepared before foreach step"
-            )
-            lag = group_step - state["step"]
+        codec = _codec_for(md)
+        chunks = self._foreach_chunks(params, group, budget)
+        memos = self._chunk_memos(group, chunks)
+        coeffs: dict[int, dict[str, float]] = {}
+        for chunk, memo in zip(chunks, memos, strict=True):
+            lag = chunk.key
             assert lag >= 0, "AdaPNM parameter step cannot exceed its group step"
-            g = p.grad
-            # The DEVICE belongs in both keys: a bucket is stepped with ``torch.stack`` /
-            # ``_foreach_*`` over its members, so a CPU and a CUDA weight of the same shape landing
-            # in one bucket raised "Expected all tensors to be on the same device" and took the
-            # WHOLE step down. Same fix (and same reason) as Adakaon's foreach plan.
-            if g.ndim >= 2:
-                matrixize = g.ndim > 2
-                eff = (g.shape[0], g.numel() // g.shape[0]) if matrixize else tuple(g.shape)
-                key = (eff, p.dtype, p.device, matrixize, lag)
-                factored_buckets.setdefault(key, []).append(p)
-            else:  # ndim <= 1 — 0-D scalars ride as length 1 (numel == shape[0] for 1-D)
-                key = (g.numel(), p.dtype, p.device, lag)
-                flat_buckets.setdefault(key, []).append(p)
-
-        for (eff, _dtype, _dev, matrixize, lag), plist in factored_buckets.items():
-            c = self._coeffs(group, group_step - lag)
-            stepn = max(1, budget // max(eff[0] * eff[1], 1))
-            for i in range(0, len(plist), stepn):
-                self._factored_bucket(plist[i:i + stepn], eff, matrixize, md, pos, neg, c, group)
-        for (length, _dtype, _dev, lag), plist in flat_buckets.items():
-            c = self._coeffs(group, group_step - lag)
-            stepn = max(1, budget // max(length, 1))
-            for i in range(0, len(plist), stepn):
-                self._nonfactored_bucket(plist[i:i + stepn], length, md, pos, neg, c, group)
+            c = coeffs.get(lag)
+            if c is None:
+                c = coeffs[lag] = self._coeffs(group, group_step - lag)
+            if chunk.eff is not None:
+                self._factored_bucket(chunk, memo, codec, pos, neg, c, group)
+            else:
+                self._nonfactored_bucket(chunk, memo, codec, pos, neg, c, group)
 
     @torch.no_grad()
     def _factored_bucket(
         self,
-        plist: list[Tensor],
-        eff: tuple[int, int],
-        matrixize: bool,
-        md: str,
+        chunk: ForeachChunk,
+        memo: dict,
+        codec: _MomentumCodec,
         pos: str,
         neg: str,
         c: dict[str, float],
         group: dict[str, Any],
     ) -> None:
-        R, C = eff  # noqa: N806
+        R, C = chunk.eff  # noqa: N806
         eps1 = group["eps"]
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
+        rows, cols = chunk.state_views
 
-        def mat(t: Tensor) -> Tensor:
-            return t.view(R, C) if matrixize else t
-
-        states = [self.state[p] for p in plist]
-        rows = [s["row"] for s in states]
-        cols = [s["col"] for s in states]
-
-        grad = torch.stack([mat(p.grad) for p in plist]).float()          # [N, R, C]
+        grad = _grad_stack_fp32(chunk)                                    # [N, R, C]
         row = torch.stack(rows)                                           # [N, R]
         col = torch.stack(cols)                                           # [N, C]
 
-        # Decoupled weight decay BEFORE moment updates (kozistr order): p *= (1 - lr*wd).
-        if wd != 0:
-            self._apply_decoupled_wd_batched(plist, mat, group["lr"] * wd)
+        # Decoupled weight decay (kozistr order: it reads the PRE-step weight). fp32/fp64
+        # weights keep the in-place ``p *= 1 - lr*wd``; low-precision ones fold it into the
+        # delta below — same ``is_low_precision`` predicate as _step_one_param.
+        fold_wd = wd != 0 and is_low_precision(chunk.pviews[0])
+        if wd != 0 and not fold_wd:
+            torch._foreach_mul_(chunk.pviews, 1.0 - group["lr"] * wd)
 
         # Factored second-moment EMA (HF eps1 placement).
         omb2 = 1.0 - c["beta2"]
@@ -1475,6 +1639,9 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             grad_sq = grad_sq.add_(eps1)
         row.lerp_(grad_sq.mean(dim=-1), omb2)
         col.lerp_(grad_sq.mean(dim=-2), omb2)
+        # ``grad_sq`` is a whole [N, R, C] fp32 buffer that nothing below reads: drop it
+        # now rather than at return, so it is not live under the momentum / cautious peak.
+        del grad_sq
         torch._foreach_copy_(rows, list(row.unbind(0)))
         torch._foreach_copy_(cols, list(col.unbind(0)))
 
@@ -1483,23 +1650,29 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])                        # 1/sqrt(v_hat)
 
         # Positive-negative momentum mixing (read both, EMA only the positive).
-        pn = self._pn_stacked(states, pos, neg, md, (R, C), grad, c)               # [N, R, C]
+        pn = self._pn_stacked(memo, chunk, codec, pos, neg, (R, C), grad, c)       # [N, R, C]
 
-        update = _rms_clip_batched_(pn.mul_(inv_denom), group["clip_threshold"])   # rms(u)<=clip
+        pn.mul_(inv_denom)
+        del inv_denom                                  # same reason as grad_sq above
+        update = _rms_clip_batched_(pn, group["clip_threshold"])                   # rms(u)<=clip
         delta = update.mul_(c["step_size"])                                        # full step
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([mat(p.data) for p in plist], delta, bf16_method, sr=self.sr_stream,
-                          comp=_residual_views(plist, states, bf16_method, mat))
+        ck_stacks = None
+        if fold_wd:                                    # after cautious: the decay is ungated
+            p_val, ck_stacks = _decay_value_stacked(chunk, bf16_method)
+            delta = delta.add_(p_val, alpha=group["lr"] * wd)
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=ck_stacks)
 
     @torch.no_grad()
     def _nonfactored_bucket(
         self,
-        plist: list[Tensor],
-        length: int,
-        md: str,
+        chunk: ForeachChunk,
+        memo: dict,
+        codec: _MomentumCodec,
         pos: str,
         neg: str,
         c: dict[str, float],
@@ -1517,15 +1690,15 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         wd = group["weight_decay"]
         cautious, bf16_method = group["cautious"], group["bf16_method"]
         ams_bound = group["ams_bound"]
+        length = chunk.length
+        (vs,) = chunk.state_views
 
-        states = [self.state[p] for p in plist]
-        vs = [flat_view(s["v"]) for s in states]
-
-        grad = torch.stack([flat_view(p.grad) for p in plist]).float()    # [N, L]
+        grad = _grad_stack_fp32(chunk)                                    # [N, L]
         v = torch.stack(vs)                                               # [N, L]
 
-        if wd != 0:
-            self._apply_decoupled_wd_batched(plist, flat_view, group["lr"] * wd)
+        fold_wd = wd != 0 and is_low_precision(chunk.pviews[0])   # see _factored_bucket
+        if wd != 0 and not fold_wd:
+            torch._foreach_mul_(chunk.pviews, 1.0 - group["lr"] * wd)
 
         # Full per-coordinate second moment (1-D). eps here goes on the denominator
         # (kozistr), NOT folded into grad^2; eps1==eps for the 1-D path.
@@ -1533,58 +1706,64 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
         if ams_bound:
-            max_vs = [flat_view(s["max_v"]) for s in states]
+            # ``max_v`` exists only under ams_bound, so it is not a spec key: its views are
+            # built here, on the (rare) opt-in path only.
+            view = chunk.view
+            max_vs = [view(s["max_v"]) for s in chunk.states]
             max_v = torch.stack(max_vs)
             torch.maximum(max_v, v, out=max_v)
             torch._foreach_copy_(max_vs, list(max_v.unbind(0)))
-            de_nom = max_v.add(1e-15).sqrt_().add_(eps1)
+            de_nom = max_v.add(1e-15).sqrt_()
         else:
-            de_nom = v.add(1e-15).sqrt_().add_(eps1)
-        de_nom.div_(c["bc2_sq"])                                          # v_hat denom
+            de_nom = v.add(1e-15).sqrt_()
+        de_nom.div_(c["bc2_sq"]).add_(eps1)                               # sqrt(v_hat) + eps
 
-        pn = self._pn_stacked(states, pos, neg, md, (length,), grad, c)   # [N, L]
-        update = _rms_clip_batched_(pn.div_(de_nom), group["clip_threshold"])
+        pn = self._pn_stacked(memo, chunk, codec, pos, neg, (length,), grad, c)   # [N, L]
+        pn.div_(de_nom)
+        del de_nom                                     # not live under the cautious peak
+        update = _rms_clip_batched_(pn, group["clip_threshold"])
         delta = update.mul_(c["step_size"])
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
-        subtract_batched_([flat_view(p.data) for p in plist], delta, bf16_method,
-                          sr=self.sr_stream,
-                          comp=_residual_views(plist, states, bf16_method, flat_view))
+        ck_stacks = None
+        if fold_wd:
+            p_val, ck_stacks = _decay_value_stacked(chunk, bf16_method)
+            delta = delta.add_(p_val, alpha=group["lr"] * wd)
+        subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream, comp=chunk.cviews,
+                          stacked=ck_stacks)
 
     def _pn_stacked(
         self,
-        states: list[dict[str, Any]],
+        memo: dict,
+        chunk: ForeachChunk,
+        codec: _MomentumCodec,
         pos: str,
         neg: str,
-        md: str,
         shape: tuple[int, ...],
         grad: Tensor,
         c: dict[str, float],
     ) -> Tensor:
         """Stacked positive-negative momentum numerator (EMA the positive buffer).
 
-        ``grad`` is the stacked, reshaped, post-WD gradient (``[N, *shape]``). Reads
-        both momenta as fp32, EMA-updates only the positive buffer with the raw
-        gradient (decay ``beta1**2``), stores it back, and returns the renormalized
+        ``grad`` is the stacked, reshaped gradient (``[N, *shape]``). Reads both momenta
+        as fp32, EMA-updates only the positive buffer with the raw gradient (decay
+        ``beta1**2``), stores it back, and returns the renormalized
         ``((1+beta0)*m_pos - beta0*m_neg)/noise_norm``.
         """
         n = grad.shape[0]
-        m_pos = self._dequant_stacked(states, pos, md, shape).reshape((n, *shape))
-        m_neg = self._dequant_stacked(states, neg, md, shape).reshape((n, *shape))
+        view = chunk.view
+        pos_states, pos_views = self._chunk_momentum(memo, chunk, pos, codec)
+        neg_states, neg_views = self._chunk_momentum(memo, chunk, neg, codec)
+        m_pos = codec.dequant_stacked(pos_states, view, shape, views=pos_views).reshape((n, *shape))
+        m_neg = codec.dequant_stacked(neg_states, view, shape, views=neg_views).reshape((n, *shape))
         m_pos.mul_(c["beta1_sq"]).add_(grad, alpha=1.0 - c["beta1_sq"])
-        self._store_stacked(states, pos, md, m_pos.reshape((n, *shape)))
-        # m_pos is a fresh stacked tensor (torch.stack copies) and is already stored, so
+        codec.store_stacked(pos_states, m_pos, views=pos_views)
+        # m_pos is a fresh stacked tensor (the dequant copies) and is already stored, so
         # the pos-neg mix can run in-place on it — no extra [N, *shape] allocation.
         pn = m_pos.mul_(1.0 + c["beta0"]).add_(m_neg, alpha=-c["beta0"]).mul_(1.0 / c["noise_norm"])
         return pn
-
-    @torch.no_grad()
-    def _apply_decoupled_wd_batched(self, plist: list[Tensor], mat: Any, factor: float) -> None:
-        """In-place decoupled WD ``p *= (1 - factor)`` on the (matrixized) weights."""
-        scale = 1.0 - factor
-        torch._foreach_mul_([mat(p.data) for p in plist], scale)
 
     # ---------------------------------------------------------- per-parameter
     @torch.no_grad()
@@ -1605,8 +1784,18 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
         ndim = grad.ndim
         factored = ndim >= 2
 
-        # Decoupled weight decay BEFORE the moment updates (kozistr order).
-        if wd != 0:
+        # Decoupled weight decay, kozistr order: the decay reads the PRE-step weight
+        # (``p *= 1 - lr*wd`` then ``p -= delta`` is ``p -= delta + lr*wd*p_old``). On an fp32
+        # weight that is the in-place multiply it always was. On a low-precision weight it is
+        # FOLDED into the fp32 delta and goes through the same SR / Kahan write as the step:
+        # a separate bf16 ``mul_`` rounds to nearest, so any ``lr*wd`` under half a bf16 ulp
+        # (2^-9 near 1.0 — every realistic fine-tune) was a silent no-op, and under
+        # kahan8/kahan16 it moved the bf16 half without its residual. The folded term reads
+        # the full value (decoded under kahan8/kahan16, see kaon._backend.weight_value) and
+        # is added AFTER the cautious mask, so cautious still does not gate the decay.
+        # Same result as the fused kernels' ``p*(1 - lr*wd) - delta`` up to fp32 rounding.
+        fold_wd = wd != 0 and is_low_precision(p)
+        if wd != 0 and not fold_wd:
             p.data.mul_(1.0 - group["lr"] * wd)
 
         if factored:
@@ -1626,16 +1815,27 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, SRSeedState, Optimizer):
             if ams_bound:
                 max_v = state["max_v"]
                 torch.maximum(max_v, v, out=max_v)
-                de_nom = max_v.add(1e-15).sqrt_().add_(eps1)
+                de_nom = max_v.add(1e-15).sqrt_()
             else:
-                de_nom = v.add(1e-15).sqrt_().add_(eps1)
-            de_nom.div_(c["bc2_sq"])
+                de_nom = v.add(1e-15).sqrt_()
+            # sqrt(v_hat) + eps, the class docstring's denominator: the bias correction scales
+            # sqrt(v) only. The old ``(sqrt(v) + eps) / bc2`` was sqrt(v_hat) + eps/bc2, i.e.
+            # eps inflated ~31.6x at step 1 (beta2=0.999). The 1e-15 floor stays: it is what
+            # keeps eps=0 finite on an all-zero-gradient coordinate.
+            de_nom.div_(c["bc2_sq"]).add_(eps1)
             pn = self._pn_one(state, pos, neg, md, grad, c)
             update = _rms_clip_one_(pn.div_(de_nom), group["clip_threshold"])
             delta = update.mul_(c["step_size"])
 
         if cautious:
             delta = cautious_one_(delta, grad)
+
+        if fold_wd:
+            # bf16 ``p.data`` is added as-is (promoted to fp32 in the kernel, bit-identical
+            # to ``.float()`` without the copy); only compact Kahan needs the decode.
+            p_val = (weight_value(p, state, bf16_method) if is_compact_kahan(bf16_method)
+                     else p.data)
+            delta = delta.add_(p_val, alpha=group["lr"] * wd)
 
         subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
 

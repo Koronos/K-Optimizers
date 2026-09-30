@@ -1363,3 +1363,82 @@ def test_a_bf16_bucket_under_another_method_never_launches_fused():
     assert _fused_sr({"bf16_method": "none"}, False) is False       # fp32 bucket: no SR
     with pytest.raises(RuntimeError, match="stale routing"):
         _fused_sr({"bf16_method": "none"}, True)
+
+
+# ----------------------------------------------------------------- bf16 weight decay
+@pytest.mark.parametrize("shapes", [[(128, 128)] * 2, [(1024, 512)] * 2, [(1024, 512)],
+                                    [(8192,)] * 2], ids=["one_block", "big_batched",
+                                                        "lone_big", "one_dim"])
+@pytest.mark.parametrize("fused", [True, False])
+def test_bf16_weight_decay_moves_the_weight_on_every_route(shapes, fused):
+    """bf16 ones, lr=1e-4, wd=0.01, zero grads: every route must decay to ~(1-1e-6)^200.
+
+    The fused kernels always folded the decay into the SR write (``p*(1-lr*wd) - delta`` in
+    fp32, then SR); the native path used a separate round-to-nearest bf16 ``mul_`` that was
+    a no-op (mean stayed 1.0 exactly). Both must now agree with the ideal decay."""
+    ps = [torch.ones(s, device=DEV, dtype=torch.bfloat16).requires_grad_(True) for s in shapes]
+    opt = AdaPNM(ps, lr=1e-4, weight_decay=0.01, cautious=False, fused=fused)
+    for _ in range(200):
+        for p in ps:
+            p.grad = torch.zeros_like(p)
+        opt.step()
+    torch.cuda.synchronize()
+    if fused:
+        ob, big, od, nat = _parts(opt)
+        assert not nat, "a bf16 SR weight fell to native on the fused optimizer"
+    ideal = (1.0 - 1e-6) ** 200
+    for p in ps:
+        mean = p.detach().float().mean().item()
+        assert abs(mean - ideal) < 4e-5, (mean, ideal)
+
+
+def test_one_dim_visible_eps_matches_native():
+    """1-D fused route with an eps that MATTERS (1e-3 against grads ~1e-3): the kernel's
+    ``(sqrt(v+1e-15) + eps) / bc2_sq`` only equals native's ``sqrt(v_hat) + eps`` because the
+    host hands it ``eps * bc2_sq``. Every other parity test here runs eps=1e-30, where the two
+    forms coincide; without the host scaling eps is ~31.6x too big at step 1 and this fails."""
+    dtype = torch.float32   # fp32 weights: bf16 SR noise would swamp the displacement
+    cfg = dict(lr=1e-3, betas=(0.8, 0.999), beta0=0.5, eps=1e-3, cautious=False,
+               momentum_dtype="float32")
+    pv = _bag([(1024,)] * 3, dtype, seed=3)
+    pn = _clone(pv)
+    ov, on = AdaPNM(pv, fused=True, **cfg), AdaPNM(pn, **cfg)
+    gen = torch.Generator(device=DEV).manual_seed(9)
+    for _ in range(4):
+        gs = [torch.randn(*p.shape, generator=gen, device=DEV) * 1e-3 for p in pv]
+        for p, g in zip(pv, gs, strict=True):
+            p.grad = g.to(dtype)
+        for p, g in zip(pn, gs, strict=True):
+            p.grad = g.to(dtype)
+        ov.step()
+        on.step()
+    torch.cuda.synchronize()
+    assert len(_parts(ov)[2]) == 3, "the params did not take the 1-D fused route"
+    # Compare the DISPLACEMENT (the weights themselves are O(1) and would hide it).
+    p0 = _bag([(1024,)] * 3, dtype, seed=3)
+    for a, b, z in zip(pv, pn, p0, strict=True):
+        da, db = (a.detach().float() - z.float()), (b.detach().float() - z.float())
+        rel = (da - db).abs().max().item() / db.abs().max().item()
+        assert rel < 5e-3, f"rel={rel:.2e}"   # fp32 ulps of O(1) weights ~1e-4; no scaling -> O(1)
+
+
+def test_big_native_foreach_toggle_keeps_both_plans_across_steps():
+    """``_fused_big_batched=False`` sends the big bucket through ``_native_dispatch`` next to
+    the group's own native subset. Both used to share the plan key ``id(group)``, so each
+    evicted the other's cached foreach plan every step; each must now keep its own."""
+    cfg = dict(lr=1e-3, momentum_dtype="int8")          # int8 1-D -> native subset
+    ps = _bag([(1024, 512)] * 2 + [(96,)] * 3, torch.float32, seed=5)
+    opt = AdaPNM(ps, fused=True, **cfg)
+    opt._fused_big_batched = False
+    gen = torch.Generator(device=DEV).manual_seed(2)
+    seen = []
+    for _ in range(4):
+        for p in ps:
+            p.grad = torch.randn(*p.shape, generator=gen, device=DEV)
+        opt.step()
+        seen.append(dict(opt._foreach_plans))
+    ob, big, od, nat = _parts(opt)
+    assert len(big) == 2 and len(nat) == 3
+    assert len(seen[-1]) == 2, "native subset and big bucket must have separate plans"
+    for key, plan in seen[1].items():
+        assert all(s[key] is plan for s in seen[2:]), "a plan was rebuilt on a steady step"
