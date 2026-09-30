@@ -816,3 +816,34 @@ def test_first_step_init_with_cpu_and_cuda_params_in_one_d_scope(layout):
     assert opt.state[a]["p0"].device.type == "cpu" and opt.state[b]["p0"].device.type == "cuda"
     assert all(torch.isfinite(p).all() for p in (a, b, z))
     assert math.isfinite(opt.get_d())
+
+
+@pytest.mark.parametrize("independent_d", [True, False])
+def test_foreach_pass1_uses_each_groups_eps_factored(independent_d):
+    """Pass 1 buckets by ``(group, shape)``, so each group's factored second moment uses
+    its OWN ``eps_factored`` (the old shape-only bucket applied the first group's value
+    to every group sharing the shape): foreach must match the per-param path."""
+    g = torch.Generator().manual_seed(0)
+    base = [torch.randn(12, 8, generator=g) * 0.1 for _ in range(4)]
+
+    def run(foreach):
+        ps = [torch.nn.Parameter(t.clone()) for t in base]
+        opt = KProdigy(
+            [{"params": ps[:2], "eps_factored": 1e-30}, {"params": ps[2:], "eps_factored": 1e-3}],
+            lr=1.0, second_moment="factored", foreach=foreach, independent_d=independent_d,
+            d0=1e-6, gradient_centralization=False,
+        )
+        gen = torch.Generator().manual_seed(5)
+        directions = [torch.randn(t.shape, generator=gen) * 0.5 for t in base]
+        for _ in range(10):
+            for p, d in zip(ps, directions, strict=True):
+                p.grad = d.clone()
+            opt.step()
+        return ps, opt
+
+    pa, oa = run(False)
+    pb, ob = run(True)
+    for p, q in zip(pa, pb, strict=True):
+        torch.testing.assert_close(ob.state[q]["row"], oa.state[p]["row"], rtol=1e-6, atol=0)
+        torch.testing.assert_close(ob.state[q]["col"], oa.state[p]["col"], rtol=1e-6, atol=0)
+        _assert_params_close(p, q)
