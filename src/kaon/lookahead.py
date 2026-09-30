@@ -67,8 +67,10 @@ Either mode resumes **exactly**; they differ in what goes where:
   optimizer is in eval mode: ``step()`` refuses until you call :meth:`train`, which
   restores that ``backup`` byte-exact.
 
-If optimizer-checkpoint size matters more than exact resumption, checkpoint in train mode
-(same exactness, no ``backup``), or call :meth:`train` before ``state_dict()``.
+There is no exactness trade-off between the two: to keep the optimizer checkpoint
+smaller, save it in train mode (call :meth:`train` before ``state_dict()``) — it resumes
+just as exactly and carries no ``backup``. The price is only that the model weights saved
+alongside are then the fast ``theta``, not the slow ``phi`` you would sample from.
 """
 
 from __future__ import annotations
