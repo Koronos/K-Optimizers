@@ -49,7 +49,11 @@ import torch
 import kaon
 from kaon import ADOPT
 from kaon._backend import centralize_grads_
-from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors
+from kaon._factored import (
+    _MIN_NORMAL,
+    factored_inv_sqrt_factors,
+    zero_safe_inv_sqrt_factors,
+)
 
 _MOMENTUM_DTYPES = ("float32", "bfloat16", "int8", "4bit")
 
@@ -172,6 +176,57 @@ def test_factored_factors_propagate_nan_row() -> None:
     for floor in (0.0, _MIN_NORMAL):
         r_factor, c_factor = factored_inv_sqrt_factors(row.clone(), col.clone(), floor=floor)
         assert (r_factor * c_factor).isnan().any()
+
+
+# ------------------------------- unit: the eps1 == 0 reconstruction of the non-capping callers
+# ``zero_safe_inv_sqrt_factors`` is what AdaBelief, AdamP, AdaMuon and ScheduleFree call when
+# ``eps1 == 0`` (they do not cap the reconstruction, so ADOPT's floor would only trade the NaN
+# for an inf). One helper for the four; these pin its contract.
+@pytest.mark.parametrize("idx", range(8))  # the scaled rows down to 1e-42 (all entries > 0)
+def test_zero_safe_factors_match_the_plain_ones_on_nonzero_stats(idx) -> None:
+    """Every stat > 0 (normal OR subnormal) gets the plain reconstruction, bit for bit — no
+    floor reshapes a finite update, so ``eps1 == 0`` stays the exact math wherever the
+    math is finite."""
+    row = _row_means_grid()[idx]
+    col = torch.tensor([0.5, 2.0, 1e-30, 1e-44])
+    got_r, got_c = zero_safe_inv_sqrt_factors(row.clone(), col.clone())
+    want_r, want_c = _reference_factors(row.clone(), col.clone())
+    assert torch.isfinite(want_r).all() and torch.isfinite(want_c).all()
+    assert torch.equal(got_r.view(torch.int32), want_r.view(torch.int32))
+    assert torch.equal(got_c.view(torch.int32), want_c.view(torch.int32))
+
+
+def test_zero_safe_factors_zero_stats_give_a_zero_factor() -> None:
+    """An exactly-zero row / column statistic gives factor 0 (update 0 there), for an
+    all-zero row vector (``0/0`` in the mean) too — never inf, never NaN, and never a
+    bounded-but-huge factor: with ``g**2`` underflowed to 0 the first moment can still be
+    ~1e-25 (bf16 grads reach it), and a ``rsqrt(_MIN_NORMAL) = 2**63`` per factor made that
+    a ~1e13 step."""
+    r, c = zero_safe_inv_sqrt_factors(torch.tensor([1.0, 0.0, 4.0]), torch.tensor([0.0, 2.0]))
+    assert r.flatten().tolist()[1] == 0.0 and c.flatten().tolist()[0] == 0.0
+    assert torch.isfinite(r).all() and torch.isfinite(c).all()
+    r, c = zero_safe_inv_sqrt_factors(torch.zeros(2, 5), torch.zeros(2, 3))
+    assert r.shape == (2, 5, 1) and c.shape == (2, 1, 3)
+    assert not r.any() and not c.any()
+    m = torch.full((5, 3), 1e-25)                   # tiny first moment where v underflowed
+    assert not (m * r[0] * c[0]).any()
+
+
+def test_zero_safe_factors_underflowed_row_mean_is_a_zero_row() -> None:
+    """Nonzero subnormal row stats whose MEAN rounds to 0: the row/mean ratio is undefined,
+    so the row factor is 0 (no step), not ``rsqrt(row)`` against a substitute divisor
+    (~1e22: a giant step on a row whose gradient is ~1e-23)."""
+    row = torch.tensor([1e-45, 0.0, 0.0, 0.0])
+    assert row.mean().item() == 0.0
+    r, _ = zero_safe_inv_sqrt_factors(row, torch.ones(2))
+    assert not r.any()
+
+
+def test_zero_safe_factors_propagate_gradient_nan() -> None:
+    row = torch.tensor([1.0, float("nan"), 4.0])
+    col = torch.tensor([1.0, float("nan")])
+    r, c = zero_safe_inv_sqrt_factors(row, col)
+    assert r.isnan().all() and c.flatten().isnan().tolist() == [False, True]
 
 
 # --------------------------------------------------------------- ADOPT: no NaN

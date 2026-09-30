@@ -160,7 +160,11 @@ from kaon._backend import (
     is_low_precision,
     subtract_batched_,
 )
-from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors, update_factored_state
+from kaon._factored import (
+    factored_inv_sqrt_factors,
+    update_factored_state,
+    zero_safe_inv_sqrt_factors,
+)
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -181,27 +185,6 @@ MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 # One full-size z (and optional exp_avg) + factored v; mirrors AdaPNM's two-momenta
 # working-set estimate closely enough for the foreach budget heuristic.
 _STACK_BYTES_PER_ELEM = 48
-
-
-def _zero_safe_inv_sqrt_factors(row: Tensor, col: Tensor) -> tuple[Tensor, Tensor]:
-    """``factored_inv_sqrt_factors`` for ``eps1 == 0``, where a stat can be exactly zero.
-
-    With no ``eps1`` a weight whose gradient history is all zero (step 1 of a layer
-    behind a zero-init gate, LoRA ``A`` behind a zero-init ``B``) has ``row == 0``, so
-    ``row / mean(row)`` is ``0/0``; an all-zero row or column gives ``rsqrt(0) = inf``,
-    and the zero gradient there turns ``0 * inf`` into NaN. Nothing downstream caps the
-    reconstruction, so ADOPT's lone divisor floor would only trade the NaN for an
-    ``inf``. Flooring the divisor AND both rsqrt arguments at the smallest normal fp32
-    bounds each factor by ``rsqrt(_MIN_NORMAL) = 2**63`` (their product stays finite),
-    so a zero-stat coordinate gets a zero update. A stat is below ``_MIN_NORMAL`` only
-    when it is zero or subnormal, so every normal-range value is untouched; NaNs from the
-    gradient still propagate (``clamp`` keeps them). Only the ``eps1 == 0`` branch calls
-    this, so any ``eps1 > 0`` run stays bit-identical to the plain reconstruction.
-    """
-    row_mean = row.mean(dim=-1, keepdim=True).clamp_min_(_MIN_NORMAL)
-    r_factor = row.div(row_mean).clamp_min_(_MIN_NORMAL).rsqrt_().unsqueeze(-1)
-    c_factor = col.clamp_min(_MIN_NORMAL).rsqrt_().unsqueeze(-2)
-    return r_factor, c_factor
 
 
 class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
@@ -776,7 +759,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
             r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
             c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
         else:
-            r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
+            r_factor, c_factor = zero_safe_inv_sqrt_factors(row, col)
         inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])                        # 1/sqrt(v_hat)
 
         # ``d`` is a fresh tensor; drop the full-size ``inv_denom`` before the y/z update.
@@ -884,7 +867,7 @@ class ScheduleFree(TrainEvalWeights, ForeachPlanMixin, SRSeedState, Optimizer):
             if eps1 > 0:
                 r_factor, c_factor = factored_inv_sqrt_factors(state["row"], state["col"])
             else:
-                r_factor, c_factor = _zero_safe_inv_sqrt_factors(state["row"], state["col"])
+                r_factor, c_factor = zero_safe_inv_sqrt_factors(state["row"], state["col"])
             inv_denom = (r_factor * c_factor).mul_(c["bc2_sq"])            # 1/sqrt(v_hat)
             d = self._normalized_d_one(state, md, gv, inv_denom, c)        # [R, C]
             del inv_denom

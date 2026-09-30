@@ -79,7 +79,12 @@ from kaon._backend import (
     subtract_one_,
     validate_bf16_method,
 )
-from kaon._factored import _MIN_NORMAL, factored_inv_sqrt_factors, update_factored_state
+from kaon._factored import (
+    _MIN_NORMAL,
+    factored_inv_sqrt_factors,
+    update_factored_state,
+    zero_safe_inv_sqrt_factors,
+)
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
     _FOURBIT_BLOCK,
@@ -103,28 +108,6 @@ _UPDATE_RMS = 0.2
 # standalone module, not coupled to adakaon.py internals). See
 # docs/foreach-batching.md for the rationale behind each constant.
 _STACK_BYTES_PER_ELEM = 48
-
-
-def _zero_safe_inv_sqrt_factors(row: Tensor, col: Tensor) -> tuple[Tensor, Tensor]:
-    """``factored_inv_sqrt_factors`` for ``eps1 == 0``, where a stat can be exactly zero.
-
-    With no ``eps1`` an all-zero momentum (step 1 of a layer behind a zero-init gate,
-    LoRA ``A`` behind a zero-init ``B``) orthogonalizes to zero, so ``row == 0`` and
-    ``row / mean(row)`` is ``0/0``; an all-zero row or column (Newton-Schulz preserves
-    them) gives ``rsqrt(0) = inf`` and ``0 * inf = NaN``, which the per-slice RMS clip
-    then spreads over the whole weight. Nothing caps the reconstruction, so ADOPT's lone
-    divisor floor would only trade the NaN for an ``inf``: this floors the divisor AND
-    both rsqrt arguments at the smallest normal fp32, bounding each factor by
-    ``rsqrt(_MIN_NORMAL) = 2**63`` (the product stays finite), so a zero-stat coordinate
-    gets a zero update. Only zero/subnormal stats are touched; NaNs still propagate.
-    Only the ``eps1 == 0`` branch calls this, so ``eps1 > 0`` stays bit-identical.
-    (Same helper as ScheduleFree's; kept local so this module stays standalone.)
-    """
-    row_mean = row.mean(dim=-1, keepdim=True).clamp_min_(_MIN_NORMAL)
-    r_factor = row.div(row_mean).clamp_min_(_MIN_NORMAL).rsqrt_().unsqueeze(-1)
-    c_factor = col.clamp_min(_MIN_NORMAL).rsqrt_().unsqueeze(-2)
-    return r_factor, c_factor
-
 
 
 def zeropower_via_newtonschulz5(grad: Tensor, steps: int) -> Tensor:
@@ -275,7 +258,7 @@ def _factored_math(
         r_factor = row.div(row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)  # [N, R, 1]
         c_factor = col.rsqrt().unsqueeze(-2)                                       # [N, 1, C]
     else:
-        r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
+        r_factor, c_factor = zero_safe_inv_sqrt_factors(row, col)
     # In place: ``ortho`` is the fresh fp32 widening of the bf16 Newton-Schulz output.
     update = ortho.mul_(r_factor).mul_(c_factor)                              # [N, R, C], RMS≈1
     if bc_scale is not None:
@@ -317,7 +300,8 @@ def _nonfactored_pre_math(
     v.lerp_(grad_sq, omb)
 
     # eps1 == 0: an all-zero grad history leaves v == 0 and ``0 * rsqrt(0)`` is NaN;
-    # the same _MIN_NORMAL floor as the factored path makes that update exactly zero.
+    # a _MIN_NORMAL floor on v makes that update exactly zero (one factor, bounded by 2**63;
+    # the factored path zeroes a zero stat instead, see kaon._factored.zero_safe_inv_sqrt_factors).
     inv_sqrt_v = v.rsqrt() if eps1 > 0 else v.clamp_min(_MIN_NORMAL).rsqrt_()
     update = grad.mul(inv_sqrt_v)                                     # [N, L], RMS≈1
     if bc_scale is not None:
@@ -366,7 +350,7 @@ def _factored_one_math(
     if eps1 > 0:
         r_factor, c_factor = factored_inv_sqrt_factors(row, col)
     else:
-        r_factor, c_factor = _zero_safe_inv_sqrt_factors(row, col)
+        r_factor, c_factor = zero_safe_inv_sqrt_factors(row, col)
     # In place: ``ortho`` is a fresh fp32 copy (see _factored_math).
     update = ortho.mul_(r_factor).mul_(c_factor)                      # [R, C], RMS≈1
     if bc_scale is not None:
