@@ -135,6 +135,11 @@ def _zero_safe_inv_sqrt_factors(row: Tensor, col: Tensor) -> tuple[Tensor, Tenso
     return r_factor.unsqueeze(-1), c_factor.unsqueeze(-2)
 
 
+#: ``dict.__setitem__``, i.e. a per-param state write that SKIPS the state-identity
+#: hook (:class:`kaon._foreach_plan.WatchedParamState`), as in :mod:`kaon.adapnm`. Legal
+#: for scalar bookkeeping keys ONLY (the per-param ``step``) — never for a tensor buffer.
+_set_unwatched = dict.__setitem__
+
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
 # One momentum + factored v; on par with Adakaon's single-momentum working set.
@@ -372,14 +377,14 @@ class AdamP(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         state = self.state[p]
         if not state:
             self._init_state(p, state, group)
-            state["step"] = 1
+            _set_unwatched(state, "step", 1)
         elif "step" not in state:
             # Legacy checkpoints only stored the group clock. The global clock
             # has already advanced for this call, so it reconstructs the normal
             # all-params-active trajectory exactly.
-            state["step"] = group["step"]
+            _set_unwatched(state, "step", group["step"])
         else:
-            state["step"] += 1
+            _set_unwatched(state, "step", state["step"] + 1)
 
     # ------------------------------------------------------------- projection
     def _project_one(

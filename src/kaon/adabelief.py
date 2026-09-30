@@ -143,6 +143,11 @@ def _zero_safe_inv_sqrt_factors(row: Tensor, col: Tensor) -> tuple[Tensor, Tenso
     return r_factor.unsqueeze(-1), c_factor.unsqueeze(-2)
 
 
+#: ``dict.__setitem__``, i.e. a per-param state write that SKIPS the state-identity
+#: hook (:class:`kaon._foreach_plan.WatchedParamState`), as in :mod:`kaon.adapnm`. Legal
+#: for scalar bookkeeping keys ONLY (the per-param ``step``) — never for a tensor buffer.
+_set_unwatched = dict.__setitem__
+
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
 # Performance / memory knobs mirror Adakaon (see that module for the rationale).
@@ -445,14 +450,14 @@ class AdaBelief(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         state = self.state[p]
         if not state:
             self._init_state(p, state, group)
-            state["step"] = 1
+            _set_unwatched(state, "step", 1)
         elif "step" not in state:
             # Legacy checkpoints only stored the group clock. At the first
             # resumed update, the already-advanced global clock is the best
             # exact reconstruction for params that had trained normally.
-            state["step"] = group["step"]
+            _set_unwatched(state, "step", group["step"])
         else:
-            state["step"] += 1
+            _set_unwatched(state, "step", state["step"] + 1)
 
     # ----------------------------------------------------------------- foreach
     # Bucketing, chunking and the cached view plan live in kaon._foreach_plan. ``row`` /

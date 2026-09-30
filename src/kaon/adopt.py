@@ -151,6 +151,11 @@ from kaon._momentum_codec import (
 
 __all__ = ["ADOPT"]
 
+#: ``dict.__setitem__``, i.e. a per-param state write that SKIPS the state-identity
+#: hook (:class:`kaon._foreach_plan.WatchedParamState`), as in :mod:`kaon.adapnm`. Legal
+#: for scalar bookkeeping keys ONLY (the per-param ``step``) — never for a tensor buffer.
+_set_unwatched = dict.__setitem__
+
 MomentumDtype = Literal["bfloat16", "float32", "int8", "4bit"]
 
 # Performance / memory knobs mirror Adakaon (one momentum + factored v).
@@ -463,8 +468,9 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
             bucket = self._factored_bucket if chunk.eff is not None else self._nonfactored_bucket
             bucket(chunk, c, group)
             nxt = pstep + 1
+            set_raw = _set_unwatched
             for state in chunk.states:
-                state["step"] = nxt
+                set_raw(state, "step", nxt)
 
     @torch.no_grad()
     def _factored_bucket(
@@ -600,7 +606,7 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
                 state["col"].copy_(grad_sq.mean(dim=-2))
             else:
                 state["v"].copy_(grad * grad)
-            state["step"] = 1
+            _set_unwatched(state, "step", 1)
             return
 
         c = self._coeffs(group, pstep)
@@ -645,4 +651,4 @@ class ADOPT(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         if wd != 0:
             delta = decay_one_(delta, p, state, bf16_method, group["lr"] * wd)
         subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
-        state["step"] = pstep + 1
+        _set_unwatched(state, "step", pstep + 1)
