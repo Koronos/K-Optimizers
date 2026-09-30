@@ -787,3 +787,20 @@ def test_cautious_wd_backfilled_on_old_checkpoint():
     assert opt2.param_groups[0]["cautious_wd"] == "masked"
     p.grad = torch.randn(4, 4)
     opt2.step()
+
+
+@pytest.mark.parametrize("cautious_wd", ["masked", "full"])
+@pytest.mark.parametrize("foreach", [True, False])
+def test_kahan16_with_weight_decay_is_bit_exact_to_an_fp32_master(foreach, cautious_wd):
+    """Decoupled WD reads the weight's full VALUE (decoded under kahan8/kahan16), as in
+    Adakaon: reading the bare bf16 ``p`` rounded it to the bf16 grid inside the update and
+    split a kahan16 run from its fp32 twin as soon as ``weight_decay > 0``."""
+    from .test_kahan16 import _assert_fp32_master, _bag, _drive
+
+    p32, p16 = _bag(torch.float32), _bag()
+    kw = dict(lr=1e-3, weight_decay=0.1, foreach=foreach, gradient_centralization=False,
+              momentum_dtype="float32", cautious_wd=cautious_wd)
+    o32 = Lion(p32, **kw)
+    o16 = Lion(p16, bf16_method="kahan16", **kw)
+    _drive([o32, o16], [p32, p16])
+    _assert_fp32_master(p16, o16, p32)

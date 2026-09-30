@@ -87,6 +87,7 @@ from kaon._backend import (
     subtract_batched_,
     subtract_one_,
     validate_bf16_method,
+    weight_value,
 )
 from kaon._foreach_plan import ForeachChunk, ForeachPlanMixin, ForeachSpec
 from kaon._momentum_codec import (
@@ -436,14 +437,16 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         m.mul_(beta2).add_(grad, alpha=1.0 - beta2)
         codec.store_stacked(states, m, views=views)
 
+        # The decay reads the weight's full VALUE: decoded ``(weight, residual)`` under
+        # kahan8/kahan16, the historical fp32 stack otherwise (see ChunkPlan.value_stack).
         if wd != 0 and not wd_full:
-            delta = delta.add_(chunk.param_stack(), alpha=wd)
+            delta = delta.add_(chunk.value_stack(bf16_method), alpha=wd)
 
         if cautious:
             delta = cautious_batched_(delta, grad)
 
         if wd_full:
-            delta = delta.add_(chunk.param_stack(), alpha=wd)
+            delta = delta.add_(chunk.value_stack(bf16_method), alpha=wd)
 
         delta.mul_(lr)
         subtract_batched_(chunk.pviews, delta, bf16_method, sr=self.sr_stream,
@@ -479,17 +482,18 @@ class Lion(AutoLRMixin, ForeachPlanMixin, SRSeedState, Optimizer):
         # survivors get it rescaled by 1/keep); "full" masks only the sign update and
         # decays every coordinate by the same lr*wd. With cautious=False both are the same
         # add on an untouched delta, hence bit-identical.
+        # The decay reads the weight's full VALUE (decoded under kahan8/kahan16, the
+        # historical ``p.data`` / ``p.data.float()`` otherwise) — see
+        # kaon._backend.weight_value; same as Adakaon.
         wd_full = wd != 0 and group["cautious_wd"] == "full"
         if wd != 0 and not wd_full:
-            p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
-            delta = delta.add_(p_fp32, alpha=wd)
+            delta = delta.add_(weight_value(p, state, bf16_method), alpha=wd)
 
         if cautious:
             delta = cautious_one_(delta, grad)
 
         if wd_full:
-            p_fp32 = p.data if p.dtype == torch.float32 else p.data.float()
-            delta = delta.add_(p_fp32, alpha=wd)
+            delta = delta.add_(weight_value(p, state, bf16_method), alpha=wd)
 
         delta.mul_(lr)
         subtract_one_(p, delta, state, bf16_method, sr=self.sr_stream)
