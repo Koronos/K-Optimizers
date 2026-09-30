@@ -1787,6 +1787,7 @@ if _HAS_TRITON:
         beta1_sq, beta0, inv_noise, beta2, sc, lrwd, eps1, clip_eff, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         GC: tl.constexpr, SR: tl.constexpr, CLIP: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        GF32: tl.constexpr = False,
     ):
         t = tl.program_id(0)
         R = tl.load(Rs_ptr + t)
@@ -1799,12 +1800,8 @@ if _HAS_TRITON:
         negi = tl.load(neg_addr + t)
         rowp = tl.load(row_addr + t).to(tl.pointer_type(tl.float32))
         colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
-        if LOWP:
-            gp = gi.to(tl.pointer_type(tl.bfloat16))
-            pp = pi.to(tl.pointer_type(tl.bfloat16))
-        else:
-            gp = gi.to(tl.pointer_type(tl.float32))
-            pp = pi.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gi, LOWP, GF32)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         ri = tl.arange(0, BR)[:, None]
         ci = tl.arange(0, BC)[None, :]
         rr = tl.arange(0, BR)
@@ -2047,7 +2044,7 @@ if _HAS_TRITON:
         g_addr, rowmean_ptr, pos_addr, neg_addr, rfac_ptr, cfac_ptr, keep_ptr, rms_ptr,
         R, C, n, K, beta1_sq, beta0, inv_noise,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
-        CLIP: tl.constexpr, BLOCK: tl.constexpr,
+        CLIP: tl.constexpr, BLOCK: tl.constexpr, GF32: tl.constexpr = False,
     ):
         """As ``_adapnm_chunked_mom_batched`` but grad comes from the pointer array (GC via rowmean)."""
         pid = tl.program_id(0)
@@ -2057,7 +2054,7 @@ if _HAS_TRITON:
         mask = offs < n
         i = offs // C
         gbase = tl.load(g_addr + t)
-        gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gbase, LOWP, GF32)
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
         if GC:
             g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2094,7 +2091,7 @@ if _HAS_TRITON:
         g_addr, rowmean_ptr, pos_addr, neg_addr, p_addr, rfac_ptr, cfac_ptr, sc_ptr, inv_mean_ptr,
         R, C, n, K, beta0, inv_noise, lrwd, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr,
-        WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr,
+        WD: tl.constexpr, SR: tl.constexpr, BLOCK: tl.constexpr, GF32: tl.constexpr = False,
     ):
         """As ``_adapnm_chunked_apply_batched`` but grad (for cautious) comes from the pointer array + GC."""
         pid = tl.program_id(0)
@@ -2118,8 +2115,7 @@ if _HAS_TRITON:
         pn = ((1.0 + beta0) * m_pos - beta0 * m_neg) * inv_noise
         delta = pn * rf * cf * sc
         if CAUTIOUS:
-            gbase = tl.load(g_addr + t)
-            gp = gbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else gbase.to(tl.pointer_type(tl.float32))
+            gp = grad_ptr(tl.load(g_addr + t), LOWP, GF32)
             g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
             if GC:
                 g = g - tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
@@ -2148,7 +2144,7 @@ if _HAS_TRITON:
         g_addr, p_addr, pos_addr, neg_addr, v_addr, Ls_ptr,
         beta1_sq, beta0, inv_noise, beta2, step_size, bc2_sq, eps, lrwd, clip, seed,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
-        CLIP: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr,
+        CLIP: tl.constexpr, SR: tl.constexpr, BL: tl.constexpr, GF32: tl.constexpr = False,
     ):
         """One program == one 1-D tensor. Whole non-factored AdaPNM step, in place via pointer-array."""
         t = tl.program_id(0)
@@ -2157,12 +2153,8 @@ if _HAS_TRITON:
         gi = tl.load(g_addr + t)
         pi = tl.load(p_addr + t)
         vp = tl.load(v_addr + t).to(tl.pointer_type(tl.float32))
-        if LOWP:
-            gp = gi.to(tl.pointer_type(tl.bfloat16))
-            pp = pi.to(tl.pointer_type(tl.bfloat16))
-        else:
-            gp = gi.to(tl.pointer_type(tl.float32))
-            pp = pi.to(tl.pointer_type(tl.float32))
+        gp = grad_ptr(gi, LOWP, GF32)
+        pp = pi.to(tl.pointer_type(tl.bfloat16)) if LOWP else pi.to(tl.pointer_type(tl.float32))
         offs = tl.arange(0, BL)
         mask = offs < L
         g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)

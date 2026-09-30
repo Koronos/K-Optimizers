@@ -160,7 +160,7 @@ from kaon._momentum_codec import (
 # the big route's pointer arrays need. Reused rather than duplicated — ``kaon.adakaon`` imports
 # nothing from here, so there is no cycle, and a divergence between two copies of this logic is
 # exactly the class of bug the audit found.
-from kaon.adakaon import _demote_unfusable_grads, _grad_unfusable, _same_shape_device_buckets
+from kaon.adakaon import _adakaon_demoted, _demote_by_id, _gf32, _same_shape_device_buckets
 
 __all__ = ["AdaPNM"]
 
@@ -757,13 +757,18 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
 
         for group in self.param_groups:
             # ONE pass over the grads: the None filter, the sparse check and whether any grad is
-            # one a fused kernel cannot read (dtype != param's, or non-contiguous — see
-            # _demote_unfusable_grads). ``unfusable`` False (the steady state) lets _fused_demote
-            # skip its own sweep; True for a param routed native anyway is harmless (the sweep
-            # then moves nothing). Every grad is checked, never one per bucket: a bucket can mix
-            # grad dtypes.
+            # one a fused kernel cannot read (non-contiguous, or a dtype that is neither the
+            # param's nor an fp32 grad on a bf16 weight — see _fused_demote). ``unfusable`` False
+            # (the steady state) lets _fused_demote skip its own sweep; True for a param routed
+            # native anyway is harmless (the sweep then moves nothing). Every grad is checked,
+            # never one per bucket: a bucket can mix grad dtypes.
+            #
+            # An fp32 grad on a bf16 weight (``wide``) is READ by the fused kernels (``GF32``), so
+            # it only needs the sweep when the group also has a bf16 weight with a bf16 grad
+            # (``GF32`` is one constexpr per launch) — checked lazily, as in Adakaon.
             params: list[Tensor] = []
             unfusable = False
+            wide = False
             for p in group["params"]:
                 g = p.grad
                 if g is None:
@@ -771,8 +776,16 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                 if g.is_sparse:
                     raise RuntimeError("AdaPNM does not support sparse gradients")
                 params.append(p)
-                if g.dtype != p.dtype or not g.is_contiguous():
+                if g.dtype != p.dtype:
+                    if g.dtype == torch.float32 and p.dtype == torch.bfloat16:
+                        wide = True
+                    else:
+                        unfusable = True
+                if not g.is_contiguous():
                     unfusable = True
+            if wide and not unfusable:
+                unfusable = any(p.dtype == torch.bfloat16 and p.grad.dtype == torch.bfloat16
+                                for p in params)
             if not params:
                 continue
             group["step"] += 1
@@ -914,8 +927,8 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         downstream memo and ``_WitnessedCache`` revalidates by list identity.
 
         Grad properties deliberately stay OUT of this key: a gradient is a new tensor every
-        backward, so its contiguity and dtype are re-checked per step in
-        :func:`kaon.adakaon._demote_unfusable_grads` rather than frozen into the routing.
+        backward, so its contiguity and dtype are re-checked per step in :meth:`_fused_demote`
+        rather than frozen into the routing.
         """
         gid = id(group)
         witness = ft.param_witness(params)
@@ -939,7 +952,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
             # ndim>2 (conv) is matrixized to (out, in*kh*kw); needs fp32/bf16 momentum (quant's
             # per-row requant would reshape the conv state) -> else native. The matrixized
             # write-back also needs a contiguous GRAD, enforced per step by
-            # _demote_unfusable_grads (below) and NOT here, because the grad changes every
+            # _fused_demote (below) and NOT here, because the grad changes every
             # backward and this partition is cached across steps.
             conv_ok = p.ndim <= 2 or float_mom
             ok = bf_ok and conv_ok and ft.fused_eligible(p, cap)
@@ -995,14 +1008,19 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         return fourbit_block_size(p.grad, group)
 
     def _fused_demote(self, gid: int, parts: tuple, unfusable: bool = True) -> tuple:
-        """This step's routing, with any tensor whose grad is non-contiguous or not of the
-        param's dtype (fp32 grad on a bf16 weight) moved to the native subset.
+        """This step's routing, with any tensor whose grad a fused kernel cannot read moved to
+        the native subset: a non-contiguous grad, or a grad whose dtype is neither the param's
+        nor an fp32 grad on a bf16 weight (a bf16 grad on an fp32 weight, fp16, ...).
 
-        Thin memo over :func:`kaon.adakaon._demote_unfusable_grads`. Every fused kernel reads
-        the gradient as ``base + ri*C + ci`` (or ``base + offs``) straight off ``grad.data_ptr()``,
-        so a transposed (``grad = x.t()``) or strided (``grad = buf[::2]``) gradient has the right
-        shape and the wrong layout and the kernel silently steps the wrong numbers — measured at
-        ~1e-2 against native on all three routes, with no error raised anywhere.
+        Thin memo over :func:`kaon.adakaon._adakaon_demoted` — the same rule as Adakaon's. Every
+        fused kernel reads the gradient as ``base + ri*C + ci`` (or ``base + offs``) straight off
+        ``grad.data_ptr()``, so a transposed (``grad = x.t()``) or strided (``grad = buf[::2]``)
+        gradient has the right shape and the wrong layout and the kernel silently steps the wrong
+        numbers — measured at ~1e-2 against native on all three routes, with no error raised
+        anywhere. An fp32 grad on a bf16 weight STAYS fused since 0.7.18: the kernels take a
+        ``GF32`` constexpr that types the grad pointer fp32 (upcast on load either way, as
+        native's ``grad.float()``). ``GF32`` is one constexpr per launch, so a route whose bf16
+        weights MIX bf16 and fp32 grads demotes the fp32-grad ones (the rare case).
 
         The demotion has to build fresh route lists, and a fresh list means every downstream
         pointer cache re-validates; reuse the lists while both the partition (identity of its four
@@ -1013,8 +1031,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         """
         # ``unfusable`` is the caller's verdict from the grad pass it already makes (False: no
         # grad in the group is unfusable, so there is nothing to sweep for).
-        demoted = () if not unfusable else tuple(
-            id(p) for sub in parts[:3] for p in sub if _grad_unfusable(p))
+        demoted = () if not unfusable else _adakaon_demoted(parts)
         if not demoted:
             self._fused_demoted.pop(gid, None)
             return parts
@@ -1022,7 +1039,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         if (cached is not None and cached[0] == demoted
                 and all(a is b for a, b in zip(cached[1], parts, strict=True))):
             return cached[2]
-        out = _demote_unfusable_grads(*parts)
+        out = _demote_by_id(parts, demoted)
         self._fused_demoted[gid] = (demoted, parts, out)
         return out
 
@@ -1084,7 +1101,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                     # kaon._backend.gc_applies.
                     WD=wd != 0, GC=gc and bk["gc_ok"],
                     SR=_fused_sr(group, bk["lowp"]), CLIP=clip > 0.0, BR=bk["BR"], BC=bk["BC"],
-                    num_warps=ft.warps_for(lanes),
+                    num_warps=ft.warps_for(lanes), GF32=_gf32(bk["plist"]),
                 )
 
     def _fused_one_dim(
@@ -1129,7 +1146,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                     eps_k, lr * wd, clip, group["step"], LOWP=bk["lowp"], MOM=bk["mom"],
                     CAUTIOUS=cautious, WD=wd != 0, CLIP=clip > 0.0, SR=_fused_sr(group, bk["lowp"]),
                     BL=bk["BL"],
-                    num_warps=ft.warps_for(bk["BL"]),
+                    num_warps=ft.warps_for(bk["BL"]), GF32=_gf32(bk["plist"]),
                 )
 
     @torch.no_grad()
@@ -1325,6 +1342,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                 g_addr, rowmean, pos_addr, neg_addr, r, cfac, keep, rms_acc, R, C, n, K,
                 c["beta1_sq"], c["beta0"], inv_noise,
                 LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, CLIP=clip > 0.0, BLOCK=1024,
+                GF32=_gf32(plist),
             )
         else:
             ft._adapnm_chunked_mom_batched[grid](
@@ -1349,6 +1367,7 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
                 g_addr, rowmean, pos_addr, neg_addr, p_addr, r, cfac, sc_apply, inv_mean, R, C, n, K,
                 c["beta0"], inv_noise, lr * wd, group["step"],
                 LOWP=lowp, MOM=mom, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, BLOCK=1024,
+                GF32=_gf32(plist),
             )
         else:
             ft._adapnm_chunked_apply_batched[grid](
@@ -1389,15 +1408,17 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         rowmean = cache.rowmean
         rowsum = cache.rowsum
         cache.zero_accumulators()  # colsum (atomic target) + keep + rms_acc, one launch
+        gf32 = _gf32(plist)        # fp32 grads on bf16 weights, read in place (GF32)
         if ct:
             ft._reduce_rowcol_ct[(N * RB,)](
                 g_addr, rowmean, rowsum, colsum, colsum, R, C, RB,
                 LOWP=lowp, GC=gc, BR=BR, BC=BC, DET=False, num_warps=ft.warps_for(BR * BC),
+                GF32=gf32,
             )
         else:
             ft._reduce_rowcol[(N * RB,)](
                 g_addr, rowmean, rowsum, colsum, R, C, RB,
-                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC),
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC), GF32=gf32,
             )
         ft.factor_rowcol_(row_addr, col_addr, rowsum, colsum, rowsum, colsum, N, R, C, b2, eps1)
         return g_addr, rowmean, rowsum, colsum

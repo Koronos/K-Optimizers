@@ -212,7 +212,7 @@ def _adakaon_demoted(parts: tuple) -> tuple:
     the bucket's first grad, so every bf16 weight of a route must agree on its grad dtype: when a
     route mixes bf16-grad and fp32-grad bf16 weights, the fp32-grad ones are demoted as before
     (the rare case; the common ones — every grad fp32, or every grad bf16 — keep the whole route).
-    AdaPNM keeps :func:`_grad_unfusable` (its kernels type the grad by the weight)."""
+    AdaPNM uses the same rule since 0.7.18 (its kernels take ``GF32`` too)."""
     out: list[int] = []
     for sub in parts[:3]:
         wide: list[int] = []

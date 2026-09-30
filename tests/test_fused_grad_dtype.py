@@ -8,20 +8,20 @@ bf16 pairs of fp32 words: NaN/garbage weights from the first step, on every fuse
 Adakaon, AdaPNM). 0.7.17 demoted such a param to the native path FOR THAT STEP (the native path
 upcasts any grad to fp32) — correct, but it cost the whole bag the fused speed on every step.
 
-Since 0.7.18 ADAKAON's kernels (and so Nekaon's) take a ``GF32`` constexpr that types the grad
-pointer fp32 while the weight stays bf16, so a bf16 weight with an fp32 grad STAYS FUSED. The
-grad is upcast to fp32 on load either way, so on grad VALUES a bf16 grad can hold, the fp32-grad
-launch is the bf16-grad launch, bit for bit. AdaPNM still demotes (its kernels have no ``GF32``);
-so does a route whose bf16 weights MIX bf16 and fp32 grads (``GF32`` is one constexpr per
-launch), and so does every other mismatch (a bf16 grad on an fp32 weight, ...).
+Since 0.7.18 the kernels of ADAKAON (and so Nekaon's) and of ADAPNM take a ``GF32`` constexpr
+that types the grad pointer fp32 while the weight stays bf16, so a bf16 weight with an fp32 grad
+STAYS FUSED. The grad is upcast to fp32 on load either way, so on grad VALUES a bf16 grad can
+hold, the fp32-grad launch is the bf16-grad launch, bit for bit. A route whose bf16 weights MIX
+bf16 and fp32 grads still demotes the fp32-grad ones (``GF32`` is one constexpr per launch), and
+so does every other mismatch (a bf16 grad on an fp32 weight, ...).
 
 What is pinned here:
 
-1. AdaPNM: fused + fp32 grad == ``fused=False`` + the same fp32 grad, BIT FOR BIT (weights and
-   the compact-Kahan residual), per ``bf16_method`` x route — the demoted bag runs the very
-   same native code, and both SR noise streams are pinned to the same id (:class:`SRStream`).
-   Adakaon / Nekaon: the fp32-grad bag stays on its fused route, is bit-identical to the same
-   fused optimizer fed the bf16 grads of the same values, and close to native.
+1. The fp32-grad bag stays on its fused route, is bit-identical to the same fused optimizer
+   fed the bf16 grads of the same values, and close to native (Adakaon / Nekaon per
+   ``bf16_method`` x route; AdaPNM, which fuses bf16 weights only under SR, per route). AdaPNM
+   under compact Kahan is native by partition: fused + fp32 grad == ``fused=False`` + the same
+   fp32 grad, BIT FOR BIT (weights and residual).
 2. Only the offending tensor leaves the fused route; its neighbours stay fused.
 3. A grad that changes dtype between steps re-routes every step (the demotion memo keys on
    the demoted SET, never on a stale partition), and the trajectory matches native.
@@ -170,26 +170,19 @@ def _fp32_grads(step, i, p):
 @pytest.mark.parametrize("name", list(_OPTS))
 def test_fp32_grad_on_bf16_param_matches_native(name, method, route):
     """The repro: fp32 grads on bf16 weights under ``fused=True``. Must be finite AND the same
-    bits as ``fused=False`` on the same grads — the param is demoted, not stepped by a kernel
-    reading its fp32 words as bf16. (AdaPNM; Adakaon/Nekaon keep the fused route — below.)"""
-    if name != "AdaPNM":
-        pytest.skip("Adakaon/Nekaon read fp32 grads fused: see "
-                    "test_fp32_grad_on_bf16_param_stays_fused")
+    bits as ``fused=False`` on the same grads. (AdaPNM under compact Kahan, native by partition;
+    every fused bf16 case keeps the fused route — test_fp32_grad_on_bf16_param_stays_fused.)"""
+    if name != "AdaPNM" or method == "stochastic_rounding":
+        pytest.skip("read fused (GF32): see test_fp32_grad_on_bf16_param_stays_fused")
     shapes = _ROUTES[route]
     pv = _bag(shapes, seed=11)
     pn = _clone(pv)
     ov = _make(name, pv, True, method)
     on = _make(name, pn, False, method)
     _drive([(pv, ov), (pn, on)], 3, seed=13, dtype_of=_fp32_grads)
-    # The partition still ROUTES the params to the fused kernel (it only sees the param) —
-    # the per-step grad sweep is what keeps them off it. AdaPNM fuses bf16 weights only under
-    # SR, so its compact-Kahan cases are native by partition (never affected; still pinned).
-    if name == "AdaPNM" and method != "stochastic_rounding":
-        assert all(_route_of(ov, p) == "native" for p in pv)
-    else:
-        expected = "big" if route.startswith("big") else route
-        assert all(_route_of(ov, p) == expected for p in pv), [_route_of(ov, p) for p in pv]
-        assert _demoted_ids(ov) == {id(p) for p in pv}
+    # AdaPNM fuses bf16 weights only under SR, so its compact-Kahan cases are native by
+    # partition (never affected by GF32; still pinned).
+    assert all(_route_of(ov, p) == "native" for p in pv)
     _assert_same_bits(pv, pn, ov, on, f"{name}/{method}/{route}")
 
 
@@ -235,6 +228,82 @@ def test_fp32_grad_on_bf16_param_stays_fused(name, method, route):
         # ulp) under kahan8; kahan16 has no noise, only fp32 rounding / reduction order.
         tol = {"stochastic_rounding": 3e-2, "kahan8": 1e-4}.get(method, 1e-5)
         assert d / scale < tol, f"{name}/{method}/{route}: rel {d / scale:.2e} vs native"
+
+
+# AdaPNM's batched-big route sums ``colsum``/``rms`` with fp32 atomics (no deterministic mode),
+# so its bit-identity oracle uses a bucket small enough for ONE row block and ONE chunk
+# (``fused_tile_cap=64``): the same kernels, in a fixed order.
+_PNM_ROUTES = {**_ROUTES, "big": [(8, 64)] * 2 + [(16, 32)] * 2}
+_PNM_CAP = {"big": 64}
+
+
+@pytest.mark.parametrize("route", list(_PNM_ROUTES))
+def test_adapnm_fp32_grad_on_bf16_param_stays_fused(route):
+    """AdaPNM's kernels read an fp32 grad on a bf16 weight too (``GF32``): no demotion, and the
+    trajectory is BIT-IDENTICAL to AdaPNM fed the bf16 grads of the SAME values — weights and
+    both momenta (same SR noise id). Against native as close as fused SR always is."""
+    shapes = _PNM_ROUTES[route]
+    extra = {"fused_tile_cap": _PNM_CAP[route]} if route in _PNM_CAP else {}
+    pw = _bag(shapes, seed=11)
+    pb = _clone(pw)
+    pn = _clone(pw)
+    ow = _make("AdaPNM", pw, True, "stochastic_rounding", **extra)
+    ob = _make("AdaPNM", pb, True, "stochastic_rounding", **extra)
+    on = _make("AdaPNM", pn, False, "stochastic_rounding")
+    gen = torch.Generator(device=DEV).manual_seed(13)
+    for _ in range(3):
+        raw = [torch.randn(tuple(p.shape), generator=gen, device=DEV).bfloat16() for p in pw]
+        for plist, as32 in ((pw, True), (pb, False), (pn, True)):
+            for p, g in zip(plist, raw, strict=True):
+                p.grad = g.float() if as32 else g.clone()
+        for o in (ow, ob, on):
+            o.step()
+    torch.cuda.synchronize()
+    expected = "big" if route.startswith("big") else route
+    assert all(_route_of(ow, p) == expected for p in pw), [_route_of(ow, p) for p in pw]
+    assert _demoted_ids(ow) == set()
+    _assert_same_bits(pw, pb, ow, ob, f"AdaPNM/{route}: fp32 vs bf16 grads")
+    for a, b in zip(pw, pb, strict=True):
+        for key in ("m_pos", "m_neg"):
+            assert torch.equal(ow.state[a][key], ob.state[b][key]), f"{route}: {key} differs"
+    for a, b in zip(pw, pn, strict=True):
+        scale = b.detach().float().abs().max().item()
+        d = (a.detach().float() - b.detach().float()).abs().max().item()
+        assert d / scale < 3e-2, f"AdaPNM/{route}: rel {d / scale:.2e} vs native"
+
+
+@pytest.mark.parametrize("route", list(_ROUTES))
+def test_adapnm_fp32_grad_not_representable_in_bf16_is_read_exactly(route):
+    """GF32 with fp32 grads a bf16 grad could NOT hold (plain ``randn``). AdaPNM fuses bf16
+    weights only under SR, whose noise differs from native's, so the weights are no oracle —
+    but the momenta and the factored second moment depend on the GRADS alone (GC off): the
+    fused ones must equal native's to fp32 rounding / reduction order (a bf16 truncation of the
+    grad would show at ~1e-3)."""
+    shapes = _ROUTES[route]
+    pw = _bag(shapes, seed=71)
+    pn = _clone(pw)
+    cfg = dict(momentum_dtype="float32", gradient_centralization=False)
+    ow = _make("AdaPNM", pw, True, "stochastic_rounding", **cfg)
+    on = _make("AdaPNM", pn, False, "stochastic_rounding", **cfg)
+    gen = torch.Generator(device=DEV).manual_seed(73)
+    for _ in range(3):
+        raw = [torch.randn(tuple(p.shape), generator=gen, device=DEV) for p in pw]
+        for plist in (pw, pn):
+            for p, g in zip(plist, raw, strict=True):
+                p.grad = g.clone()
+        ow.step()
+        on.step()
+    torch.cuda.synchronize()
+    expected = "big" if route.startswith("big") else route
+    assert all(_route_of(ow, p) == expected for p in pw) and _demoted_ids(ow) == set()
+    keys = ("m_pos", "m_neg", "v") if route == "one_dim" else ("m_pos", "m_neg", "row", "col")
+    for a, b in zip(pw, pn, strict=True):
+        for key in keys:
+            x, y = ow.state[a][key], on.state[b][key]
+            rel = ((x - y).abs().max() / y.abs().max()).item()
+            # 1.29e-5 today: the kernels form ``1 - beta2`` in fp32 from an fp32 beta2
+            # (native: fp64 -> fp32), a -1.3e-5 relative error on the EMA weight.
+            assert rel < 5e-5, f"AdaPNM/{route}: state {key} rel {rel:.2e} vs native"
 
 
 @pytest.mark.parametrize("route", list(_ROUTES))
@@ -356,9 +425,9 @@ def test_grad_dtype_changing_between_steps_reroutes_and_matches_native(
     for step in range(6):
         dt = even if step % 2 == 0 else odd
         _drive([(pv, ov), (pn, on)], 1, seed=37 + step, dtype_of=lambda _s, i, p, d=dt: d)
-        # A bf16 weight's fp32 grad is read fused by Adakaon (and Nekaon's inner Adakaon);
-        # every other mismatch is demoted on the mismatched steps.
-        widened = pdtype == torch.bfloat16 and even == torch.float32 and name != "AdaPNM"
+        # A bf16 weight's fp32 grad is read fused (GF32); every other mismatch is demoted on
+        # the mismatched steps.
+        widened = pdtype == torch.bfloat16 and even == torch.float32
         want = {id(p) for p in pv} if step % 2 == 0 and not widened else set()
         assert _demoted_ids(ov) == want, f"step {step}: wrong demotion"
         assert all(torch.isfinite(p).all() for p in pv), f"step {step}: non-finite weights"
