@@ -849,6 +849,13 @@ def test_narrowing_rebind_writes_past_the_param_into_the_shared_storage(shape_wi
     param must be seen to move — that is the corruption a sibling view would suffer. Asserted
     rather than described so that a future fix (a ``numel`` field, say) fails here loudly instead
     of leaving a stale docstring behind.
+
+    The narrowed param's GRAD is the first 8 rows of a full, finite ``(16, 64)`` buffer (a
+    contiguous view, so the kernel reads it in place): the stale-extent step then over-reads
+    ``gfull[8:]`` — defined, finite numbers. With a fresh 512-element grad the over-read landed
+    in whatever the caching allocator had next to it; NaN/inf/huge garbage there made the
+    moved-elements count come out 0 (``NaN > 0`` is False) and the test flaked. A NaN written
+    beyond the param is counted as moved, too: it is the same corruption.
     """
     ps = _bag([(16, 64)] * 2, torch.float32, seed=73)
     opt = Adakaon(ps, fused=True, **_FP32_CFG)
@@ -858,12 +865,16 @@ def test_narrowing_rebind_writes_past_the_param_into_the_shared_storage(shape_wi
     ptr = ps[0].data_ptr()
     ps[0].data = ps[0].data[:8]
     assert ps[0].data_ptr() == ptr and ps[0].is_contiguous() and ps[0].numel() == 512
-    for p in ps:
-        p.grad = torch.randn(tuple(p.shape), device=DEV)
+    gfull = torch.randn(16, 64, device=DEV)
+    ps[0].grad = gfull[:8]
+    # read in place (not compacted / copied), so the over-read covers gfull[8:]
+    assert ps[0].grad.data_ptr() == gfull.data_ptr() and ps[0].grad.is_contiguous()
+    ps[1].grad = torch.randn(tuple(ps[1].shape), device=DEV)
     opt.step()
     torch.cuda.synchronize()
-    beyond = (full[512:] - snap[512:]).abs()
-    assert int((beyond > 0).sum()) > 0, (
+    assert ps[0].grad.data_ptr() == gfull.data_ptr()
+    moved = full[512:] != snap[512:]              # NaN != x: a NaN written there counts
+    assert int(moved.sum()) > 0, (
         "the narrowed param no longer writes past its numel — the blind spot is closed, so "
         "update test_narrowing_rebind_is_blind_even_to_the_shape_witness and the docs"
     )
