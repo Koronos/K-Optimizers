@@ -1355,8 +1355,8 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         # int8's scale is per ROW, so a chunk may requantize a row only if it owns the whole
         # row: C <= BLOCK and BLOCK % C == 0 (see _chunked_int8_apply_batched_g). Otherwise the
         # per-row absmax would need a cross-program reduction and the codec fallback stands.
-        direct_int8 = (md == "int8" and self._direct_int8
-                       and C <= 1024 and 1024 % C == 0)
+        int8_route = ft.int8_route(C) if md == "int8" and self._direct_int8 else "codec"
+        direct_int8 = int8_route == "aligned"
         if direct_int8 and fused_red:
             if cautious:
                 ft._chunked_int8_keep_batched_g[grid](
@@ -1369,6 +1369,24 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
                 keep, rms, clip, lr, wd, b1, self._t, R, C, n, K,
                 LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
                 CSEG=C, RPC=1024 // C, BLOCK=1024, WDFULL=wd_full, GF32=gf32,
+            )
+            return
+        if int8_route == "rows" and fused_red and cache.rowmax is not None:
+            # Rows span chunks: the two-pass cross-program row absmax (see
+            # ``ft._chunked_int8_rowmax_batched_g``). Pass 1 also counts the cautious keep,
+            # so this route costs the aligned one's two launches, with or without cautious.
+            ft._chunked_int8_rowmax_batched_g[grid](
+                g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
+                keep, rms, cache.rowmax, cache.oldscale, clip, wd, b1, R, C, n, K,
+                LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024,
+                WDFULL=wd_full, CK=ck, GF32=gf32,
+            )
+            ft._chunked_int8_apply_rows_batched_g[grid](
+                g_addr, rowmean, cache.m_addr, cache.mscale_addr, p_addr, c_addr, r, c,
+                keep, rms, cache.rowmax, cache.oldscale, clip, lr, wd, b1, self._t,
+                R, C, n, K,
+                LOWP=lowp, GC=gc, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
+                BLOCK=1024, WDFULL=wd_full, GF32=gf32,
             )
             return
         if direct_4bit and fused_red:

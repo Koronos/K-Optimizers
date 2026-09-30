@@ -13,6 +13,8 @@ Skips cleanly when CUDA or Triton is unavailable (the kernel is GPU-only).
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -1567,17 +1569,9 @@ def test_big_int8_direct_path_never_dequantizes_to_stacked_temp(monkeypatch):
     opt.step()
 
 
-def test_big_int8_direct_path_declines_when_a_row_spans_chunks(monkeypatch):
-    """C=1152 (a matrixized 3x3 conv) does NOT divide 1024, so a row has several writers.
-
-    The per-row absmax would then need a cross-program reduction; the routing must fall back
-    to the codec rather than requantize a partial row. This asserts the guard is REACHED -
-    without it the kernel would silently write a wrong scale for every split row.
-    """
-    ps = _bag([(256, 128, 3, 3)] * 2, torch.float32, seed=82)
-    for p in ps:
-        p.grad = torch.randn_like(p)
-    opt = _fused(ps, lr=1e-3, momentum_dtype="int8")
+def _spy_codec_fallback(monkeypatch, opt):
+    """Record every ``dequant_stacked`` call — i.e. every big bucket that took the codec
+    fallback (dequant -> fp32 temp -> requant) instead of an in-kernel int8 route."""
     codec = opt._codec(opt.param_groups[0])
     seen = []
     real = codec.dequant_stacked
@@ -1587,8 +1581,100 @@ def test_big_int8_direct_path_declines_when_a_row_spans_chunks(monkeypatch):
         return real(*a, **k)
 
     monkeypatch.setattr(codec, "dequant_stacked", spy)
+    return seen
+
+
+def test_big_int8_direct_path_declines_when_rows_are_too_narrow(monkeypatch):
+    """C=100 neither divides the 1024-element chunk nor reaches ``INT8_ROWS_MIN_C``: a chunk
+    would touch ~12 rows, one segmented max each. The routing must keep the codec fallback;
+    this asserts the guard is REACHED."""
+    import kaon._fused_triton as ft
+    assert ft.int8_route(100) == "codec"
+    ps = _bag([(256, 100)] * 2, torch.float32, seed=82)
+    for p in ps:
+        p.grad = torch.randn_like(p)
+    opt = _fused(ps, lr=1e-3, momentum_dtype="int8")
+    seen = _spy_codec_fallback(monkeypatch, opt)
     opt.step()
-    assert seen, "a bucket whose rows span chunks must keep the codec fallback"
+    assert len(_parts(opt)[1]) == 2
+    assert seen, "a bucket whose rows are too narrow for the row route must keep the codec"
+
+
+_INT8_ROWS = [
+    [(256, 128, 3, 3)] * 2,          # matrixized 3x3 conv, C = 1152 (a row spans two chunks)
+    [(64, 4608)] * 2,                # DiT fc2, C = 4608
+    [(96, 1280), (96, 1280)],        # C = 1280, R not a power of two
+    [(40, 1536)],                    # a LONE big tensor (N == 1)
+    [(300, 320)] * 2,                # C = 320 < BLOCK, 1024 % 320 != 0: rows straddle chunks
+]
+
+
+@pytest.mark.parametrize("shapes", _INT8_ROWS, ids=lambda s: "x".join(map(str, s[0])))
+def test_big_int8_rows_route_skips_the_codec_fallback(monkeypatch, shapes):
+    """Rows that SPAN chunks (C > 1024, or 1024 % C != 0) take the two-pass in-kernel route:
+    no ``dequant_stacked`` (no fp32 [N,R,C] temp) on any step."""
+    import kaon._fused_triton as ft
+    R, C = shapes[0][0], math.prod(shapes[0][1:])  # noqa: N806
+    assert ft.int8_route(C) == "rows"
+    ps = _bag(shapes, torch.float32, seed=86)
+    opt = _fused(ps, lr=1e-3, momentum_dtype="int8")
+    seen = _spy_codec_fallback(monkeypatch, opt)
+    for _ in range(2):
+        for p in ps:
+            p.grad = torch.randn_like(p)
+        opt.step()
+    assert len(_parts(opt)[1]) == len(shapes)
+    assert not seen, "a row-spanning int8 bucket fell back to the codec"
+    cache = next(iter(opt._fused_big_caches.values()))
+    assert cache.rowmax is not None and cache.rowmax.numel() == len(shapes) * R
+    zs = cache._zeros.untyped_storage().data_ptr()
+    assert cache.rowmax.untyped_storage().data_ptr() == zs, "rowmax must share the one zero_()"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cautious", [True, False])
+@pytest.mark.parametrize("shapes", _INT8_ROWS, ids=lambda s: "x".join(map(str, s[0])))
+def test_big_int8_rows_route_equals_codec_fallback(shapes, cautious, dtype):
+    """The row route and the codec fallback are two implementations of one codec: same
+    per-row scale layout, same codes (to an occasional rounding tie at fp32 ulps), same weights
+    to fp32-reduction ulps. Deterministic reductions on both, so only the codec differs."""
+    cfg = dict(lr=2e-3, weight_decay=0.05, cautious=cautious, gradient_centralization=True,
+               momentum_dtype="int8", deterministic_reductions=True)
+    pd = _bag(shapes, dtype, seed=87)
+    pc = _clone(pd)
+    od = _fused(pd, **cfg)
+    oc = _fused(pc, **cfg)
+    oc._direct_int8 = False
+    gen = torch.Generator(device=DEV).manual_seed(19)
+    for _ in range(6):
+        gs = [torch.randn(tuple(p.shape), generator=gen, device=DEV, dtype=dtype) for p in pd]
+        for ps in (pd, pc):
+            for p, g in zip(ps, gs, strict=True):
+                p.grad = g.clone()
+        od.step()
+        oc.step()
+    torch.cuda.synchronize()
+    for a, b in zip(pd, pc, strict=True):
+        sa, sb = od.state[a], oc.state[b]
+        assert sa["m"].dtype == torch.int8 and sa["m"].shape == sb["m"].shape
+        assert sa["m_scale"].shape == sb["m_scale"].shape
+        rs = ((sa["m_scale"] - sb["m_scale"]).abs() / sb["m_scale"].abs()).max().item()
+        assert rs < 1e-4, f"row scales rel {rs:.2e}"
+        dq = (sa["m"].int() - sb["m"].int()).abs()
+        assert dq.max().item() <= 1 and dq.float().mean().item() < 1e-2
+    d = max((a.float() - b.float()).abs().max().item() for a, b in zip(pd, pc, strict=True))
+    scale = max(b.float().abs().max().item() for b in pc)
+    # fp32: fp32-ulp sized. bf16: both arms stochastic-round with the same seeds, so they
+    # agree except where an ulp-level momentum difference flips an SR draw (one bf16 ulp).
+    tol = 5e-4 if dtype == torch.float32 else 1e-2
+    assert d / scale < tol, f"rows route vs codec rel={d / scale:.2e}"
+
+
+def test_big_int8_rows_route_matches_native():
+    """End to end against the native per-row int8 codec, on a DiT-width bucket."""
+    d, scale, ov = _run_parity([(128, 1152)] * 2, torch.float32, "int8", wd=0.05)
+    assert len(_parts(ov)[1]) == 2
+    assert d / scale < 5e-4, f"rel={d / scale:.2e}"
 
 
 @pytest.mark.parametrize("shape", [(512, 512), (1024, 512), (2048, 64), (300, 1024)])
@@ -1993,19 +2079,24 @@ def test_big_cache_records_gc_and_rebuilds_on_a_flip():
 
 
 # ------------------------------------------------- int8 direct-path guard: BOTH halves matter
-@pytest.mark.parametrize(("shape", "direct"), [
-    ((512, 512), True),      # C=512 divides 1024
-    ((300, 1024), True),     # C=1024 divides 1024 (one row per chunk)
-    ((256, 513), False),     # C=513 <= 1024 but does NOT divide it -> rows span chunks
-    ((64, 4096), False),     # C=4096 > 1024 -> a row spans four chunks
+@pytest.mark.parametrize(("shape", "route"), [
+    ((512, 512), "aligned"),   # C=512 divides 1024
+    ((300, 1024), "aligned"),  # C=1024 divides 1024 (one row per chunk)
+    ((256, 513), "rows"),      # C=513 <= 1024 but does NOT divide it -> rows span chunks
+    ((64, 4096), "rows"),      # C=4096 > 1024 -> a row spans four chunks
+    ((256, 100), "codec"),     # rows span chunks AND are too narrow for the row route
 ])
-def test_big_int8_guard_routes_on_row_alignment(shape, direct, monkeypatch):
+def test_big_int8_guard_routes_on_row_alignment(shape, route, monkeypatch):
     """``C <= 1024 and 1024 % C == 0`` — the second half is load-bearing on its own.
 
-    ``(256, 513)`` is under the block size and still splits rows, so the per-row absmax would
-    have several writing programs and the kernel would store a scale computed from part of a
-    row. It must fall back to the codec.
+    ``(256, 513)`` is under the block size and still splits rows, so the ALIGNED kernel's
+    per-row absmax would have several writing programs and store a scale computed from part of
+    a row. It must take the cross-program row route (0.7.18; the codec fallback before), which
+    is the one whose cache carries the ``rowmax`` accumulator; too-narrow rows keep the codec.
     """
+    import kaon._fused_triton as ft
+    assert ft.int8_route(shape[1]) == route
+    direct = route != "codec"
     ps = _bag([shape] * 2, torch.float32, seed=98)
     for p in ps:
         p.grad = torch.randn_like(p)
@@ -2023,6 +2114,8 @@ def test_big_int8_guard_routes_on_row_alignment(shape, direct, monkeypatch):
     assert bool(seen) is (not direct), (
         f"{shape}: expected {'the in-kernel path' if direct else 'the codec fallback'}"
     )
+    cache = next(iter(opt._fused_big_caches.values()))
+    assert (cache.rowmax is not None) is (route == "rows")
 
 
 @pytest.mark.parametrize("shape", [(256, 513), (64, 4096)])

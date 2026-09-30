@@ -2357,6 +2357,139 @@ if _HAS_TRITON:
         rows = (k * BLOCK) // CSEG + tl.arange(0, RPC)
         tl.store(scales + rows, new_scale, mask=rows < R)
 
+    # ---- in-kernel INT8 momentum when a row SPANS chunks (C > BLOCK, or BLOCK % C != 0) ----
+    # The DiT/UNet widths — 1152, 1280, 1536, 3072, 4096, 4608, and the matrixized 3x3 convs —
+    # fail the row-alignment condition above, and used to take the codec fallback on every step:
+    # a momentum-sized fp32 [N,R,C] temp (4 B/param transient), ~15 torch kernels and a
+    # host->device pointer copy. Here the per-row absmax is a CROSS-PROGRAM reduction instead:
+    #
+    #   pass 1 (``_chunked_int8_rowmax_batched_g``): the exact pre-requant EMA, its per-row
+    #     |m| max accumulated with ``tl.atomic_max`` into ``rowmax[N*R]`` (max is exact and
+    #     order-free, so the result is deterministic), the OLD per-row scales copied to
+    #     ``oldscale[N*R]``, and — under CAUTIOUS — the keep count the keep kernel makes;
+    #   pass 2 (``_chunked_int8_apply_rows_batched_g``): recompute the same EMA from the old
+    #     codes and ``oldscale`` (never the state's scale, which this pass rewrites while other
+    #     programs of the row still need the old value), update the weight, requantize every
+    #     lane against ``max(rowmax, 1e-12) / 127`` and store the new scale from the ONE program
+    #     that owns the row's first element.
+    #
+    # Codes are per element (one writer each), so the only shared datum is the row scale, and
+    # it is never read and written in the same pass. The codec format (int8 codes + fp32 scale
+    # per row, ``_momentum_codec._quant_int8``) is unchanged. A chunk touches at most
+    # ``BLOCK // C + 2`` rows; the host takes this route for ``C >= 128`` only (<= 10 per-row
+    # reductions per chunk), narrower misaligned rows keep the codec fallback.
+    @triton.jit
+    def _chunked_int8_rowmax_batched_g(
+        g_addr, rowmean_ptr, code_addr, scale_addr, p_addr, c_addr, rfac_ptr, cfac_ptr,
+        keep_ptr, rms_ptr, rowmax_ptr, oldscale_ptr, clip, wd, beta1, R, C, n, K,
+        LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
+        BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        GF32: tl.constexpr = False,
+    ):
+        """Pass 1 of the row-spanning int8 route: row absmax of the new EMA (+ keep count)."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs - i * C
+        gbase = tl.load(g_addr + t)
+        gp = grad_ptr(gbase, LOWP, GF32)
+        g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+        if GC:
+            g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
+        upd = g * tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+        upd *= tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+        upd *= inv_rms_clip(rms_ptr, t, n, clip)
+        codes = tl.load(code_addr + t).to(tl.pointer_type(tl.int8))
+        scales = tl.load(scale_addr + t).to(tl.pointer_type(tl.float32))
+        sc = tl.load(scales + i, mask=mask, other=0.0)
+        old = tl.load(codes + offs, mask=mask, other=0).to(tl.float32)
+        old *= sc                                                  # per-row dequant
+        momentum = beta1 * old + (1.0 - beta1) * upd
+        # One writer per row for the old-scale copy: the lane holding the row's first element
+        # in this chunk (the chunk's first lane, or a lane where a row starts).
+        first = mask & ((j == 0) | (tl.arange(0, BLOCK) == 0))
+        tl.store(oldscale_ptr + t * R + i, sc, mask=first)
+        am = tl.where(mask, tl.abs(momentum), 0.0)
+        r0 = (k * BLOCK) // C
+        r1 = tl.minimum((k * BLOCK + BLOCK - 1) // C, R - 1)
+        for rr in range(r0, r1 + 1):
+            tl.atomic_max(rowmax_ptr + t * R + rr, tl.max(tl.where(i == rr, am, 0.0)))
+        if CAUTIOUS:
+            delta = momentum
+            if WD and not WDFULL:
+                pbase = tl.load(p_addr + t)
+                pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
+                delta = wd_keep(delta, g, wd, pp, c_addr, t, offs, mask, CK)
+            keep = ((delta * g) > 0.0) & mask
+            tl.atomic_add(keep_ptr + t, tl.sum(keep.to(tl.int32)))
+
+    @triton.jit
+    def _chunked_int8_apply_rows_batched_g(
+        g_addr, rowmean_ptr, code_addr, scale_addr, p_addr, c_addr, rfac_ptr, cfac_ptr,
+        keep_ptr, rms_ptr, rowmax_ptr, oldscale_ptr, clip, lr, wd, beta1, seed, R, C, n, K,
+        LOWP: tl.constexpr, GC: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
+        SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False,
+        CK: tl.constexpr = 0, GF32: tl.constexpr = False,
+    ):
+        """Pass 2 of the row-spanning int8 route: exact update + per-row requant (see above).
+        The weight arithmetic is ``_chunked_int8_apply_batched_g``'s, line for line."""
+        pid = tl.program_id(0)
+        t = pid // K
+        k = pid % K
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        i = offs // C
+        j = offs - i * C
+        gbase = tl.load(g_addr + t)
+        gp = grad_ptr(gbase, LOWP, GF32)
+        g = tl.load(gp + offs, mask=mask, other=0.0).to(tl.float32)
+        if GC:
+            g -= tl.load(rowmean_ptr + t * R + i, mask=mask, other=0.0)
+        upd = g * tl.load(rfac_ptr + t * R + i, mask=mask, other=0.0)
+        upd *= tl.load(cfac_ptr + t * C + j, mask=mask, other=0.0)
+        upd *= inv_rms_clip(rms_ptr, t, n, clip)
+        codes = tl.load(code_addr + t).to(tl.pointer_type(tl.int8))
+        scales = tl.load(scale_addr + t).to(tl.pointer_type(tl.float32))
+        old = tl.load(codes + offs, mask=mask, other=0).to(tl.float32)
+        old *= tl.load(oldscale_ptr + t * R + i, mask=mask, other=0.0)
+        momentum = beta1 * old + (1.0 - beta1) * upd
+
+        pbase = tl.load(p_addr + t)
+        pp = pbase.to(tl.pointer_type(tl.bfloat16)) if LOWP else pbase.to(tl.pointer_type(tl.float32))
+        p = tl.load(pp + offs, mask=mask, other=0.0).to(tl.float32)
+        if CK:
+            cp = ck_ptr(c_addr, t, CK)
+            zc = ck_decode(pp, cp, offs, mask, CK)
+            p = zc  # decay (WD) reads the full decoded value, never the bare bf16
+        delta = momentum
+        if WD and not WDFULL:
+            delta += wd * p
+        if CAUTIOUS:
+            count = tl.load(keep_ptr + t).to(tl.float32)
+            keep = (delta * g) > 0.0
+            # Mask by MULTIPLICATION so a non-finite delta propagates (see _adakaon_tile_kernel).
+            delta = delta * tl.where(keep, n.to(tl.float32) / tl.maximum(count, 1.0), 0.0)
+        if WD and WDFULL:
+            delta = tl.fma(wd, p, delta)                 # see _chunked_int8_apply_batched_g
+        if CK:  # compact Kahan: exact compensated value in, (bf16, residual) out
+            ck_store(pp, cp, offs, mask, zc - lr * delta, seed + t, CK)
+        else:
+            res = p - lr * delta
+            if SR:
+                res = sr_round(res, seed + t, offs)
+            tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
+
+        # Per-row absmax / 127, round half-to-even, clamp — element-for-element ``_quant_int8``.
+        amax = tl.maximum(tl.load(rowmax_ptr + t * R + i, mask=mask, other=1.0), 1e-12)
+        new_scale = amax / 127.0
+        q = libdevice.rint(momentum / new_scale)
+        q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+        tl.store(codes + offs, q.to(tl.int8), mask=mask)
+        tl.store(scales + i, new_scale, mask=mask & (j == 0))    # the row's one owner
+
     @triton.jit
     def _axpy_momentum_batched(
         p_addr, c_addr, m_addr, mscale_addr, alpha, clamp, n, K, row_width, seed,
@@ -2657,6 +2790,23 @@ def ck_add_(target, lo, source, alpha: float = 1.0, bits: int = 8, sr: SRStream 
         )
 
 
+#: The flat chunk of every batched big-route kernel (``BLOCK``), and the narrowest row the
+#: row-spanning int8 route takes (a chunk touches at most ``BLOCK // C + 2`` rows, one segmented
+#: max each; below this a misaligned int8 bucket keeps the codec fallback).
+BIG_BLOCK = 1024
+INT8_ROWS_MIN_C = 128
+
+
+def int8_route(C: int) -> str:  # noqa: N803
+    """Which in-kernel int8 momentum route a big bucket of row width ``C`` takes: ``"aligned"``
+    (a chunk owns whole rows: ``C <= BLOCK`` and ``BLOCK % C == 0`` — one pass), ``"rows"``
+    (rows span chunks: the two-pass cross-program row absmax, ``C >= INT8_ROWS_MIN_C``) or
+    ``"codec"`` (the dequant -> fp32 temp -> requant fallback)."""
+    if C <= BIG_BLOCK and BIG_BLOCK % C == 0:
+        return "aligned"
+    return "rows" if C >= INT8_ROWS_MIN_C else "codec"
+
+
 def fourbit_kernel_blocks(numel: int, block: int = 0) -> int:
     """Number of 4-bit absmax blocks a one-block tile kernel writes for an ``numel``-element
     tensor under ``block``-element absmax blocks — i.e. the ``m_scale`` capacity that layout
@@ -2846,12 +2996,21 @@ class BigPointerCache(_WitnessedCache):
         self.g_addr = ptr_array([p.grad for p in plist], dev)
         self.grad_ptrs = tuple(p.grad.data_ptr() for p in plist)
         n_c = self.N * C
-        # The three per-step-zeroed accumulators, contiguous so one zero_() clears them.
-        self._zeros = torch.zeros(n_c + 2 * self.N, dtype=torch.float32, device=dev)
+        # The row-spanning int8 route's per-row |m| max is one more per-step-zeroed
+        # accumulator, so it joins the block (same single zero_()); ``oldscale`` is written
+        # in full by its pass 1 every step and needs no zeroing. Only an int8 bucket whose
+        # rows span chunks pays for either (see :func:`int8_route`).
+        m0 = states[0].get("m")
+        rows = self.N * R if (m0 is not None and m0.dtype == torch.int8
+                              and int8_route(C) == "rows") else 0
+        # The per-step-zeroed accumulators, contiguous so one zero_() clears them.
+        self._zeros = torch.zeros(n_c + 2 * self.N + rows, dtype=torch.float32, device=dev)
         self.colsum = self._zeros[:n_c]
         self.cfac = self.colsum                     # written in place (see the class docstring)
         self.rms = self._zeros[n_c:n_c + self.N]
-        self.keep = self._zeros[n_c + self.N:].view(torch.int32)
+        self.keep = self._zeros[n_c + self.N:n_c + 2 * self.N].view(torch.int32)
+        self.rowmax = self._zeros[n_c + 2 * self.N:] if rows else None
+        self.oldscale = torch.empty(rows, dtype=torch.float32, device=dev) if rows else None
         self.rowsum = torch.empty(self.N * R, dtype=torch.float32, device=dev)
         self.rfac = self.rowsum                     # written in place
         # Whether GC is DEFINED for this bucket's shape (fan-in >= 2), resolved once here —
