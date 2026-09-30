@@ -317,8 +317,12 @@ def test_fp32_grad_not_representable_in_bf16_is_read_exactly(name, route):
     shapes = _ROUTES[route]
     pw = _bag(shapes, seed=71)
     pn = _clone(pw)
-    ow = _make(name, pw, True, "kahan16")
-    on = _make(name, pn, False, "kahan16")
+    # fp32 momentum: Nekaon's default 4-bit momentum turns any ulp-level fused/native
+    # difference into a flipped 4-bit code (a ~1e-4 step difference on that coordinate —
+    # 16 of 524288 on the big route after the host-side ``1 - beta2`` change, 1-2 on the lone
+    # route already before it), which is no statement about how the GRAD was read.
+    ow = _make(name, pw, True, "kahan16", momentum_dtype="float32")
+    on = _make(name, pn, False, "kahan16", momentum_dtype="float32")
     gen = torch.Generator(device=DEV).manual_seed(73)
     for _ in range(3):
         raw = [torch.randn(tuple(p.shape), generator=gen, device=DEV) for p in pw]

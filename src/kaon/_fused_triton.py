@@ -1361,7 +1361,7 @@ if _HAS_TRITON:
     @triton.jit
     def _factor_rowcol_batched(
         row_addr, col_addr, rowsum_ptr, colsum_ptr, rfac_ptr, cfac_ptr,
-        R, C, beta2, eps1,
+        R, C, omb, eps1,
         BR: tl.constexpr, BC: tl.constexpr,
     ):
         """Update factored EMA state in place and emit inverse-sqrt factors."""
@@ -1374,7 +1374,6 @@ if _HAS_TRITON:
         colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
         row_old = tl.load(rowp + rr, mask=rmask, other=0.0)
         col_old = tl.load(colp + cc, mask=cmask, other=0.0)
-        omb = 1.0 - beta2
         row_new = row_old + omb * (
             tl.load(rowsum_ptr + t * R + rr, mask=rmask, other=0.0) / C + eps1 - row_old
         )
@@ -1468,7 +1467,7 @@ if _HAS_TRITON:
     @triton.jit
     def _factor_rowcol_batched_ct(
         row_addr, col_addr, rowsum_ptr, colsum_ptr, rfac_ptr, cfac_ptr,
-        R, C, beta2, eps1,
+        R, C, omb, eps1,
         BR: tl.constexpr, BC: tl.constexpr,
     ):
         """:func:`_factor_rowcol_batched` with the COLUMNS walked in ``BC`` tiles (the rows
@@ -1479,7 +1478,6 @@ if _HAS_TRITON:
         rmask = rr < R
         rowp = tl.load(row_addr + t).to(tl.pointer_type(tl.float32))
         colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
-        omb = 1.0 - beta2
         row_old = tl.load(rowp + rr, mask=rmask, other=0.0)
         row_new = row_old + omb * (
             tl.load(rowsum_ptr + t * R + rr, mask=rmask, other=0.0) / C + eps1 - row_old
@@ -1500,7 +1498,7 @@ if _HAS_TRITON:
     @triton.jit
     def _factor_rowcol_batched_rt(
         row_addr, col_addr, rowsum_ptr, colsum_ptr, rfac_ptr, cfac_ptr,
-        R, C, beta2, eps1,
+        R, C, omb, eps1,
         BR: tl.constexpr, BC: tl.constexpr,
     ):
         """:func:`_factor_rowcol_batched` with the ROWS walked in ``BR`` tiles too (and the
@@ -1514,7 +1512,6 @@ if _HAS_TRITON:
         t = tl.program_id(0)
         rowp = tl.load(row_addr + t).to(tl.pointer_type(tl.float32))
         colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
-        omb = 1.0 - beta2
         acc = tl.zeros((BR,), dtype=tl.float32)
         for r0 in range(0, R, BR):
             rr = r0 + tl.arange(0, BR)
@@ -3093,22 +3090,26 @@ def factor_rowcol_(row_addr, col_addr, rowsum, colsum, rfac, cfac, N, R, C, beta
     ``rowsum``/``colsum`` (program ``t`` reads and writes the same indices; see
     :class:`BigPointerCache`).
     """
+    # ``1 - beta2`` in fp64 on the host, rounded once to fp32 at the launch — what the torch
+    # path's ``lerp_(x, 1.0 - beta2)`` uses. Forming it in the kernel from an fp32 ``beta2``
+    # was ``fp32(1 - fp32(0.999))``: a -1.3e-5 relative error on every EMA update.
+    omb = 1.0 - beta2
     FR = triton.next_power_of_2(R)  # noqa: N806
     FC = triton.next_power_of_2(C)  # noqa: N806
     if FR > REDUCTION_C_CAP:
         BC = min(FC, REDUCTION_C_TILE)  # noqa: N806
         _factor_rowcol_batched_rt[(N,)](
-            row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, beta2, eps1,
+            row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, omb, eps1,
             BR=REDUCTION_C_TILE, BC=BC, num_warps=warps_for(REDUCTION_C_TILE),
         )
     elif FC > REDUCTION_C_CAP:
         _factor_rowcol_batched_ct[(N,)](
-            row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, beta2, eps1,
+            row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, omb, eps1,
             BR=FR, BC=REDUCTION_C_TILE, num_warps=warps_for(max(FR, REDUCTION_C_TILE)),
         )
     else:
         _factor_rowcol_batched[(N,)](
-            row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, beta2, eps1,
+            row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, omb, eps1,
             BR=FR, BC=FC, num_warps=warps_for(max(FR, FC)),
         )
 
