@@ -321,6 +321,25 @@ class WatchedState(defaultdict):
     __copy__ = copy
 
 
+def plain_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """``state_dict`` with every per-param entry of ``state_dict["state"]`` as a PLAIN dict.
+
+    ``Optimizer.state_dict`` hands the per-param state dicts out BY REFERENCE, i.e. as
+    :class:`WatchedParamState`. Pickled, those reduce to ``builtins.dict`` via a ``GLOBAL``
+    opcode, which ``torch.load``'s default ``weights_only=True`` unpickler refuses
+    ("Unsupported global: GLOBAL dict") — a checkpoint that loads only with
+    ``weights_only=False``. A shallow copy is a real ``dict`` (pickled with the plain dict
+    opcodes) and keeps the very same tensor references, so it costs one small dict per
+    param and no tensor memory.
+    """
+    state = state_dict.get("state")
+    if isinstance(state, dict) and any(type(v) is WatchedParamState for v in state.values()):
+        state_dict["state"] = {
+            k: (dict(v) if type(v) is WatchedParamState else v) for k, v in state.items()
+        }
+    return state_dict
+
+
 def _plain_state(items: list[tuple[Any, Any]]) -> defaultdict:
     """Unpickle/deepcopy target for :class:`WatchedState` — a plain ``defaultdict(dict)``.
 
@@ -407,6 +426,11 @@ class WatchedStateMixin:
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)                         # type: ignore[misc]
         self._install_state_watch()
+
+    def state_dict(self) -> dict[str, Any]:
+        """Plain per-param dicts, loadable with ``torch.load(weights_only=True)`` (see
+        :func:`plain_state_dict`)."""
+        return plain_state_dict(super().state_dict())       # type: ignore[misc]
 
 
 class ForeachSpec:
@@ -799,6 +823,11 @@ class ForeachPlanMixin:
         current = self.__dict__.get("state")
         if current is not None and type(current) is not WatchedState:
             self.state = _as_watched(current)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Plain per-param dicts, loadable with ``torch.load(weights_only=True)`` (see
+        :func:`plain_state_dict`; idempotent next to :class:`WatchedStateMixin`'s)."""
+        return plain_state_dict(super().state_dict())       # type: ignore[misc]
 
     def _foreach_spec(self, group: dict[str, Any]) -> ForeachSpec:
         """The spec that governs ``group``'s bucketing. Normally the class attribute.
