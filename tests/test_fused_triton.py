@@ -1635,9 +1635,12 @@ def test_big_int8_rows_route_skips_the_codec_fallback(monkeypatch, shapes):
 @pytest.mark.parametrize("cautious", [True, False])
 @pytest.mark.parametrize("shapes", _INT8_ROWS, ids=lambda s: "x".join(map(str, s[0])))
 def test_big_int8_rows_route_equals_codec_fallback(shapes, cautious, dtype):
-    """The row route and the codec fallback are two implementations of one codec: same
-    per-row scale layout, same codes (to an occasional rounding tie at fp32 ulps), same weights
-    to fp32-reduction ulps. Deterministic reductions on both, so only the codec differs."""
+    """The row route and the codec fallback are two implementations of one codec. Measured
+    (deterministic reductions on both, so only the codec differs): the FIRST step is
+    bit-identical in the weights, and over 30 steps the drift stays at fp32-ulp level —
+    max 6.7e-5 relative in fp32, and in bf16 0 except where an ulp-level momentum difference
+    flips one SR draw (7.9e-4, one bf16 ulp of a small weight); row scales identical, codes
+    within one rounding tie."""
     cfg = dict(lr=2e-3, weight_decay=0.05, cautious=cautious, gradient_centralization=True,
                momentum_dtype="int8", deterministic_reductions=True)
     pd = _bag(shapes, dtype, seed=87)
@@ -1646,28 +1649,62 @@ def test_big_int8_rows_route_equals_codec_fallback(shapes, cautious, dtype):
     oc = _fused(pc, **cfg)
     oc._direct_int8 = False
     gen = torch.Generator(device=DEV).manual_seed(19)
-    for _ in range(6):
+    for step in range(30):
         gs = [torch.randn(tuple(p.shape), generator=gen, device=DEV, dtype=dtype) for p in pd]
         for ps in (pd, pc):
             for p, g in zip(ps, gs, strict=True):
                 p.grad = g.clone()
         od.step()
         oc.step()
+        if step == 0:
+            assert all(torch.equal(a, b) for a, b in zip(pd, pc, strict=True)), \
+                "first step must be bit-identical to the codec fallback"
     torch.cuda.synchronize()
     for a, b in zip(pd, pc, strict=True):
         sa, sb = od.state[a], oc.state[b]
         assert sa["m"].dtype == torch.int8 and sa["m"].shape == sb["m"].shape
         assert sa["m_scale"].shape == sb["m_scale"].shape
         rs = ((sa["m_scale"] - sb["m_scale"]).abs() / sb["m_scale"].abs()).max().item()
-        assert rs < 1e-4, f"row scales rel {rs:.2e}"
+        assert rs < 1e-6, f"row scales rel {rs:.2e}"
         dq = (sa["m"].int() - sb["m"].int()).abs()
-        assert dq.max().item() <= 1 and dq.float().mean().item() < 1e-2
+        assert dq.max().item() <= 1 and dq.float().mean().item() < 1e-3
     d = max((a.float() - b.float()).abs().max().item() for a, b in zip(pd, pc, strict=True))
     scale = max(b.float().abs().max().item() for b in pc)
-    # fp32: fp32-ulp sized. bf16: both arms stochastic-round with the same seeds, so they
-    # agree except where an ulp-level momentum difference flips an SR draw (one bf16 ulp).
-    tol = 5e-4 if dtype == torch.float32 else 1e-2
-    assert d / scale < tol, f"rows route vs codec rel={d / scale:.2e}"
+    tol = 2e-4 if dtype == torch.float32 else 2e-3
+    assert d / scale < tol, f"rows route vs codec rel={d / scale:.2e} after 30 steps"
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf"])
+@pytest.mark.parametrize("shape", [(96, 1152), (128, 512)], ids=["rows", "aligned"])
+def test_big_int8_in_kernel_routes_propagate_non_finite_like_the_codec(shape, bad):
+    """NaN policy (0.7.12): a non-finite grad poisons the step identically on every path. The
+    codec's ``amax`` of a NaN row is NaN (scale NaN) and ``NaN.to(int8)`` is 0; ``tl.max`` /
+    ``tl.atomic_max`` drop NaN and Triton's clamp picks a bound, so both in-kernel int8 routes
+    (row-spanning and aligned) used to leave finite scales and different codes."""
+    import kaon._fused_triton as ft
+    assert ft.int8_route(shape[1]) == ("rows" if shape[1] == 1152 else "aligned")
+    out = []
+    for direct in (True, False):
+        ps = _bag([shape] * 2, torch.float32, seed=99)
+        opt = _fused(ps, lr=1e-3, momentum_dtype="int8", deterministic_reductions=True)
+        opt._direct_int8 = direct
+        gen = torch.Generator(device=DEV).manual_seed(5)
+        for step in range(2):
+            for p in ps:
+                g = torch.randn(tuple(p.shape), generator=gen, device=DEV)
+                if step == 1:
+                    g[3, 5] = float(bad)
+                p.grad = g
+            opt.step()
+        torch.cuda.synchronize()
+        out.append([(opt.state[p]["m_scale"].clone(), opt.state[p]["m"].clone(), p.detach().clone())
+                    for p in ps])
+    for (sd, md, pd), (sc, mc, pc) in zip(*out, strict=True):
+        assert sc.isnan().any(), "the codec reference no longer makes NaN scales"
+        assert torch.equal(sd.isnan(), sc.isnan()), "NaN scale rows differ from the codec"
+        assert torch.equal(sd[~sd.isnan()], sc[~sc.isnan()])
+        assert torch.equal(md, mc), "codes differ from the codec under a non-finite grad"
+        assert torch.equal(pd.isnan(), pc.isnan())
 
 
 def test_big_int8_rows_route_matches_native():
@@ -2288,3 +2325,4 @@ def test_grad_pointer_refresh_tracks_every_step():
         # 1.05e-5 is the big route's ordinary fused-vs-native drift over 8 steps (the same
         # with the pre-0.7.18 refresh); a stale pointer reads NaN/garbage (poisoned buffers).
         assert torch.allclose(a, b, atol=5e-5), "a fused route read a stale grad pointer"
+

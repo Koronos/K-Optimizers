@@ -479,6 +479,22 @@ if _HAS_TRITON:
             return base.to(tl.pointer_type(tl.float32))
 
     @triton.jit
+    def max_nan(a, b):
+        """``max`` that PROPAGATES NaN (``fmax.NaN``, same cost as a plain max) — the combine
+        function for row absmaxes that must match torch's ``amax`` on a NaN row."""
+        return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+    @triton.jit
+    def int8_codes(m, scale):
+        """``_quant_int8``'s codes for fp32 ``m`` against ``scale``, NaN included: torch's
+        ``round().clamp(-127, 127).to(int8)`` keeps a NaN through the clamp and casts it to 0,
+        while Triton's min/max do not propagate NaN (the clamp would pick a bound). A NaN
+        quotient — NaN momentum, a NaN scale, or ``inf / inf`` — is therefore coded 0
+        explicitly; finite quotients are clamped exactly as before."""
+        q = libdevice.rint(m / scale)
+        return tl.where(q == q, tl.minimum(tl.maximum(q, -127.0), 127.0), 0.0)
+
+    @triton.jit
     def ck_ptr(c_addr, t, BITS: tl.constexpr):
         """The residual pointer of tensor ``t`` in a compact-Kahan pointer array: ``uint8``
         for ``kahan8``, ``int16`` (the uint16 pattern in signed storage) for ``kahan16``."""
@@ -2536,11 +2552,16 @@ if _HAS_TRITON:
         # Per-row absmax / 127, round half-to-even, clamp — element-for-element
         # ``_quant_int8``. One reduce over the row axis of a (RPC, CSEG) reshape; padded lanes
         # of a final partial chunk carry 0.0 so they neither bias a row's absmax nor get stored.
+        #
+        # NaN PROPAGATES like the codec (policy since 0.7.12): torch's ``amax`` of a row with a
+        # NaN is NaN, and so is ``clamp_(min=1e-12)`` of it, so that row's scale is NaN.
+        # ``tl.max`` drops NaN and ``tl.maximum`` would floor it, hence the NaN-propagating
+        # reduction (``max_nan``) and clamp — the same instructions, so free on finite rows.
         mrows = tl.reshape(tl.where(mask, momentum, 0.0), (RPC, CSEG))
-        amax = tl.maximum(tl.max(tl.abs(mrows), axis=1), 1e-12)
+        amax = tl.maximum(tl.reduce(tl.abs(mrows), 1, max_nan), 1e-12,
+                          propagate_nan=tl.PropagateNan.ALL)          # [RPC]
         new_scale = amax / 127.0                                  # [RPC]
-        q = libdevice.rint(mrows / new_scale[:, None])
-        q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+        q = int8_codes(mrows, new_scale[:, None])
         tl.store(codes + offs, tl.reshape(q, (BLOCK,)).to(tl.int8), mask=mask)
         rows = (k * BLOCK) // CSEG + tl.arange(0, RPC)
         tl.store(scales + rows, new_scale, mask=rows < R)
@@ -2603,8 +2624,12 @@ if _HAS_TRITON:
         am = tl.where(mask, tl.abs(momentum), 0.0)
         r0 = (k * BLOCK) // C
         r1 = tl.minimum((k * BLOCK + BLOCK - 1) // C, R - 1)
+        # A NaN momentum must make its row's scale NaN, as the codec's ``amax`` does, but
+        # ``tl.max`` drops NaN: reduce with ``max_nan`` instead (same cost), so a row holding
+        # one accumulates a positive quiet NaN (the fp32 atomic max orders by the bit pattern,
+        # where it ranks above +inf, so it sticks against every later finite max).
         for rr in range(r0, r1 + 1):
-            tl.atomic_max(rowmax_ptr + t * R + rr, tl.max(tl.where(i == rr, am, 0.0)))
+            tl.atomic_max(rowmax_ptr + t * R + rr, tl.reduce(tl.where(i == rr, am, 0.0), 0, max_nan))
         if CAUTIOUS:
             delta = momentum
             if WD and not WDFULL:
@@ -2671,10 +2696,11 @@ if _HAS_TRITON:
             tl.store(pp + offs, res.to(pp.dtype.element_ty), mask=mask)
 
         # Per-row absmax / 127, round half-to-even, clamp — element-for-element ``_quant_int8``.
-        amax = tl.maximum(tl.load(rowmax_ptr + t * R + i, mask=mask, other=1.0), 1e-12)
+        # A NaN row max stays NaN (``clamp_(min=1e-12)`` of NaN is NaN in the codec).
+        amax = tl.maximum(tl.load(rowmax_ptr + t * R + i, mask=mask, other=1.0), 1e-12,
+                          propagate_nan=tl.PropagateNan.ALL)
         new_scale = amax / 127.0
-        q = libdevice.rint(momentum / new_scale)
-        q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+        q = int8_codes(momentum, new_scale)
         tl.store(codes + offs, q.to(tl.int8), mask=mask)
         tl.store(scales + i, new_scale, mask=mask & (j == 0))    # the row's one owner
 
