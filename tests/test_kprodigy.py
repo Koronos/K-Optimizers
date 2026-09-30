@@ -792,3 +792,27 @@ def test_p0_is_scalar_for_zero_weights_and_a_slice_copy_otherwise(foreach, slice
         torch.testing.assert_close(
             opt.state[p]["p0"], before[id(p)].flatten()[::slice_p], rtol=0, atol=0,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("layout", ["one_mixed_group", "two_groups_shared_d"])
+def test_first_step_init_with_cpu_and_cuda_params_in_one_d_scope(layout):
+    """The batched first-step ``norm > 0`` check groups params by device: a D scope
+    that mixes CPU and CUDA params (one mixed group, or two groups sharing D) worked on
+    the per-param path and must not hit a cross-device ``torch.stack``. (``foreach=True``
+    with mixed devices already failed in 0.7.17's batched pass 1; not covered here.)"""
+    foreach = False
+    torch.manual_seed(0)
+    a = torch.nn.Parameter(torch.randn(8, 4))
+    b = torch.nn.Parameter(torch.randn(8, 4, device="cuda"))
+    z = torch.nn.Parameter(torch.zeros(8, 4, device="cuda"))
+    groups = [a, b, z] if layout == "one_mixed_group" else [{"params": [a]}, {"params": [b, z]}]
+    opt = KProdigy(groups, foreach=foreach, independent_d=False)
+    for _ in range(2):
+        for p in (a, b, z):
+            p.grad = torch.randn_like(p)
+        opt.step()
+    assert opt.state[z]["p0"].ndim == 0
+    assert opt.state[a]["p0"].device.type == "cpu" and opt.state[b]["p0"].device.type == "cuda"
+    assert all(torch.isfinite(p).all() for p in (a, b, z))
+    assert math.isfinite(opt.get_d())

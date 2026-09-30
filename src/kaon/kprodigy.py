@@ -281,7 +281,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
     @torch.no_grad()
     def _init_new_states(self, groups: list[dict[str, Any]]) -> None:
         """Initialize every gradient-bearing param of ``groups`` that has no state yet,
-        with ONE host sync for all of them.
+        with ONE host sync per device.
 
         :meth:`_init_state` branches on ``sliced.norm() > 0`` (a zero weight keeps a 0-D
         ``p0`` instead of a full fp32 copy), a device->host sync per parameter: measured
@@ -296,10 +296,17 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
         ]
         if not todo:
             return
-        norms = torch._foreach_norm([p.detach().flatten()[::g["slice_p"]] for p, g in todo])
-        nonzero = (torch.stack([n.float() for n in norms]) > 0).tolist()
-        for (p, g), nz in zip(todo, nonzero, strict=True):
-            self._init_state(p, self.state[p], g, nonzero=nz)
+        # One stack + one transfer PER DEVICE: a D scope may mix CPU and CUDA params
+        # (one mixed group, or several groups with a shared D), and a cross-device
+        # ``stack`` would raise.
+        by_device: dict[torch.device, list[tuple[Tensor, dict[str, Any]]]] = {}
+        for p, g in todo:
+            by_device.setdefault(p.device, []).append((p, g))
+        for items in by_device.values():
+            norms = torch._foreach_norm([p.detach().flatten()[::g["slice_p"]] for p, g in items])
+            nonzero = (torch.stack([n.float() for n in norms]) > 0).tolist()
+            for (p, g), nz in zip(items, nonzero, strict=True):
+                self._init_state(p, self.state[p], g, nonzero=nz)
 
     @torch.no_grad()
     def _init_state(
@@ -495,9 +502,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
                     continue
                 if p.grad.is_sparse:
                     raise RuntimeError("KProdigy does not support sparse gradients")
-                state = self.state[p]
-                if "step" not in state:
-                    self._init_state(p, state, group)
+                state = self.state[p]  # initialized by _init_new_states above
                 device_seen = p.device
 
                 grad_fp32 = self._collect_grad(p, group)
@@ -582,9 +587,7 @@ class KProdigy(ForeachPlanMixin, SRSeedState, Optimizer):
                     continue
                 if p.grad.is_sparse:
                     raise RuntimeError("KProdigy does not support sparse gradients")
-                state = self.state[p]
-                if "step" not in state:
-                    self._init_state(p, state, group)
+                state = self.state[p]  # initialized by _init_new_states above
                 device_seen = p.device
                 buckets.setdefault((id(group), tuple(p.shape)), []).append(len(records))
                 records.append((p, state, group, do_d))
