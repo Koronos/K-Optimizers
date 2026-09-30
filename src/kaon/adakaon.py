@@ -1803,6 +1803,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             gsq_eps = (grad_sq + eps1) if (eps1 > 0 and matvec) else (
                 grad_sq.add_(eps1) if eps1 > 0 else grad_sq)
             row_mean, col_mean = gsq_eps.mean(dim=-1), gsq_eps.mean(dim=-2)
+            del gsq_eps
+        if not matvec:
+            # Dead from here on: dropping it lets the allocator hand its [N,R,C] block to
+            # ``update`` instead of holding both through the EMA/decay/cautious tail (one
+            # bucket-sized fp32 buffer off the foreach step's peak).
+            del grad_sq
         row.lerp_(row_mean, omb)
         col.lerp_(col_mean, omb)
         torch._foreach_copy_(rows, list(row.unbind(0)))
@@ -1829,6 +1835,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             rms = (r * r).mul_(
                 torch.bmm(grad_sq, (c * c).unsqueeze(-1)).squeeze(-1)
             ).sum(-1).div_(R * C).sqrt_()                                          # [N]
+            del grad_sq                                  # dead: see the non-matvec branch
             r = r.mul_(rms.div_(clip).clamp_(min=1.0).reciprocal_().unsqueeze(-1))
             update = grad.mul(r.unsqueeze(-1)).mul_(c.unsqueeze(-2))               # [N, R, C]
         else:  # A/B baseline: build the update, then norm it and divide it down.
@@ -1916,9 +1923,12 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         if eps1 > 0:
             grad_sq = grad_sq.add_(eps1)
         v.lerp_(grad_sq, omb)
+        del grad_sq                    # dead: frees its [N, L] block for ``update``
         torch._foreach_copy_(vs, list(v.unbind(0)))
 
-        update = grad.mul(v.rsqrt())                                      # [N, L]
+        # rsqrt(v) * grad, in the rsqrt's own buffer: one [N, L] temp instead of two
+        # (the product is commutative, so this is bit-identical to ``grad.mul(v.rsqrt())``).
+        update = v.rsqrt().mul_(grad)                                     # [N, L]
         rms = update.norm(2, dim=1) / math.sqrt(length)                   # per-slice RMS
         update.div_(rms.div_(clip).clamp_(min=1.0).view(N, 1))
 
