@@ -31,6 +31,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from kaon import _stochastic_rounding as _sr
 from kaon._backend import SRSeedState
 from kaon._stochastic_rounding import SRStream, _device_generator
 
@@ -129,9 +130,31 @@ def _row_rest(shape: tuple[int, ...]) -> tuple[int, int]:
 STOCHASTIC_MOMENTUM_REQUANT = False
 
 
+# The toggle's OWN generators: device -> (generator, (global seed, reseed epoch) synced to).
+# NOT the SR module's shared ``_device_generator``: that one is seeded with the bare global
+# initial seed, exactly like SR stream 0's reference-path generator (``_stream_offset(0, .)``
+# is 0), so on CPU the momentum requant and the bf16 weight write would have consumed the
+# SAME mt19937 words — correlated noise across the two roundings of one step.
+_MOMENTUM_SR_OFFSET = 0x6D6F6D53          # "momS": any fixed offset away from every stream's
+_momentum_generators: dict[torch.device, tuple[torch.Generator, tuple[int, int]]] = {}
+
+
 def _momentum_gen(device: torch.device) -> torch.Generator | None:
-    """The momentum requant's generator: ``None`` (round-to-nearest) unless opted in."""
-    return _device_generator(device) if STOCHASTIC_MOMENTUM_REQUANT else None
+    """The momentum requant's generator: ``None`` (round-to-nearest) unless opted in.
+
+    Seeded ``_mix32(global initial seed ^ offset)`` — a seed no SR stream uses — and re-synced
+    when the global seed changes or :func:`kaon.reseed_stochastic_rounding` runs, so
+    ``torch.manual_seed`` + reseed reproduces it like every other kaon noise source.
+    """
+    if not STOCHASTIC_MOMENTUM_REQUANT:
+        return None
+    key = (_sr._global_initial_seed(device), _sr._reseed_epoch)
+    entry = _momentum_generators.get(device)
+    if entry is None or entry[1] != key:
+        gen = torch.Generator(device=device)
+        gen.manual_seed(_sr._mix32(key[0] ^ _MOMENTUM_SR_OFFSET) | (key[0] & ~0xFFFFFFFF))
+        entry = _momentum_generators[device] = (gen, key)
+    return entry[0]
 
 
 def _round_(x: Tensor, gen: torch.Generator | None) -> Tensor:

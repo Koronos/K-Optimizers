@@ -503,3 +503,24 @@ def test_stochastic_momentum_requant_stacked_and_per_param_stay_in_range(md, mon
         back = codec.dequant_one(s, torch.zeros(shape))
         assert torch.isfinite(back).all()
         assert (back - upd[0]).abs().max() < 10
+
+
+def test_stochastic_momentum_noise_is_not_the_weight_sr_stream(monkeypatch):
+    """The toggle's generator must not replay SR stream 0's words (same global seed)."""
+    import kaon._momentum_codec as mc
+    from kaon import reseed_stochastic_rounding
+    from kaon._stochastic_rounding import SRStream
+
+    monkeypatch.setattr(mc, "STOCHASTIC_MOMENTUM_REQUANT", True)
+    torch.manual_seed(123)
+    reseed_stochastic_rounding()
+    dev = torch.device("cpu")
+    a = torch.rand(100_000, generator=mc._momentum_gen(dev))
+    b = torch.rand(100_000, generator=SRStream().generator(dev))     # stream 0 after reseed
+    assert not torch.equal(a, b)
+    corr = torch.corrcoef(torch.stack([a, b]))[0, 1].abs().item()
+    assert corr < 0.02, f"momentum requant noise correlates with the weight SR noise ({corr})"
+    # ... and it is reproducible under the protocol.
+    torch.manual_seed(123)
+    reseed_stochastic_rounding()
+    assert torch.equal(a, torch.rand(100_000, generator=mc._momentum_gen(dev)))
