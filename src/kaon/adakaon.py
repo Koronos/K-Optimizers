@@ -940,8 +940,11 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             # compatible with that view (int8 scales dim-0, 4-bit blocks the same flat storage).
             # The matrixized write-back needs a contiguous GRAD — enforced per step by
             # _demote_unfusable_grads, not here, because the grad changes every backward.
+            # The chunked kernels index one tensor in int32 (``k * BLOCK + arange``), so a
+            # single weight of >= 2**31 elements stays native instead of wrapping its offsets.
             two_d = bf_ok and p.ndim >= 2 and p.is_cuda and p.is_contiguous() \
-                and p.dtype in (torch.float32, torch.bfloat16)
+                and p.dtype in (torch.float32, torch.bfloat16) \
+                and p.numel() < ft.I64_THRESHOLD
             ok = bf_ok and ft.fused_eligible(p, cap)
             if ok and momentum and md == "4bit" and ft.eff_2d(p)[1] % 2 != 0:
                 ok = False                                  # one-block 4bit needs even C
@@ -1442,7 +1445,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             ft._chunked_mom_batched[grid](
                 g, m_addr, p_addr, c_addr, r, c, keep, inv_rms, wd, b1, R, C, n, K,
                 LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, BLOCK=1024, WDFULL=wd_full,
-                CK=ck,
+                CK=ck, I64=ft.needs_i64(N * K * 1024),
             )
         if quant:  # requant the updated fp32 temp back into per-tensor storage (apply reads the temp)
             # Batched requant (same write pattern as ema_stacked: in-place copies keep the
@@ -1474,7 +1477,7 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
             ft._chunked_apply_batched[grid](
                 g, m_addr, p_addr, c_addr, inv_mean, lr, wd, self._t, n, K,
                 LOWP=lowp, MOM=mom, CAUTIOUS=cautious, WD=wd != 0, SR=sr, CK=ck,
-                BLOCK=1024, WDFULL=wd_full,
+                BLOCK=1024, WDFULL=wd_full, I64=ft.needs_i64(N * K * 1024),
             )
 
     def _chunked_step_batched_nomom(

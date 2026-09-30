@@ -2209,3 +2209,51 @@ def test_in_place_views_pointer_array_follows_a_rebind():
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(views, before, strict=True))
     assert not all(torch.equal(a, b) for a, b in zip(moved, before, strict=True))
+
+
+@pytest.mark.parametrize("kernel", ["sr", "ck8", "ck16", "decode", "sr_views", "ck_views"])
+def test_int64_indexing_is_bit_identical_below_the_threshold(kernel):
+    """The ``I64`` variant (taken for >= 2**31-element index spaces, whose int32 offsets used to
+    wrap negative and slip past the ``offs < n`` mask) must compute exactly what the int32
+    variant computes wherever int32 did not wrap — same Philox noise included (an int64
+    counter below 2**32 draws the int32 stream). Allocating 2**31 elements is not possible on
+    a test GPU, so the variant is forced on a small buffer."""
+    import kaon._fused_triton as ft
+    n = 5000
+    g = torch.Generator(device=DEV).manual_seed(93)
+    p0 = torch.randn(n, generator=g, device=DEV).bfloat16()
+    d = torch.randn(n, generator=g, device=DEV) * 1e-2
+    bits = 16 if kernel == "ck16" else 8
+    lo0 = torch.randint(0, 256, (n,), generator=g, device=DEV).to(torch.uint8)
+    if bits == 16:
+        lo0 = torch.randint(-2**15, 2**15, (n,), generator=g, device=DEV).to(torch.int16)
+    outs = []
+    for i64 in (False, True):
+        p, lo = p0.clone(), lo0.clone()
+        grid = ((n + 1023) // 1024,)
+        if kernel == "sr":
+            ft._sr_axpy_kernel[grid](p, d, -0.5, n, 123, BLOCK=1024, I64=i64)
+            res = (p,)
+        elif kernel in ("ck8", "ck16"):
+            ft._ck_axpy_kernel[grid](p, lo, d, -0.5, n, 123, BITS=bits, BLOCK=1024, I64=i64)
+            res = (p, lo)
+        elif kernel == "decode":
+            out = torch.empty(n, device=DEV)
+            ft._ck_decode_kernel[grid](p, lo, out, n, BITS=8, BLOCK=1024, I64=i64)
+            res = (out,)
+        else:
+            views = list(p.view(5, 1000).unbind(0))
+            lows = list(lo.view(5, 1000).unbind(0))
+            K = 1  # noqa: N806
+            parr = ft._view_ptr_array(views, p.device)
+            if kernel == "sr_views":
+                ft._sr_axpy_views_kernel[(5,)](parr, d, -0.5, 1000, K, 123, BLOCK=1024, I64=i64)
+            else:
+                ft._ck_axpy_views_kernel[(5,)](parr, ft._view_ptr_array(lows, p.device), d, -0.5,
+                                               1000, K, 123, BITS=8, BLOCK=1024, I64=i64)
+            res = (p, lo)
+        torch.cuda.synchronize()
+        outs.append(res)
+    for a, b in zip(*outs, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    assert not ft.needs_i64(2**31 - 4096) and ft.needs_i64(2**31)

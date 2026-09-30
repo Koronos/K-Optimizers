@@ -582,7 +582,8 @@ if _HAS_TRITON:
             ck_store_noise(pp, cp, idx, mask, res, noise, BITS)
 
     @triton.jit
-    def _sr_axpy_kernel(p_ptr, d_ptr, alpha, n, seed, BLOCK: tl.constexpr):
+    def _sr_axpy_kernel(p_ptr, d_ptr, alpha, n, seed, BLOCK: tl.constexpr,
+                        I64: tl.constexpr = False):
         """``p += alpha * d`` for a bf16 ``p`` and an fp32 ``d``, stochastically rounded.
 
         ONE kernel and ZERO temporaries, against the torch path's chain inside
@@ -600,6 +601,8 @@ if _HAS_TRITON:
         nondeterminism, only a second place that uses it.
         """
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
         p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
@@ -607,13 +610,16 @@ if _HAS_TRITON:
         tl.store(p_ptr + offs, sr_round(p + alpha * d, seed, offs).to(tl.bfloat16), mask=mask)
 
     @triton.jit
-    def _ck_axpy_kernel(p_ptr, c_ptr, d_ptr, alpha, n, seed, BITS: tl.constexpr, BLOCK: tl.constexpr):
+    def _ck_axpy_kernel(p_ptr, c_ptr, d_ptr, alpha, n, seed, BITS: tl.constexpr, BLOCK: tl.constexpr,
+                        I64: tl.constexpr = False):
         """``(p, lo) += alpha * d`` for a compact-Kahan bf16 ``p`` + residual ``lo`` and an
         fp32 ``d``: ONE launch, ZERO temporaries — the ``kahan8`` twin of ``_sr_axpy_kernel``.
         The torch reference (``kaon._compact_kahan.compensated_add_``) is a dozen integer
         kernels with parameter-sized int32 scratch (measured ~23 B/elem transient on a
         stacked bucket); this reads 3 B/elem and writes 3 B/elem (4 and 4 for ``kahan16``)."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
         z = ck_decode(p_ptr, c_ptr, offs, mask, BITS)
@@ -621,12 +627,15 @@ if _HAS_TRITON:
         ck_store(p_ptr, c_ptr, offs, mask, z + alpha * d, seed, BITS)
 
     @triton.jit
-    def _ck_decode_kernel(p_ptr, c_ptr, out_ptr, n, BITS: tl.constexpr, BLOCK: tl.constexpr):
+    def _ck_decode_kernel(p_ptr, c_ptr, out_ptr, n, BITS: tl.constexpr, BLOCK: tl.constexpr,
+                          I64: tl.constexpr = False):
         """``out = decode(p, lo)`` as fp32, one launch (the torch reference,
         ``kaon._compact_kahan.decode``, is ~10 integer kernels with three int32 temporaries —
         measured +50-80% self-CUDA on a foreach Adakaon step when the weight-decay read went
         through it). Integer-identical: ``ck_decode`` is the same bit manipulation."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
         tl.store(out_ptr + offs, ck_decode(p_ptr, c_ptr, offs, mask, BITS), mask=mask)
@@ -640,9 +649,12 @@ if _HAS_TRITON:
     # launch and the stacked flat index ``t * n + j`` as the ``tl.rand`` counter — only the
     # ADDRESS is per view — so a switch between the two is invisible in the trajectory.
     @triton.jit
-    def _sr_axpy_views_kernel(p_addr, d_ptr, alpha, n, K, seed, BLOCK: tl.constexpr):
+    def _sr_axpy_views_kernel(p_addr, d_ptr, alpha, n, K, seed, BLOCK: tl.constexpr,
+                              I64: tl.constexpr = False):
         """``view_t += alpha * d[t]`` (bf16 SR) for every view ``t`` of a pointer array."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         t = pid // K
         k = pid % K
         local = k * BLOCK + tl.arange(0, BLOCK)
@@ -655,10 +667,12 @@ if _HAS_TRITON:
 
     @triton.jit
     def _ck_axpy_views_kernel(p_addr, c_addr, d_ptr, alpha, n, K, seed, BITS: tl.constexpr,
-                              BLOCK: tl.constexpr):
+                              BLOCK: tl.constexpr, I64: tl.constexpr = False):
         """``(view_t, lo_t) += alpha * d[t]`` (compact Kahan) for every view of a pointer array;
         :func:`ck_store`'s draw on the stacked index, as ``_ck_axpy_kernel`` makes it."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         t = pid // K
         k = pid % K
         local = k * BLOCK + tl.arange(0, BLOCK)
@@ -1062,11 +1076,14 @@ if _HAS_TRITON:
         wd, beta1, R, C, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        I64: tl.constexpr = False,
     ):
         """Batched pass 1: momentum EMA of the normalized update over a flat chunk of tensor ``t``;
         accumulates the cautious keep-count (on delta incl. WD unless ``WDFULL``, matching native)
         into ``keep_ptr[t]``."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         t = pid // K
         k = pid % K
         offs = k * BLOCK + tl.arange(0, BLOCK)
@@ -1107,10 +1124,13 @@ if _HAS_TRITON:
         g_ptr, m_addr, p_addr, c_addr, inv_mean_ptr, lr, wd, seed, n, K,
         LOWP: tl.constexpr, MOM: tl.constexpr, CAUTIOUS: tl.constexpr, WD: tl.constexpr,
         SR: tl.constexpr, BLOCK: tl.constexpr, WDFULL: tl.constexpr = False, CK: tl.constexpr = 0,
+        I64: tl.constexpr = False,
     ):
         """Batched pass 2: delta = cautious(m + wd*p, g) ["masked"] or cautious(m, g) + wd*p
         ["full"]; p -= lr*delta (bf16 SR if LOWP+SR)."""
         pid = tl.program_id(0)
+        if I64:  # see I64_THRESHOLD: a >= 2**31-element index space
+            pid = pid.to(tl.int64)
         t = pid // K
         k = pid % K
         offs = k * BLOCK + tl.arange(0, BLOCK)
@@ -2769,7 +2789,7 @@ def sr_add_(target, source, alpha: float = 1.0, sr: SRStream | None = None) -> N
     seed = stream.next_seed(target.device)
     with torch.cuda.device(target.device):   # a launch targets the CURRENT device
         _sr_axpy_kernel[((n + 1023) // 1024,)](
-            target, source, alpha, n, seed, BLOCK=1024,
+            target, source, alpha, n, seed, BLOCK=1024, I64=needs_i64(n),
         )
 
 
@@ -2814,7 +2834,8 @@ def ck_decode_fast(p, lo, bits: int):
     n = p.numel()
     if n:
         with torch.cuda.device(p.device):
-            _ck_decode_kernel[((n + 1023) // 1024,)](p, lo, out, n, BITS=bits, BLOCK=1024)
+            _ck_decode_kernel[((n + 1023) // 1024,)](p, lo, out, n, BITS=bits, BLOCK=1024,
+                                                     I64=needs_i64(n))
     return out
 
 
@@ -2831,7 +2852,7 @@ def ck_add_(target, lo, source, alpha: float = 1.0, bits: int = 8, sr: SRStream 
     seed = stream.next_seed(target.device)
     with torch.cuda.device(target.device):
         _ck_axpy_kernel[((n + 1023) // 1024,)](
-            target, lo, source, alpha, n, seed, BITS=bits, BLOCK=1024,
+            target, lo, source, alpha, n, seed, BITS=bits, BLOCK=1024, I64=needs_i64(n),
         )
 
 
@@ -2850,6 +2871,21 @@ def int8_route(C: int) -> str:  # noqa: N803
     if C <= BIG_BLOCK and BIG_BLOCK % C == 0:
         return "aligned"
     return "rows" if C >= INT8_ROWS_MIN_C else "codec"
+
+
+#: Element count from which a flat / stacked launch indexes in int64 (the kernels' ``I64``
+#: constexpr). ``pid * BLOCK + arange`` and ``t * n + j`` are int32 in Triton, so a stacked
+#: bucket (or a flat buffer) of >= 2**31 elements wrapped to negative offsets — which then
+#: PASSED the ``offs < n`` mask and addressed memory before the buffer. Below the threshold the
+#: kernels compile exactly as before (``I64=False``), so the common sizes pay nothing; above it
+#: the index is int64 end to end, and the ``tl.rand`` counter (int64 below 2**32 draws the
+#: same Philox stream as int32) keeps the SR noise of every index that did not wrap.
+I64_THRESHOLD = 2**31 - 2 * 1024
+
+
+def needs_i64(total: int) -> bool:
+    """``I64`` for a launch whose largest flat index (grid extent x BLOCK) may reach ``total``."""
+    return total >= I64_THRESHOLD
 
 
 # Device pointer arrays for :func:`sr_add_views_` / :func:`ck_add_views_`, CONTENT-addressed:
@@ -2909,6 +2945,7 @@ def sr_add_views_(views, source, alpha: float = 1.0, sr: SRStream | None = None)
     with torch.cuda.device(source.device):
         _sr_axpy_views_kernel[(len(views) * K,)](
             _view_ptr_array(views, source.device), source, alpha, n, K, seed, BLOCK=1024,
+            I64=needs_i64(len(views) * K * 1024),
         )
 
 
@@ -2935,6 +2972,7 @@ def ck_add_views_(views, lows, source, alpha: float = 1.0, bits: int = 8,
         _ck_axpy_views_kernel[(len(views) * K,)](
             _view_ptr_array(views, source.device), _view_ptr_array(lows, source.device),
             source, alpha, n, K, seed, BITS=bits, BLOCK=1024,
+            I64=needs_i64(len(views) * K * 1024),
         )
 
 
