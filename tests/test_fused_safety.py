@@ -1287,3 +1287,34 @@ def test_fused_group_without_any_grad_is_a_no_op(cls_name):
     opt.step()
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(before, ps, strict=True))
+
+
+# --------------------------------------------- 18. rows too wide for one reduction program
+# ``reduction_tile`` handed a program ``next_pow2(C)`` columns with no ceiling: (4, 1048576)
+# asked Triton for a 1M-lane tile and took >100 s to compile. Above ``REDUCTION_C_CAP`` the
+# column-tiled ``*_ct`` kernels walk the row instead; everything narrower is untouched.
+@pytest.mark.parametrize("det", [False, True], ids=["atomic", "deterministic"])
+@pytest.mark.parametrize("shapes", [[(4, 1 << 20)], [(3, 40000)] * 2], ids=["1M", "40000"])
+def test_very_wide_rows_take_the_column_tiled_reductions(shapes, det):
+    import time
+
+    import kaon._fused_triton as ft
+    assert triton.next_power_of_2(shapes[0][1]) > ft.REDUCTION_C_CAP
+    cfg = dict(_FP32_CFG, deterministic_reductions=det)
+    pv = _bag(shapes, seed=197)
+    pn = _clone(pv)
+    ov, on = Adakaon(pv, fused=True, **cfg), Adakaon(pn, **cfg)
+    t0 = time.perf_counter()
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(199))
+    assert time.perf_counter() - t0 < 90, "compiling the wide-row reductions took too long"
+    ob, big, od, nat = _parts(ov)
+    assert big and not nat
+    d = _maxdiff(pv, pn)
+    assert d < 1e-5, f"{shapes[0]}: max|Delta p| vs native = {d:.2e}"
+
+
+def test_reduction_tile_caps_the_column_tile_only_when_asked():
+    import kaon._fused_triton as ft
+    assert reduction_tile(4, 1 << 20)[1] == 1 << 20                  # AdaPNM: unchanged
+    br, bc, rb = reduction_tile(4, 1 << 20, cap=ft.REDUCTION_C_TILE)
+    assert bc == ft.REDUCTION_C_TILE and br * rb >= 4

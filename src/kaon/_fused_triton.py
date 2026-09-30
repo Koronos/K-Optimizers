@@ -331,7 +331,16 @@ def bucket_gc_ok(plist: list) -> bool:
     return flags.pop()
 
 
-def reduction_tile(R: int, C: int, work: int = 16384) -> tuple[int, int, int]:
+#: Widest padded row (``next_pow2(C)``) a reduction program owns whole; above it Adakaon
+#: switches to the column-tiled ``*_ct`` kernels, which walk the row in ``REDUCTION_C_TILE``
+#: columns (see :func:`reduction_tile`'s ``cap``). Every width up to the threshold keeps the
+#: exact pre-0.7.18 kernels.
+REDUCTION_C_CAP = 1 << 15
+REDUCTION_C_TILE = 1 << 13
+
+
+def reduction_tile(R: int, C: int, work: int = 16384,  # noqa: N803
+                   cap: int | None = None) -> tuple[int, int, int]:
     """Row-block sizing for the fused reduction kernels: ``(BR, BC, RB)`` — one program owns ``BR``
     rows × ``BC = next_pow2(C)`` cols (≈ ``work`` lanes) and ``RB = ceil(R/BR)`` blocks tile the rows.
 
@@ -347,8 +356,13 @@ def reduction_tile(R: int, C: int, work: int = 16384) -> tuple[int, int, int]:
     ``_chunked_reductions_fused``) masks its rows with ``ri < R`` on every load, store and
     atomic, and ``RB`` below is derived from the PADDED ``BR`` so the row blocks still tile
     ``R`` exactly once.
+
+    ``cap`` (Adakaon only; AdaPNM passes none and keeps the unbounded tile): bound ``BC`` for a
+    caller that launches the column-tiled ``*_ct`` kernels when ``next_pow2(C)`` exceeds it.
     """
     BC = triton.next_power_of_2(C)  # noqa: N806
+    if cap is not None:            # the column-tiled kernels walk C in ``cap``-wide tiles
+        BC = min(BC, cap)  # noqa: N806
     BR = triton.next_power_of_2(max(1, min(R, max(1, work // BC))))  # noqa: N806
     RB = (R + BR - 1) // BR  # noqa: N806
     return BR, BC, RB
@@ -1356,6 +1370,115 @@ if _HAS_TRITON:
         row_mean = tl.sum(tl.where(rmask, row_new, 0.0)) / (R * 1.0)  # see _reduce_rowcol on `* 1.0`
         tl.store(rfac_ptr + t * R + rr, tl.rsqrt(row_new / row_mean), mask=rmask)
         tl.store(cfac_ptr + t * C + cc, tl.rsqrt(col_new), mask=cmask)
+
+    # ---- column-TILED twins of the reductions, for rows too wide for one program ----
+    # ``reduction_tile`` gives a program ``BC = next_pow2(C)`` columns, unbounded: a
+    # (4, 1048576) weight asked Triton for a 1M-lane tile and took >100 s to compile (and ran as
+    # one fat program per row). Above :data:`REDUCTION_C_CAP` padded columns Adakaon launches
+    # these instead: same grid, same outputs, the row walked in ``BC``-column tiles (two walks
+    # under GC: the row mean first, then the centralized squares). Separate kernels rather than
+    # a branch in the originals, so every normal shape compiles exactly as before.
+    @triton.jit
+    def _reduce_rowcol_ct(
+        g_addr, rowmean_ptr, rowsum_ptr, colsum_ptr, colpart_ptr, R, C, RB,
+        LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        DET: tl.constexpr, GF32: tl.constexpr = False,
+    ):
+        """:func:`_reduce_rowcol` (``DET``: :func:`_reduce_rowcol_det`) over column tiles."""
+        pid = tl.program_id(0)
+        t = pid // RB
+        rb = pid % RB
+        ri = rb * BR + tl.arange(0, BR)
+        rmask = ri < R
+        gp = grad_ptr(tl.load(g_addr + t), LOWP, GF32)
+        if GC:
+            acc = tl.zeros((BR,), dtype=tl.float32)
+            for c0 in range(0, C, BC):
+                ci = c0 + tl.arange(0, BC)
+                m2 = rmask[:, None] & (ci < C)[None, :]
+                g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
+                acc += tl.sum(g, axis=1)
+            rmean = acc / (C * 1.0)
+            tl.store(rowmean_ptr + t * R + ri, rmean, mask=rmask)
+        rs = tl.zeros((BR,), dtype=tl.float32)
+        for c0 in range(0, C, BC):
+            ci = c0 + tl.arange(0, BC)
+            cmask = ci < C
+            m2 = rmask[:, None] & cmask[None, :]
+            g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
+            if GC:
+                g = tl.where(m2, g - rmean[:, None], 0.0)
+            gsq = g * g
+            rs += tl.sum(gsq, axis=1)
+            if DET:
+                tl.store(colpart_ptr + (t * RB + rb) * C + ci, tl.sum(gsq, axis=0), mask=cmask)
+            else:
+                tl.atomic_add(colsum_ptr + t * C + ci, tl.sum(gsq, axis=0), mask=cmask)
+        tl.store(rowsum_ptr + t * R + ri, rs, mask=rmask)
+
+    @triton.jit
+    def _reduce_rms_ct(
+        g_addr, rowmean_ptr, rfac_ptr, cfac_ptr, rms_ptr, R, C, RB,
+        LOWP: tl.constexpr, GC: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        DET: tl.constexpr, GF32: tl.constexpr = False,
+    ):
+        """:func:`_reduce_rms` (``DET``: the partial store of :func:`_reduce_rms_det`, into
+        ``rms_ptr`` = ``rmspart``) over column tiles."""
+        pid = tl.program_id(0)
+        t = pid // RB
+        rb = pid % RB
+        ri = rb * BR + tl.arange(0, BR)
+        rmask = ri < R
+        gp = grad_ptr(tl.load(g_addr + t), LOWP, GF32)
+        if GC:
+            rmean = tl.load(rowmean_ptr + t * R + ri, mask=rmask, other=0.0)
+        rf = tl.load(rfac_ptr + t * R + ri, mask=rmask, other=0.0)
+        acc = tl.zeros((BR,), dtype=tl.float32)
+        for c0 in range(0, C, BC):
+            ci = c0 + tl.arange(0, BC)
+            cmask = ci < C
+            m2 = rmask[:, None] & cmask[None, :]
+            g = tl.load(gp + ri[:, None] * C + ci[None, :], mask=m2, other=0.0).to(tl.float32)
+            if GC:
+                g = tl.where(m2, g - rmean[:, None], 0.0)
+            cf = tl.load(cfac_ptr + t * C + ci, mask=cmask, other=0.0)
+            u = g * rf[:, None] * cf[None, :]
+            acc += tl.sum(u * u, axis=1)
+        if DET:
+            tl.store(rms_ptr + t * RB + rb, tl.sum(acc))
+        else:
+            tl.atomic_add(rms_ptr + t, tl.sum(acc))
+
+    @triton.jit
+    def _factor_rowcol_batched_ct(
+        row_addr, col_addr, rowsum_ptr, colsum_ptr, rfac_ptr, cfac_ptr,
+        R, C, beta2, eps1,
+        BR: tl.constexpr, BC: tl.constexpr,
+    ):
+        """:func:`_factor_rowcol_batched` with the COLUMNS walked in ``BC`` tiles (the rows
+        stay one ``BR = next_pow2(R)`` tile, as in the original)."""
+        t = tl.program_id(0)
+        rr = tl.arange(0, BR)
+        rmask = rr < R
+        rowp = tl.load(row_addr + t).to(tl.pointer_type(tl.float32))
+        colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
+        omb = 1.0 - beta2
+        row_old = tl.load(rowp + rr, mask=rmask, other=0.0)
+        row_new = row_old + omb * (
+            tl.load(rowsum_ptr + t * R + rr, mask=rmask, other=0.0) / C + eps1 - row_old
+        )
+        tl.store(rowp + rr, row_new, mask=rmask)
+        row_mean = tl.sum(tl.where(rmask, row_new, 0.0)) / (R * 1.0)
+        tl.store(rfac_ptr + t * R + rr, tl.rsqrt(row_new / row_mean), mask=rmask)
+        for c0 in range(0, C, BC):
+            cc = c0 + tl.arange(0, BC)
+            cmask = cc < C
+            col_old = tl.load(colp + cc, mask=cmask, other=0.0)
+            col_new = col_old + omb * (
+                tl.load(colsum_ptr + t * C + cc, mask=cmask, other=0.0) / R + eps1 - col_old
+            )
+            tl.store(colp + cc, col_new, mask=cmask)
+            tl.store(cfac_ptr + t * C + cc, tl.rsqrt(col_new), mask=cmask)
 
     @triton.jit
     def _finish_rms(rms_ptr, inv_rms_ptr, n, clip, N, BLOCK: tl.constexpr):

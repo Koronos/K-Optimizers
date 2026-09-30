@@ -1546,25 +1546,35 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         b2, eps1 = group["betas"][1], group["eps"][0]
         N = len(plist)  # noqa: N806
         g_addr = cache.g_addr
-        BR, BC, RB = ft.reduction_tile(R, C)  # noqa: N806
+        ct = ft.triton.next_power_of_2(C) > ft.REDUCTION_C_CAP   # rows too wide: tiled kernels
+        BR, BC, RB = ft.reduction_tile(R, C, cap=ft.REDUCTION_C_TILE if ct else None)  # noqa: N806
         rowmean = cache.rowmean
         rowsum = cache.rowsum
         colsum = cache.colsum
         det = self._deterministic_reductions
         cache.zero_accumulators()          # colsum + rms + keep, one launch
         gf32 = _gf32(plist)
+        nw = ft.warps_for(BR * BC)
         if det:
             colpart, rmspart = cache.partials(RB)
             CB = (C + 255) // 256  # noqa: N806
+        if ct:
+            ft._reduce_rowcol_ct[(N * RB,)](
+                g_addr, rowmean, rowsum, colsum, colpart if det else colsum, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, DET=det, num_warps=nw, GF32=gf32,
+            )
+            if det:
+                ft._reduce_colpart[(N * CB,)](colpart, colsum, C, RB, CB, BCT=256)
+        elif det:
             ft._reduce_rowcol_det[(N * RB,)](
                 g_addr, rowmean, rowsum, colpart, R, C, RB,
-                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC), GF32=gf32,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=nw, GF32=gf32,
             )
             ft._reduce_colpart[(N * CB,)](colpart, colsum, C, RB, CB, BCT=256)
         else:
             ft._reduce_rowcol[(N * RB,)](
                 g_addr, rowmean, rowsum, colsum, R, C, RB,
-                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC), GF32=gf32,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=nw, GF32=gf32,
             )
         # Update persistent row/col state directly via pointer arrays and emit
         # factors in one launch (no stack/scatter or eager elementwise chain). ``r``/``c``
@@ -1576,21 +1586,35 @@ class Adakaon(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opt
         col_addr = cache.col_addr
         FR = ft.triton.next_power_of_2(R)  # noqa: N806
         FC = ft.triton.next_power_of_2(C)  # noqa: N806
-        ft._factor_rowcol_batched[(N,)](
-            row_addr, col_addr, rowsum, colsum, r, c, R, C, b2, eps1,
-            BR=FR, BC=FC, num_warps=ft.warps_for(max(FR, FC)),
-        )
+        if ct:
+            ft._factor_rowcol_batched_ct[(N,)](
+                row_addr, col_addr, rowsum, colsum, r, c, R, C, b2, eps1,
+                BR=FR, BC=ft.REDUCTION_C_TILE,
+                num_warps=ft.warps_for(max(FR, ft.REDUCTION_C_TILE)),
+            )
+        else:
+            ft._factor_rowcol_batched[(N,)](
+                row_addr, col_addr, rowsum, colsum, r, c, R, C, b2, eps1,
+                BR=FR, BC=FC, num_warps=ft.warps_for(max(FR, FC)),
+            )
         rms = cache.rms
-        if det:
+        if ct:
+            ft._reduce_rms_ct[(N * RB,)](
+                g_addr, rowmean, r, c, rmspart if det else rms, R, C, RB,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, DET=det, num_warps=nw, GF32=gf32,
+            )
+            if det:
+                ft._reduce_rmspart[(N,)](rmspart, rms, RB)
+        elif det:
             ft._reduce_rms_det[(N * RB,)](
                 g_addr, rowmean, r, c, rmspart, R, C, RB,
-                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC), GF32=gf32,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=nw, GF32=gf32,
             )
             ft._reduce_rmspart[(N,)](rmspart, rms, RB)
         else:
             ft._reduce_rms[(N * RB,)](
                 g_addr, rowmean, r, c, rms, R, C, RB,
-                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=ft.warps_for(BR * BC), GF32=gf32,
+                LOWP=lowp, GC=gc, BR=BR, BC=BC, num_warps=nw, GF32=gf32,
             )
         return g_addr, rowmean, r, c, rms
 

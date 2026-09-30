@@ -2257,3 +2257,34 @@ def test_int64_indexing_is_bit_identical_below_the_threshold(kernel):
     for a, b in zip(*outs, strict=True):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
     assert not ft.needs_i64(2**31 - 4096) and ft.needs_i64(2**31)
+
+
+def test_grad_pointer_refresh_tracks_every_step():
+    """Grads reallocated on EVERY step (the varying-sequence-length pattern), old buffers
+    poisoned right after the step that read them: every route must read this step's grads —
+    parity with native over 8 steps."""
+    shapes = [(64, 48)] * 3 + [(512, 512)] * 2 + [(96,)] * 3
+
+    def run(fused):
+        torch.manual_seed(0)
+        ps = [(torch.randn(s, device=DEV) * 0.01).requires_grad_(True) for s in shapes]
+        opt = Adakaon(ps, lr=1e-3, fused=fused, deterministic_reductions=True)
+        g = torch.Generator(device=DEV).manual_seed(3)
+        keep = []
+        for _ in range(8):
+            gs = [torch.randn(s, generator=g, device=DEV) for s in shapes]
+            for p, gr in zip(ps, gs, strict=True):
+                p.grad = gr
+            opt.step()
+            for old in keep:
+                old.fill_(float("nan"))          # a freed buffer the allocator handed back
+            keep = gs
+        torch.cuda.synchronize()
+        return [p.detach().clone() for p in ps]
+
+    wf, wn = run(True), run(False)
+    for a, b in zip(wf, wn, strict=True):
+        assert torch.isfinite(a).all()
+        # 1.05e-5 is the big route's ordinary fused-vs-native drift over 8 steps (the same
+        # with the pre-0.7.18 refresh); a stale pointer reads NaN/garbage (poisoned buffers).
+        assert torch.allclose(a, b, atol=5e-5), "a fused route read a stale grad pointer"
