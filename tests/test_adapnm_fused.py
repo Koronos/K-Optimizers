@@ -1031,6 +1031,26 @@ def test_pnm_very_wide_rows_take_the_column_tiled_reductions(shapes, gc):
     assert _maxdiff(pv, pn) / scale < 1e-5
 
 
+@pytest.mark.parametrize("shapes", [[(1 << 20, 4)] * 2, [(40000, 3)] * 2], ids=["1M", "40000"])
+def test_pnm_very_tall_buckets_take_the_row_tiled_factor_kernel(shapes):
+    """The row twin: ``_factor_rowcol_batched`` held every row in one tile (a 1M-lane
+    program for a (1048576, 4) bucket). Above ``REDUCTION_C_CAP`` padded rows it walks them."""
+    import time
+
+    assert triton_next_pow2(shapes[0][0]) > ft.REDUCTION_C_CAP
+    pv, pn, ov, on = _safe_pair(shapes, _SAFE_CFG, seed=99)
+    t0 = time.perf_counter()
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(101))
+    assert time.perf_counter() - t0 < 90, "compiling the tall-bucket factor kernel took too long"
+    _assert_safe_route(ov, "big")
+    scale = max(p.detach().abs().max().item() for p in pn)
+    assert _maxdiff(pv, pn) / scale < 1e-5
+
+
+def triton_next_pow2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
 def test_pnm_huge_tensor_is_not_routed_to_the_int32_chunked_kernels(monkeypatch):
     """The chunked kernels index one tensor in int32, so a weight of >= 2**31 elements must
     stay native (Adakaon's partition already guarded it; AdaPNM's did not). Pinned with a

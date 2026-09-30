@@ -1313,6 +1313,29 @@ def test_very_wide_rows_take_the_column_tiled_reductions(shapes, det):
     assert d < 1e-5, f"{shapes[0]}: max|Delta p| vs native = {d:.2e}"
 
 
+@pytest.mark.parametrize("det", [False, True], ids=["atomic", "deterministic"])
+@pytest.mark.parametrize("shapes", [[(1 << 20, 4)], [(40000, 3)] * 2], ids=["1M", "40000"])
+def test_very_tall_buckets_take_the_row_tiled_factor_kernel(shapes, det):
+    """``_factor_rowcol_batched`` held all ``next_pow2(R)`` rows in ONE tile, so a
+    (1048576, 4) bucket compiled a 1M-lane program (the row twin of the wide-row case).
+    Above ``REDUCTION_C_CAP`` padded rows it walks the rows in tiles; same outputs."""
+    import time
+
+    import kaon._fused_triton as ft
+    assert triton.next_power_of_2(shapes[0][0]) > ft.REDUCTION_C_CAP
+    cfg = dict(_FP32_CFG, deterministic_reductions=det)
+    pv = _bag(shapes, seed=201)
+    pn = _clone(pv)
+    ov, on = Adakaon(pv, fused=True, **cfg), Adakaon(pn, **cfg)
+    t0 = time.perf_counter()
+    _drive([(pv, ov), (pn, on)], 3, torch.Generator(device=DEV).manual_seed(203))
+    assert time.perf_counter() - t0 < 90, "compiling the tall-bucket factor kernel took too long"
+    ob, big, od, nat = _parts(ov)
+    assert big and not nat
+    d = _maxdiff(pv, pn)
+    assert d < 1e-5, f"{shapes[0]}: max|Delta p| vs native = {d:.2e}"
+
+
 def test_reduction_tile_caps_the_column_tile_only_when_asked():
     import kaon._fused_triton as ft
     assert reduction_tile(4, 1 << 20)[1] == 1 << 20                  # no cap: unchanged

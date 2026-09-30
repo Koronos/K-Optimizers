@@ -1472,7 +1472,8 @@ if _HAS_TRITON:
         BR: tl.constexpr, BC: tl.constexpr,
     ):
         """:func:`_factor_rowcol_batched` with the COLUMNS walked in ``BC`` tiles (the rows
-        stay one ``BR = next_pow2(R)`` tile, as in the original)."""
+        stay one ``BR = next_pow2(R)`` tile, as in the original; more than
+        ``REDUCTION_C_CAP`` padded rows take :func:`_factor_rowcol_batched_rt`)."""
         t = tl.program_id(0)
         rr = tl.arange(0, BR)
         rmask = rr < R
@@ -1486,6 +1487,51 @@ if _HAS_TRITON:
         tl.store(rowp + rr, row_new, mask=rmask)
         row_mean = tl.sum(tl.where(rmask, row_new, 0.0)) / (R * 1.0)
         tl.store(rfac_ptr + t * R + rr, tl.rsqrt(row_new / row_mean), mask=rmask)
+        for c0 in range(0, C, BC):
+            cc = c0 + tl.arange(0, BC)
+            cmask = cc < C
+            col_old = tl.load(colp + cc, mask=cmask, other=0.0)
+            col_new = col_old + omb * (
+                tl.load(colsum_ptr + t * C + cc, mask=cmask, other=0.0) / R + eps1 - col_old
+            )
+            tl.store(colp + cc, col_new, mask=cmask)
+            tl.store(cfac_ptr + t * C + cc, tl.rsqrt(col_new), mask=cmask)
+
+    @triton.jit
+    def _factor_rowcol_batched_rt(
+        row_addr, col_addr, rowsum_ptr, colsum_ptr, rfac_ptr, cfac_ptr,
+        R, C, beta2, eps1,
+        BR: tl.constexpr, BC: tl.constexpr,
+    ):
+        """:func:`_factor_rowcol_batched` with the ROWS walked in ``BR`` tiles too (and the
+        columns in ``BC`` tiles), for ``next_pow2(R) > REDUCTION_C_CAP``: the original kept all
+        ``next_pow2(R)`` rows in one tile, so a (1048576, 4) bucket compiled a 1M-lane program.
+        Two row walks, because the row factor needs the mean of the UPDATED rows: the first
+        updates the EMA and accumulates the sum, the second reads the stored rows back and
+        writes ``rsqrt(row / mean)`` (over ``rowsum``, which ``rfac`` may alias: every read of
+        ``rowsum`` happens in the first walk). Same arithmetic per element; only the row
+        mean's summation order differs from the one-tile kernel."""
+        t = tl.program_id(0)
+        rowp = tl.load(row_addr + t).to(tl.pointer_type(tl.float32))
+        colp = tl.load(col_addr + t).to(tl.pointer_type(tl.float32))
+        omb = 1.0 - beta2
+        acc = tl.zeros((BR,), dtype=tl.float32)
+        for r0 in range(0, R, BR):
+            rr = r0 + tl.arange(0, BR)
+            rmask = rr < R
+            row_old = tl.load(rowp + rr, mask=rmask, other=0.0)
+            row_new = row_old + omb * (
+                tl.load(rowsum_ptr + t * R + rr, mask=rmask, other=0.0) / C + eps1 - row_old
+            )
+            tl.store(rowp + rr, row_new, mask=rmask)
+            acc += tl.where(rmask, row_new, 0.0)
+        row_mean = tl.sum(acc) / (R * 1.0)                # see _reduce_rowcol on the `* 1.0`
+        tl.debug_barrier()                                # the stores above before the reloads
+        for r0 in range(0, R, BR):
+            rr = r0 + tl.arange(0, BR)
+            rmask = rr < R
+            row_new = tl.load(rowp + rr, mask=rmask, other=1.0)
+            tl.store(rfac_ptr + t * R + rr, tl.rsqrt(row_new / row_mean), mask=rmask)
         for c0 in range(0, C, BC):
             cc = c0 + tl.arange(0, BC)
             cmask = cc < C
@@ -3048,14 +3094,22 @@ def factor_rowcol_(row_addr, col_addr, rowsum, colsum, rfac, cfac, N, R, C, beta
 
     One launch (``grid=(N,)``) over :func:`_factor_rowcol_batched`, or its column-tiled twin
     :func:`_factor_rowcol_batched_ct` when the rows are wider than :data:`REDUCTION_C_CAP`
-    padded lanes (every narrower width compiles exactly the kernel it always did). Shared by
+    padded lanes, or the row-AND-column-tiled :func:`_factor_rowcol_batched_rt` when there are
+    more than :data:`REDUCTION_C_CAP` padded ROWS (the one-tile kernels hold every row in one
+    program). Every shape under both caps compiles exactly the kernel it always did. Shared by
     Adakaon's and AdaPNM's batched-big reductions. ``rfac``/``cfac`` may alias
     ``rowsum``/``colsum`` (program ``t`` reads and writes the same indices; see
     :class:`BigPointerCache`).
     """
     FR = triton.next_power_of_2(R)  # noqa: N806
     FC = triton.next_power_of_2(C)  # noqa: N806
-    if FC > REDUCTION_C_CAP:
+    if FR > REDUCTION_C_CAP:
+        BC = min(FC, REDUCTION_C_TILE)  # noqa: N806
+        _factor_rowcol_batched_rt[(N,)](
+            row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, beta2, eps1,
+            BR=REDUCTION_C_TILE, BC=BC, num_warps=warps_for(REDUCTION_C_TILE),
+        )
+    elif FC > REDUCTION_C_CAP:
         _factor_rowcol_batched_ct[(N,)](
             row_addr, col_addr, rowsum, colsum, rfac, cfac, R, C, beta2, eps1,
             BR=FR, BC=REDUCTION_C_TILE, num_warps=warps_for(max(FR, REDUCTION_C_TILE)),
