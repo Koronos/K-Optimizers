@@ -111,7 +111,8 @@ drops into per-parameter / gradient-release training loops unchanged.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections import ChainMap
+from collections.abc import Hashable, Iterable
 from typing import Any, Literal
 
 import torch
@@ -1147,7 +1148,10 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
         if len(big) >= 2 and not self._fused_big_batched:
             if group["gradient_centralization"]:
                 centralize_grads_(big)
-            self._native_dispatch(big, group)
+            # Its own plan key: the native subset of the same group goes through
+            # _native_dispatch too, and sharing ``id(group)`` made the two param lists evict
+            # each other's cached plan on every step.
+            self._native_dispatch(big, self._plan_group(group, ("big", lag)))
             return
         # Group by EXACT shape, dtype AND DEVICE: a bucket is launched as one grid against pointer
         # arrays built on ``plist[0].device``, so two CUDA devices sharing a shape would run the
@@ -1512,15 +1516,33 @@ class AdaPNM(AutoLRMixin, WatchedStateMixin, ForeachPlanMixin, SRSeedState, Opti
     def _clear_foreach_plans(self) -> None:
         """Drop every cached plan and, with them, the per-chunk momentum aliases."""
         super()._clear_foreach_plans()
-        memo = self.__dict__.get("_pnm_momentum_memo")
-        if memo:
-            memo.clear()
+        for name in ("_pnm_momentum_memo", "_pnm_plan_groups"):
+            memo = self.__dict__.get(name)
+            if memo:
+                memo.clear()
 
     def _drop_foreach_plan(self, group: dict[str, Any]) -> None:
         super()._drop_foreach_plan(group)
         memo = self.__dict__.get("_pnm_momentum_memo")
         if memo:
             memo.pop(id(group), None)
+
+    def _plan_group(self, group: dict[str, Any], tag: Hashable) -> ChainMap:
+        """A stable, LIVE stand-in for ``group`` under which a second param subset of the same
+        group gets its own foreach plan (the plan cache is keyed by ``id(group)``).
+
+        A ``ChainMap`` over the group reads every hyperparameter (``lr``, ``step``, ...) live
+        and is never written to by the step. Cached per ``(id(group), tag)`` and checked by
+        identity of the wrapped group, so a recycled ``id`` can never hand back another
+        group's proxy."""
+        proxies = self.__dict__.get("_pnm_plan_groups")
+        if proxies is None:
+            proxies = self.__dict__["_pnm_plan_groups"] = {}
+        key = (id(group), tag)
+        proxy = proxies.get(key)
+        if proxy is None or proxy.maps[0] is not group:
+            proxy = proxies[key] = ChainMap(group)
+        return proxy
 
     def _chunk_memos(self, group: dict[str, Any], chunks: list[ForeachChunk]) -> list[dict]:
         """One momentum memo per chunk, valid for as long as the plan hands back ``chunks``.

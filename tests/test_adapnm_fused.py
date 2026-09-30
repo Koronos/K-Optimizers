@@ -1420,3 +1420,25 @@ def test_one_dim_visible_eps_matches_native():
         da, db = (a.detach().float() - z.float()), (b.detach().float() - z.float())
         rel = (da - db).abs().max().item() / db.abs().max().item()
         assert rel < 5e-3, f"rel={rel:.2e}"   # fp32 ulps of O(1) weights ~1e-4; no scaling -> O(1)
+
+
+def test_big_native_foreach_toggle_keeps_both_plans_across_steps():
+    """``_fused_big_batched=False`` sends the big bucket through ``_native_dispatch`` next to
+    the group's own native subset. Both used to share the plan key ``id(group)``, so each
+    evicted the other's cached foreach plan every step; each must now keep its own."""
+    cfg = dict(lr=1e-3, momentum_dtype="int8")          # int8 1-D -> native subset
+    ps = _bag([(1024, 512)] * 2 + [(96,)] * 3, torch.float32, seed=5)
+    opt = AdaPNM(ps, fused=True, **cfg)
+    opt._fused_big_batched = False
+    gen = torch.Generator(device=DEV).manual_seed(2)
+    seen = []
+    for _ in range(4):
+        for p in ps:
+            p.grad = torch.randn(*p.shape, generator=gen, device=DEV)
+        opt.step()
+        seen.append(dict(opt._foreach_plans))
+    ob, big, od, nat = _parts(opt)
+    assert len(big) == 2 and len(nat) == 3
+    assert len(seen[-1]) == 2, "native subset and big bucket must have separate plans"
+    for key, plan in seen[1].items():
+        assert all(s[key] is plan for s in seen[2:]), "a plan was rebuilt on a steady step"
