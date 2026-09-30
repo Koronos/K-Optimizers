@@ -213,12 +213,14 @@ them on every step, once per *use site*: an int8 bucket cost four such lists per
 Each codec therefore exposes `stacked_views(states, view, eff) -> _StackedViews | None`,
 built **once per chunk** by `ForeachChunk.momentum_views(codec)` and handed to every
 stacked call as `views=`. **Every optimizer that calls those stacked entry points
-passes them** — AdaBelief, AdamP, ADOPT, AdaMuon, Adakaon, Lion and KProdigy.
+passes them** — AdaBelief, AdamP, ADOPT, AdaMuon, Adakaon, Lion, KProdigy and AdaPNM.
 (ScheduleFree is on the shared plan too, but it reaches the codec through the
 `CodecBuffer` helpers, which take `states` rather than a `mat` callback and so have no
 view lists to prebuild.) `views=None` still runs the original code and is
-bit-identical, which is what **AdaPNM** (the last optimizer doing its own bucketing)
-keeps using. The table below was measured on the first four to adopt it plus Adakaon's
+bit-identical. **AdaPNM** was the last optimizer doing its own bucketing; since 0.7.18 it
+is on the shared plan too (the param's lag behind the group step is its `extra_key`), and
+its two momenta reach the codec through per-chunk alias dicts (`{"m": state["m_pos"], ...}`)
+whose `stacked_views` are built once per chunk. The table below was measured on the first four to adopt it plus Adakaon's
 own follow-up rows; Lion's and KProdigy's are in their own section further down.
 
 Because nothing calls the codec's `mat` argument on the cached path any more, the

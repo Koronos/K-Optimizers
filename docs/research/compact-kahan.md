@@ -482,11 +482,16 @@ intentionally (its decay/GC/theta now read its ~ulp/256 value instead of the bf1
 
 What is still NOT the fp32 run:
 
-* **The other optimizers' weight decay** (Lion, AdaBelief, ADOPT, KProdigy, AdaMuon, AdaPNM,
+* **The other optimizers' weight decay** (Lion, AdaBelief, ADOPT, KProdigy, AdaMuon,
   AdamP) still reads the stored bf16 `p` — `wd·lr·(z − w)` per step, ≤ `wd·lr·½ulp`. The
-  helper is there (`weight_value` / `value_stack`); wiring each optimizer (and AdaPNM's fused
-  kernels) is a follow-up. **AdamP's projection** reads the bf16 weight too. Their native GC
-  also still runs in the grad's dtype.
+  helper is there (`weight_value` / `value_stack`); wiring each optimizer is a follow-up.
+  **AdamP's projection** reads the bf16 weight too. Their native GC also still runs in the
+  grad's dtype (AdaPNM's included).
+* **AdaPNM's weight decay reads the decoded value since 0.7.18** (native per-param and
+  foreach): on a bf16 weight the decay is folded into the fp32 delta
+  (`delta += lr·wd·value(p_old)`, after cautious) and goes through the SR / Kahan write, so
+  `kahan16` + wd follows the fp32 run (`tests/test_adapnm.py`). Its fused kernels never see a
+  kahan8/kahan16 bucket (they decline it, see above).
 * The fp32 reference itself is not invariant to bucket composition on CUDA (a foreach bucket
   of N same-shape tensors reduces differently from N-1), so a mixed fp32/bf16 group is
   bit-comparable only against a reference with the same bucketing.
