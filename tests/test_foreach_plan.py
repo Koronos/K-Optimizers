@@ -33,6 +33,7 @@ from kaon import (
     Adakaon,
     AdamP,
     AdaMuon,
+    AdaPNM,
     KProdigy,
     Lion,
     ScheduleFree,
@@ -48,6 +49,9 @@ OPTIMIZERS = {
     "ADOPT": (ADOPT, {}),
     "ScheduleFree": (ScheduleFree, {}),
     "Lion": (Lion, {}),
+    # AdaPNM's extra key is the param's LAG behind the group step (not a per-param clock
+    # that counts up), so the lagging bucket carries the LARGER key — see the order test.
+    "AdaPNM": (AdaPNM, {}),
     # KProdigy's bucketing depends on ``second_moment`` (its ``ndim >= 2`` state is a
     # factored row/col pair or a full per-coordinate ``v``), so BOTH of its specs get the
     # whole battery. ``d0`` is raised off the 1e-6 default so the update is not orders of
@@ -57,7 +61,7 @@ OPTIMIZERS = {
 }
 NAMES = list(OPTIMIZERS)
 # ScheduleFree / KProdigy: no AutoLR mixin.
-AUTOLR = ["Adakaon", "AdaMuon", "AdaBelief", "AdamP", "ADOPT", "Lion"]
+AUTOLR = ["Adakaon", "AdaMuon", "AdaBelief", "AdamP", "ADOPT", "Lion", "AdaPNM"]
 # Coefficients are per group, not per param -> no per-parameter clock in the bucket key.
 NO_EXTRA_KEY = ["Adakaon", "ScheduleFree", "Lion", "KProdigy", "KProdigyFactored"]
 EXTRA_KEY = [n for n in NAMES if n not in NO_EXTRA_KEY]
@@ -640,6 +644,7 @@ STATE_KEYS = {
     "ADOPT": (("row", "col"), 1),
     "ScheduleFree": (("row", "col"), 1),
     "Lion": ((), 0),
+    "AdaPNM": (("row", "col"), 1),
     "KProdigy": (("v",), 1),
     "KProdigyFactored": (("row", "col"), 1),
 }
@@ -737,6 +742,15 @@ def test_bucket_order_is_anchored(name):
         assert kinds == [True, False, True, False]
         assert keys[0] == keys[1] and keys[2] == keys[3] and keys[0] != keys[2]
         assert keys[0] < keys[2]            # the first-seen clock is the lagging one
+    elif name == "AdaPNM":
+        # All factored first, then all flat, each in first-seen key order — but the key is
+        # the LAG (group step - param step), so the first-seen (lagging) bucket has lag 1
+        # and the up-to-date one lag 0: the inequality runs the other way from a clock.
+        assert kinds == [True, True, False, False]
+        assert keys == [1, 0, 1, 0]
+        lagging = {id(_bag[0]), id(_bag[2])}
+        for c in chunks:
+            assert all((id(p) in lagging) == (c.key == 1) for p in c.plist)
     else:
         # all factored buckets first, then all flat, each in first-seen key order.
         assert kinds == [True, True, False, False]
